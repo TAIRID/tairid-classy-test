@@ -1,0 +1,1186 @@
+name: TAIRID Cosmology v3.32 Independent Reach Family Interpretation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-family-interpretation:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.32 independent reach family interpretation
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_32
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_32")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_32_independent_reach_family_interpretation"
+
+          C_LIGHT_KM_S = 299792.458
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This interprets v3.31 independent reach pressure families.",
+              "A family interpretation is not a model claim.",
+              "Large time-delay pressure is diagnostic information and may reflect reference choice, product semantics, or source-specific assumptions.",
+              "Mixed BAO signs are diagnostic information and must not be averaged into one global reach claim.",
+              "All reach rows remain diagnostic-only.",
+              "KiDS growth rows are loaded only to preserve the existing consolidation/growth comparison lane.",
+              "A pass means the single-reach-surface question is answered well enough to choose the next audit."
+          ]
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          KIDS_TARBALL_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_cosmic_shear_data_release.tgz"
+          KIDS_STATS = ["xipm", "bp", "cosebis"]
+
+          EBOSS_PRODUCTS = [
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_QSO",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR12_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              }
+          ]
+
+          BOSS_PRODUCTS = {
+              "archive_url": "https://data.sdss.org/sas/dr10/boss/papers/clustering/Anderson_2013_CMASSDR11_LOWZDR11_cosmomc.tar.gz",
+              "cmass_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/CMASSDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat",
+              "lowz_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/LOWZDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+          }
+
+          TDCOSMO_PRODUCTS = {
+              "posterior_table_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv"
+          }
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.32-independent-reach-family-interpretation/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def load_numeric_matrix(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lines = [
+                  line for line in text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+              if not lines:
+                  raise RuntimeError(f"No numeric lines found in {path}")
+              return np.loadtxt(io.StringIO("\n".join(lines)))
+
+          def parse_bao_data_table(path):
+              rows = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      z = float(parts[0])
+                      value = float(parts[1])
+                  except Exception:
+                      continue
+                  rows.append({
+                      "z": z,
+                      "value": value,
+                      "observable": parts[2]
+                  })
+              return rows
+
+          def parse_float_or_none(value):
+              if value is None:
+                  return None
+              text = str(value).strip()
+              if text in ["", "-", "--", "nan", "NaN", "NAN", "None", "null"]:
+                  return None
+              try:
+                  x = float(text)
+              except Exception:
+                  return None
+              if not math.isfinite(x):
+                  return None
+              return x
+
+          def classify_bao_observable(observable):
+              lower = observable.lower()
+              if "dm" in lower:
+                  return {
+                      "standardized_reach_family": "bao_transverse_reach",
+                      "standardized_observable": "DM_over_rd",
+                      "reach_axis": "transverse_comoving_reach"
+                  }
+              if "dh" in lower:
+                  return {
+                      "standardized_reach_family": "bao_radial_reach",
+                      "standardized_observable": "DH_over_rd",
+                      "reach_axis": "radial_hubble_reach"
+                  }
+              return {
+                  "standardized_reach_family": "bao_unclassified_reach",
+                  "standardized_observable": observable,
+                  "reach_axis": "bao_unclassified"
+              }
+
+          def standard_row(
+              source,
+              family,
+              source_role,
+              standardized_reach_family,
+              reach_axis,
+              standardized_observable,
+              value,
+              sigma,
+              z_effective,
+              z_lens="",
+              z_source="",
+              covariance_available=False,
+              posterior_table_available=False,
+              source_native_parameter="",
+              boundary_note=""
+          ):
+              value = float(value)
+              sigma = float(sigma)
+              fractional_sigma = sigma / abs(value) if value != 0 else None
+              return {
+                  "source": source,
+                  "surface": "reach_geometry",
+                  "family": family,
+                  "source_role": source_role,
+                  "standardized_reach_family": standardized_reach_family,
+                  "reach_axis": reach_axis,
+                  "standardized_observable": standardized_observable,
+                  "source_native_parameter": source_native_parameter,
+                  "z_effective": z_effective,
+                  "z_lens": z_lens,
+                  "z_source": z_source,
+                  "value": value,
+                  "sigma": sigma,
+                  "fractional_sigma": fractional_sigma if fractional_sigma is not None else "",
+                  "covariance_available": covariance_available,
+                  "posterior_table_available": posterior_table_available,
+                  "included_in_model": False,
+                  "model_anchor_allowed_now": False,
+                  "diagnostic_only": True,
+                  "boundary_note": boundary_note
+              }
+
+          def ingest_eboss():
+              eboss_dir = DOWNLOADS / "SDSS_eBOSS_DR16"
+              eboss_dir.mkdir(parents=True, exist_ok=True)
+              rows = []
+
+              for product in EBOSS_PRODUCTS:
+                  data_path = eboss_dir / safe_name(product["data_url"])
+                  cov_path = eboss_dir / safe_name(product["cov_url"])
+                  download(product["data_url"], data_path)
+                  download(product["cov_url"], cov_path)
+
+                  data_rows = parse_bao_data_table(data_path)
+                  cov = load_numeric_matrix(cov_path)
+
+                  if cov.ndim == 0:
+                      cov = cov.reshape((1, 1))
+                  elif cov.ndim == 1:
+                      cov = cov.reshape((1, -1))
+
+                  covariance_match = cov.ndim == 2 and cov.shape[0] == cov.shape[1] == len(data_rows)
+                  if not covariance_match:
+                      raise RuntimeError(f"Covariance mismatch for {product['family']}")
+
+                  for i, data_row in enumerate(data_rows):
+                      diag = float(cov[i, i])
+                      sigma = math.sqrt(diag) if diag >= 0 else None
+                      if sigma is None:
+                          continue
+                      cls = classify_bao_observable(data_row["observable"])
+                      rows.append(standard_row(
+                          source=product["source"],
+                          family=product["family"],
+                          source_role=product["role"],
+                          standardized_reach_family=cls["standardized_reach_family"],
+                          reach_axis=cls["reach_axis"],
+                          standardized_observable=cls["standardized_observable"],
+                          source_native_parameter=data_row["observable"],
+                          value=data_row["value"],
+                          sigma=sigma,
+                          z_effective=data_row["z"],
+                          covariance_available=True,
+                          boundary_note="eBOSS BAO reach/ruler diagnostic. Interpretation only; not a model anchor."
+                      ))
+              return rows
+
+          def parse_archive_bao_member(tf, member_name):
+              member = next((m for m in tf.getmembers() if m.name.endswith(member_name)), None)
+              if member is None:
+                  raise RuntimeError(f"Archive member not found: {member_name}")
+              f = tf.extractfile(member)
+              if f is None:
+                  raise RuntimeError(f"Could not extract member: {member_name}")
+              text = f.read().decode("utf-8", errors="replace")
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  nums = []
+                  for p in stripped.split():
+                      try:
+                          nums.append(float(p))
+                      except Exception:
+                          pass
+                  if len(nums) >= 3:
+                      rows.append({
+                          "z": nums[0],
+                          "value": nums[1],
+                          "sigma": nums[2],
+                          "raw_line": stripped
+                      })
+              return rows
+
+          def ingest_boss():
+              boss_dir = DOWNLOADS / "BOSS_DR12_BAO"
+              boss_dir.mkdir(parents=True, exist_ok=True)
+              archive_path = boss_dir / safe_name(BOSS_PRODUCTS["archive_url"])
+              cmass_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["cmass_cov_url"])
+              lowz_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["lowz_cov_url"])
+
+              download(BOSS_PRODUCTS["archive_url"], archive_path)
+              download(BOSS_PRODUCTS["cmass_cov_url"], cmass_cov_path)
+              download(BOSS_PRODUCTS["lowz_cov_url"], lowz_cov_path)
+
+              with tarfile.open(archive_path, "r:*") as tf:
+                  cmass_rows = parse_archive_bao_member(tf, "data/sdss_DR11CMASS_bao.txt")
+                  lowz_rows = parse_archive_bao_member(tf, "data/sdss_DR11LOWZ_bao.txt")
+
+              cmass_cov = load_numeric_matrix(cmass_cov_path)
+              lowz_cov = load_numeric_matrix(lowz_cov_path)
+
+              rows = []
+
+              for family, native_rows, cov in [
+                  ("BOSS_DR11_CMASS_archive_BAO", cmass_rows, cmass_cov),
+                  ("BOSS_DR11_LOWZ_archive_BAO", lowz_rows, lowz_cov)
+              ]:
+                  cov_shape_ok = cov.ndim == 2 and cov.shape[0] == cov.shape[1]
+                  for native in native_rows:
+                      rows.append(standard_row(
+                          source="BOSS_DR12_BAO",
+                          family=family,
+                          source_role="pre_DESI_BOSS_archive_BAO",
+                          standardized_reach_family="bao_archive_isotropic_reach",
+                          reach_axis="isotropic_or_archive_bao_reach",
+                          standardized_observable="DV_over_rd_assumed_from_archive_scalar",
+                          source_native_parameter="BAO_archive_observable",
+                          value=native["value"],
+                          sigma=native["sigma"],
+                          z_effective=native["z"],
+                          covariance_available=cov_shape_ok,
+                          boundary_note="Older BOSS archive BAO scalar. Supporting interpretation only."
+                      ))
+              return rows
+
+          def ingest_tdcosmo():
+              td_dir = DOWNLOADS / "TDCOSMO_2020"
+              td_dir.mkdir(parents=True, exist_ok=True)
+              table_path = td_dir / safe_name(TDCOSMO_PRODUCTS["posterior_table_url"])
+              download(TDCOSMO_PRODUCTS["posterior_table_url"], table_path)
+
+              with table_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                  reader = csv.DictReader(f)
+                  table_rows = list(reader)
+                  fieldnames = reader.fieldnames or []
+
+              required = ["name", "z_lens", "z_source", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma", "flag"]
+              missing = [c for c in required if c not in fieldnames]
+              if missing:
+                  raise RuntimeError(f"TDCOSMO posterior table missing columns: {missing}")
+
+              rows = []
+              skipped = []
+
+              for i, row in enumerate(table_rows):
+                  name = row.get("name", f"row_{i}")
+                  flag = parse_float_or_none(row.get("flag"))
+                  z_lens = parse_float_or_none(row.get("z_lens"))
+                  z_source = parse_float_or_none(row.get("z_source"))
+                  ddt_mean = parse_float_or_none(row.get("Ddt_mean"))
+                  ddt_sigma = parse_float_or_none(row.get("Ddt_sigma"))
+
+                  if flag is not None and flag < 0:
+                      skipped.append({"name": name, "row_index": i, "reason": "negative_flag", "flag": row.get("flag")})
+                      continue
+
+                  if z_lens is None or z_source is None or ddt_mean is None or ddt_sigma is None or ddt_sigma <= 0:
+                      skipped.append({"name": name, "row_index": i, "reason": "missing_or_invalid_Ddt_fields", "flag": row.get("flag")})
+                      continue
+
+                  base = standard_row(
+                      source="TDCOSMO_2020",
+                      family="TDCOSMO_time_delay",
+                      source_role="hierarchical_time_delay_posterior_table",
+                      standardized_reach_family="time_delay_distance_reach",
+                      reach_axis="time_delay_path_reach",
+                      standardized_observable="Ddt_time_delay_distance",
+                      source_native_parameter="Ddt_mean_Ddt_sigma",
+                      value=ddt_mean,
+                      sigma=ddt_sigma,
+                      z_effective=z_lens,
+                      z_lens=z_lens,
+                      z_source=z_source,
+                      covariance_available=False,
+                      posterior_table_available=True,
+                      boundary_note="TDCOSMO Ddt time-delay distance diagnostic. Interpretation only; not a model anchor."
+                  )
+                  base["lens_name"] = name
+                  base["tdcosmo_flag"] = flag if flag is not None else ""
+                  rows.append(base)
+
+              return rows, skipped
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+                  try:
+                      rows.append({
+                          "parameter_raw": name_raw,
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+                  text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+              marg = {r["parameter"]: r for r in parse_planck_margestats(text)}
+              required = ["H0", "omegam", "rdrag", "S8"]
+              missing = [p for p in required if p not in marg]
+              if missing:
+                  raise RuntimeError(f"Missing Planck reference parameters: {missing}")
+
+              return {
+                  "H0": float(marg["H0"]["mean"]),
+                  "omegam": float(marg["omegam"]["mean"]),
+                  "rdrag": float(marg["rdrag"]["mean"]),
+                  "S8": float(marg["S8"]["mean"]),
+                  "S8_sigma": float(marg["S8"]["sddev"])
+              }
+
+          def E_z(z, omega_m):
+              return math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+          def comoving_distance_mpc(z, h0, omega_m):
+              if z <= 0:
+                  return 0.0
+              n = 2000
+              if n % 2:
+                  n += 1
+              xs = np.linspace(0.0, z, n + 1)
+              ys = np.array([1.0 / E_z(float(x), omega_m) for x in xs])
+              h = z / n
+              integral = h / 3.0 * (
+                  ys[0] + ys[-1] + 4.0 * np.sum(ys[1:-1:2]) + 2.0 * np.sum(ys[2:-2:2])
+              )
+              return C_LIGHT_KM_S / h0 * integral
+
+          def angular_diameter_distance_mpc(z, h0, omega_m):
+              return comoving_distance_mpc(z, h0, omega_m) / (1.0 + z)
+
+          def angular_diameter_between_mpc(z_lens, z_source, h0, omega_m):
+              if z_source <= z_lens:
+                  return None
+              dc_lens = comoving_distance_mpc(z_lens, h0, omega_m)
+              dc_source = comoving_distance_mpc(z_source, h0, omega_m)
+              return (dc_source - dc_lens) / (1.0 + z_source)
+
+          def reference_dm_over_rd(z, planck):
+              return comoving_distance_mpc(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+
+          def reference_dh_over_rd(z, planck):
+              dh = C_LIGHT_KM_S / (planck["H0"] * E_z(z, planck["omegam"]))
+              return dh / planck["rdrag"]
+
+          def reference_dv_over_rd(z, planck):
+              dm = comoving_distance_mpc(z, planck["H0"], planck["omegam"])
+              dh = C_LIGHT_KM_S / (planck["H0"] * E_z(z, planck["omegam"]))
+              dv = (z * dm * dm * dh) ** (1.0 / 3.0)
+              return dv / planck["rdrag"]
+
+          def reference_ddt_mpc(z_lens, z_source, planck):
+              d_l = angular_diameter_distance_mpc(z_lens, planck["H0"], planck["omegam"])
+              d_s = angular_diameter_distance_mpc(z_source, planck["H0"], planck["omegam"])
+              d_ls = angular_diameter_between_mpc(z_lens, z_source, planck["H0"], planck["omegam"])
+              if d_ls is None or d_ls <= 0:
+                  return None
+              return (1.0 + z_lens) * d_l * d_s / d_ls
+
+          def pressure_map_row(row, planck):
+              mapped = dict(row)
+              obs = row["standardized_observable"]
+              z = float(row["z_effective"])
+              value = float(row["value"])
+              sigma = float(row["sigma"])
+
+              reference_value = None
+              reference_observable = ""
+
+              if obs == "DM_over_rd":
+                  reference_value = reference_dm_over_rd(z, planck)
+                  reference_observable = "Planck_flat_LCDM_DM_over_rd"
+              elif obs == "DH_over_rd":
+                  reference_value = reference_dh_over_rd(z, planck)
+                  reference_observable = "Planck_flat_LCDM_DH_over_rd"
+              elif obs == "DV_over_rd_assumed_from_archive_scalar":
+                  reference_value = reference_dv_over_rd(z, planck)
+                  reference_observable = "Planck_flat_LCDM_DV_over_rd"
+              elif obs == "Ddt_time_delay_distance":
+                  z_lens = parse_float_or_none(row.get("z_lens"))
+                  z_source = parse_float_or_none(row.get("z_source"))
+                  if z_lens is not None and z_source is not None:
+                      reference_value = reference_ddt_mpc(z_lens, z_source, planck)
+                      reference_observable = "Planck_flat_LCDM_Ddt_Mpc"
+
+              if reference_value is None or sigma <= 0:
+                  pressure_z = ""
+                  pressure_sign = "unmapped"
+                  finite_pressure = False
+              else:
+                  pressure_z = (value - reference_value) / sigma
+                  pressure_sign = "positive" if pressure_z > 0 else "negative" if pressure_z < 0 else "zero"
+                  finite_pressure = math.isfinite(pressure_z)
+
+              mapped["declared_reference"] = "Planck_2018_base_plikHM_TTTEEE_lowl_lowE_flat_LCDM_diagnostic"
+              mapped["reference_observable"] = reference_observable
+              mapped["reference_value"] = reference_value if reference_value is not None else ""
+              mapped["pressure_z"] = pressure_z
+              mapped["pressure_sign"] = pressure_sign
+              mapped["finite_pressure"] = finite_pressure
+              mapped["abs_pressure_z"] = abs(pressure_z) if finite_pressure else ""
+              mapped["large_pressure_flag_abs_gt_5"] = bool(finite_pressure and abs(pressure_z) > 5.0)
+              mapped["extreme_pressure_flag_abs_gt_10"] = bool(finite_pressure and abs(pressure_z) > 10.0)
+              mapped["included_in_model"] = False
+              mapped["model_anchor_allowed_now"] = False
+              mapped["diagnostic_only"] = True
+              return mapped
+
+          def split_chain_text(text):
+              comment_lines = []
+              data_lines = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if stripped.startswith("#"):
+                      comment_lines.append(stripped)
+                  else:
+                      data_lines.append(stripped)
+              if not data_lines:
+                  raise RuntimeError("No numeric chain rows found.")
+              data = np.loadtxt(io.StringIO("\n".join(data_lines)))
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+              return comment_lines, data
+
+          def token_is_numeric(token):
+              try:
+                  float(token)
+                  return True
+              except Exception:
+                  return False
+
+          def detect_chain_header(comment_lines, ncols):
+              candidates = []
+              for line in comment_lines:
+                  candidate = line.lstrip("#").strip()
+                  if not candidate:
+                      continue
+                  tokens = re.split(r"\s+", candidate)
+                  if len(tokens) != ncols:
+                      continue
+                  numeric_count = sum(1 for t in tokens if token_is_numeric(t))
+                  parameterish_count = sum(1 for t in tokens if "--" in t or "COSMOLOGICAL" in t.upper() or t in ["weight", "prior", "like", "post"])
+                  if numeric_count == 0 and parameterish_count >= max(3, ncols // 5):
+                      candidates.append(tokens)
+              if not candidates:
+                  return [f"col_{i}" for i in range(ncols)], False
+              return candidates[0], True
+
+          def parse_chain_file(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              comment_lines, data = split_chain_text(text)
+              header, header_detected = detect_chain_header(comment_lines, data.shape[1])
+              return header, data, header_detected
+
+          def weight_array(header, data):
+              col = {name: i for i, name in enumerate(header)}
+              if "weight" in col:
+                  return data[:, col["weight"]], "weight"
+              return np.ones(data.shape[0]), None
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+              if len(values) == 0:
+                  return [None for _ in qs]
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def summarize_parameter(values, weights):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+              if len(values) == 0:
+                  raise RuntimeError("No finite values available.")
+              q16, q50, q84 = weighted_quantile(values, weights, [0.16, 0.50, 0.84])
+              sigma = (q84 - q16) / 2.0 if q16 is not None and q84 is not None else None
+              mean = float(np.average(values, weights=weights)) if np.sum(weights) > 0 else float(np.mean(values))
+              return {"mean": mean, "q16": q16, "q50": q50, "q84": q84, "sigma": sigma}
+
+          def load_kids_growth(planck):
+              kids_dir = DOWNLOADS / "KiDS_1000"
+              kids_dir.mkdir(parents=True, exist_ok=True)
+              tar_path = kids_dir / "KiDS1000_cosmic_shear_data_release.tgz"
+              download(KIDS_TARBALL_URL, tar_path)
+
+              extract_dir = OUTDIR / "kids_1000_extracted"
+              extract_dir.mkdir(parents=True, exist_ok=True)
+
+              with tarfile.open(tar_path, "r:gz") as tf:
+                  safe_members = []
+                  for member in tf.getmembers():
+                      target = (extract_dir / member.name).resolve()
+                      if str(target).startswith(str(extract_dir.resolve())):
+                          safe_members.append(member)
+                  tf.extractall(extract_dir, members=safe_members)
+
+              bases = [p for p in extract_dir.iterdir() if p.is_dir() and "KiDS1000" in p.name and "shear_data_release" in p.name]
+              if not bases:
+                  raise RuntimeError("Could not find KiDS extracted base directory.")
+              base = bases[0]
+
+              rows = []
+              for stat in KIDS_STATS:
+                  chain_path = base / "chains_and_config_files" / "main_chains_iterative_covariance" / stat / "chain" / "output_multinest_C.txt"
+                  header, data, header_detected = parse_chain_file(chain_path)
+                  col = {name: i for i, name in enumerate(header)}
+                  if "COSMOLOGICAL_PARAMETERS--S_8" not in col:
+                      raise RuntimeError(f"KiDS S8 column missing for {stat}.")
+                  weights, weight_col = weight_array(header, data)
+                  summary = summarize_parameter(data[:, col["COSMOLOGICAL_PARAMETERS--S_8"]], weights)
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck["S8_sigma"] ** 2)
+                  pressure = (summary["q50"] - planck["S8"]) / combined_sigma
+                  rows.append({
+                      "surface": "consolidation_growth",
+                      "source": "KiDS_1000",
+                      "family": "KiDS_1000",
+                      "statistic": stat,
+                      "pressure_vs_planck_z": pressure,
+                      "pressure_sign": "negative" if pressure < 0 else "positive" if pressure > 0 else "zero",
+                      "boundary_note": "Existing prototype growth/consolidation lane."
+                  })
+              return {
+                  "rows": rows,
+                  "all_negative": all(r["pressure_sign"] == "negative" for r in rows),
+                  "mean_pressure_z": float(np.mean([r["pressure_vs_planck_z"] for r in rows]))
+              }
+
+          def interpret_family(family, rows):
+              finite = [r for r in rows if r["finite_pressure"] is True]
+              pressures = [float(r["pressure_z"]) for r in finite]
+              signs = sorted(set(r["pressure_sign"] for r in finite))
+              row_count = len(rows)
+              large_count = sum(1 for r in finite if r["large_pressure_flag_abs_gt_5"] is True)
+              extreme_count = sum(1 for r in finite if r["extreme_pressure_flag_abs_gt_10"] is True)
+
+              mean_pressure = float(np.mean(pressures)) if pressures else ""
+              median_pressure = float(np.median(pressures)) if pressures else ""
+              min_pressure = float(np.min(pressures)) if pressures else ""
+              max_pressure = float(np.max(pressures)) if pressures else ""
+              abs_mean = abs(mean_pressure) if pressures else None
+
+              if family in ["bao_transverse_reach", "bao_radial_reach"]:
+                  if len(signs) > 1 and abs_mean is not None and abs_mean < 1.0:
+                      interpretation_label = "near_reference_mixed_small_bao_pressure"
+                      recommended_handling = "keep_as_bao_subsurface_diagnostic_not_global_reach"
+                  elif abs_mean is not None and abs_mean < 2.0:
+                      interpretation_label = "small_bao_pressure"
+                      recommended_handling = "keep_as_bao_subsurface_diagnostic"
+                  else:
+                      interpretation_label = "nontrivial_bao_pressure_review_needed"
+                      recommended_handling = "audit_reference_and_covariance_before_use"
+              elif family == "bao_archive_isotropic_reach":
+                  interpretation_label = "supporting_negative_archive_bao_pressure"
+                  recommended_handling = "supporting_subsurface_only_not_primary_anchor"
+              elif family == "time_delay_distance_reach":
+                  if large_count > 0 or extreme_count > 0:
+                      interpretation_label = "strong_positive_time_delay_pressure_reference_sensitivity_required"
+                      recommended_handling = "separate_time_delay_subsurface_and_run_reference_semantics_audit"
+                  else:
+                      interpretation_label = "positive_time_delay_pressure"
+                      recommended_handling = "separate_time_delay_subsurface"
+              else:
+                  interpretation_label = "unclassified_reach_family"
+                  recommended_handling = "manual_review"
+
+              return {
+                  "standardized_reach_family": family,
+                  "row_count": row_count,
+                  "finite_pressure_count": len(finite),
+                  "source_count": len(set(r["source"] for r in rows)),
+                  "source_list": ";".join(sorted(set(r["source"] for r in rows))),
+                  "mean_pressure_z": mean_pressure,
+                  "median_pressure_z": median_pressure,
+                  "min_pressure_z": min_pressure,
+                  "max_pressure_z": max_pressure,
+                  "signs_present": ";".join(signs),
+                  "large_pressure_abs_gt_5_count": large_count,
+                  "extreme_pressure_abs_gt_10_count": extreme_count,
+                  "interpretation_label": interpretation_label,
+                  "recommended_handling": recommended_handling,
+                  "single_reach_surface_safe": False,
+                  "model_anchor_allowed": False,
+                  "boundary_note": "Family interpretation only. No refit and no model claim."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_31_status": "independent_reach_pressure_mapping_passed_ready_for_v3_32_family_interpretation_audit",
+                  "v3_31_mapped_reach_rows": 23,
+                  "v3_31_mixed_sign_families": ["bao_radial_reach", "bao_transverse_reach"],
+                  "v3_31_large_pressure_abs_gt_5_count": 9,
+                  "v3_31_extreme_pressure_abs_gt_10_count": 6
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.32 independent reach family interpretation")
+          print("Truth boundary: interpretation only; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+          reach_rows = []
+          skipped_rows = []
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_results"]["Planck_2018"] = {"load_pass": True, "H0": planck["H0"], "omegam": planck["omegam"], "rdrag": planck["rdrag"]}
+              print("Planck reference loaded.")
+          except Exception as e:
+              failed_gates.append("planck_reference_load_failed")
+              planck = None
+              inventory["source_results"]["Planck_2018"] = {"load_pass": False, "error": f"{type(e).__name__}: {e}"}
+              print(f"Planck failed: {type(e).__name__}: {e}")
+
+          try:
+              eboss_rows = ingest_eboss()
+              reach_rows.extend(eboss_rows)
+              inventory["source_results"]["SDSS_eBOSS_DR16"] = {"load_pass": len(eboss_rows) >= 8, "row_count": len(eboss_rows)}
+              print(f"eBOSS rows: {len(eboss_rows)}")
+          except Exception as e:
+              failed_gates.append("eboss_load_failed")
+              inventory["source_results"]["SDSS_eBOSS_DR16"] = {"load_pass": False, "error": f"{type(e).__name__}: {e}"}
+              print(f"eBOSS failed: {type(e).__name__}: {e}")
+
+          try:
+              boss_rows = ingest_boss()
+              reach_rows.extend(boss_rows)
+              inventory["source_results"]["BOSS_DR12_BAO"] = {"load_pass": len(boss_rows) >= 2, "row_count": len(boss_rows)}
+              print(f"BOSS rows: {len(boss_rows)}")
+          except Exception as e:
+              failed_gates.append("boss_load_failed")
+              inventory["source_results"]["BOSS_DR12_BAO"] = {"load_pass": False, "error": f"{type(e).__name__}: {e}"}
+              print(f"BOSS failed: {type(e).__name__}: {e}")
+
+          try:
+              td_rows, td_skipped = ingest_tdcosmo()
+              reach_rows.extend(td_rows)
+              skipped_rows.extend(td_skipped)
+              inventory["source_results"]["TDCOSMO_2020"] = {"load_pass": len(td_rows) >= 10, "row_count": len(td_rows), "skipped_row_count": len(td_skipped)}
+              print(f"TDCOSMO rows: {len(td_rows)}")
+          except Exception as e:
+              failed_gates.append("tdcosmo_load_failed")
+              inventory["source_results"]["TDCOSMO_2020"] = {"load_pass": False, "error": f"{type(e).__name__}: {e}"}
+              print(f"TDCOSMO failed: {type(e).__name__}: {e}")
+
+          mapped_rows = []
+          if planck is not None:
+              mapped_rows = [pressure_map_row(r, planck) for r in reach_rows]
+
+          try:
+              kids = load_kids_growth(planck)
+              inventory["source_results"]["KiDS_1000"] = {
+                  "load_pass": len(kids["rows"]) == 3 and kids["all_negative"] is True,
+                  "growth_row_count": len(kids["rows"]),
+                  "all_negative": kids["all_negative"],
+                  "mean_pressure_z": kids["mean_pressure_z"]
+              }
+              print(f"KiDS rows: {len(kids['rows'])}")
+          except Exception as e:
+              failed_gates.append("kids_growth_load_failed")
+              kids = {"rows": [], "all_negative": False, "mean_pressure_z": None}
+              inventory["source_results"]["KiDS_1000"] = {"load_pass": False, "error": f"{type(e).__name__}: {e}"}
+              print(f"KiDS failed: {type(e).__name__}: {e}")
+
+          families = sorted(set(r["standardized_reach_family"] for r in mapped_rows))
+          family_rows = []
+          for family in families:
+              family_rows.append(interpret_family(family, [r for r in mapped_rows if r["standardized_reach_family"] == family]))
+
+          all_reach_pressures = [float(r["pressure_z"]) for r in mapped_rows if r["finite_pressure"] is True]
+          overall_reach_mean = float(np.mean(all_reach_pressures)) if all_reach_pressures else None
+          overall_reach_median = float(np.median(all_reach_pressures)) if all_reach_pressures else None
+
+          family_mean_values = [
+              float(r["mean_pressure_z"])
+              for r in family_rows
+              if str(r.get("mean_pressure_z", "")) not in ["", "nan"]
+          ]
+
+          family_mean_spread = float(max(family_mean_values) - min(family_mean_values)) if family_mean_values else None
+
+          mixed_sign_families = [
+              r["standardized_reach_family"]
+              for r in family_rows
+              if ";" in str(r.get("signs_present", ""))
+          ]
+
+          strong_positive_time_delay = any(
+              r["standardized_reach_family"] == "time_delay_distance_reach"
+              and str(r["interpretation_label"]).startswith("strong_positive")
+              for r in family_rows
+          )
+
+          near_reference_bao = all(
+              abs(float(r["mean_pressure_z"])) < 1.0
+              for r in family_rows
+              if r["standardized_reach_family"] in ["bao_transverse_reach", "bao_radial_reach"]
+          )
+
+          negative_archive_bao = any(
+              r["standardized_reach_family"] == "bao_archive_isotropic_reach"
+              and float(r["mean_pressure_z"]) < 0
+              for r in family_rows
+          )
+
+          single_reach_surface_too_blunt = (
+              len(mixed_sign_families) > 0
+              or strong_positive_time_delay
+              or (family_mean_spread is not None and family_mean_spread > 5.0)
+          )
+
+          reach_subsurface_split_required = single_reach_surface_too_blunt
+
+          mapped_csv = OUTDIR / "independent_reach_family_interpretation_mapped_rows_v3_32.csv"
+          mapped_fields = sorted({k for row in mapped_rows for k in row.keys()}) if mapped_rows else ["source", "pressure_z"]
+          with mapped_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=mapped_fields)
+              writer.writeheader()
+              for row in mapped_rows:
+                  writer.writerow({k: row.get(k, "") for k in mapped_fields})
+
+          family_csv = OUTDIR / "independent_reach_family_interpretation_summary_v3_32.csv"
+          family_fields = [
+              "standardized_reach_family", "row_count", "finite_pressure_count", "source_count", "source_list",
+              "mean_pressure_z", "median_pressure_z", "min_pressure_z", "max_pressure_z",
+              "signs_present", "large_pressure_abs_gt_5_count", "extreme_pressure_abs_gt_10_count",
+              "interpretation_label", "recommended_handling",
+              "single_reach_surface_safe", "model_anchor_allowed", "boundary_note"
+          ]
+          with family_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=family_fields)
+              writer.writeheader()
+              for row in family_rows:
+                  writer.writerow({k: row.get(k, "") for k in family_fields})
+
+          kids_csv = OUTDIR / "kids_growth_comparison_rows_v3_32.csv"
+          kids_fields = ["surface", "source", "family", "statistic", "pressure_vs_planck_z", "pressure_sign", "boundary_note"]
+          with kids_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=kids_fields)
+              writer.writeheader()
+              for row in kids.get("rows", []):
+                  writer.writerow({k: row.get(k, "") for k in kids_fields})
+
+          interpretation_rows = [
+              {
+                  "interpretation_gate": "single_reach_surface_too_blunt",
+                  "result": single_reach_surface_too_blunt,
+                  "value": f"family_mean_spread={family_mean_spread}; mixed={';'.join(mixed_sign_families)}; strong_time_delay={strong_positive_time_delay}",
+                  "meaning": "If true, independent reach should be split into sub-surfaces before any refit."
+              },
+              {
+                  "interpretation_gate": "bao_primary_families_near_reference_but_mixed",
+                  "result": near_reference_bao,
+                  "value": f"mixed_bao_families={';'.join(mixed_sign_families)}",
+                  "meaning": "BAO transverse/radial rows hover near the Planck diagnostic reference and should not be forced into one signed reach claim."
+              },
+              {
+                  "interpretation_gate": "time_delay_family_strong_positive",
+                  "result": strong_positive_time_delay,
+                  "value": "time_delay_distance_reach",
+                  "meaning": "The time-delay lane is strongly positive and needs a reference/semantics sensitivity audit before interpretation."
+              },
+              {
+                  "interpretation_gate": "archive_bao_supporting_negative",
+                  "result": negative_archive_bao,
+                  "value": "bao_archive_isotropic_reach",
+                  "meaning": "The older archive BAO scalar is negative and should remain supporting, not primary."
+              },
+              {
+                  "interpretation_gate": "growth_lane_stays_negative",
+                  "result": kids.get("all_negative") is True,
+                  "value": kids.get("mean_pressure_z"),
+                  "meaning": "The consolidation/growth lane remains negative."
+              },
+              {
+                  "interpretation_gate": "model_claim_allowed",
+                  "result": False,
+                  "value": False,
+                  "meaning": "No validation or new-physics claim is allowed."
+              },
+              {
+                  "interpretation_gate": "refit_allowed",
+                  "result": False,
+                  "value": False,
+                  "meaning": "No refit is allowed in v3.32."
+              }
+          ]
+
+          interpretation_csv = OUTDIR / "independent_reach_family_interpretation_gates_v3_32.csv"
+          with interpretation_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["interpretation_gate", "result", "value", "meaning"])
+              writer.writeheader()
+              for row in interpretation_rows:
+                  writer.writerow(row)
+
+          if len(mapped_rows) < 23:
+              failed_gates.append("mapped_reach_row_count_below_v3_31_baseline")
+
+          if len(family_rows) < 4:
+              failed_gates.append("fewer_than_four_reach_families_interpreted")
+
+          if not single_reach_surface_too_blunt:
+              failed_gates.append("single_reach_surface_not_rejected_as_too_blunt")
+
+          if not kids.get("all_negative"):
+              failed_gates.append("kids_growth_lane_not_ready")
+
+          reach_model_anchor_violations = [r for r in mapped_rows if r.get("model_anchor_allowed_now") is not False]
+          reach_diagnostic_violations = [r for r in mapped_rows if r.get("diagnostic_only") is not True]
+
+          if reach_model_anchor_violations:
+              failed_gates.append("reach_model_anchor_promotion_violation")
+
+          if reach_diagnostic_violations:
+              failed_gates.append("reach_diagnostic_boundary_violation")
+
+          audit_rows = [
+              {
+                  "audit_gate": "v3_31_reach_rows_reproduced",
+                  "pass": len(mapped_rows) >= 23,
+                  "value": len(mapped_rows),
+                  "boundary": "v3.31 mapped 23 independent reach rows."
+              },
+              {
+                  "audit_gate": "four_reach_families_interpreted",
+                  "pass": len(family_rows) >= 4,
+                  "value": ";".join([r["standardized_reach_family"] for r in family_rows]),
+                  "boundary": "Reach interpretation must remain family-specific."
+              },
+              {
+                  "audit_gate": "single_reach_surface_too_blunt",
+                  "pass": single_reach_surface_too_blunt,
+                  "value": f"family_mean_spread={family_mean_spread}; overall_mean={overall_reach_mean}; overall_median={overall_reach_median}",
+                  "boundary": "A single reach surface should be rejected if subfamilies split strongly."
+              },
+              {
+                  "audit_gate": "reach_subsurface_split_required",
+                  "pass": reach_subsurface_split_required,
+                  "value": reach_subsurface_split_required,
+                  "boundary": "Subsurface split is a mapping requirement, not a model claim."
+              },
+              {
+                  "audit_gate": "time_delay_reference_sensitivity_required",
+                  "pass": strong_positive_time_delay,
+                  "value": strong_positive_time_delay,
+                  "boundary": "Large TDCOSMO pressure needs a source semantics/reference audit before interpretation."
+              },
+              {
+                  "audit_gate": "kids_growth_lane_ready",
+                  "pass": kids.get("all_negative") is True,
+                  "value": kids.get("mean_pressure_z"),
+                  "boundary": "Growth/consolidation remains negative."
+              },
+              {
+                  "audit_gate": "no_reach_model_anchor_promotion",
+                  "pass": len(reach_model_anchor_violations) == 0,
+                  "value": len(reach_model_anchor_violations),
+                  "boundary": "Interpretation does not promote reach rows to model anchors."
+              },
+              {
+                  "audit_gate": "all_reach_rows_remain_diagnostic",
+                  "pass": len(reach_diagnostic_violations) == 0,
+                  "value": len(reach_diagnostic_violations),
+                  "boundary": "All reach rows remain diagnostic-only."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed in v3.32."
+              }
+          ]
+
+          audit_csv = OUTDIR / "independent_reach_family_interpretation_audit_v3_32.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          if not failed_gates:
+              readiness_label = "independent_reach_family_interpretation_passed_single_reach_surface_too_blunt"
+          else:
+              readiness_label = "independent_reach_family_interpretation_needs_followup"
+
+          next_step = (
+              "Build v3.33 reach subsurface reference-sensitivity audit: keep BAO transverse, BAO radial, BOSS archive, and time-delay reach separate; test whether TDCOSMO amplitude survives source-semantics and reference-choice checks before any refit."
+              if not failed_gates
+              else "Inspect failed v3.32 interpretation gates before the reference-sensitivity audit."
+          )
+
+          inventory["mapped_reach_row_count"] = len(mapped_rows)
+          inventory["reach_family_count"] = len(family_rows)
+          inventory["overall_reach_mean_pressure_z"] = overall_reach_mean
+          inventory["overall_reach_median_pressure_z"] = overall_reach_median
+          inventory["family_mean_spread"] = family_mean_spread
+          inventory["mixed_sign_families"] = mixed_sign_families
+          inventory["strong_positive_time_delay"] = strong_positive_time_delay
+          inventory["near_reference_bao"] = near_reference_bao
+          inventory["negative_archive_bao"] = negative_archive_bao
+          inventory["single_reach_surface_too_blunt"] = single_reach_surface_too_blunt
+          inventory["reach_subsurface_split_required"] = reach_subsurface_split_required
+          inventory["kids_growth_ready"] = kids.get("all_negative") is True
+          inventory["kids_growth_mean_pressure_z"] = kids.get("mean_pressure_z")
+          inventory["model_anchor_violation_count"] = len(reach_model_anchor_violations)
+          inventory["diagnostic_violation_count"] = len(reach_diagnostic_violations)
+          inventory["output_files"] = {
+              "mapped_rows": str(mapped_csv),
+              "family_summary": str(family_csv),
+              "interpretation_gates": str(interpretation_csv),
+              "kids_growth_rows": str(kids_csv),
+              "audit": str(audit_csv)
+          }
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "single_reach_surface_too_blunt": single_reach_surface_too_blunt,
+              "reach_subsurface_split_required": reach_subsurface_split_required,
+              "mixed_sign_families": mixed_sign_families,
+              "strong_positive_time_delay": strong_positive_time_delay,
+              "near_reference_bao": near_reference_bao,
+              "negative_archive_bao": negative_archive_bao,
+              "kids_growth_ready": inventory["kids_growth_ready"],
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_32_independent_reach_family_interpretation.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.32 — Independent Reach Family Interpretation")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.32 interprets the independent reach pressure families from v3.31.")
+          md.append("")
+          md.append("It asks whether a single reach surface is still too blunt after independent reach pressure mapping.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Mapped reach rows: `{len(mapped_rows)}`")
+          md.append(f"- Reach families interpreted: `{len(family_rows)}`")
+          md.append(f"- Overall reach mean pressure: `{overall_reach_mean}`")
+          md.append(f"- Overall reach median pressure: `{overall_reach_median}`")
+          md.append(f"- Family mean spread: `{family_mean_spread}`")
+          md.append(f"- Mixed-sign families: `{', '.join(mixed_sign_families) if mixed_sign_families else 'none'}`")
+          md.append(f"- Strong positive time-delay pressure: `{strong_positive_time_delay}`")
+          md.append(f"- Near-reference BAO behavior: `{near_reference_bao}`")
+          md.append(f"- Negative archive BAO: `{negative_archive_bao}`")
+          md.append(f"- Single reach surface too blunt: `{single_reach_surface_too_blunt}`")
+          md.append(f"- KiDS growth ready: `{inventory['kids_growth_ready']}`")
+          md.append(f"- KiDS mean growth pressure: `{inventory['kids_growth_mean_pressure_z']}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not failed_gates:
+              md.append("The independent reach side should not be collapsed into one reach surface. BAO transverse/radial rows remain near-reference and mixed, BOSS archive BAO is supporting-negative, and TDCOSMO time-delay distance is strongly positive. The next step is a reference-sensitivity and source-semantics audit, not a refit.")
+          else:
+              md.append("The interpretation audit did not clear all gates. No reference-sensitivity audit should run until the failed gates are repaired.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_family_interpretation_mapped_rows_v3_32.csv`")
+          md.append("- `independent_reach_family_interpretation_summary_v3_32.csv`")
+          md.append("- `independent_reach_family_interpretation_gates_v3_32.csv`")
+          md.append("- `kids_growth_comparison_rows_v3_32.csv`")
+          md.append("- `independent_reach_family_interpretation_audit_v3_32.csv`")
+          md.append("- `tairid_cosmology_v3_32_independent_reach_family_interpretation.json`")
+          md.append("- `tairid_cosmology_v3_32_independent_reach_family_interpretation.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_32_independent_reach_family_interpretation.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.32 independent reach family interpretation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-32-independent-reach-family-interpretation
+          path: artifacts/tairid_cosmology_v3_32/
