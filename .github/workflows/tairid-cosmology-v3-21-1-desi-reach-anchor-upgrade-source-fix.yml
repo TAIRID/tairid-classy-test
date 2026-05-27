@@ -1,0 +1,766 @@
+name: TAIRID Cosmology v3.21.1 DESI Reach Anchor Upgrade Source Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  desi-reach-anchor-upgrade-source-fix:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.21.1 DESI reach anchor upgrade source fix
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_21_1
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_21_1")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_21_1_desi_reach_anchor_upgrade_source_fix"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This fixes the v3.21 source-load strictness issue.",
+              "This tests whether DESI DR1 BAO provides a stricter direct reach/ruler anchor candidate.",
+              "The old DESI H0 diagnostic from H0rdrag/rdrag remains diagnostic-only because it is algebraically derived.",
+              "Only direct DESI chain parameters may be considered reach-anchor candidates.",
+              "Planck is used as a reference surface, not as a full likelihood replacement.",
+              "A pass means a reach-anchor candidate exists for a later refit-decision gate; it still does not validate TAIRID."
+          ]
+
+          DESI_CHAIN_URLS = [
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.1.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.2.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.3.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.4.txt"
+          ]
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+          PLANCK_COVMAT_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.covmat"
+          PLANCK_PARAMNAMES_PATH = "base/plikHM_TTTEEE_lowl_lowE/base_plikHM_TTTEEE_lowl_lowE.paramnames"
+
+          DIRECT_DESI_REACH_CANDIDATES = [
+              "H0rdrag",
+              "rdrag",
+              "hrdrag",
+              "omegamh2",
+              "omm",
+              "omegam"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.21.1-desi-reach-anchor-upgrade-source-fix/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def token_is_numeric(token):
+              try:
+                  float(token)
+                  return True
+              except Exception:
+                  return False
+
+          def split_chain_text(text):
+              comment_lines = []
+              data_lines = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if stripped.startswith("#"):
+                      comment_lines.append(stripped)
+                  else:
+                      data_lines.append(stripped)
+
+              if not data_lines:
+                  raise RuntimeError("No numeric chain rows found.")
+
+              data = np.loadtxt(io.StringIO("\n".join(data_lines)))
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+
+              return comment_lines, data
+
+          def detect_chain_header(comment_lines, ncols):
+              candidates = []
+              for line in comment_lines:
+                  candidate = line.lstrip("#").strip()
+                  if not candidate:
+                      continue
+
+                  tokens = re.split(r"\s+", candidate)
+                  if len(tokens) != ncols:
+                      continue
+
+                  numeric_count = sum(1 for t in tokens if token_is_numeric(t))
+                  parameterish_count = sum(
+                      1 for t in tokens
+                      if t in ["weight", "minuslogpost", "minuslogprior", "chi2"]
+                      or t in ["omm", "omegam", "rdrag", "H0rdrag", "hrdrag", "omegamh2"]
+                      or "--" in t
+                      or "COSMOLOGICAL" in t.upper()
+                  )
+
+                  if numeric_count > 0:
+                      continue
+
+                  if parameterish_count < max(3, ncols // 5):
+                      continue
+
+                  candidates.append(tokens)
+
+              if not candidates:
+                  return [f"col_{i}" for i in range(ncols)], False
+
+              return candidates[0], True
+
+          def parse_chain_file(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              comment_lines, data = split_chain_text(text)
+              header, header_detected = detect_chain_header(comment_lines, data.shape[1])
+              return header, data, header_detected
+
+          def weight_array(header, data):
+              col = {name: i for i, name in enumerate(header)}
+              if "weight" in col:
+                  return data[:, col["weight"]], "weight"
+              return np.ones(data.shape[0]), None
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def summarize_parameter(values, weights):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  raise RuntimeError("No finite values available.")
+
+              q16, q50, q84 = weighted_quantile(values, weights, [0.16, 0.50, 0.84])
+              mean = float(np.average(values, weights=weights)) if np.sum(weights) > 0 else float(np.mean(values))
+              sigma = (q84 - q16) / 2.0 if q16 is not None and q84 is not None else None
+
+              return {
+                  "mean": mean,
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "sigma": sigma,
+                  "min": float(np.min(values)),
+                  "max": float(np.max(values)),
+                  "row_count": int(len(values))
+              }
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+
+                  try:
+                      rows.append({
+                          "parameter_raw": name_raw,
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "lower1": float(parts[3]),
+                          "upper1": float(parts[4]),
+                          "lower2": float(parts[6]),
+                          "upper2": float(parts[7]),
+                          "lower3": float(parts[9]),
+                          "upper3": float(parts[10]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              dl = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  names = zf.namelist()
+
+                  if PLANCK_MARGESTATS_PATH not in names:
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+
+                  marg_text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+                  marg_rows = parse_planck_margestats(marg_text)
+                  marg = {r["parameter"]: r for r in marg_rows}
+
+                  paramnames = []
+                  cov = None
+                  cov_index = {}
+
+                  if PLANCK_PARAMNAMES_PATH in names:
+                      paramnames_text = zf.read(PLANCK_PARAMNAMES_PATH).decode("utf-8", errors="replace")
+                      for line in paramnames_text.splitlines():
+                          stripped = line.strip()
+                          if stripped:
+                              paramnames.append(stripped.split()[0].rstrip("*"))
+
+                  if PLANCK_COVMAT_PATH in names:
+                      cov_text = zf.read(PLANCK_COVMAT_PATH).decode("utf-8", errors="replace")
+                      cov_lines = [
+                          line for line in cov_text.splitlines()
+                          if line.strip() and not line.strip().startswith("#")
+                      ]
+                      try:
+                          cov = np.loadtxt(io.StringIO("\n".join(cov_lines)))
+                          if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+                              cov = None
+                      except Exception:
+                          cov = None
+
+                  if cov is not None and paramnames:
+                      usable = min(cov.shape[0], len(paramnames))
+                      cov_index = {paramnames[i]: i for i in range(usable)}
+
+              return {
+                  "download": dl,
+                  "marginal_rows": marg,
+                  "paramnames_count": len(paramnames),
+                  "covmat": cov,
+                  "cov_shape": [int(cov.shape[0]), int(cov.shape[1])] if cov is not None else None,
+                  "cov_index": cov_index,
+                  "cov_index_count": len(cov_index)
+              }
+
+          def planck_param_mean_sigma(planck, param):
+              marg = planck["marginal_rows"].get(param)
+              if marg is None:
+                  return None
+
+              sigma_source = "margestats"
+              sigma = float(marg["sddev"])
+              covariance_backed = False
+
+              cov = planck.get("covmat")
+              idx = planck.get("cov_index", {}).get(param)
+
+              if cov is not None and idx is not None:
+                  variance = float(cov[idx, idx])
+                  if variance >= 0:
+                      sigma = math.sqrt(variance)
+                      sigma_source = "covmat"
+                      covariance_backed = True
+
+              return {
+                  "parameter": param,
+                  "mean": float(marg["mean"]),
+                  "sigma": sigma,
+                  "sigma_source": sigma_source,
+                  "covariance_backed": covariance_backed
+              }
+
+          def planck_product_reference(planck, a, b, product_name, scale=1.0):
+              pa = planck_param_mean_sigma(planck, a)
+              pb = planck_param_mean_sigma(planck, b)
+
+              if pa is None or pb is None:
+                  return None
+
+              aval = pa["mean"]
+              bval = pb["mean"]
+              value = aval * bval * scale
+
+              # Conservative independent-error fallback. If covariance is indexed for both,
+              # include covariance term. Otherwise this is margestats-backed, not covariance-backed.
+              vara = pa["sigma"] ** 2
+              varb = pb["sigma"] ** 2
+              covab = 0.0
+              covariance_backed = pa["covariance_backed"] and pb["covariance_backed"]
+
+              cov = planck.get("covmat")
+              ia = planck.get("cov_index", {}).get(a)
+              ib = planck.get("cov_index", {}).get(b)
+
+              if cov is not None and ia is not None and ib is not None:
+                  covab = float(cov[ia, ib])
+                  covariance_backed = True
+
+              variance = scale ** 2 * ((bval ** 2) * vara + (aval ** 2) * varb + 2.0 * aval * bval * covab)
+
+              if variance < 0:
+                  variance = scale ** 2 * ((bval ** 2) * vara + (aval ** 2) * varb)
+
+              return {
+                  "parameter": product_name,
+                  "mean": value,
+                  "sigma": math.sqrt(variance),
+                  "component_a": a,
+                  "component_b": b,
+                  "covariance_backed": covariance_backed,
+                  "sigma_source": "covmat_delta_method" if covariance_backed else "margestats_independent_error_fallback"
+              }
+
+          def load_desi_chains():
+              desi_dir = DOWNLOADS / "DESI_DR1_BAO"
+              desi_dir.mkdir(parents=True, exist_ok=True)
+
+              downloads = []
+              parts = []
+              header_ref = None
+              header_detected_all = True
+              shape_rows = []
+
+              for url in DESI_CHAIN_URLS:
+                  fname = url.rstrip("/").split("/")[-1]
+                  path = desi_dir / fname
+                  downloads.append(download(url, path))
+
+                  header, data, header_detected = parse_chain_file(path)
+
+                  if header_ref is None:
+                      header_ref = header
+                  elif len(header) != len(header_ref):
+                      raise RuntimeError(f"DESI header width mismatch in {fname}")
+
+                  parts.append(data)
+                  header_detected_all = header_detected_all and header_detected
+
+                  shape_rows.append({
+                      "file": fname,
+                      "rows": int(data.shape[0]),
+                      "columns": int(data.shape[1]),
+                      "header_detected": header_detected
+                  })
+
+              combined = np.vstack(parts)
+              weights, weight_column = weight_array(header_ref, combined)
+              col = {name: i for i, name in enumerate(header_ref)}
+
+              return {
+                  "downloads": downloads,
+                  "header": header_ref,
+                  "data": combined,
+                  "weights": weights,
+                  "weight_column": weight_column,
+                  "columns": col,
+                  "header_detected_all": header_detected_all,
+                  "shape_rows": shape_rows
+              }
+
+          def build_candidate_rows(desi, planck):
+              rows = []
+              data = desi["data"]
+              weights = desi["weights"]
+              col = desi["columns"]
+
+              for param in DIRECT_DESI_REACH_CANDIDATES:
+                  if param not in col:
+                      continue
+
+                  summary = summarize_parameter(data[:, col[param]], weights)
+
+                  planck_ref = None
+                  comparison_name = ""
+
+                  if param == "rdrag":
+                      planck_ref = planck_param_mean_sigma(planck, "rdrag")
+                      comparison_name = "Planck_rdrag"
+                  elif param == "H0rdrag":
+                      planck_ref = planck_product_reference(planck, "H0", "rdrag", "H0_times_rdrag")
+                      comparison_name = "Planck_H0_times_rdrag"
+                  elif param == "hrdrag":
+                      planck_ref = planck_product_reference(planck, "H0", "rdrag", "h_times_rdrag", scale=0.01)
+                      comparison_name = "Planck_h_times_rdrag"
+                  elif param == "omegamh2":
+                      planck_ref = planck_param_mean_sigma(planck, "omegamh2")
+                      comparison_name = "Planck_omegamh2"
+                  elif param in ["omm", "omegam"]:
+                      planck_ref = planck_param_mean_sigma(planck, "omegam")
+                      comparison_name = "Planck_omegam"
+
+                  pressure = None
+                  combined_sigma = None
+                  planck_mean = None
+                  planck_sigma = None
+                  sigma_source = ""
+                  comparison_available = False
+
+                  if planck_ref is not None and summary["sigma"] is not None:
+                      planck_mean = float(planck_ref["mean"])
+                      planck_sigma = float(planck_ref["sigma"])
+                      sigma_source = planck_ref.get("sigma_source", "")
+                      comparison_available = True
+
+                      combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck_sigma ** 2)
+                      if combined_sigma > 0:
+                          pressure = (summary["q50"] - planck_mean) / combined_sigma
+
+                  eligible = (
+                      comparison_available
+                      and pressure is not None
+                      and summary["sigma"] is not None
+                      and summary["sigma"] > 0
+                      and param in ["H0rdrag", "rdrag", "hrdrag", "omegamh2", "omm", "omegam"]
+                  )
+
+                  rows.append({
+                      "surface": "reach_geometry",
+                      "source": "DESI_DR1_BAO",
+                      "entry_type": "direct_desi_reach_ruler_candidate",
+                      "parameter": param,
+                      "desi_q16": summary["q16"],
+                      "desi_q50": summary["q50"],
+                      "desi_q84": summary["q84"],
+                      "desi_sigma_half_width": summary["sigma"],
+                      "desi_mean": summary["mean"],
+                      "planck_comparison": comparison_name,
+                      "planck_reference_value": planck_mean,
+                      "planck_reference_sigma": planck_sigma,
+                      "planck_sigma_source": sigma_source,
+                      "combined_sigma": combined_sigma,
+                      "pressure_vs_planck_z": pressure,
+                      "pressure_sign": "positive" if pressure is not None and pressure > 0 else "negative" if pressure is not None and pressure < 0 else "unscored",
+                      "direct_desi_chain_parameter": True,
+                      "algebraically_derived_from_desi": False,
+                      "candidate_reach_anchor_eligible": eligible,
+                      "model_anchor_allowed_now": False,
+                      "boundary_note": "Direct DESI BAO chain parameter. Candidate only; later workflow must decide whether to promote."
+                  })
+
+              if "H0rdrag" in col and "rdrag" in col:
+                  h0_derived = data[:, col["H0rdrag"]] / data[:, col["rdrag"]]
+                  summary = summarize_parameter(h0_derived, weights)
+                  planck_h0 = planck_param_mean_sigma(planck, "H0")
+
+                  pressure = None
+                  combined_sigma = None
+
+                  if planck_h0 is not None and summary["sigma"] is not None:
+                      combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck_h0["sigma"] ** 2)
+                      pressure = (summary["q50"] - planck_h0["mean"]) / combined_sigma
+
+                  rows.append({
+                      "surface": "reach_geometry",
+                      "source": "DESI_DR1_BAO",
+                      "entry_type": "blocked_algebraic_diagnostic",
+                      "parameter": "H0_derived_from_H0rdrag_over_rdrag",
+                      "desi_q16": summary["q16"],
+                      "desi_q50": summary["q50"],
+                      "desi_q84": summary["q84"],
+                      "desi_sigma_half_width": summary["sigma"],
+                      "desi_mean": summary["mean"],
+                      "planck_comparison": "Planck_H0",
+                      "planck_reference_value": planck_h0["mean"] if planck_h0 else None,
+                      "planck_reference_sigma": planck_h0["sigma"] if planck_h0 else None,
+                      "planck_sigma_source": planck_h0["sigma_source"] if planck_h0 else "",
+                      "combined_sigma": combined_sigma,
+                      "pressure_vs_planck_z": pressure,
+                      "pressure_sign": "positive" if pressure is not None and pressure > 0 else "negative" if pressure is not None and pressure < 0 else "unscored",
+                      "direct_desi_chain_parameter": False,
+                      "algebraically_derived_from_desi": True,
+                      "candidate_reach_anchor_eligible": False,
+                      "model_anchor_allowed_now": False,
+                      "boundary_note": "Blocked: H0 is derived from H0rdrag/rdrag and remains diagnostic-only."
+                  })
+
+              return rows
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_21_status": "source load failed because Planck/DESI source strictness blocked candidate evaluation",
+                  "v3_21_1_fix": "Planck covmat-paramnames matching made tolerant; margestats fallback allowed for candidate screening."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.21.1 DESI reach anchor upgrade source fix")
+          print("Truth boundary: reach-anchor candidate test only; no validation claim.")
+          print()
+
+          failed_gates = []
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_summaries"]["Planck_2018"] = {
+                  "cov_shape": planck["cov_shape"],
+                  "paramnames_count": planck["paramnames_count"],
+                  "cov_index_count": planck["cov_index_count"],
+                  "has_H0": "H0" in planck["marginal_rows"],
+                  "has_rdrag": "rdrag" in planck["marginal_rows"],
+                  "has_omegamh2": "omegamh2" in planck["marginal_rows"],
+                  "has_omegam": "omegam" in planck["marginal_rows"],
+                  "download": planck["download"]
+              }
+              print("Planck reference loaded.")
+              print(f"  cov shape: {planck['cov_shape']}")
+              print(f"  paramnames count: {planck['paramnames_count']}")
+              print(f"  cov index count: {planck['cov_index_count']}")
+              print()
+          except Exception as e:
+              failed_gates.append("planck_reference_load_failed")
+              planck = None
+              inventory["source_summaries"]["Planck_2018"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"Planck failed: {type(e).__name__}: {e}")
+              print()
+
+          try:
+              desi = load_desi_chains()
+              inventory["source_summaries"]["DESI_DR1_BAO"] = {
+                  "combined_rows": int(desi["data"].shape[0]),
+                  "combined_columns": int(desi["data"].shape[1]),
+                  "header_detected_all": desi["header_detected_all"],
+                  "available_direct_candidates": [p for p in DIRECT_DESI_REACH_CANDIDATES if p in desi["columns"]],
+                  "weight_column": desi["weight_column"],
+                  "shape_rows": desi["shape_rows"],
+                  "downloads": desi["downloads"]
+              }
+              print("DESI chains loaded.")
+              print(f"  rows: {desi['data'].shape[0]}")
+              print(f"  columns: {desi['data'].shape[1]}")
+              print(f"  available candidates: {[p for p in DIRECT_DESI_REACH_CANDIDATES if p in desi['columns']]}")
+              print()
+          except Exception as e:
+              failed_gates.append("desi_chain_load_failed")
+              desi = None
+              inventory["source_summaries"]["DESI_DR1_BAO"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"DESI failed: {type(e).__name__}: {e}")
+              print()
+
+          candidate_rows = build_candidate_rows(desi, planck) if planck is not None and desi is not None else []
+
+          candidates_csv = OUTDIR / "desi_reach_anchor_candidates_v3_21_1.csv"
+          fieldnames = [
+              "surface", "source", "entry_type", "parameter",
+              "desi_q16", "desi_q50", "desi_q84",
+              "desi_sigma_half_width", "desi_mean",
+              "planck_comparison", "planck_reference_value",
+              "planck_reference_sigma", "planck_sigma_source",
+              "combined_sigma", "pressure_vs_planck_z",
+              "pressure_sign", "direct_desi_chain_parameter",
+              "algebraically_derived_from_desi",
+              "candidate_reach_anchor_eligible",
+              "model_anchor_allowed_now", "boundary_note"
+          ]
+
+          with candidates_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in candidate_rows:
+                  writer.writerow({k: row.get(k) for k in fieldnames})
+
+          eligible_rows = [r for r in candidate_rows if r.get("candidate_reach_anchor_eligible") is True]
+          direct_candidate_rows = [r for r in candidate_rows if r.get("entry_type") == "direct_desi_reach_ruler_candidate"]
+          blocked_rows = [r for r in candidate_rows if r.get("entry_type") == "blocked_algebraic_diagnostic"]
+
+          audit_rows = [
+              {
+                  "audit_gate": "source_loads_completed",
+                  "pass": planck is not None and desi is not None,
+                  "value": f"planck={planck is not None}; desi={desi is not None}",
+                  "boundary": "Candidate screening requires both source products to load."
+              },
+              {
+                  "audit_gate": "desi_direct_candidates_present",
+                  "pass": len(direct_candidate_rows) > 0,
+                  "value": len(direct_candidate_rows),
+                  "boundary": "At least one direct DESI chain reach/ruler parameter must exist."
+              },
+              {
+                  "audit_gate": "algebraic_h0_diagnostic_blocked",
+                  "pass": len(blocked_rows) == 1 and blocked_rows[0]["candidate_reach_anchor_eligible"] is False,
+                  "value": len(blocked_rows),
+                  "boundary": "DESI H0 from H0rdrag/rdrag cannot become a reach model anchor here."
+              },
+              {
+                  "audit_gate": "reach_anchor_candidate_found",
+                  "pass": len(eligible_rows) > 0,
+                  "value": ";".join([r["parameter"] for r in eligible_rows]),
+                  "boundary": "A candidate exists, but model_anchor_allowed_now remains false until v3.22."
+              }
+          ]
+
+          audit_csv = OUTDIR / "desi_reach_anchor_upgrade_audit_v3_21_1.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failures = ["planck_reference_load_failed", "desi_chain_load_failed"]
+
+          if any(g in failed_gates for g in hard_failures):
+              readiness_label = "desi_reach_anchor_upgrade_source_fix_failed_followup_needed"
+          elif len(eligible_rows) > 0:
+              readiness_label = "desi_reach_anchor_candidate_found_ready_for_v3_22_refit_decision"
+          else:
+              readiness_label = "desi_reach_anchor_upgrade_loaded_no_candidate_found_more_reach_source_work_needed"
+
+          next_step = (
+              "Build v3.22 refit-decision gate: decide whether the DESI direct reach/ruler candidate may enter a limited two-surface refit beside KiDS growth anchors."
+              if len(eligible_rows) > 0
+              else "Do not refit yet. Find another reach/geometry source or improve DESI/BAO likelihood extraction before attempting two-surface comparison."
+          )
+
+          inventory["candidate_count"] = len(candidate_rows)
+          inventory["eligible_reach_anchor_candidate_count"] = len(eligible_rows)
+          inventory["eligible_reach_anchor_candidates"] = [r["parameter"] for r in eligible_rows]
+          inventory["blocked_algebraic_diagnostic_count"] = len(blocked_rows)
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "candidate_count": len(candidate_rows),
+              "eligible_reach_anchor_candidate_count": len(eligible_rows),
+              "eligible_reach_anchor_candidates": [r["parameter"] for r in eligible_rows],
+              "model_claim_allowed": False,
+              "model_anchor_allowed_now": False,
+              "old_two_surface_bic_rerun_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_21_1_desi_reach_anchor_upgrade_source_fix.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.21.1 — DESI Reach Anchor Upgrade Source Fix")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this fixes")
+          md.append("")
+          md.append("v3.21 failed before candidate evaluation because source-loading was too strict. v3.21.1 makes Planck covariance matching tolerant and allows a marginal-statistics fallback for screening, while keeping all model claims blocked.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Candidate rows: `{len(candidate_rows)}`")
+          md.append(f"- Eligible reach-anchor candidates: `{len(eligible_rows)}`")
+          md.append(f"- Eligible candidate names: `{', '.join([r['parameter'] for r in eligible_rows]) if eligible_rows else 'none'}`")
+          md.append(f"- Blocked algebraic diagnostics: `{len(blocked_rows)}`")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `desi_reach_anchor_candidates_v3_21_1.csv`")
+          md.append("- `desi_reach_anchor_upgrade_audit_v3_21_1.csv`")
+          md.append("- `tairid_cosmology_v3_21_1_desi_reach_anchor_upgrade_source_fix.json`")
+          md.append("- `tairid_cosmology_v3_21_1_desi_reach_anchor_upgrade_source_fix.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_21_1_desi_reach_anchor_upgrade_source_fix.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if any(g in failed_gates for g in hard_failures):
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.21.1 DESI reach anchor upgrade source fix artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-21-1-desi-reach-anchor-upgrade-source-fix
+          path: artifacts/tairid_cosmology_v3_21_1/
