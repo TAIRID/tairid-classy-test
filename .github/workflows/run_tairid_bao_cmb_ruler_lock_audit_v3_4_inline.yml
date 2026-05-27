@@ -1,0 +1,647 @@
+name: Run TAIRID BAO CMB Ruler Lock Audit v3.4 Inline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-bao-cmb-ruler-lock-audit-v3-4-inline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy matplotlib
+
+      - name: Create and run TAIRID v3.4 inline script
+        run: |
+          cat > run_tairid_bao_cmb_ruler_lock_audit_v3_4_inline.py <<'PY'
+          #!/usr/bin/env python3
+          """
+          TAIRID BAO/CMB Ruler-Lock Audit v3.4 Inline
+
+          Why this test exists:
+          v3.3.3 showed that the frozen TAIRID low-z gate does not earn promotion
+          as a supernova distance correction term after AIC/BIC penalties.
+
+          v3.4 moves to the next surface: BAO/CMB ruler preservation.
+
+          Core question:
+              Can the frozen low-z TAIRID gate be used as a BAO/CMB ruler term,
+              or would it damage the standard-ruler surfaces too strongly?
+
+          This test DOES:
+              - fetch DESI DR1 BAO mean/covariance files when reachable,
+              - parse BAO redshift surfaces and covariance/precision structure,
+              - compute the frozen gate at each BAO redshift,
+              - estimate how much damage the gate would cause if wrongly used as
+                a distance/ruler correction,
+              - apply a hard CMB preservation check at z≈1100,
+              - decide whether the frozen gate is allowed forward as a ruler term.
+
+          This test DOES NOT:
+              - validate TAIRID,
+              - prove H0 correction,
+              - prove new physics,
+              - disprove standard cosmology,
+              - fit a BAO likelihood,
+              - change the frozen gate,
+              - promote the frozen gate if it fails ruler preservation.
+
+          Truth boundary:
+          This is a BAO/CMB ruler-lock audit only.
+          """
+
+          import csv
+          import json
+          import math
+          import re
+          import traceback
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import matplotlib.pyplot as plt
+          import numpy as np
+
+          OUTDIR = Path("tairid_bao_cmb_ruler_lock_audit_v3_4_inline_outputs")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOAD_DIR = OUTDIR / "downloaded"
+          DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+          BAO_REPO = "CobayaSampler/bao_data"
+          BAO_BRANCHES = ["master", "main"]
+
+          BAO_TARGETS = [
+              {
+                  "label": "BGS_z0.1_0.4",
+                  "mean": "desi_2024_gaussian_bao_BGS_BRIGHT-21.5_GCcomb_z0.1-0.4_mean.txt",
+                  "cov": "desi_2024_gaussian_bao_BGS_BRIGHT-21.5_GCcomb_z0.1-0.4_cov.txt",
+              },
+              {
+                  "label": "LRG_z0.4_0.6",
+                  "mean": "desi_2024_gaussian_bao_LRG_GCcomb_z0.4-0.6_mean.txt",
+                  "cov": "desi_2024_gaussian_bao_LRG_GCcomb_z0.4-0.6_cov.txt",
+              },
+              {
+                  "label": "LRG_z0.6_0.8",
+                  "mean": "desi_2024_gaussian_bao_LRG_GCcomb_z0.6-0.8_mean.txt",
+                  "cov": "desi_2024_gaussian_bao_LRG_GCcomb_z0.6-0.8_cov.txt",
+              },
+              {
+                  "label": "LRG_ELG_z0.8_1.1",
+                  "mean": "desi_2024_gaussian_bao_LRG+ELG_LOPnotqso_GCcomb_z0.8-1.1_mean.txt",
+                  "cov": "desi_2024_gaussian_bao_LRG+ELG_LOPnotqso_GCcomb_z0.8-1.1_cov.txt",
+              },
+              {
+                  "label": "ELG_z1.1_1.6",
+                  "mean": "desi_2024_gaussian_bao_ELG_LOPnotqso_GCcomb_z1.1-1.6_mean.txt",
+                  "cov": "desi_2024_gaussian_bao_ELG_LOPnotqso_GCcomb_z1.1-1.6_cov.txt",
+              },
+              {
+                  "label": "QSO_z0.8_2.1",
+                  "mean": "desi_2024_gaussian_bao_QSO_GCcomb_z0.8-2.1_mean.txt",
+                  "cov": "desi_2024_gaussian_bao_QSO_GCcomb_z0.8-2.1_cov.txt",
+              },
+              {
+                  "label": "LYA_z2.33",
+                  "mean": "desi_2024_gaussian_bao_Lya_GCcomb_mean.txt",
+                  "cov": "desi_2024_gaussian_bao_Lya_GCcomb_cov.txt",
+              },
+          ]
+
+          FROZEN_GATE = {
+              "name": "frozen_joint_gate_v0_1",
+              "A": 0.6580586049,
+              "zt": 0.2224541370,
+              "p": 2.0,
+              "boundary": "Frozen low-z pressure gate. Diagnostic only unless it survives preservation locks.",
+          }
+
+          CLAIMS = {
+              "test_name": "TAIRID BAO/CMB Ruler-Lock Audit v3.4 Inline",
+              "primary_question": "Can the frozen low-z gate be used as a BAO/CMB ruler term without damaging ruler preservation?",
+              "truth_boundary": "BAO/CMB ruler-lock audit only; no validation, no H0 correction, no new physics.",
+          }
+
+
+          def json_default(obj):
+              if isinstance(obj, (np.integer,)):
+                  return int(obj)
+              if isinstance(obj, (np.floating,)):
+                  return float(obj)
+              if isinstance(obj, np.ndarray):
+                  return obj.tolist()
+              return str(obj)
+
+
+          def write_json(path, obj):
+              path.write_text(json.dumps(obj, indent=2, default=json_default), encoding="utf-8")
+
+
+          def write_csv(path, rows):
+              if not rows:
+                  path.write_text("", encoding="utf-8")
+                  return
+              fields = []
+              seen = set()
+              for row in rows:
+                  for key in row:
+                      if key not in seen:
+                          fields.append(key)
+                          seen.add(key)
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+
+          def safe_name(text):
+              return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text)).strip("_")[:180]
+
+
+          def raw_url(repo, branch, repo_path):
+              return f"https://raw.githubusercontent.com/{repo}/{branch}/{repo_path}"
+
+
+          def fetch_text(repo, branches, repo_path, timeout=90):
+              errors = []
+              for branch in branches:
+                  url = raw_url(repo, branch, repo_path)
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          headers={"User-Agent": "TAIRID-v3.4-bao-cmb-ruler-lock-audit"},
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          data = response.read()
+                      text = data.decode("utf-8", errors="replace")
+                      if text.lower().lstrip().startswith("<!doctype html") or "404: not found" in text.lower()[:200]:
+                          errors.append({"branch": branch, "url": url, "error": "html_or_not_found_payload"})
+                          continue
+                      return {
+                          "status": "downloaded",
+                          "branch": branch,
+                          "url": url,
+                          "bytes": len(data),
+                          "text": text,
+                          "errors": errors,
+                      }
+                  except Exception as exc:
+                      errors.append({"branch": branch, "url": url, "error": repr(exc)})
+              return {
+                  "status": "failed",
+                  "branch": None,
+                  "url": None,
+                  "bytes": 0,
+                  "text": "",
+                  "errors": errors,
+              }
+
+
+          def to_float(value):
+              try:
+                  out = float(str(value).replace("D", "E"))
+              except Exception:
+                  return None
+              return out if math.isfinite(out) else None
+
+
+          def numeric_tokens(text):
+              vals = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  for tok in stripped.split():
+                      val = to_float(tok)
+                      if val is not None:
+                          vals.append(val)
+              return vals
+
+
+          def parse_covariance(text):
+              vals = numeric_tokens(text)
+              if not vals:
+                  return {
+                      "dimension": None,
+                      "diagonal": [],
+                      "shape_status": "no_numeric_values",
+                  }
+
+              first = int(vals[0]) if abs(vals[0] - int(vals[0])) < 1e-9 else None
+
+              if first is not None and len(vals) - 1 == first * first:
+                  arr = np.asarray(vals[1:], dtype=float).reshape((first, first))
+                  return {
+                      "dimension": first,
+                      "diagonal": np.diag(arr).tolist(),
+                      "shape_status": "dimension_prefix_square",
+                  }
+
+              root = int(round(math.sqrt(len(vals))))
+              if root * root == len(vals):
+                  arr = np.asarray(vals, dtype=float).reshape((root, root))
+                  return {
+                      "dimension": root,
+                      "diagonal": np.diag(arr).tolist(),
+                      "shape_status": "plain_square",
+                  }
+
+              return {
+                  "dimension": None,
+                  "diagonal": [],
+                  "shape_status": f"not_square_numeric_count_{len(vals)}",
+              }
+
+
+          def z_eff_from_name(name, label):
+              m = re.search(r"z([0-9.]+)-([0-9.]+)", name)
+              if m:
+                  return (float(m.group(1)) + float(m.group(2))) / 2.0
+              if "Lya" in name or "LYA" in label:
+                  return 2.33
+              if "QSO" in name:
+                  return 1.49
+              return None
+
+
+          def frozen_gate(z):
+              z = np.asarray(z, dtype=float)
+              return np.exp(-FROZEN_GATE["A"] * (z / (z + FROZEN_GATE["zt"])) ** FROZEN_GATE["p"])
+
+
+          def ruler_damage_from_gate(z):
+              g = float(frozen_gate(np.asarray([z]))[0])
+              distance_multiplier_if_misused = 1.0 / max(g, 1e-12)
+              fractional_damage = abs(distance_multiplier_if_misused - 1.0)
+              return {
+                  "gate_value": g,
+                  "distance_multiplier_if_misused": distance_multiplier_if_misused,
+                  "fractional_ruler_damage_if_misused": fractional_damage,
+              }
+
+
+          def parse_bao_surfaces():
+              download_rows = []
+              surface_rows = []
+
+              for target in BAO_TARGETS:
+                  label = target["label"]
+                  mean_fetch = fetch_text(BAO_REPO, BAO_BRANCHES, target["mean"])
+                  cov_fetch = fetch_text(BAO_REPO, BAO_BRANCHES, target["cov"])
+
+                  for kind, fetched, path in [
+                      ("mean", mean_fetch, target["mean"]),
+                      ("cov", cov_fetch, target["cov"]),
+                  ]:
+                      download_rows.append(
+                          {
+                              "label": label,
+                              "kind": kind,
+                              "path": path,
+                              "status": fetched["status"],
+                              "branch": fetched["branch"],
+                              "url": fetched["url"],
+                              "bytes": fetched["bytes"],
+                              "errors": json.dumps(fetched["errors"], default=json_default),
+                          }
+                      )
+                      if fetched["status"] == "downloaded":
+                          (DOWNLOAD_DIR / safe_name(path)).write_text(fetched["text"], encoding="utf-8")
+
+                  mean_vals = numeric_tokens(mean_fetch["text"]) if mean_fetch["status"] == "downloaded" else []
+                  cov_info = parse_covariance(cov_fetch["text"]) if cov_fetch["status"] == "downloaded" else {
+                      "dimension": None,
+                      "diagonal": [],
+                      "shape_status": "not_downloaded",
+                  }
+
+                  z_eff = z_eff_from_name(target["mean"], label)
+                  damage = ruler_damage_from_gate(z_eff) if z_eff is not None else {
+                      "gate_value": None,
+                      "distance_multiplier_if_misused": None,
+                      "fractional_ruler_damage_if_misused": None,
+                  }
+
+                  frac_precisions = []
+                  diag = cov_info.get("diagonal", [])
+                  for i, mean_val in enumerate(mean_vals):
+                      if i < len(diag) and mean_val and abs(mean_val) > 0 and diag[i] >= 0:
+                          sigma = math.sqrt(max(float(diag[i]), 0.0))
+                          frac_precisions.append(abs(sigma / float(mean_val)))
+
+                  median_frac_precision = float(np.median(frac_precisions)) if frac_precisions else None
+                  conservative_tolerance = max(0.05, 5.0 * median_frac_precision) if median_frac_precision is not None else 0.05
+
+                  damage_value = damage["fractional_ruler_damage_if_misused"]
+                  gate_allowed_by_bao_precision = (
+                      damage_value is not None and damage_value <= conservative_tolerance
+                  )
+
+                  surface_rows.append(
+                      {
+                          "label": label,
+                          "z_eff": z_eff,
+                          "mean_status": mean_fetch["status"],
+                          "cov_status": cov_fetch["status"],
+                          "mean_numeric_count": len(mean_vals),
+                          "cov_dimension": cov_info.get("dimension"),
+                          "cov_shape_status": cov_info.get("shape_status"),
+                          "median_fractional_precision_estimate": median_frac_precision,
+                          "conservative_damage_tolerance": conservative_tolerance,
+                          "gate_value": damage["gate_value"],
+                          "distance_multiplier_if_misused": damage["distance_multiplier_if_misused"],
+                          "fractional_ruler_damage_if_misused": damage_value,
+                          "gate_allowed_by_bao_precision": gate_allowed_by_bao_precision,
+                          "truth_boundary": "BAO ruler-lock audit only; not a BAO likelihood fit.",
+                      }
+                  )
+
+              return download_rows, surface_rows
+
+
+          def cmb_guard():
+              z_cmb = 1100.0
+              damage = ruler_damage_from_gate(z_cmb)
+              return {
+                  "surface": "CMB_ACOUSTIC_RULER_LOCK",
+                  "z": z_cmb,
+                  "gate_value": damage["gate_value"],
+                  "distance_multiplier_if_misused": damage["distance_multiplier_if_misused"],
+                  "fractional_ruler_damage_if_misused": damage["fractional_ruler_damage_if_misused"],
+                  "hard_tolerance": 0.001,
+                  "passes_cmb_lock": damage["fractional_ruler_damage_if_misused"] <= 0.001,
+                  "interpretation": "A low-z gate cannot be blindly extended into the CMB acoustic surface.",
+                  "truth_boundary": "CMB preservation guard only; not a CMB likelihood fit.",
+              }
+
+
+          def decide(surface_rows, cmb):
+              parsed_mean_count = sum(1 for r in surface_rows if r["mean_status"] == "downloaded")
+              parsed_cov_count = sum(1 for r in surface_rows if r["cov_status"] == "downloaded")
+              precision_count = sum(1 for r in surface_rows if r["median_fractional_precision_estimate"] is not None)
+              bao_pass_count = sum(1 for r in surface_rows if r["gate_allowed_by_bao_precision"] is True)
+              bao_fail_count = sum(1 for r in surface_rows if r["gate_allowed_by_bao_precision"] is False)
+
+              gates = [
+                  {
+                      "gate": "G1_bao_mean_surfaces_available",
+                      "passed": parsed_mean_count >= 5,
+                      "evidence": {"parsed_mean_count": parsed_mean_count, "target_count": len(surface_rows)},
+                  },
+                  {
+                      "gate": "G2_bao_covariance_surfaces_available",
+                      "passed": parsed_cov_count >= 5,
+                      "evidence": {"parsed_cov_count": parsed_cov_count, "target_count": len(surface_rows)},
+                  },
+                  {
+                      "gate": "G3_bao_precision_estimates_available",
+                      "passed": precision_count >= 3,
+                      "evidence": {"precision_count": precision_count},
+                  },
+                  {
+                      "gate": "G4_frozen_gate_preserves_bao_ruler_surface",
+                      "passed": bao_fail_count == 0 and bao_pass_count >= 5,
+                      "evidence": {
+                          "bao_pass_count": bao_pass_count,
+                          "bao_fail_count": bao_fail_count,
+                          "rule": "frozen gate damage must not exceed conservative BAO tolerance",
+                      },
+                  },
+                  {
+                      "gate": "G5_frozen_gate_preserves_cmb_acoustic_surface",
+                      "passed": cmb["passes_cmb_lock"],
+                      "evidence": cmb,
+                  },
+                  {
+                      "gate": "G6_no_validation_claim_allowed",
+                      "passed": True,
+                      "evidence": {
+                          "validation_claim": False,
+                          "h0_correction_claim": False,
+                          "new_physics_claim": False,
+                          "standard_cosmology_disproof_claim": False,
+                      },
+                  },
+              ]
+
+              failed = [g["gate"] for g in gates if not g["passed"]]
+
+              if "G4_frozen_gate_preserves_bao_ruler_surface" in failed or "G5_frozen_gate_preserves_cmb_acoustic_surface" in failed:
+                  status = "frozen_gate_rejected_as_bao_cmb_ruler_term"
+                  readiness = 8
+                  next_wall = (
+                      "Do not use the frozen low-z gate as a BAO/CMB ruler correction. "
+                      "It may remain a diagnostic/local pressure object only. Next move should be growth-vs-geometry split or derivation-level gate rework."
+                  )
+              elif not failed:
+                  status = "frozen_gate_survives_bao_cmb_ruler_lock_not_validation"
+                  readiness = 9
+                  next_wall = "Gate survived ruler lock; next test would need real BAO/CMB likelihood fitting before any claim."
+              elif len(failed) <= 2:
+                  status = "bao_cmb_ruler_lock_partial_with_cautions"
+                  readiness = 7
+                  next_wall = "Repair missing BAO/covariance parsing before deciding the ruler-term question."
+              else:
+                  status = "bao_cmb_ruler_lock_not_ready"
+                  readiness = 5
+                  next_wall = "Core BAO/CMB ruler surfaces did not parse."
+
+              return {
+                  "final_status": status,
+                  "readiness_score_0_to_10": readiness,
+                  "next_wall": next_wall,
+                  "failed_gates": failed,
+                  "gates": gates,
+                  "truth_boundary": CLAIMS["truth_boundary"],
+              }
+
+
+          def make_plots(surface_rows, cmb):
+              try:
+                  usable = [r for r in surface_rows if r["z_eff"] is not None]
+                  labels = [r["label"] for r in usable]
+                  damage = [r["fractional_ruler_damage_if_misused"] for r in usable]
+                  tolerance = [r["conservative_damage_tolerance"] for r in usable]
+                  x = np.arange(len(labels))
+
+                  plt.figure(figsize=(11, 5))
+                  plt.bar(x - 0.2, damage, width=0.4, label="gate ruler damage")
+                  plt.bar(x + 0.2, tolerance, width=0.4, label="conservative tolerance")
+                  plt.xticks(x, labels, rotation=35, ha="right")
+                  plt.ylabel("fractional scale")
+                  plt.title("v3.4 BAO ruler damage if frozen gate is misused")
+                  plt.legend()
+                  plt.tight_layout()
+                  plt.savefig(OUTDIR / "bao_gate_ruler_damage_v3_4_inline.png", dpi=160)
+                  plt.close()
+
+                  z_values = np.asarray([r["z_eff"] for r in usable] + [1100.0], dtype=float)
+                  g_values = frozen_gate(z_values)
+
+                  plt.figure(figsize=(8, 5))
+                  plt.plot(z_values, g_values, marker="o")
+                  plt.xscale("log")
+                  plt.xlabel("redshift z")
+                  plt.ylabel("frozen gate G(z)")
+                  plt.title("v3.4 frozen gate across BAO to CMB surfaces")
+                  plt.tight_layout()
+                  plt.savefig(OUTDIR / "gate_across_bao_to_cmb_v3_4_inline.png", dpi=160)
+                  plt.close()
+
+              except Exception as exc:
+                  write_json(
+                      OUTDIR / "plot_error_v3_4_inline.json",
+                      {"error": repr(exc), "traceback": traceback.format_exc()},
+                  )
+
+
+          def write_handoff(decision, cmb):
+              lines = [
+                  "# TAIRID v3.4 Inline Handoff",
+                  "",
+                  "## Current status",
+                  "",
+                  f"- Final status: `{decision['final_status']}`",
+                  f"- Readiness score: `{decision['readiness_score_0_to_10']}/10`",
+                  f"- Next wall: {decision['next_wall']}",
+                  "",
+                  "## What this means",
+                  "",
+                  "- v3.3.3 already rejected the frozen gate as an SN distance correction.",
+                  "- v3.4 tests whether that same frozen gate can survive BAO/CMB ruler preservation.",
+                  "- If rejected here, the frozen gate should not be used as a direct cosmology correction term.",
+                  "- It can remain a diagnostic/local pressure object unless a later derivation redefines the gate correctly.",
+                  "",
+                  "## CMB guard",
+                  "",
+                  f"- Gate at z=1100: `{cmb['gate_value']}`",
+                  f"- Fractional ruler damage if misused: `{cmb['fractional_ruler_damage_if_misused']}`",
+                  f"- Passes CMB lock: `{cmb['passes_cmb_lock']}`",
+                  "",
+                  "## Truth boundary",
+                  "",
+                  "- v3.4 is a BAO/CMB ruler-lock audit only.",
+                  "- It does not validate TAIRID.",
+                  "- It does not prove H0 correction.",
+                  "- It does not prove new physics.",
+                  "- It does not disprove standard cosmology.",
+                  "",
+                  "## Next test",
+                  "",
+              ]
+
+              if decision["final_status"] == "frozen_gate_rejected_as_bao_cmb_ruler_term":
+                  lines.append("Build v3.5 — Growth-vs-Geometry Split Audit. Stop pushing the frozen gate as a direct distance/ruler correction.")
+              elif decision["final_status"] == "frozen_gate_survives_bao_cmb_ruler_lock_not_validation":
+                  lines.append("Build a real BAO/CMB likelihood follow-up before any larger claim.")
+              else:
+                  lines.append("Repair missing BAO parsing before choosing the next surface.")
+
+              lines.append("")
+              return "\n".join(lines)
+
+
+          def main():
+              print("TAIRID BAO/CMB Ruler-Lock Audit v3.4 Inline starting.")
+              print("Boundary: ruler-lock audit only; no validation, no H0 claim, no new physics claim.")
+
+              write_json(OUTDIR / "claims_v3_4_inline.json", CLAIMS)
+              write_json(OUTDIR / "frozen_gate_v0_1_ruler_lock_v3_4_inline.json", FROZEN_GATE)
+
+              download_rows, surface_rows = parse_bao_surfaces()
+              cmb = cmb_guard()
+              decision = decide(surface_rows, cmb)
+
+              write_csv(OUTDIR / "bao_download_ledger_v3_4_inline.csv", download_rows)
+              write_csv(OUTDIR / "bao_ruler_surface_audit_v3_4_inline.csv", surface_rows)
+              write_json(OUTDIR / "cmb_acoustic_surface_guard_v3_4_inline.json", cmb)
+              write_json(OUTDIR / "decision_v3_4_inline.json", decision)
+
+              make_plots(surface_rows, cmb)
+
+              handoff = write_handoff(decision, cmb)
+              (OUTDIR / "next_thread_handoff_after_v3_4_inline.md").write_text(handoff, encoding="utf-8")
+              (OUTDIR / "next_thread_handoff_after_v3_4_inline.txt").write_text(handoff, encoding="utf-8")
+
+              summary = {
+                  "test_name": CLAIMS["test_name"],
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "boundary": CLAIMS["truth_boundary"],
+                  "bao_surface_count": len(surface_rows),
+                  "bao_downloaded_mean_count": sum(1 for r in surface_rows if r["mean_status"] == "downloaded"),
+                  "bao_downloaded_cov_count": sum(1 for r in surface_rows if r["cov_status"] == "downloaded"),
+                  "bao_surfaces": surface_rows,
+                  "cmb_guard": cmb,
+                  "decision": decision,
+                  "interpretation": {
+                      "what_success_means": "The frozen gate does not damage BAO/CMB ruler surfaces beyond the audit tolerance.",
+                      "what_failure_means": "The frozen gate must not be used as a direct BAO/CMB ruler correction term.",
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  },
+              }
+
+              write_json(OUTDIR / "bao_cmb_ruler_lock_audit_v3_4_inline_summary.json", summary)
+
+              with open(OUTDIR / "bao_cmb_ruler_lock_audit_v3_4_inline_summary.txt", "w", encoding="utf-8") as f:
+                  f.write("TAIRID BAO/CMB Ruler-Lock Audit v3.4 Inline\n\n")
+                  f.write("Boundary: BAO/CMB ruler-lock audit only. No validation. No H0 claim. No new physics claim.\n\n")
+                  f.write(f"Final status: {decision['final_status']}\n")
+                  f.write(f"Readiness score: {decision['readiness_score_0_to_10']}/10\n")
+                  f.write(f"Next wall: {decision['next_wall']}\n\n")
+                  f.write("Failed gates:\n")
+                  f.write(json.dumps(decision["failed_gates"], indent=2, default=json_default) + "\n\n")
+                  f.write("CMB guard:\n")
+                  f.write(json.dumps(cmb, indent=2, default=json_default) + "\n\n")
+                  f.write("Truth boundary:\n")
+                  f.write("- This does not prove TAIRID.\n")
+                  f.write("- This does not prove H0 correction.\n")
+                  f.write("- This does not prove new physics.\n")
+                  f.write("- This does not disprove standard cosmology.\n")
+                  f.write("- This only audits whether the frozen gate can survive BAO/CMB ruler preservation.\n")
+
+              print("TAIRID BAO/CMB Ruler-Lock Audit v3.4 Inline complete.")
+              print(f"Final status: {decision['final_status']}")
+              print(f"Readiness score: {decision['readiness_score_0_to_10']}/10")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  OUTDIR.mkdir(parents=True, exist_ok=True)
+                  summary = {
+                      "test_name": CLAIMS["test_name"],
+                      "created_utc": datetime.now(timezone.utc).isoformat(),
+                      "final_status": "bao_cmb_ruler_lock_audit_v3_4_inline_runtime_failed",
+                      "error": repr(exc),
+                      "traceback": traceback.format_exc(),
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  }
+                  write_json(OUTDIR / "bao_cmb_ruler_lock_audit_v3_4_inline_summary.json", summary)
+                  print(summary["traceback"])
+                  raise
+          PY
+
+          python run_tairid_bao_cmb_ruler_lock_audit_v3_4_inline.py
+
+      - name: Upload inline outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-bao-cmb-ruler-lock-audit-v3-4-inline-output
+          path: |
+            tairid_bao_cmb_ruler_lock_audit_v3_4_inline_outputs/**
