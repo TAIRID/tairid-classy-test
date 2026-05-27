@@ -1,0 +1,852 @@
+name: TAIRID Cosmology v3.17 Targeted Ingestion
+
+on:
+  workflow_dispatch:
+
+jobs:
+  targeted-ingestion:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.17 targeted ingestion
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_17
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_17")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_17_targeted_ingestion"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not replace full DESI, Planck, or HSC likelihood analysis.",
+              "DESI DR1 BAO is ingested as a reach/ruler chain-product lane.",
+              "Planck 2018 is ingested as a CMB reference-product lane.",
+              "HSC-Y3 is ingested as a chain-only growth/consolidation follow-up because data vectors remained gated in v3.16.",
+              "Any anchor promoted from these products must pass a later ledger-boundary test."
+          ]
+
+          DESI_CHAIN_URLS = [
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.1.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.2.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.3.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.4.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.updated.yaml"
+          ]
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+
+          HSC_CHAIN_ZIP_URL = "https://hsc-release.mtk.nao.ac.jp/doc/wp-content/uploads/2025/11/chain-real-hscs19a-fid-dpz0.093-corrected-tol0.01-final.zip"
+
+          HSC_GATED_DATA_VECTOR_URLS = [
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_space_data_vector.sacc",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/li23/data/data_vector.fits",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_cosmic_shear.txt"
+          ]
+
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+          PLANCK_COVMAT_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.covmat"
+          PLANCK_PARAMNAMES_PATH = "base/plikHM_TTTEEE_lowl_lowE/base_plikHM_TTTEEE_lowl_lowE.paramnames"
+
+          TARGET_PLANCK_PARAMS = [
+              "H0", "S8", "sigma8", "omegam", "omegal",
+              "omegabh2", "omegach2", "ns", "tau"
+          ]
+
+          TARGET_CHAIN_PATTERNS = [
+              "H0", "h0", "omegam", "omega_m", "Omega_m", "omm",
+              "sigma8", "sigma_8", "S8", "s8", "rdrag", "rd", "omegabh2",
+              "omegach2", "ns", "n_s", "tau"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=240):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.17-targeted-ingestion/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def probe_url(url, max_bytes=8192, timeout=40):
+              result = {
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "bytes_read": 0,
+                  "error": None
+              }
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v3.17-targeted-ingestion/1.0",
+                          "Accept": "*/*",
+                          "Range": f"bytes=0-{max_bytes - 1}"
+                      }
+                  )
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      body = resp.read(max_bytes)
+                      status = getattr(resp, "status", None)
+                      result.update({
+                          "ok": status is not None and 200 <= status < 400,
+                          "status": status,
+                          "content_type": resp.headers.get("Content-Type"),
+                          "content_length": resp.headers.get("Content-Length"),
+                          "bytes_read": len(body)
+                      })
+              except Exception as e:
+                  code = getattr(e, "code", None)
+                  result.update({
+                      "ok": False,
+                      "status": code,
+                      "error": f"{type(e).__name__}: {e}"
+                  })
+              return result
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def find_header_and_data_lines(text):
+              lines = text.splitlines()
+              header = None
+              data_lines = []
+
+              for line in lines:
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+
+                  if stripped.startswith("#"):
+                      candidate = stripped.lstrip("#").strip()
+                      if not candidate:
+                          continue
+
+                      if "=" in candidate and "\t" not in candidate:
+                          continue
+
+                      parts = re.split(r"\s+", candidate)
+                      if len(parts) >= 3 and not all(re.fullmatch(r"[-+0-9.eE]+", p) for p in parts[:3]):
+                          header = parts
+                          continue
+
+                  else:
+                      data_lines.append(stripped)
+
+              return header, data_lines
+
+          def parse_chain_text_file(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              header, data_lines = find_header_and_data_lines(text)
+
+              if not data_lines:
+                  raise RuntimeError(f"No numeric data lines found in chain file: {path}")
+
+              data = np.loadtxt(io.StringIO("\n".join(data_lines)))
+
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+
+              if header is None or len(header) != data.shape[1]:
+                  header = [f"col_{i}" for i in range(data.shape[1])]
+
+              return header, data
+
+          def find_weight_column(header):
+              lower = [h.lower() for h in header]
+              for candidate in ["weight", "weights", "mult", "sample_weight"]:
+                  if candidate in lower:
+                      return lower.index(candidate)
+              return None
+
+          def summarize_chain_columns(source, surface, header, data, extra_prefix=""):
+              weight_col = find_weight_column(header)
+              weights = data[:, weight_col] if weight_col is not None else np.ones(data.shape[0])
+
+              summaries = []
+
+              for i, name in enumerate(header):
+                  lower_name = name.lower()
+                  include = any(pattern.lower() in lower_name for pattern in TARGET_CHAIN_PATTERNS)
+
+                  if not include:
+                      continue
+
+                  values = data[:, i]
+                  if not np.all(np.isfinite(values)):
+                      values = values[np.isfinite(values)]
+
+                  if len(values) == 0:
+                      continue
+
+                  q16, q50, q84 = weighted_quantile(values, weights[:len(values)], [0.16, 0.50, 0.84])
+
+                  summaries.append({
+                      "source": source,
+                      "surface": surface,
+                      "parameter": f"{extra_prefix}{name}",
+                      "row_count": int(data.shape[0]),
+                      "weighted_mean": float(np.average(values, weights=weights[:len(values)])) if np.sum(weights[:len(values)]) > 0 else float(np.mean(values)),
+                      "q16": q16,
+                      "q50": q50,
+                      "q84": q84,
+                      "min": float(np.min(values)),
+                      "max": float(np.max(values)),
+                      "weight_column": header[weight_col] if weight_col is not None else None
+                  })
+
+              return summaries
+
+          def ingest_desi():
+              desi_dir = DOWNLOADS / "DESI_DR1_BAO"
+              desi_dir.mkdir(parents=True, exist_ok=True)
+
+              downloads = []
+              chain_paths = []
+              yaml_path = None
+
+              for url in DESI_CHAIN_URLS:
+                  fname = url.rstrip("/").split("/")[-1]
+                  path = desi_dir / fname
+                  downloads.append(download(url, path))
+                  if fname.endswith(".txt"):
+                      chain_paths.append(path)
+                  elif fname.endswith(".yaml") or fname.endswith(".yml"):
+                      yaml_path = path
+
+              all_data = []
+              header_ref = None
+              file_shapes = []
+
+              for path in chain_paths:
+                  header, data = parse_chain_text_file(path)
+
+                  if header_ref is None:
+                      header_ref = header
+
+                  if len(header) != len(header_ref):
+                      raise RuntimeError(f"DESI chain header length mismatch: {path}")
+
+                  all_data.append(data)
+                  file_shapes.append({
+                      "file": path.name,
+                      "rows": int(data.shape[0]),
+                      "columns": int(data.shape[1]),
+                      "header_detected": not header[0].startswith("col_")
+                  })
+
+              combined = np.vstack(all_data)
+
+              column_summaries = summarize_chain_columns(
+                  source="DESI_DR1_BAO",
+                  surface="reach_geometry",
+                  header=header_ref,
+                  data=combined
+              )
+
+              summary_path = OUTDIR / "desi_dr1_bao_chain_parameter_summary.csv"
+              with summary_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "source", "surface", "parameter", "row_count",
+                      "weighted_mean", "q16", "q50", "q84",
+                      "min", "max", "weight_column"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in column_summaries:
+                      writer.writerow(row)
+
+              shape_path = OUTDIR / "desi_dr1_bao_chain_shape_summary.csv"
+              with shape_path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(
+                      f,
+                      fieldnames=["file", "rows", "columns", "header_detected"]
+                  )
+                  writer.writeheader()
+                  for row in file_shapes:
+                      writer.writerow(row)
+
+              yaml_hits = []
+              if yaml_path is not None:
+                  yaml_text = yaml_path.read_text(encoding="utf-8", errors="replace")
+                  for term in ["H0", "omegam", "Omega", "rdrag", "bao", "desi", "theta", "ombh2", "omch2"]:
+                      if term.lower() in yaml_text.lower():
+                          yaml_hits.append(term)
+
+              return {
+                  "surface": "reach_geometry",
+                  "source": "DESI_DR1_BAO",
+                  "ingestion_pass": combined.shape[0] > 100 and combined.shape[1] > 5,
+                  "chain_file_count": len(chain_paths),
+                  "combined_rows": int(combined.shape[0]),
+                  "combined_columns": int(combined.shape[1]),
+                  "parameter_summary_rows": len(column_summaries),
+                  "chain_shape_table": str(shape_path),
+                  "parameter_summary_table": str(summary_path),
+                  "yaml_detected": yaml_path is not None,
+                  "yaml_hits": sorted(set(yaml_hits)),
+                  "downloads": downloads,
+                  "model_anchor_allowed": False,
+                  "boundary": "DESI chain product ingested as reach/ruler product; not yet promoted into model anchor."
+              }
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+
+                  try:
+                      mean = float(parts[1])
+                      sddev = float(parts[2])
+                      lower1 = float(parts[3])
+                      upper1 = float(parts[4])
+                      lower2 = float(parts[6])
+                      upper2 = float(parts[7])
+                      lower3 = float(parts[9])
+                      upper3 = float(parts[10])
+                  except Exception:
+                      continue
+
+                  label = " ".join(parts[12:]) if len(parts) > 12 else ""
+
+                  rows.append({
+                      "parameter_raw": name_raw,
+                      "parameter": name,
+                      "mean": mean,
+                      "sddev": sddev,
+                      "lower1": lower1,
+                      "upper1": upper1,
+                      "lower2": lower2,
+                      "upper2": upper2,
+                      "lower3": lower3,
+                      "upper3": upper3,
+                      "label": label
+                  })
+
+              return rows
+
+          def ingest_planck():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              planck_dir.mkdir(parents=True, exist_ok=True)
+
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              dl = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  names = zf.namelist()
+
+                  for required in [PLANCK_MARGESTATS_PATH, PLANCK_COVMAT_PATH, PLANCK_PARAMNAMES_PATH]:
+                      if required not in names:
+                          raise RuntimeError(f"Missing Planck product inside archive: {required}")
+
+                  marg_text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+                  cov_text = zf.read(PLANCK_COVMAT_PATH).decode("utf-8", errors="replace")
+                  paramnames_text = zf.read(PLANCK_PARAMNAMES_PATH).decode("utf-8", errors="replace")
+
+              all_marg_rows = parse_planck_margestats(marg_text)
+
+              target_set = {x.lower() for x in TARGET_PLANCK_PARAMS}
+              target_rows = [
+                  row for row in all_marg_rows
+                  if row["parameter"].lower() in target_set
+              ]
+
+              params = []
+              for line in paramnames_text.splitlines():
+                  clean = line.strip()
+                  if not clean:
+                      continue
+                  params.append(clean.split()[0])
+
+              cov_lines = [
+                  line for line in cov_text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+              cov = np.loadtxt(io.StringIO("\n".join(cov_lines)))
+
+              if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+                  raise RuntimeError("Planck covariance matrix did not parse as square.")
+
+              target_path = OUTDIR / "planck_2018_reference_parameters.csv"
+              with target_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "source", "surface", "parameter", "mean", "sddev",
+                      "lower1", "upper1", "lower2", "upper2", "lower3", "upper3", "label"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in target_rows:
+                      out = dict(row)
+                      out["source"] = "Planck_2018"
+                      out["surface"] = "cmb_reference"
+                      writer.writerow({k: out.get(k) for k in fieldnames})
+
+              cov_path = OUTDIR / "planck_2018_covmat_shape_summary.csv"
+              with cov_path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(
+                      f,
+                      fieldnames=[
+                          "source", "surface", "cov_rows", "cov_columns",
+                          "paramname_count", "diag_min", "diag_max",
+                          "symmetry_max_abs_delta"
+                      ]
+                  )
+                  writer.writeheader()
+                  writer.writerow({
+                      "source": "Planck_2018",
+                      "surface": "cmb_reference",
+                      "cov_rows": int(cov.shape[0]),
+                      "cov_columns": int(cov.shape[1]),
+                      "paramname_count": len(params),
+                      "diag_min": float(np.min(np.diag(cov))),
+                      "diag_max": float(np.max(np.diag(cov))),
+                      "symmetry_max_abs_delta": float(np.max(np.abs(cov - cov.T)))
+                  })
+
+              target_names_found = sorted([r["parameter"] for r in target_rows])
+
+              return {
+                  "surface": "cmb_reference",
+                  "source": "Planck_2018",
+                  "ingestion_pass": len(target_rows) >= 4 and cov.shape[0] == cov.shape[1],
+                  "archive_member_count": len(names),
+                  "margestats_row_count": len(all_marg_rows),
+                  "target_parameter_rows": len(target_rows),
+                  "target_parameters_found": target_names_found,
+                  "cov_shape": [int(cov.shape[0]), int(cov.shape[1])],
+                  "paramname_count": len(params),
+                  "reference_parameter_table": str(target_path),
+                  "covmat_shape_table": str(cov_path),
+                  "download": dl,
+                  "model_anchor_allowed": False,
+                  "boundary": "Planck reference parameters ingested as CMB reference surface; not a full Planck likelihood replacement."
+              }
+
+          def ingest_hsc():
+              hsc_dir = DOWNLOADS / "HSC_Y3"
+              hsc_dir.mkdir(parents=True, exist_ok=True)
+
+              zip_path = hsc_dir / "hsc_y3_chain_candidate.zip"
+              dl = download(HSC_CHAIN_ZIP_URL, zip_path)
+
+              gated_probes = [probe_url(url) for url in HSC_GATED_DATA_VECTOR_URLS]
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  members = [name for name in zf.namelist() if name.lower().endswith(".txt")]
+                  if not members:
+                      raise RuntimeError("No TXT chain member found in HSC chain ZIP.")
+
+                  chain_name = members[0]
+                  text = zf.read(chain_name).decode("utf-8", errors="replace")
+
+              temp_chain_path = hsc_dir / chain_name
+              temp_chain_path.write_text(text, encoding="utf-8")
+
+              header, data = parse_chain_text_file(temp_chain_path)
+
+              summaries = summarize_chain_columns(
+                  source="HSC_Y3",
+                  surface="consolidation_growth",
+                  header=header,
+                  data=data
+              )
+
+              col = {h: i for i, h in enumerate(header)}
+              lower_col = {h.lower(): i for i, h in enumerate(header)}
+
+              derived_rows = []
+              sigma_key = None
+              omega_de_key = None
+
+              for h in header:
+                  if h.lower() == "cosmological_parameters--sigma_8":
+                      sigma_key = h
+                  if h.lower() == "cosmological_parameters--omega_de":
+                      omega_de_key = h
+
+              weight_col = find_weight_column(header)
+              weights = data[:, weight_col] if weight_col is not None else np.ones(data.shape[0])
+
+              if sigma_key and omega_de_key:
+                  sigma8 = data[:, col[sigma_key]]
+                  omega_de = data[:, col[omega_de_key]]
+                  omega_m_flat = 1.0 - omega_de
+                  mask = np.isfinite(sigma8) & np.isfinite(omega_m_flat) & (omega_m_flat > 0)
+                  derived_s8 = sigma8[mask] * np.sqrt(omega_m_flat[mask] / 0.3)
+                  derived_weights = weights[mask]
+
+                  q16, q50, q84 = weighted_quantile(derived_s8, derived_weights, [0.16, 0.50, 0.84])
+
+                  derived_rows.append({
+                      "source": "HSC_Y3",
+                      "surface": "consolidation_growth",
+                      "parameter": "S8_flat_derived_from_sigma8_and_omega_de",
+                      "row_count": int(len(derived_s8)),
+                      "weighted_mean": float(np.average(derived_s8, weights=derived_weights)) if np.sum(derived_weights) > 0 else float(np.mean(derived_s8)),
+                      "q16": q16,
+                      "q50": q50,
+                      "q84": q84,
+                      "min": float(np.min(derived_s8)),
+                      "max": float(np.max(derived_s8)),
+                      "weight_column": header[weight_col] if weight_col is not None else None,
+                      "derivation_boundary": "Computed as sigma8 * sqrt((1 - omega_de)/0.3); diagnostic only until HSC data-vector/likelihood ingestion is resolved."
+                  })
+
+              summary_path = OUTDIR / "hsc_y3_chain_parameter_summary.csv"
+              with summary_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "source", "surface", "parameter", "row_count",
+                      "weighted_mean", "q16", "q50", "q84",
+                      "min", "max", "weight_column"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in summaries:
+                      writer.writerow(row)
+
+              derived_path = OUTDIR / "hsc_y3_chain_derived_s8_diagnostic.csv"
+              with derived_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "source", "surface", "parameter", "row_count",
+                      "weighted_mean", "q16", "q50", "q84",
+                      "min", "max", "weight_column", "derivation_boundary"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in derived_rows:
+                      writer.writerow(row)
+
+              gated_path = OUTDIR / "hsc_y3_data_vector_gate_status.csv"
+              with gated_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "url", "ok", "status", "content_type",
+                      "content_length", "bytes_read", "error"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in gated_probes:
+                      writer.writerow(row)
+
+              gated_401_count = sum(1 for p in gated_probes if p["status"] == 401)
+
+              return {
+                  "surface": "consolidation_growth",
+                  "source": "HSC_Y3",
+                  "ingestion_pass": data.shape[0] > 1000 and data.shape[1] >= 10 and sigma_key is not None,
+                  "chain_member": chain_name,
+                  "chain_rows": int(data.shape[0]),
+                  "chain_columns": int(data.shape[1]),
+                  "parameter_summary_rows": len(summaries),
+                  "derived_s8_rows": len(derived_rows),
+                  "sigma8_column_found": sigma_key is not None,
+                  "omega_de_column_found": omega_de_key is not None,
+                  "gated_probe_count": len(gated_probes),
+                  "gated_401_count": gated_401_count,
+                  "parameter_summary_table": str(summary_path),
+                  "derived_s8_diagnostic_table": str(derived_path),
+                  "data_vector_gate_status_table": str(gated_path),
+                  "download": dl,
+                  "model_anchor_allowed": False,
+                  "boundary": "HSC chain-only diagnostic. Data-vector products stayed gated, so do not promote this to a full growth anchor yet."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_16_status": "source_specific_shape_probes_passed_ready_for_v3_17_targeted_ingestion",
+                  "v3_16_next_allowed_step": "Build v3.17 targeted ingestion for DESI_DR1_BAO, Planck_2018, HSC_Y3_chain_only_followup."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "surface_ledger": [],
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.17 targeted ingestion")
+          print("Truth boundary: ingestion only; no validation claim.")
+          print()
+
+          failed = []
+
+          for name, fn in [
+              ("DESI_DR1_BAO", ingest_desi),
+              ("Planck_2018", ingest_planck),
+              ("HSC_Y3", ingest_hsc)
+          ]:
+              print(f"Ingesting {name}")
+              try:
+                  result = fn()
+              except Exception as e:
+                  result = {
+                      "source": name,
+                      "surface": "unknown",
+                      "ingestion_pass": False,
+                      "error": f"{type(e).__name__}: {e}",
+                      "model_anchor_allowed": False
+                  }
+                  failed.append(f"{name}_ingestion_failed")
+
+              inventory["source_results"][name] = result
+              print(f"  pass: {result.get('ingestion_pass')}")
+              if result.get("error"):
+                  print(f"  error: {result.get('error')}")
+              print()
+
+          for name, result in inventory["source_results"].items():
+              inventory["surface_ledger"].append({
+                  "source": name,
+                  "surface": result.get("surface"),
+                  "ingestion_pass": result.get("ingestion_pass"),
+                  "model_anchor_allowed": result.get("model_anchor_allowed"),
+                  "boundary": result.get("boundary"),
+                  "error": result.get("error")
+              })
+
+          ledger_path = OUTDIR / "targeted_ingestion_surface_ledger_v3_17.csv"
+          with ledger_path.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "ingestion_pass",
+                  "model_anchor_allowed", "boundary", "error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in inventory["surface_ledger"]:
+                  writer.writerow(row)
+
+          summary_path = OUTDIR / "targeted_ingestion_summary_v3_17.csv"
+          with summary_path.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "ingestion_pass",
+                  "main_count", "secondary_count", "model_anchor_allowed", "boundary"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+
+              d = inventory["source_results"].get("DESI_DR1_BAO", {})
+              writer.writerow({
+                  "source": "DESI_DR1_BAO",
+                  "surface": d.get("surface"),
+                  "ingestion_pass": d.get("ingestion_pass"),
+                  "main_count": d.get("combined_rows"),
+                  "secondary_count": d.get("parameter_summary_rows"),
+                  "model_anchor_allowed": d.get("model_anchor_allowed"),
+                  "boundary": d.get("boundary")
+              })
+
+              p = inventory["source_results"].get("Planck_2018", {})
+              writer.writerow({
+                  "source": "Planck_2018",
+                  "surface": p.get("surface"),
+                  "ingestion_pass": p.get("ingestion_pass"),
+                  "main_count": p.get("target_parameter_rows"),
+                  "secondary_count": p.get("cov_shape"),
+                  "model_anchor_allowed": p.get("model_anchor_allowed"),
+                  "boundary": p.get("boundary")
+              })
+
+              h = inventory["source_results"].get("HSC_Y3", {})
+              writer.writerow({
+                  "source": "HSC_Y3",
+                  "surface": h.get("surface"),
+                  "ingestion_pass": h.get("ingestion_pass"),
+                  "main_count": h.get("chain_rows"),
+                  "secondary_count": h.get("derived_s8_rows"),
+                  "model_anchor_allowed": h.get("model_anchor_allowed"),
+                  "boundary": h.get("boundary")
+              })
+
+          passed = [
+              name for name, result in inventory["source_results"].items()
+              if result.get("ingestion_pass") is True
+          ]
+
+          failed_or_partial = [
+              name for name, result in inventory["source_results"].items()
+              if result.get("ingestion_pass") is not True
+          ]
+
+          failed_gates = list(failed)
+
+          if len(passed) < 2:
+              failed_gates.append("fewer_than_two_targeted_ingestions_passed")
+
+          if not failed_gates and len(passed) == 3:
+              readiness_label = "targeted_ingestion_passed_all_three_ready_for_v3_18_anchor_boundary_integration"
+          elif not failed_gates:
+              readiness_label = "targeted_ingestion_partial_pass_ready_for_limited_v3_18_boundary_integration"
+          else:
+              readiness_label = "targeted_ingestion_needs_followup_before_anchor_integration"
+
+          next_step = (
+              "Build v3.18 anchor-boundary integration: add Planck CMB reference parameters, DESI BAO chain summaries, and HSC chain-only diagnostic to the ledger without promoting them beyond their passed boundaries."
+              if not failed_gates
+              else "Fix failed targeted ingestion before v3.18 anchor-boundary integration."
+          )
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "passed_sources": passed,
+              "failed_or_partial_sources": failed_or_partial,
+              "model_claim_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_17_targeted_ingestion.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.17 — Targeted Ingestion")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.17 performs targeted ingestion after the v3.16 source-specific shape probes.")
+          md.append("")
+          md.append("- DESI DR1 BAO: downloads the BAO-only Cobaya chain files and creates chain summaries.")
+          md.append("- Planck 2018: downloads the cosmological-parameter archive and extracts reference parameters plus covariance shape.")
+          md.append("- HSC-Y3: downloads the chain ZIP, summarizes chain parameters, records gated data-vector status, and keeps the result chain-only.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append("| Source | Surface | Ingestion pass | Boundary |")
+          md.append("|---|---|---:|---|")
+          for name, result in inventory["source_results"].items():
+              md.append(
+                  f"| {name} | {result.get('surface')} | {result.get('ingestion_pass')} | {result.get('boundary')} |"
+              )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `desi_dr1_bao_chain_parameter_summary.csv`")
+          md.append("- `desi_dr1_bao_chain_shape_summary.csv`")
+          md.append("- `planck_2018_reference_parameters.csv`")
+          md.append("- `planck_2018_covmat_shape_summary.csv`")
+          md.append("- `hsc_y3_chain_parameter_summary.csv`")
+          md.append("- `hsc_y3_chain_derived_s8_diagnostic.csv`")
+          md.append("- `hsc_y3_data_vector_gate_status.csv`")
+          md.append("- `targeted_ingestion_surface_ledger_v3_17.csv`")
+          md.append("- `targeted_ingestion_summary_v3_17.csv`")
+          md.append("- `tairid_cosmology_v3_17_targeted_ingestion.json`")
+          md.append("- `tairid_cosmology_v3_17_targeted_ingestion.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_17_targeted_ingestion.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.17 targeted ingestion artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-17-targeted-ingestion
+          path: artifacts/tairid_cosmology_v3_17/
