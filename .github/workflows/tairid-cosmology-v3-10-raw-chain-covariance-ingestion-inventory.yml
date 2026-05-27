@@ -1,0 +1,523 @@
+name: TAIRID Cosmology v3.10 Raw-Chain Covariance Ingestion Inventory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  raw-chain-covariance-inventory:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.10 ingestion inventory
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_10
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_10")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_10_raw_chain_covariance_ingestion_inventory"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This only checks whether raw chains, covariances, likelihood files, or data-product pages are reachable enough for later covariance-aware testing.",
+              "Published summary anchors are not replaced until raw/covariance ingestion works."
+          ]
+
+          SOURCES = [
+              {
+                  "surface": "reach_geometry",
+                  "source": "PantheonPlus_SH0ES",
+                  "target_type": "SN distances and covariance",
+                  "expected_products": [
+                      "supernova distance table",
+                      "full statistical plus systematic covariance",
+                      "cosmology inputs",
+                      "chains or likelihood support"
+                  ],
+                  "urls": [
+                      "https://github.com/PantheonPlusSH0ES/DataRelease",
+                      "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES.dat",
+                      "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES_STAT%2BSYS.cov"
+                  ],
+                  "notes": "Already partly reachable in earlier prototypes; this inventory checks exact file reachability again."
+              },
+              {
+                  "surface": "reach_geometry",
+                  "source": "DESI_DR1_BAO",
+                  "target_type": "BAO cosmology products",
+                  "expected_products": [
+                      "BAO cosmology chains",
+                      "posterior maximization results",
+                      "BAO covariance or likelihood files",
+                      "DR1 data-product structure"
+                  ],
+                  "urls": [
+                      "https://data.desi.lbl.gov/doc/releases/dr1/vac/bao-cosmo-params/",
+                      "https://data.desi.lbl.gov/doc/releases/dr1/",
+                      "https://data.desi.lbl.gov/public/dr1/"
+                  ],
+                  "notes": "Reach/ruler lane. This inventory does not refit DESI; it checks whether product paths are accessible enough for a later parser."
+              },
+              {
+                  "surface": "reach_geometry",
+                  "source": "Planck_2018",
+                  "target_type": "CMB chains and parameter covariance",
+                  "expected_products": [
+                      "Planck MCMC chains",
+                      "parameter tables",
+                      "likelihood products",
+                      "ancillary products"
+                  ],
+                  "urls": [
+                      "https://pla.esac.esa.int/",
+                      "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/",
+                      "https://lambda.gsfc.nasa.gov/product/planck/curr/planck_prod_esa.html"
+                  ],
+                  "notes": "CMB anchor lane. Direct automated access may require PLA-specific follow-up."
+              },
+              {
+                  "surface": "consolidation_growth",
+                  "source": "KiDS_1000",
+                  "target_type": "weak-lensing chains and covariance",
+                  "expected_products": [
+                      "Multinest posterior chains",
+                      "data vectors",
+                      "covariance matrices",
+                      "redshift distributions",
+                      "CosmoSIS configs"
+                  ],
+                  "urls": [
+                      "https://kids.strw.leidenuniv.nl/DR4/KiDS-1000_cosmicshear.php",
+                      "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_cosmic_shear_data_release.tgz"
+                  ],
+                  "notes": "Growth/consolidation lane. This is the strongest direct-download candidate in this inventory."
+              },
+              {
+                  "surface": "consolidation_growth",
+                  "source": "DES_Y3",
+                  "target_type": "weak-lensing / 3x2pt data products",
+                  "expected_products": [
+                      "DES Y3 cosmology data products",
+                      "covariance products",
+                      "chains or likelihood outputs",
+                      "3x2pt support products"
+                  ],
+                  "urls": [
+                      "https://www.darkenergysurvey.org/des-year-3-cosmology-results-papers/",
+                      "https://des.ncsa.illinois.edu/releases/y3a2"
+                  ],
+                  "notes": "Growth/consolidation lane. This inventory checks official landing and release paths before attempting deeper product parsing."
+              },
+              {
+                  "surface": "consolidation_growth",
+                  "source": "HSC_Y3",
+                  "target_type": "weak-lensing chains and covariance",
+                  "expected_products": [
+                      "cosmic shear data vectors",
+                      "covariance products",
+                      "chains or posterior samples",
+                      "catalog/lensing products"
+                  ],
+                  "urls": [
+                      "https://hsc-release.mtk.nao.ac.jp/doc/index.php/wly3/"
+                  ],
+                  "notes": "Growth/consolidation lane. May remain landing-page-only unless direct product links are discoverable."
+              }
+          ]
+
+          KEYWORDS = [
+              "chain", "chains", "mcmc", "posterior", "posteriors",
+              "covariance", "covariance matrix", "covmat", "stat+sys",
+              "data vector", "data vectors", "likelihood", "cosmosis",
+              "multinest", "fits", "tarball", "download", "parameter",
+              "bao", "s8", "sigma_8", "omega_m", "h0", "planck"
+          ]
+
+          DIRECT_EXT_HINTS = (
+              ".tgz", ".tar", ".tar.gz", ".gz", ".zip",
+              ".fits", ".fit", ".cov", ".dat", ".txt",
+              ".ini", ".yaml", ".yml", ".chain", ".paramnames"
+          )
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def normalize_space(text):
+              return re.sub(r"\s+", " ", text or "").strip()
+
+          def probe_url(url, max_bytes=8192, timeout=30):
+              """
+              Range-probe a URL without intentionally downloading large data products.
+              Some servers ignore Range, so we still only read max_bytes from the response stream.
+              """
+              headers = {
+                  "User-Agent": "TAIRID-v3.10-ingestion-inventory/1.0",
+                  "Accept": "*/*",
+                  "Range": f"bytes=0-{max_bytes - 1}"
+              }
+
+              result = {
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "reason": None,
+                  "final_url": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "accept_ranges": None,
+                  "content_range": None,
+                  "bytes_read": 0,
+                  "snippet": "",
+                  "error": None,
+                  "checked_at_utc": now_iso()
+              }
+
+              req = urllib.request.Request(url, headers=headers, method="GET")
+
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", None)
+                      body = resp.read(max_bytes)
+                      headers_obj = resp.headers
+
+                      result.update({
+                          "ok": status is not None and 200 <= status < 400,
+                          "status": status,
+                          "reason": getattr(resp, "reason", None),
+                          "final_url": resp.geturl(),
+                          "content_type": headers_obj.get("Content-Type"),
+                          "content_length": headers_obj.get("Content-Length"),
+                          "accept_ranges": headers_obj.get("Accept-Ranges"),
+                          "content_range": headers_obj.get("Content-Range"),
+                          "bytes_read": len(body),
+                          "snippet": normalize_space(body.decode("utf-8", errors="replace")[:1200])
+                      })
+
+              except urllib.error.HTTPError as e:
+                  try:
+                      body = e.read(max_bytes)
+                  except Exception:
+                      body = b""
+
+                  result.update({
+                      "ok": False,
+                      "status": e.code,
+                      "reason": getattr(e, "reason", None),
+                      "final_url": url,
+                      "content_type": e.headers.get("Content-Type") if e.headers else None,
+                      "content_length": e.headers.get("Content-Length") if e.headers else None,
+                      "accept_ranges": e.headers.get("Accept-Ranges") if e.headers else None,
+                      "content_range": e.headers.get("Content-Range") if e.headers else None,
+                      "bytes_read": len(body),
+                      "snippet": normalize_space(body.decode("utf-8", errors="replace")[:1200]),
+                      "error": f"HTTPError: {e.code} {getattr(e, 'reason', '')}"
+                  })
+
+              except Exception as e:
+                  result.update({
+                      "ok": False,
+                      "error": f"{type(e).__name__}: {e}"
+                  })
+
+              return result
+
+          def keyword_hits(text):
+              lower = (text or "").lower()
+              return sorted({k for k in KEYWORDS if k.lower() in lower})
+
+          def looks_direct(url):
+              parsed = urllib.parse.urlparse(url)
+              path = parsed.path.lower()
+              host = parsed.netloc.lower()
+              if "raw.githubusercontent.com" in host:
+                  return True
+              return any(path.endswith(ext) for ext in DIRECT_EXT_HINTS)
+
+          def classify_source(source, probes):
+              ok_probes = [p for p in probes if p.get("ok")]
+              direct_ok = [p for p in ok_probes if looks_direct(p["url"])]
+              all_text = " ".join([p.get("snippet", "") for p in probes])
+              hits = keyword_hits(all_text)
+
+              has_chain_signal = any(h in hits for h in ["chain", "chains", "mcmc", "posterior", "posteriors", "multinest"])
+              has_cov_signal = any(h in hits for h in ["covariance", "covariance matrix", "covmat", "stat+sys"])
+              has_likelihood_signal = any(h in hits for h in ["likelihood", "cosmosis"])
+              has_data_signal = any(h in hits for h in ["data vector", "data vectors", "fits", "tarball", "download"])
+
+              if direct_ok and (has_cov_signal or has_chain_signal or has_data_signal or looks_direct(direct_ok[0]["url"])):
+                  status = "ready_for_targeted_download_probe"
+                  score = 3
+              elif ok_probes and (has_chain_signal or has_cov_signal or has_likelihood_signal or has_data_signal):
+                  status = "landing_page_ready_for_manual_link_extraction"
+                  score = 2
+              elif ok_probes:
+                  status = "landing_page_reachable_but_product_links_need_followup"
+                  score = 1
+              else:
+                  status = "not_reachable_from_ci_probe"
+                  score = 0
+
+              return {
+                  "source": source["source"],
+                  "surface": source["surface"],
+                  "target_type": source["target_type"],
+                  "ingestion_readiness_status": status,
+                  "readiness_score_0_to_3": score,
+                  "reachable_url_count": len(ok_probes),
+                  "direct_resource_url_count": len(direct_ok),
+                  "keyword_hits": hits,
+                  "signals": {
+                      "chain_or_posterior_signal": has_chain_signal,
+                      "covariance_signal": has_cov_signal,
+                      "likelihood_signal": has_likelihood_signal,
+                      "data_vector_or_download_signal": has_data_signal
+                  },
+                  "expected_products": source["expected_products"],
+                  "notes": source["notes"]
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "milestone_input": {
+                  "previous_status": "expanded_growth_anchor_robustness_supports_two_surface_probe_not_validation",
+                  "previous_readiness": "9/10",
+                  "failed_gates": "none",
+                  "next_clean_move": "raw-chain / covariance ingestion inventory"
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": [],
+              "url_probes": []
+          }
+
+          print("TAIRID Cosmology v3.10 raw-chain/covariance ingestion inventory")
+          print("Truth boundary: data-access readiness only; no model claim.")
+          print()
+
+          for source in SOURCES:
+              print(f"Checking {source['source']} [{source['surface']}]")
+              probes = []
+              for url in source["urls"]:
+                  probe = probe_url(url)
+                  probes.append(probe)
+                  inventory["url_probes"].append({
+                      "source": source["source"],
+                      "surface": source["surface"],
+                      **probe
+                  })
+
+                  status = probe.get("status")
+                  ok = probe.get("ok")
+                  ctype = probe.get("content_type")
+                  err = probe.get("error")
+                  print(f"  - {status} ok={ok} type={ctype} url={url}")
+                  if err:
+                      print(f"    error: {err}")
+
+                  time.sleep(0.25)
+
+              summary = classify_source(source, probes)
+              inventory["source_summaries"].append(summary)
+              print(f"  => {summary['ingestion_readiness_status']} score={summary['readiness_score_0_to_3']}")
+              print()
+
+          surface_rollup = {}
+          for summary in inventory["source_summaries"]:
+              surface = summary["surface"]
+              surface_rollup.setdefault(surface, {
+                  "sources": 0,
+                  "ready_for_targeted_download_probe": 0,
+                  "landing_or_better": 0,
+                  "score_sum": 0
+              })
+              surface_rollup[surface]["sources"] += 1
+              surface_rollup[surface]["score_sum"] += summary["readiness_score_0_to_3"]
+              if summary["ingestion_readiness_status"] == "ready_for_targeted_download_probe":
+                  surface_rollup[surface]["ready_for_targeted_download_probe"] += 1
+              if summary["readiness_score_0_to_3"] >= 1:
+                  surface_rollup[surface]["landing_or_better"] += 1
+
+          for surface, row in surface_rollup.items():
+              row["average_readiness_score_0_to_3"] = round(row["score_sum"] / max(row["sources"], 1), 3)
+
+          inventory["surface_rollup"] = surface_rollup
+
+          ready_count = sum(
+              1 for s in inventory["source_summaries"]
+              if s["ingestion_readiness_status"] == "ready_for_targeted_download_probe"
+          )
+          landing_or_better_count = sum(
+              1 for s in inventory["source_summaries"]
+              if s["readiness_score_0_to_3"] >= 1
+          )
+
+          inventory["gate_result"] = {
+              "failed_gates": [],
+              "readiness_label": (
+                  "raw_covariance_ingestion_inventory_ready_for_targeted_download_probe"
+                  if ready_count >= 2 and landing_or_better_count >= 5
+                  else "raw_covariance_ingestion_inventory_partial_manual_followup_needed"
+              ),
+              "ready_source_count": ready_count,
+              "landing_or_better_source_count": landing_or_better_count,
+              "model_claim_allowed": False,
+              "next_allowed_step": "Build a targeted downloader/parser only for sources classified ready_for_targeted_download_probe."
+          }
+
+          # Write JSON.
+          json_path = OUTDIR / "tairid_cosmology_v3_10_raw_chain_covariance_inventory.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          # Write CSV.
+          csv_path = OUTDIR / "tairid_cosmology_v3_10_source_summary.csv"
+          with csv_path.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "surface",
+                      "source",
+                      "target_type",
+                      "ingestion_readiness_status",
+                      "readiness_score_0_to_3",
+                      "reachable_url_count",
+                      "direct_resource_url_count",
+                      "keyword_hits",
+                      "chain_or_posterior_signal",
+                      "covariance_signal",
+                      "likelihood_signal",
+                      "data_vector_or_download_signal",
+                      "notes"
+                  ]
+              )
+              writer.writeheader()
+              for s in inventory["source_summaries"]:
+                  writer.writerow({
+                      "surface": s["surface"],
+                      "source": s["source"],
+                      "target_type": s["target_type"],
+                      "ingestion_readiness_status": s["ingestion_readiness_status"],
+                      "readiness_score_0_to_3": s["readiness_score_0_to_3"],
+                      "reachable_url_count": s["reachable_url_count"],
+                      "direct_resource_url_count": s["direct_resource_url_count"],
+                      "keyword_hits": "; ".join(s["keyword_hits"]),
+                      "chain_or_posterior_signal": s["signals"]["chain_or_posterior_signal"],
+                      "covariance_signal": s["signals"]["covariance_signal"],
+                      "likelihood_signal": s["signals"]["likelihood_signal"],
+                      "data_vector_or_download_signal": s["signals"]["data_vector_or_download_signal"],
+                      "notes": s["notes"]
+                  })
+
+          # Write Markdown report.
+          md = []
+          md.append("# TAIRID Cosmology v3.10 — Raw-Chain / Covariance Ingestion Inventory")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{inventory['gate_result']['readiness_label']}`")
+          md.append("")
+          md.append("Failed gates: none for data-access inventory unless every source becomes unreachable.")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## Why this test exists")
+          md.append("")
+          md.append(
+              "v3.8 and v3.9 supported a two-surface reach/consolidation pressure pattern using published summary anchors. "
+              "That is useful but not sufficient. This v3.10 test checks whether the next stage can move away from hand-entered anchors "
+              "toward covariance-aware or chain-level inputs."
+          )
+          md.append("")
+          md.append("## Source summary")
+          md.append("")
+          md.append("| Surface | Source | Status | Score | Reachable URLs | Direct resources | Keyword hits |")
+          md.append("|---|---|---:|---:|---:|---:|---|")
+          for s in inventory["source_summaries"]:
+              md.append(
+                  f"| {s['surface']} | {s['source']} | `{s['ingestion_readiness_status']}` | "
+                  f"{s['readiness_score_0_to_3']} | {s['reachable_url_count']} | "
+                  f"{s['direct_resource_url_count']} | {', '.join(s['keyword_hits'])} |"
+              )
+          md.append("")
+          md.append("## Surface rollup")
+          md.append("")
+          md.append("| Surface | Sources | Ready direct-download probes | Landing-or-better | Average score |")
+          md.append("|---|---:|---:|---:|---:|")
+          for surface, row in inventory["surface_rollup"].items():
+              md.append(
+                  f"| {surface} | {row['sources']} | {row['ready_for_targeted_download_probe']} | "
+                  f"{row['landing_or_better']} | {row['average_readiness_score_0_to_3']} |"
+              )
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append(
+              "A source marked `ready_for_targeted_download_probe` is not scientifically ingested yet. "
+              "It only means the source has a direct resource or enough machine-readable access to justify a later downloader/parser."
+          )
+          md.append("")
+          md.append(
+              "A source marked `landing_page_ready_for_manual_link_extraction` should not be discarded. "
+              "It means the official product page is visible but the next workflow may need a source-specific link parser or manually confirmed product URL."
+          )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(inventory["gate_result"]["next_allowed_step"])
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_cosmology_v3_10_raw_chain_covariance_inventory.json`")
+          md.append("- `tairid_cosmology_v3_10_source_summary.csv`")
+          md.append("- `tairid_cosmology_v3_10_raw_chain_covariance_inventory.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_10_raw_chain_covariance_inventory.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Wrote artifacts:")
+          print(f"  {json_path}")
+          print(f"  {csv_path}")
+          print(f"  {md_path}")
+          print()
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+
+          if landing_or_better_count == 0:
+              print("No reachable sources found. Failing workflow because the inventory cannot proceed.")
+              sys.exit(2)
+
+          sys.exit(0)
+          PY
+
+      - name: Upload TAIRID v3.10 inventory artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-10-raw-chain-covariance-ingestion-inventory
+          path: artifacts/tairid_cosmology_v3_10/
