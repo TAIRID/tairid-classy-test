@@ -1,0 +1,920 @@
+name: TAIRID Cosmology v3.27 Independent Reach Shape Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-shape-probe:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.27 independent reach shape probe
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_27
+
+          python - <<'PY'
+          import csv
+          import gzip
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import tarfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_27")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_27_independent_reach_shape_probe"
+
+          MAX_DOWNLOAD_BYTES = 120 * 1024 * 1024
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This is a targeted shape probe for independent non-DESI reach/geometry products.",
+              "DESI is intentionally excluded because v3.25 already showed the mapped DESI reach rows are scaled counterparts.",
+              "Passing a shape probe does not make a product a model anchor.",
+              "A pass only means one or more independent reach lanes are ready for targeted ingestion.",
+              "No diagnostic-only row may be promoted to a model claim."
+          ]
+
+          PRODUCTS = [
+              {
+                  "source": "PantheonPlus_SH0ES",
+                  "lane": "local_ladder_sn_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "shoes_h0_ladder_result_text",
+                  "url": "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/SH0ES_Data/lstsq_results.txt"
+              },
+              {
+                  "source": "PantheonPlus_SH0ES",
+                  "lane": "local_ladder_sn_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "shoes_ladder_data_table",
+                  "url": "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/SH0ES_Data/optical_wes_R22_for19fromR16.dat"
+              },
+              {
+                  "source": "PantheonPlus_SH0ES",
+                  "lane": "local_ladder_sn_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "shoes_ladder_data_table_m31",
+                  "url": "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/SH0ES_Data/optical_wes_R22_for19fromR16.wM31.dat"
+              },
+              {
+                  "source": "PantheonPlus_SH0ES",
+                  "lane": "local_ladder_sn_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "shoes_mcmc_reader_code",
+                  "url": "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/SH0ES_Data/read_chains_example.py"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "lane": "strong_lens_time_delay_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "h0licow_time_delay_lightcurve_data",
+                  "url": "https://shsuyu.github.io/H0LiCOW/site/data/HE0435_lcs.dat"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "lane": "strong_lens_time_delay_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "h0licow_lens_csv",
+                  "url": "https://shsuyu.github.io/H0LiCOW/site/data/J1206_final.csv"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "lane": "strong_lens_time_delay_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "h0licow_catalog_text",
+                  "url": "https://shsuyu.github.io/H0LiCOW/site/data/PaperIII_complete_catalogue.txt"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "lane": "strong_lens_time_delay_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "h0licow_data_archive",
+                  "url": "https://shsuyu.github.io/H0LiCOW/site/data/HE0435_data_PaperII.tar.gz"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "lane": "strong_lens_time_delay_reach",
+                  "surface": "reach_geometry",
+                  "expected_role": "h0licow_h0_inference_code_zip",
+                  "url": "https://zenodo.org/records/3633035/files/H0_inference_code.zip?download=1"
+              },
+              {
+                  "source": "TDCOSMO_2020",
+                  "lane": "hierarchical_time_delay_cosmography",
+                  "surface": "reach_geometry",
+                  "expected_role": "tdcosmo_posterior_table_csv",
+                  "url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv"
+              },
+              {
+                  "source": "TDCOSMO_2020",
+                  "lane": "hierarchical_time_delay_cosmography",
+                  "surface": "reach_geometry",
+                  "expected_role": "tdcosmo_processed_posterior_pickle_binary_shape_only",
+                  "url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_processed.pkl"
+              },
+              {
+                  "source": "TDCOSMO_2020",
+                  "lane": "hierarchical_time_delay_cosmography",
+                  "surface": "reach_geometry",
+                  "expected_role": "tdcosmo_om_processed_pickle_binary_shape_only",
+                  "url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed.pkl"
+              },
+              {
+                  "source": "TDCOSMO_2020",
+                  "lane": "hierarchical_time_delay_cosmography",
+                  "surface": "reach_geometry",
+                  "expected_role": "tdcosmo_om_kappa_processed_pickle_binary_shape_only",
+                  "url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed_with_kappa.pkl"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "surface": "reach_geometry",
+                  "expected_role": "eboss_bao_only_readme",
+                  "url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/README.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "surface": "reach_geometry",
+                  "expected_role": "eboss_dr16_lrg_bao_dmdh",
+                  "url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "surface": "reach_geometry",
+                  "expected_role": "eboss_dr16_lrg_bao_cov",
+                  "url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "surface": "reach_geometry",
+                  "expected_role": "eboss_dr16_qso_bao_dmdh",
+                  "url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "surface": "reach_geometry",
+                  "expected_role": "eboss_dr16_qso_bao_cov",
+                  "url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "surface": "reach_geometry",
+                  "expected_role": "eboss_dr12_lrg_bao_dmdh",
+                  "url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "surface": "reach_geometry",
+                  "expected_role": "eboss_dr12_lrg_bao_cov",
+                  "url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "BOSS_DR12_BAO",
+                  "lane": "pre_DESI_boss_bao",
+                  "surface": "reach_geometry",
+                  "expected_role": "boss_cosmomc_archive",
+                  "url": "https://data.sdss.org/sas/dr10/boss/papers/clustering/Anderson_2013_CMASSDR11_LOWZDR11_cosmomc.tar.gz"
+              },
+              {
+                  "source": "BOSS_DR12_BAO",
+                  "lane": "pre_DESI_boss_bao",
+                  "surface": "reach_geometry",
+                  "expected_role": "boss_cmass_covariance",
+                  "url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/CMASSDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+              },
+              {
+                  "source": "BOSS_DR12_BAO",
+                  "lane": "pre_DESI_boss_bao",
+                  "surface": "reach_geometry",
+                  "expected_role": "boss_lowz_covariance",
+                  "url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/LOWZDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+              }
+          ]
+
+          PRODUCT_TERMS = [
+              "h0", "hubble", "sh0es", "pantheon", "cepheid",
+              "bao", "rdrag", "rd", "dv", "dm", "dh", "dmdh",
+              "time-delay", "timedelay", "time_delay", "tdcosmo", "h0licow",
+              "posterior", "posteriors", "chain", "chains", "mcmc", "cosmomc",
+              "likelihood", "covariance", "covmat", "cov", "distances",
+              "angular", "diameter", "cosmosis", "samples", "table",
+              "fits", "dat", "csv", "txt", "tar", "gz", "zip", "pickle", "pkl"
+          ]
+
+          TEXT_EXTENSIONS = [".txt", ".dat", ".csv", ".tsv", ".md", ".py", ".ini", ".yaml", ".yml", ".tex", ".out"]
+          ARCHIVE_EXTENSIONS = [".zip", ".tar.gz", ".tgz", ".tar"]
+          BINARY_SHAPE_EXTENSIONS = [".fits", ".fit", ".pkl", ".pickle", ".npy", ".npz"]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              parsed = urllib.parse.urlparse(url)
+              name = parsed.path.rstrip("/").split("/")[-1] or "downloaded_product"
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              if not name:
+                  name = "downloaded_product"
+              return name[:160]
+
+          def product_hits(text):
+              lower = (text or "").lower()
+              return sorted({term for term in PRODUCT_TERMS if term in lower})
+
+          def extension_kind(path_or_url):
+              lower = str(path_or_url).lower().split("?")[0]
+              for ext in ARCHIVE_EXTENSIONS:
+                  if lower.endswith(ext):
+                      return "archive"
+              for ext in TEXT_EXTENSIONS:
+                  if lower.endswith(ext):
+                      return "text"
+              for ext in BINARY_SHAPE_EXTENSIONS:
+                  if lower.endswith(ext):
+                      return "binary_shape"
+              if lower.endswith(".gz"):
+                  return "gzip_or_archive"
+              return "unknown"
+
+          def download_capped(url, path, max_bytes=MAX_DOWNLOAD_BYTES, timeout=300):
+              result = {
+                  "url": url,
+                  "path": str(path),
+                  "downloaded": False,
+                  "skipped": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "size_bytes": 0,
+                  "error": None
+              }
+
+              headers = {
+                  "User-Agent": "TAIRID-v3.27-independent-reach-shape-probe/1.0",
+                  "Accept": "*/*"
+              }
+
+              try:
+                  req = urllib.request.Request(url, headers=headers, method="GET")
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", None)
+                      ctype = resp.headers.get("Content-Type")
+                      clen = resp.headers.get("Content-Length")
+
+                      result["status"] = status
+                      result["content_type"] = ctype
+                      result["content_length"] = clen
+
+                      if status is None or not (200 <= status < 400):
+                          raise RuntimeError(f"HTTP status {status}")
+
+                      if clen is not None:
+                          try:
+                              clen_int = int(clen)
+                              if clen_int > max_bytes:
+                                  result["skipped"] = True
+                                  result["error"] = f"content_length_exceeds_cap:{clen_int}>{max_bytes}"
+                                  return result
+                          except Exception:
+                              pass
+
+                      path.parent.mkdir(parents=True, exist_ok=True)
+
+                      total = 0
+                      with path.open("wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > max_bytes:
+                                  f.close()
+                                  try:
+                                      path.unlink()
+                                  except Exception:
+                                      pass
+                                  result["skipped"] = True
+                                  result["error"] = f"download_exceeds_cap:{total}>{max_bytes}"
+                                  return result
+                              f.write(chunk)
+
+                      result["downloaded"] = True
+                      result["size_bytes"] = path.stat().st_size
+                      return result
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+                  return result
+
+          def read_head_bytes(path, max_bytes=262144):
+              with path.open("rb") as f:
+                  return f.read(max_bytes)
+
+          def summarize_text_bytes(data, name):
+              text = data.decode("utf-8", errors="replace")
+              lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+              numeric_rows = 0
+              max_numeric_cols = 0
+              header_like = ""
+              first_lines = []
+
+              for line in lines[:8]:
+                  first_lines.append(line[:240])
+
+              for line in lines[:250]:
+                  clean = line.lstrip("#").strip()
+                  if not clean:
+                      continue
+
+                  parts = re.split(r"[\s,]+", clean)
+                  numeric = 0
+                  for p in parts:
+                      try:
+                          float(p)
+                          numeric += 1
+                      except Exception:
+                          pass
+
+                  if numeric >= max(1, min(2, len(parts))):
+                      numeric_rows += 1
+                      max_numeric_cols = max(max_numeric_cols, numeric)
+                  elif not header_like and any(hit in clean.lower() for hit in PRODUCT_TERMS):
+                      header_like = clean[:300]
+
+              return {
+                  "member_or_file": name,
+                  "text_line_count_sample": len(lines),
+                  "numeric_rows_in_sample": numeric_rows,
+                  "max_numeric_columns_in_sample": max_numeric_cols,
+                  "product_hits": product_hits(text + " " + name),
+                  "header_like": header_like,
+                  "first_lines": first_lines
+              }
+
+          def inspect_zip(path, product):
+              archive_rows = []
+              text_rows = []
+              result = {
+                  "archive_valid": False,
+                  "archive_type": "zip",
+                  "archive_member_count": 0,
+                  "archive_text_member_count": 0,
+                  "archive_chain_like_member_count": 0,
+                  "archive_posterior_like_member_count": 0,
+                  "archive_covariance_like_member_count": 0,
+                  "archive_error": None
+              }
+
+              try:
+                  with zipfile.ZipFile(path, "r") as zf:
+                      infos = [i for i in zf.infolist() if not i.is_dir()]
+                      result["archive_valid"] = True
+                      result["archive_member_count"] = len(infos)
+
+                      for info in infos[:300]:
+                          lower = info.filename.lower()
+                          hits = product_hits(info.filename)
+                          member_row = {
+                              "source": product["source"],
+                              "expected_role": product["expected_role"],
+                              "archive_path": str(path),
+                              "member_name": info.filename,
+                              "member_size_bytes": int(info.file_size),
+                              "product_hits": ";".join(hits)
+                          }
+                          archive_rows.append(member_row)
+
+                      result["archive_text_member_count"] = sum(1 for i in infos if extension_kind(i.filename) == "text")
+                      result["archive_chain_like_member_count"] = sum(1 for i in infos if any(x in i.filename.lower() for x in ["chain", "mcmc", "cosmomc", "sample"]))
+                      result["archive_posterior_like_member_count"] = sum(1 for i in infos if any(x in i.filename.lower() for x in ["posterior", "post", "h0", "distance"]))
+                      result["archive_covariance_like_member_count"] = sum(1 for i in infos if any(x in i.filename.lower() for x in ["cov", "covariance", "covmat"]))
+
+                      sampled = 0
+                      for info in infos:
+                          if sampled >= 20:
+                              break
+                          if info.file_size > 2 * 1024 * 1024:
+                              continue
+                          if extension_kind(info.filename) != "text":
+                              continue
+
+                          data = zf.read(info.filename)[:262144]
+                          summary = summarize_text_bytes(data, info.filename)
+                          text_rows.append({
+                              "source": product["source"],
+                              "expected_role": product["expected_role"],
+                              "file_or_member": info.filename,
+                              "text_line_count_sample": summary["text_line_count_sample"],
+                              "numeric_rows_in_sample": summary["numeric_rows_in_sample"],
+                              "max_numeric_columns_in_sample": summary["max_numeric_columns_in_sample"],
+                              "product_hits": ";".join(summary["product_hits"]),
+                              "header_like": summary["header_like"],
+                              "first_lines": " | ".join(summary["first_lines"])
+                          })
+                          sampled += 1
+
+              except Exception as e:
+                  result["archive_error"] = f"{type(e).__name__}: {e}"
+
+              return result, archive_rows, text_rows
+
+          def inspect_tar(path, product):
+              archive_rows = []
+              text_rows = []
+              result = {
+                  "archive_valid": False,
+                  "archive_type": "tar",
+                  "archive_member_count": 0,
+                  "archive_text_member_count": 0,
+                  "archive_chain_like_member_count": 0,
+                  "archive_posterior_like_member_count": 0,
+                  "archive_covariance_like_member_count": 0,
+                  "archive_error": None
+              }
+
+              try:
+                  with tarfile.open(path, "r:*") as tf:
+                      infos = [i for i in tf.getmembers() if i.isfile()]
+                      result["archive_valid"] = True
+                      result["archive_member_count"] = len(infos)
+
+                      for info in infos[:300]:
+                          hits = product_hits(info.name)
+                          archive_rows.append({
+                              "source": product["source"],
+                              "expected_role": product["expected_role"],
+                              "archive_path": str(path),
+                              "member_name": info.name,
+                              "member_size_bytes": int(info.size),
+                              "product_hits": ";".join(hits)
+                          })
+
+                      result["archive_text_member_count"] = sum(1 for i in infos if extension_kind(i.name) == "text")
+                      result["archive_chain_like_member_count"] = sum(1 for i in infos if any(x in i.name.lower() for x in ["chain", "mcmc", "cosmomc", "sample"]))
+                      result["archive_posterior_like_member_count"] = sum(1 for i in infos if any(x in i.name.lower() for x in ["posterior", "post", "h0", "distance"]))
+                      result["archive_covariance_like_member_count"] = sum(1 for i in infos if any(x in i.name.lower() for x in ["cov", "covariance", "covmat"]))
+
+                      sampled = 0
+                      for info in infos:
+                          if sampled >= 20:
+                              break
+                          if info.size > 2 * 1024 * 1024:
+                              continue
+                          if extension_kind(info.name) != "text":
+                              continue
+
+                          f = tf.extractfile(info)
+                          if f is None:
+                              continue
+
+                          data = f.read(262144)
+                          summary = summarize_text_bytes(data, info.name)
+                          text_rows.append({
+                              "source": product["source"],
+                              "expected_role": product["expected_role"],
+                              "file_or_member": info.name,
+                              "text_line_count_sample": summary["text_line_count_sample"],
+                              "numeric_rows_in_sample": summary["numeric_rows_in_sample"],
+                              "max_numeric_columns_in_sample": summary["max_numeric_columns_in_sample"],
+                              "product_hits": ";".join(summary["product_hits"]),
+                              "header_like": summary["header_like"],
+                              "first_lines": " | ".join(summary["first_lines"])
+                          })
+                          sampled += 1
+
+              except Exception as e:
+                  result["archive_error"] = f"{type(e).__name__}: {e}"
+
+              return result, archive_rows, text_rows
+
+          def inspect_product(product):
+              source_dir = DOWNLOADS / re.sub(r"[^A-Za-z0-9._-]+", "_", product["source"])
+              filename = safe_name(product["url"])
+              target = source_dir / filename
+
+              dl = download_capped(product["url"], target)
+              kind = extension_kind(product["url"])
+
+              record = {
+                  "source": product["source"],
+                  "lane": product["lane"],
+                  "surface": product["surface"],
+                  "expected_role": product["expected_role"],
+                  "url": product["url"],
+                  "downloaded": dl["downloaded"],
+                  "skipped": dl["skipped"],
+                  "status": dl["status"],
+                  "content_type": dl["content_type"],
+                  "content_length": dl["content_length"],
+                  "size_bytes": dl["size_bytes"],
+                  "download_error": dl["error"],
+                  "extension_kind": kind,
+                  "text_shape_ok": False,
+                  "binary_shape_ok": False,
+                  "archive_valid": False,
+                  "archive_member_count": 0,
+                  "archive_text_member_count": 0,
+                  "archive_chain_like_member_count": 0,
+                  "archive_posterior_like_member_count": 0,
+                  "archive_covariance_like_member_count": 0,
+                  "numeric_rows_in_sample": 0,
+                  "max_numeric_columns_in_sample": 0,
+                  "shape_product_hits": "",
+                  "shape_notes": ""
+              }
+
+              archive_rows = []
+              text_rows = []
+
+              if not dl["downloaded"]:
+                  return record, archive_rows, text_rows
+
+              hits = product_hits(product["url"] + " " + product["expected_role"])
+              notes = []
+
+              if kind == "text":
+                  data = read_head_bytes(target)
+                  summary = summarize_text_bytes(data, filename)
+                  record["text_shape_ok"] = summary["text_line_count_sample"] > 0
+                  record["numeric_rows_in_sample"] = summary["numeric_rows_in_sample"]
+                  record["max_numeric_columns_in_sample"] = summary["max_numeric_columns_in_sample"]
+                  hits = sorted(set(hits) | set(summary["product_hits"]))
+                  text_rows.append({
+                      "source": product["source"],
+                      "expected_role": product["expected_role"],
+                      "file_or_member": filename,
+                      "text_line_count_sample": summary["text_line_count_sample"],
+                      "numeric_rows_in_sample": summary["numeric_rows_in_sample"],
+                      "max_numeric_columns_in_sample": summary["max_numeric_columns_in_sample"],
+                      "product_hits": ";".join(summary["product_hits"]),
+                      "header_like": summary["header_like"],
+                      "first_lines": " | ".join(summary["first_lines"])
+                  })
+
+              elif kind == "binary_shape":
+                  data = read_head_bytes(target, max_bytes=2048)
+                  record["binary_shape_ok"] = target.stat().st_size > 0
+                  hits = sorted(set(hits) | set(product_hits(data.decode("utf-8", errors="replace"))))
+                  notes.append("binary_shape_only_no_payload_parse")
+
+              elif kind == "archive" or kind == "gzip_or_archive":
+                  if str(target).lower().endswith(".zip"):
+                      ares, arows, trows = inspect_zip(target, product)
+                  else:
+                      ares, arows, trows = inspect_tar(target, product)
+
+                  archive_rows.extend(arows)
+                  text_rows.extend(trows)
+
+                  record["archive_valid"] = ares["archive_valid"]
+                  record["archive_member_count"] = ares["archive_member_count"]
+                  record["archive_text_member_count"] = ares["archive_text_member_count"]
+                  record["archive_chain_like_member_count"] = ares["archive_chain_like_member_count"]
+                  record["archive_posterior_like_member_count"] = ares["archive_posterior_like_member_count"]
+                  record["archive_covariance_like_member_count"] = ares["archive_covariance_like_member_count"]
+
+                  if ares["archive_error"]:
+                      notes.append(ares["archive_error"])
+
+                  for row in archive_rows:
+                      hits = sorted(set(hits) | set(row.get("product_hits", "").split(";")))
+
+              else:
+                  data = read_head_bytes(target)
+                  summary = summarize_text_bytes(data, filename)
+                  if summary["text_line_count_sample"] > 0:
+                      record["text_shape_ok"] = True
+                      record["numeric_rows_in_sample"] = summary["numeric_rows_in_sample"]
+                      record["max_numeric_columns_in_sample"] = summary["max_numeric_columns_in_sample"]
+                      hits = sorted(set(hits) | set(summary["product_hits"]))
+                      text_rows.append({
+                          "source": product["source"],
+                          "expected_role": product["expected_role"],
+                          "file_or_member": filename,
+                          "text_line_count_sample": summary["text_line_count_sample"],
+                          "numeric_rows_in_sample": summary["numeric_rows_in_sample"],
+                          "max_numeric_columns_in_sample": summary["max_numeric_columns_in_sample"],
+                          "product_hits": ";".join(summary["product_hits"]),
+                          "header_like": summary["header_like"],
+                          "first_lines": " | ".join(summary["first_lines"])
+                      })
+                  else:
+                      record["binary_shape_ok"] = target.stat().st_size > 0
+                      notes.append("unknown_binary_shape_only")
+
+              record["shape_product_hits"] = ";".join(sorted({h for h in hits if h}))
+              record["shape_notes"] = ";".join(notes)
+
+              return record, archive_rows, text_rows
+
+          product_records = []
+          archive_member_records = []
+          text_sample_records = []
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_26_status": "independent_reach_source_search_passed_multiple_shape_probe_targets_found",
+                  "v3_26_next_allowed_step": "Build v3.27 targeted independent reach shape probe."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": [],
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.27 independent reach shape probe")
+          print("Truth boundary: shape probe only; no refit; no model claim.")
+          print()
+
+          for product in PRODUCTS:
+              print(f"Probing {product['source']} :: {product['expected_role']}")
+              record, archive_rows, text_rows = inspect_product(product)
+              product_records.append(record)
+              archive_member_records.extend(archive_rows)
+              text_sample_records.extend(text_rows)
+              print(f"  downloaded={record['downloaded']} text={record['text_shape_ok']} archive={record['archive_valid']} binary={record['binary_shape_ok']}")
+              print()
+
+          source_names = sorted(set(p["source"] for p in PRODUCTS))
+
+          for source in source_names:
+              rows = [r for r in product_records if r["source"] == source]
+
+              downloaded = [r for r in rows if r["downloaded"]]
+              text_ok = [r for r in rows if r["text_shape_ok"]]
+              archive_ok = [r for r in rows if r["archive_valid"]]
+              binary_ok = [r for r in rows if r["binary_shape_ok"]]
+              numeric_ok = [r for r in rows if r["numeric_rows_in_sample"] > 0]
+              cov_signal = [r for r in rows if "cov" in r["shape_product_hits"] or "covariance" in r["shape_product_hits"]]
+              bao_signal = [r for r in rows if "bao" in r["shape_product_hits"] or "dmdh" in r["shape_product_hits"]]
+              h0_signal = [r for r in rows if "h0" in r["shape_product_hits"] or "hubble" in r["shape_product_hits"] or "sh0es" in r["shape_product_hits"]]
+              lens_signal = [r for r in rows if "h0licow" in r["shape_product_hits"] or "tdcosmo" in r["shape_product_hits"] or "time-delay" in r["shape_product_hits"] or "timedelay" in r["shape_product_hits"]]
+              posterior_signal = [r for r in rows if "posterior" in r["shape_product_hits"] or "chain" in r["shape_product_hits"] or "mcmc" in r["shape_product_hits"] or r["archive_chain_like_member_count"] > 0 or r["archive_posterior_like_member_count"] > 0]
+              likelihood_signal = [r for r in rows if "likelihood" in r["shape_product_hits"] or r["archive_covariance_like_member_count"] > 0]
+
+              if source == "SDSS_eBOSS_DR16":
+                  shape_pass = len(downloaded) >= 5 and len(numeric_ok) >= 4 and len(cov_signal) >= 2 and len(bao_signal) >= 2
+                  recommended_next = "targeted_bao_likelihood_ingestion"
+              elif source == "BOSS_DR12_BAO":
+                  shape_pass = len(downloaded) >= 2 and (len(archive_ok) >= 1 or len(cov_signal) >= 2)
+                  recommended_next = "targeted_boss_bao_archive_or_covariance_ingestion"
+              elif source == "H0LiCOW":
+                  shape_pass = len(downloaded) >= 3 and (len(archive_ok) >= 1 or len(lens_signal) >= 2) and len(h0_signal) >= 1
+                  recommended_next = "targeted_time_delay_shape_or_posterior_ingestion"
+              elif source == "TDCOSMO_2020":
+                  shape_pass = len(downloaded) >= 3 and len(posterior_signal) >= 2 and len(h0_signal) >= 1
+                  recommended_next = "targeted_tdcosmo_posterior_table_ingestion"
+              elif source == "PantheonPlus_SH0ES":
+                  shape_pass = len(downloaded) >= 3 and len(h0_signal) >= 2 and (len(text_ok) >= 2 or len(binary_ok) >= 1)
+                  recommended_next = "targeted_shoes_ladder_shape_ingestion"
+              else:
+                  shape_pass = len(downloaded) >= 2
+                  recommended_next = "manual_review"
+
+              if shape_pass:
+                  status = "independent_reach_shape_probe_passed_ready_for_targeted_ingestion"
+                  readiness_score = 3
+              elif len(downloaded) >= 2:
+                  status = "independent_reach_shape_probe_partial_targeted_followup_needed"
+                  readiness_score = 2
+              elif len(downloaded) >= 1:
+                  status = "independent_reach_shape_probe_weak_single_product_found"
+                  readiness_score = 1
+              else:
+                  status = "independent_reach_shape_probe_failed_no_downloaded_products"
+                  readiness_score = 0
+
+              inventory["source_summaries"].append({
+                  "source": source,
+                  "surface": rows[0]["surface"] if rows else "",
+                  "lane": rows[0]["lane"] if rows else "",
+                  "shape_status": status,
+                  "readiness_score_0_to_3": readiness_score,
+                  "product_count": len(rows),
+                  "downloaded_product_count": len(downloaded),
+                  "text_shape_count": len(text_ok),
+                  "binary_shape_count": len(binary_ok),
+                  "archive_shape_count": len(archive_ok),
+                  "numeric_product_count": len(numeric_ok),
+                  "covariance_signal_count": len(cov_signal),
+                  "bao_signal_count": len(bao_signal),
+                  "h0_signal_count": len(h0_signal),
+                  "lens_signal_count": len(lens_signal),
+                  "posterior_or_chain_signal_count": len(posterior_signal),
+                  "likelihood_signal_count": len(likelihood_signal),
+                  "shape_pass": shape_pass,
+                  "recommended_next": recommended_next
+              })
+
+          product_csv = OUTDIR / "independent_reach_shape_product_summary_v3_27.csv"
+          with product_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "lane", "surface", "expected_role", "url",
+                  "downloaded", "skipped", "status", "content_type",
+                  "content_length", "size_bytes", "download_error",
+                  "extension_kind", "text_shape_ok", "binary_shape_ok",
+                  "archive_valid", "archive_member_count",
+                  "archive_text_member_count", "archive_chain_like_member_count",
+                  "archive_posterior_like_member_count",
+                  "archive_covariance_like_member_count",
+                  "numeric_rows_in_sample", "max_numeric_columns_in_sample",
+                  "shape_product_hits", "shape_notes"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in product_records:
+                  writer.writerow({k: row.get(k) for k in fieldnames})
+
+          archive_csv = OUTDIR / "independent_reach_shape_archive_members_v3_27.csv"
+          with archive_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "expected_role", "archive_path",
+                  "member_name", "member_size_bytes", "product_hits"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in archive_member_records:
+                  writer.writerow({k: row.get(k) for k in fieldnames})
+
+          text_csv = OUTDIR / "independent_reach_shape_text_samples_v3_27.csv"
+          with text_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "expected_role", "file_or_member",
+                  "text_line_count_sample", "numeric_rows_in_sample",
+                  "max_numeric_columns_in_sample", "product_hits",
+                  "header_like", "first_lines"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in text_sample_records:
+                  writer.writerow({k: row.get(k) for k in fieldnames})
+
+          summary_csv = OUTDIR / "independent_reach_shape_source_summary_v3_27.csv"
+          with summary_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "lane", "shape_status",
+                  "readiness_score_0_to_3", "product_count",
+                  "downloaded_product_count", "text_shape_count",
+                  "binary_shape_count", "archive_shape_count",
+                  "numeric_product_count", "covariance_signal_count",
+                  "bao_signal_count", "h0_signal_count",
+                  "lens_signal_count", "posterior_or_chain_signal_count",
+                  "likelihood_signal_count", "shape_pass",
+                  "recommended_next"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in inventory["source_summaries"]:
+                  writer.writerow({k: row.get(k) for k in fieldnames})
+
+          shape_pass_sources = [s for s in inventory["source_summaries"] if s["shape_pass"]]
+          partial_sources = [s for s in inventory["source_summaries"] if s["readiness_score_0_to_3"] >= 2]
+          failed_gates = []
+
+          if len(shape_pass_sources) < 2:
+              failed_gates.append("fewer_than_two_independent_reach_sources_passed_shape_probe")
+
+          if not failed_gates and len(shape_pass_sources) >= 4:
+              readiness_label = "independent_reach_shape_probe_passed_multiple_ingestion_lanes_ready"
+          elif not failed_gates:
+              readiness_label = "independent_reach_shape_probe_passed_limited_ingestion_lanes_ready"
+          else:
+              readiness_label = "independent_reach_shape_probe_needs_manual_followup"
+
+          # Prefer simple numeric BAO likelihood ingestion first, then time-delay, then local ladder.
+          priority = {
+              "SDSS_eBOSS_DR16": 0,
+              "BOSS_DR12_BAO": 1,
+              "TDCOSMO_2020": 2,
+              "H0LiCOW": 3,
+              "PantheonPlus_SH0ES": 4
+          }
+
+          ordered_targets = [
+              s["source"] for s in sorted(
+                  shape_pass_sources,
+                  key=lambda x: priority.get(x["source"], 99)
+              )
+          ]
+
+          if ordered_targets:
+              next_step = "Build v3.28 targeted independent reach ingestion for: " + ", ".join(ordered_targets[:3]) + "."
+          else:
+              next_step = "Manually inspect v3.27 outputs and add explicit source product URLs before targeted ingestion."
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "shape_pass_source_count": len(shape_pass_sources),
+              "partial_or_pass_source_count": len(partial_sources),
+              "shape_pass_sources": ordered_targets,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_27_independent_reach_shape_probe.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.27 — Independent Reach Shape Probe")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.27 performs targeted shape checks on the independent non-DESI reach lanes discovered in v3.26.")
+          md.append("")
+          md.append("It checks whether products are downloadable, whether they look like numeric tables, archives, chains, posterior products, covariance files, or binary shape products.")
+          md.append("")
+          md.append("It does not ingest these products into a model and does not allow a refit.")
+          md.append("")
+          md.append("## Source summary")
+          md.append("")
+          md.append("| Source | Lane | Shape pass | Status | Downloaded | Numeric | Archives | Next |")
+          md.append("|---|---|---:|---|---:|---:|---:|---|")
+          for s in inventory["source_summaries"]:
+              md.append(
+                  f"| {s['source']} | {s['lane']} | {s['shape_pass']} | `{s['shape_status']}` | "
+                  f"{s['downloaded_product_count']} | {s['numeric_product_count']} | {s['archive_shape_count']} | `{s['recommended_next']}` |"
+              )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_shape_product_summary_v3_27.csv`")
+          md.append("- `independent_reach_shape_source_summary_v3_27.csv`")
+          md.append("- `independent_reach_shape_archive_members_v3_27.csv`")
+          md.append("- `independent_reach_shape_text_samples_v3_27.csv`")
+          md.append("- `tairid_cosmology_v3_27_independent_reach_shape_probe.json`")
+          md.append("- `tairid_cosmology_v3_27_independent_reach_shape_probe.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_27_independent_reach_shape_probe.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.27 independent reach shape probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-27-independent-reach-shape-probe
+          path: artifacts/tairid_cosmology_v3_27/
