@@ -1,0 +1,913 @@
+name: TAIRID Cosmology v3.25 Mapped Refit Robustness Audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mapped-refit-robustness-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.25 mapped refit robustness audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_25
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_25")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_25_mapped_refit_robustness_audit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This is a robustness audit of the v3.24 limited mapped prototype.",
+              "The v3.24 row-level BIC is not treated as strong evidence because DESI H0rdrag and hrdrag are scaled counterparts.",
+              "This test checks whether the reach-positive / growth-negative sign pattern survives after DESI duplicate/scaled-row demotion.",
+              "KiDS-1000 rows remain same-survey family members, not independent surveys.",
+              "A pass means the mapped sign pattern survived boundary stress; it still does not validate TAIRID.",
+              "No diagnostic-only row may be promoted to a model claim."
+          ]
+
+          DESI_CHAIN_URLS = [
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.1.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.2.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.3.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.4.txt"
+          ]
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          KIDS_TARBALL_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_cosmic_shear_data_release.tgz"
+          KIDS_STATS = ["xipm", "bp", "cosebis"]
+
+          REACH_ALLOWED_DESI = ["H0rdrag", "hrdrag"]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.25-mapped-refit-robustness-audit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def token_is_numeric(token):
+              try:
+                  float(token)
+                  return True
+              except Exception:
+                  return False
+
+          def split_chain_text(text):
+              comment_lines = []
+              data_lines = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if stripped.startswith("#"):
+                      comment_lines.append(stripped)
+                  else:
+                      data_lines.append(stripped)
+
+              if not data_lines:
+                  raise RuntimeError("No numeric chain rows found.")
+
+              data = np.loadtxt(io.StringIO("\n".join(data_lines)))
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+
+              return comment_lines, data
+
+          def detect_chain_header(comment_lines, ncols):
+              candidates = []
+              for line in comment_lines:
+                  candidate = line.lstrip("#").strip()
+                  if not candidate:
+                      continue
+
+                  tokens = re.split(r"\s+", candidate)
+                  if len(tokens) != ncols:
+                      continue
+
+                  numeric_count = sum(1 for t in tokens if token_is_numeric(t))
+                  parameterish_count = sum(
+                      1 for t in tokens
+                      if t in ["weight", "minuslogpost", "minuslogprior", "chi2"]
+                      or t in ["omm", "omegam", "rdrag", "H0rdrag", "hrdrag", "omegamh2"]
+                      or "--" in t
+                      or "COSMOLOGICAL" in t.upper()
+                  )
+
+                  if numeric_count > 0:
+                      continue
+
+                  if parameterish_count < max(3, ncols // 5):
+                      continue
+
+                  candidates.append(tokens)
+
+              if not candidates:
+                  return [f"col_{i}" for i in range(ncols)], False
+
+              return candidates[0], True
+
+          def parse_chain_file(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              comment_lines, data = split_chain_text(text)
+              header, header_detected = detect_chain_header(comment_lines, data.shape[1])
+              return header, data, header_detected
+
+          def weight_array(header, data):
+              col = {name: i for i, name in enumerate(header)}
+              if "weight" in col:
+                  return data[:, col["weight"]], "weight"
+              return np.ones(data.shape[0]), None
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def summarize_parameter(values, weights):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  raise RuntimeError("No finite values available.")
+
+              q16, q50, q84 = weighted_quantile(values, weights, [0.16, 0.50, 0.84])
+              mean = float(np.average(values, weights=weights)) if np.sum(weights) > 0 else float(np.mean(values))
+              sigma = (q84 - q16) / 2.0 if q16 is not None and q84 is not None else None
+
+              return {
+                  "mean": mean,
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "sigma": sigma,
+                  "min": float(np.min(values)),
+                  "max": float(np.max(values)),
+                  "row_count": int(len(values))
+              }
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+
+                  try:
+                      rows.append({
+                          "parameter_raw": name_raw,
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "lower1": float(parts[3]),
+                          "upper1": float(parts[4]),
+                          "lower2": float(parts[6]),
+                          "upper2": float(parts[7]),
+                          "lower3": float(parts[9]),
+                          "upper3": float(parts[10]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              dl = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+                  text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+              rows = parse_planck_margestats(text)
+              marg = {r["parameter"]: r for r in rows}
+
+              required = ["H0", "rdrag", "S8"]
+              missing = [p for p in required if p not in marg]
+              if missing:
+                  raise RuntimeError(f"Missing Planck reference parameters: {missing}")
+
+              return {
+                  "download": dl,
+                  "marginal_rows": marg,
+                  "has_H0": "H0" in marg,
+                  "has_S8": "S8" in marg,
+                  "has_rdrag": "rdrag" in marg
+              }
+
+          def planck_param(planck, param):
+              row = planck["marginal_rows"].get(param)
+              if row is None:
+                  return None
+              return {
+                  "parameter": param,
+                  "mean": float(row["mean"]),
+                  "sigma": float(row["sddev"]),
+                  "source": "Planck_margestats_reference"
+              }
+
+          def planck_product(planck, a, b, product_name, scale=1.0):
+              pa = planck_param(planck, a)
+              pb = planck_param(planck, b)
+              if pa is None or pb is None:
+                  return None
+
+              mean = pa["mean"] * pb["mean"] * scale
+              sigma = scale * math.sqrt(
+                  (pb["mean"] ** 2) * (pa["sigma"] ** 2)
+                  + (pa["mean"] ** 2) * (pb["sigma"] ** 2)
+              )
+
+              return {
+                  "parameter": product_name,
+                  "mean": mean,
+                  "sigma": sigma,
+                  "source": "Planck_margestats_independent_error_fallback"
+              }
+
+          def load_desi_rows(planck):
+              desi_dir = DOWNLOADS / "DESI_DR1_BAO"
+              desi_dir.mkdir(parents=True, exist_ok=True)
+
+              parts = []
+              header_ref = None
+              header_detected_all = True
+              downloads = []
+              shape_rows = []
+
+              for url in DESI_CHAIN_URLS:
+                  fname = url.rstrip("/").split("/")[-1]
+                  path = desi_dir / fname
+                  downloads.append(download(url, path))
+
+                  header, data, header_detected = parse_chain_file(path)
+
+                  if header_ref is None:
+                      header_ref = header
+                  elif len(header) != len(header_ref):
+                      raise RuntimeError(f"DESI header width mismatch in {fname}")
+
+                  parts.append(data)
+                  header_detected_all = header_detected_all and header_detected
+                  shape_rows.append({
+                      "file": fname,
+                      "rows": int(data.shape[0]),
+                      "columns": int(data.shape[1]),
+                      "header_detected": header_detected
+                  })
+
+              data = np.vstack(parts)
+              weights, weight_col = weight_array(header_ref, data)
+              col = {name: i for i, name in enumerate(header_ref)}
+
+              reach_rows = []
+
+              for param in REACH_ALLOWED_DESI:
+                  if param not in col:
+                      raise RuntimeError(f"Allowed DESI reach parameter missing: {param}")
+
+                  summary = summarize_parameter(data[:, col[param]], weights)
+
+                  if param == "H0rdrag":
+                      ref = planck_product(planck, "H0", "rdrag", "Planck_H0_times_rdrag")
+                      comparison = "Planck_H0_times_rdrag"
+                  elif param == "hrdrag":
+                      ref = planck_product(planck, "H0", "rdrag", "Planck_h_times_rdrag", scale=0.01)
+                      comparison = "Planck_h_times_rdrag"
+                  else:
+                      ref = None
+                      comparison = ""
+
+                  if ref is None:
+                      raise RuntimeError(f"Planck comparison missing for {param}")
+
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + ref["sigma"] ** 2)
+                  pressure = (summary["q50"] - ref["mean"]) / combined_sigma
+
+                  reach_rows.append({
+                      "surface": "reach_geometry",
+                      "source": "DESI_DR1_BAO",
+                      "family": "DESI_bao_expansion_product",
+                      "entry_role": "mapped_reach_accessibility_candidate",
+                      "parameter": param,
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "sigma": summary["sigma"],
+                      "planck_comparison": comparison,
+                      "planck_reference_value": ref["mean"],
+                      "planck_reference_sigma": ref["sigma"],
+                      "combined_sigma": combined_sigma,
+                      "pressure_z": pressure,
+                      "sign": "positive" if pressure > 0 else "negative" if pressure < 0 else "zero",
+                      "included_in_limited_refit": True,
+                      "model_anchor_allowed_now": True,
+                      "boundary_note": "Allowed by v3.23 as mapped reach/accessibility candidate."
+                  })
+
+              scaled_ratio_summary = {}
+              if "H0rdrag" in col and "hrdrag" in col:
+                  ratio = data[:, col["H0rdrag"]] / (100.0 * data[:, col["hrdrag"]])
+                  finite_ratio = ratio[np.isfinite(ratio)]
+                  scaled_ratio_summary = {
+                      "ratio_name": "H0rdrag_div_100hrdrag",
+                      "mean": float(np.mean(finite_ratio)),
+                      "std": float(np.std(finite_ratio)),
+                      "min": float(np.min(finite_ratio)),
+                      "max": float(np.max(finite_ratio)),
+                      "near_exact_scaled_duplicate": bool(np.max(np.abs(finite_ratio - 1.0)) < 1.0e-8)
+                  }
+
+              return {
+                  "downloads": downloads,
+                  "combined_rows": int(data.shape[0]),
+                  "combined_columns": int(data.shape[1]),
+                  "header_detected_all": header_detected_all,
+                  "weight_column": weight_col,
+                  "shape_rows": shape_rows,
+                  "reach_rows": reach_rows,
+                  "scaled_ratio_summary": scaled_ratio_summary
+              }
+
+          def load_kids_growth_rows(planck):
+              kids_dir = DOWNLOADS / "KiDS_1000"
+              kids_dir.mkdir(parents=True, exist_ok=True)
+              tar_path = kids_dir / "KiDS1000_cosmic_shear_data_release.tgz"
+              dl = download(KIDS_TARBALL_URL, tar_path)
+
+              extract_dir = OUTDIR / "kids_1000_extracted"
+              extract_dir.mkdir(parents=True, exist_ok=True)
+
+              with tarfile.open(tar_path, "r:gz") as tf:
+                  safe_members = []
+                  for member in tf.getmembers():
+                      target = (extract_dir / member.name).resolve()
+                      if str(target).startswith(str(extract_dir.resolve())):
+                          safe_members.append(member)
+                  tf.extractall(extract_dir, members=safe_members)
+
+              bases = [
+                  p for p in extract_dir.iterdir()
+                  if p.is_dir() and "KiDS1000" in p.name and "shear_data_release" in p.name
+              ]
+              if not bases:
+                  raise RuntimeError("Could not find KiDS extracted base directory.")
+
+              base = bases[0]
+              planck_s8 = planck_param(planck, "S8")
+              rows = []
+
+              for stat in KIDS_STATS:
+                  chain_path = base / "chains_and_config_files" / "main_chains_iterative_covariance" / stat / "chain" / "output_multinest_C.txt"
+                  header, data, header_detected = parse_chain_file(chain_path)
+                  col = {name: i for i, name in enumerate(header)}
+                  if "COSMOLOGICAL_PARAMETERS--S_8" not in col:
+                      raise RuntimeError(f"KiDS S8 column missing for {stat}.")
+
+                  weights, weight_col = weight_array(header, data)
+                  summary = summarize_parameter(data[:, col["COSMOLOGICAL_PARAMETERS--S_8"]], weights)
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck_s8["sigma"] ** 2)
+                  pressure = (summary["q50"] - planck_s8["mean"]) / combined_sigma
+
+                  rows.append({
+                      "surface": "consolidation_growth",
+                      "source": "KiDS_1000",
+                      "family": "KiDS_1000",
+                      "entry_role": "chain_derived_growth_anchor",
+                      "parameter": f"KiDS_{stat}_S8",
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "sigma": summary["sigma"],
+                      "planck_comparison": "Planck_S8",
+                      "planck_reference_value": planck_s8["mean"],
+                      "planck_reference_sigma": planck_s8["sigma"],
+                      "combined_sigma": combined_sigma,
+                      "pressure_z": pressure,
+                      "sign": "negative" if pressure < 0 else "positive" if pressure > 0 else "zero",
+                      "included_in_limited_refit": True,
+                      "model_anchor_allowed_now": True,
+                      "boundary_note": "KiDS chain-derived S8 row. Same-survey family members, not independent surveys."
+                  })
+
+              return {
+                  "download": dl,
+                  "rows": rows,
+                  "all_negative": all(r["sign"] == "negative" for r in rows),
+                  "mean_pressure_z": float(np.mean([r["pressure_z"] for r in rows]))
+              }
+
+          def fit_constant_model(values, groups=None):
+              y = np.asarray(values, dtype=float)
+              n = len(y)
+              if n == 0:
+                  raise RuntimeError("No values for model fit.")
+
+              if groups is None:
+                  mu = float(np.mean(y))
+                  residuals = y - mu
+                  rss = float(np.sum(residuals ** 2))
+                  k = 1
+                  params = {"global_mean": mu}
+              else:
+                  unique_groups = sorted(set(groups))
+                  residuals = np.zeros_like(y)
+                  params = {}
+                  for g in unique_groups:
+                      idx = [i for i, gg in enumerate(groups) if gg == g]
+                      mu = float(np.mean(y[idx]))
+                      params[f"mean_{g}"] = mu
+                      residuals[idx] = y[idx] - mu
+                  rss = float(np.sum(residuals ** 2))
+                  k = len(unique_groups)
+
+              eps = 1.0e-12
+              rss_for_ic = max(rss, eps)
+              bic = n * math.log(rss_for_ic / n) + k * math.log(n)
+              aic = n * math.log(rss_for_ic / n) + 2 * k
+
+              return {
+                  "n": n,
+                  "k": k,
+                  "rss": rss,
+                  "bic": bic,
+                  "aic": aic,
+                  "params": params
+              }
+
+          def evaluate_variant(name, rows, bic_allowed=True, note=""):
+              reach = [float(r["pressure_z"]) for r in rows if r["surface"] == "reach_geometry"]
+              growth = [float(r["pressure_z"]) for r in rows if r["surface"] == "consolidation_growth"]
+
+              reach_mean = float(np.mean(reach)) if reach else None
+              growth_mean = float(np.mean(growth)) if growth else None
+              sign_pattern = reach_mean is not None and growth_mean is not None and reach_mean > 0 and growth_mean < 0
+
+              out = {
+                  "variant": name,
+                  "row_count": len(rows),
+                  "reach_row_count": len(reach),
+                  "growth_row_count": len(growth),
+                  "reach_mean": reach_mean,
+                  "growth_mean": growth_mean,
+                  "sign_pattern_preserved": sign_pattern,
+                  "bic_allowed": bic_allowed,
+                  "delta_bic_two_minus_one": "",
+                  "two_surface_preferred_by_bic": "",
+                  "note": note
+              }
+
+              if bic_allowed and len(rows) >= 4 and len(reach) >= 1 and len(growth) >= 2:
+                  y = [float(r["pressure_z"]) for r in rows]
+                  groups = [r["surface"] for r in rows]
+                  one = fit_constant_model(y, groups=None)
+                  two = fit_constant_model(y, groups=groups)
+                  out["delta_bic_two_minus_one"] = two["bic"] - one["bic"]
+                  out["two_surface_preferred_by_bic"] = two["bic"] < one["bic"]
+
+              return out
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_24_status": "limited_mapped_two_surface_refit_passed_pattern_recovered_not_validation",
+                  "v3_24_next_allowed_step": "Build v3.25 mapped-refit robustness audit."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.25 mapped refit robustness audit")
+          print("Truth boundary: robustness audit only; no validation claim.")
+          print()
+
+          failed_gates = []
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_summaries"]["Planck_2018"] = {
+                  "has_H0": planck["has_H0"],
+                  "has_S8": planck["has_S8"],
+                  "has_rdrag": planck["has_rdrag"],
+                  "download": planck["download"]
+              }
+              print("Planck loaded.")
+          except Exception as e:
+              failed_gates.append("planck_load_failed")
+              planck = None
+              inventory["source_summaries"]["Planck_2018"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"Planck failed: {type(e).__name__}: {e}")
+
+          try:
+              desi = load_desi_rows(planck)
+              inventory["source_summaries"]["DESI_DR1_BAO"] = {
+                  "combined_rows": desi["combined_rows"],
+                  "combined_columns": desi["combined_columns"],
+                  "header_detected_all": desi["header_detected_all"],
+                  "reach_row_count": len(desi["reach_rows"]),
+                  "scaled_ratio_summary": desi["scaled_ratio_summary"],
+                  "weight_column": desi["weight_column"]
+              }
+              print("DESI loaded.")
+          except Exception as e:
+              failed_gates.append("desi_load_failed")
+              desi = {"reach_rows": [], "scaled_ratio_summary": {}}
+              inventory["source_summaries"]["DESI_DR1_BAO"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"DESI failed: {type(e).__name__}: {e}")
+
+          try:
+              kids = load_kids_growth_rows(planck)
+              inventory["source_summaries"]["KiDS_1000"] = {
+                  "row_count": len(kids["rows"]),
+                  "all_negative": kids["all_negative"],
+                  "mean_pressure_z": kids["mean_pressure_z"]
+              }
+              print("KiDS loaded.")
+          except Exception as e:
+              failed_gates.append("kids_load_failed")
+              kids = {"rows": [], "all_negative": False}
+              inventory["source_summaries"]["KiDS_1000"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"KiDS failed: {type(e).__name__}: {e}")
+
+          reach_rows = desi.get("reach_rows", [])
+          kids_rows = kids.get("rows", [])
+
+          h0rdrag_rows = [r for r in reach_rows if r["parameter"] == "H0rdrag"]
+          hrdrag_rows = [r for r in reach_rows if r["parameter"] == "hrdrag"]
+
+          reach_family_mean_row = None
+          if reach_rows:
+              reach_family_mean_row = dict(reach_rows[0])
+              reach_family_mean_row["parameter"] = "DESI_reach_family_mean_deduplicated"
+              reach_family_mean_row["pressure_z"] = float(np.mean([r["pressure_z"] for r in reach_rows]))
+              reach_family_mean_row["sign"] = "positive" if reach_family_mean_row["pressure_z"] > 0 else "negative" if reach_family_mean_row["pressure_z"] < 0 else "zero"
+              reach_family_mean_row["boundary_note"] = "Deduplicated DESI reach-family mean; used for robustness only."
+
+          kids_family_mean_row = None
+          if kids_rows:
+              kids_family_mean_row = dict(kids_rows[0])
+              kids_family_mean_row["parameter"] = "KiDS_growth_family_mean"
+              kids_family_mean_row["pressure_z"] = float(np.mean([r["pressure_z"] for r in kids_rows]))
+              kids_family_mean_row["sign"] = "negative" if kids_family_mean_row["pressure_z"] < 0 else "positive" if kids_family_mean_row["pressure_z"] > 0 else "zero"
+              kids_family_mean_row["boundary_note"] = "Collapsed KiDS same-survey family mean; used for robustness only."
+
+          variant_rows = []
+
+          variants = []
+
+          if reach_rows and kids_rows:
+              variants.append((
+                  "v3_24_original_row_level",
+                  reach_rows + kids_rows,
+                  True,
+                  "Original v3.24 row-level version; known DESI scaled duplicate risk."
+              ))
+
+          if h0rdrag_rows and kids_rows:
+              variants.append((
+                  "desi_H0rdrag_only_plus_kids_rows",
+                  h0rdrag_rows + kids_rows,
+                  True,
+                  "DESI scaled duplicate removed; only H0rdrag retained."
+              ))
+
+          if hrdrag_rows and kids_rows:
+              variants.append((
+                  "desi_hrdrag_only_plus_kids_rows",
+                  hrdrag_rows + kids_rows,
+                  True,
+                  "DESI scaled duplicate removed; only hrdrag retained."
+              ))
+
+          if reach_family_mean_row and kids_rows:
+              variants.append((
+                  "desi_reach_family_mean_plus_kids_rows",
+                  [reach_family_mean_row] + kids_rows,
+                  True,
+                  "DESI reach family collapsed to one row; KiDS rows retained."
+              ))
+
+          if reach_family_mean_row and kids_family_mean_row:
+              variants.append((
+                  "family_mean_only_no_bic",
+                  [reach_family_mean_row, kids_family_mean_row],
+                  False,
+                  "One reach family mean and one growth family mean; sign audit only, BIC disallowed."
+              ))
+
+          for name, rows, bic_allowed, note in variants:
+              variant_rows.append(evaluate_variant(name, rows, bic_allowed=bic_allowed, note=note))
+
+          variants_csv = OUTDIR / "mapped_refit_robustness_variants_v3_25.csv"
+          with variants_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "variant", "row_count", "reach_row_count", "growth_row_count",
+                  "reach_mean", "growth_mean", "sign_pattern_preserved",
+                  "bic_allowed", "delta_bic_two_minus_one",
+                  "two_surface_preferred_by_bic", "note"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in variant_rows:
+                  writer.writerow(row)
+
+          input_rows = reach_rows + kids_rows
+          input_csv = OUTDIR / "mapped_refit_robustness_input_rows_v3_25.csv"
+          with input_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "surface", "source", "family", "entry_role", "parameter",
+                  "q16", "q50", "q84", "sigma",
+                  "planck_comparison", "planck_reference_value",
+                  "planck_reference_sigma", "combined_sigma",
+                  "pressure_z", "sign", "boundary_note"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in input_rows:
+                  writer.writerow({k: row.get(k) for k in fieldnames})
+
+          scaled_summary_csv = OUTDIR / "desi_scaled_duplicate_audit_v3_25.csv"
+          with scaled_summary_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = ["ratio_name", "mean", "std", "min", "max", "near_exact_scaled_duplicate"]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              if desi.get("scaled_ratio_summary"):
+                  writer.writerow({k: desi["scaled_ratio_summary"].get(k) for k in fieldnames})
+
+          scaled_duplicate_detected = bool(desi.get("scaled_ratio_summary", {}).get("near_exact_scaled_duplicate"))
+
+          sign_variants = [r for r in variant_rows if r["sign_pattern_preserved"] is True]
+          all_variants_sign_preserved = len(variant_rows) > 0 and len(sign_variants) == len(variant_rows)
+
+          bic_variants = [r for r in variant_rows if r["bic_allowed"] is True]
+          bic_preferred_after_dedup = [
+              r for r in bic_variants
+              if r["variant"] != "v3_24_original_row_level"
+              and r["two_surface_preferred_by_bic"] is True
+          ]
+
+          row_level_bic_demoted = scaled_duplicate_detected
+
+          robustness_pass = (
+              not failed_gates
+              and all_variants_sign_preserved
+              and scaled_duplicate_detected
+              and len(bic_preferred_after_dedup) >= 2
+              and kids.get("all_negative") is True
+          )
+
+          audit_rows = [
+              {
+                  "audit_gate": "source_loads_completed",
+                  "pass": len(failed_gates) == 0,
+                  "value": ";".join(failed_gates) if failed_gates else "none",
+                  "boundary": "All source loads must complete."
+              },
+              {
+                  "audit_gate": "desi_scaled_duplicate_detected",
+                  "pass": scaled_duplicate_detected,
+                  "value": json.dumps(desi.get("scaled_ratio_summary", {}), sort_keys=True),
+                  "boundary": "If true, v3.24 row-level BIC must be demoted."
+              },
+              {
+                  "audit_gate": "row_level_bic_demoted",
+                  "pass": row_level_bic_demoted,
+                  "value": row_level_bic_demoted,
+                  "boundary": "Scaled DESI duplicate means row-level BIC is not strong evidence."
+              },
+              {
+                  "audit_gate": "sign_pattern_survives_dedup_variants",
+                  "pass": all_variants_sign_preserved,
+                  "value": f"{len(sign_variants)}/{len(variant_rows)}",
+                  "boundary": "Reach-positive / growth-negative must survive duplicate demotion."
+              },
+              {
+                  "audit_gate": "dedup_bic_variants_still_prefer_two_surface",
+                  "pass": len(bic_preferred_after_dedup) >= 2,
+                  "value": ";".join([r["variant"] for r in bic_preferred_after_dedup]),
+                  "boundary": "BIC is still prototype-only, but should survive removing the scaled DESI duplicate."
+              },
+              {
+                  "audit_gate": "kids_family_negative",
+                  "pass": kids.get("all_negative") is True,
+                  "value": kids.get("mean_pressure_z", ""),
+                  "boundary": "KiDS rows remain same-survey family members."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          audit_csv = OUTDIR / "mapped_refit_robustness_audit_v3_25.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          if failed_gates:
+              readiness_label = "mapped_refit_robustness_failed_source_followup_needed"
+          elif robustness_pass:
+              readiness_label = "mapped_refit_robustness_passed_pattern_survives_duplicate_demotion_not_validation"
+          elif all_variants_sign_preserved:
+              readiness_label = "mapped_refit_robustness_partial_pattern_survives_bic_not_clean"
+          else:
+              readiness_label = "mapped_refit_robustness_failed_pattern_not_stable"
+
+          if robustness_pass:
+              next_step = (
+                  "Build v3.26 independent reach-source search: find a non-scaled, non-DESI or independently structured reach/geometry anchor before making any stronger model comparison."
+              )
+          else:
+              next_step = (
+                  "Do not advance. Inspect v3.25 robustness outputs and repair mapped reach/growth treatment before searching for another reach anchor."
+              )
+
+          inventory["variant_count"] = len(variant_rows)
+          inventory["all_variants_sign_preserved"] = all_variants_sign_preserved
+          inventory["scaled_duplicate_detected"] = scaled_duplicate_detected
+          inventory["row_level_bic_demoted"] = row_level_bic_demoted
+          inventory["dedup_bic_preferred_variant_count"] = len(bic_preferred_after_dedup)
+          inventory["robustness_pass"] = robustness_pass
+          inventory["variant_rows"] = variant_rows
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "robustness_pass": robustness_pass,
+              "scaled_duplicate_detected": scaled_duplicate_detected,
+              "row_level_bic_demoted": row_level_bic_demoted,
+              "all_variants_sign_preserved": all_variants_sign_preserved,
+              "dedup_bic_preferred_variant_count": len(bic_preferred_after_dedup),
+              "model_claim_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_25_mapped_refit_robustness_audit.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.25 — Mapped Refit Robustness Audit")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.25 stress-tests the v3.24 limited mapped refit by checking whether the pattern survives after demoting the scaled DESI duplicate problem.")
+          md.append("")
+          md.append("The key issue is that DESI `H0rdrag` and `hrdrag` are scaled counterparts. That means the v3.24 row-level BIC cannot be treated as strong evidence.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Variant count: `{len(variant_rows)}`")
+          md.append(f"- Scaled DESI duplicate detected: `{scaled_duplicate_detected}`")
+          md.append(f"- Row-level BIC demoted: `{row_level_bic_demoted}`")
+          md.append(f"- All variants preserve reach-positive / growth-negative sign pattern: `{all_variants_sign_preserved}`")
+          md.append(f"- Deduplicated BIC-preferred variant count: `{len(bic_preferred_after_dedup)}`")
+          md.append(f"- Robustness pass: `{robustness_pass}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if robustness_pass:
+              md.append("The mapped sign pattern survived duplicate demotion, but the strongest conclusion is still limited: the result supports the reach/consolidation testing lane, not TAIRID validation.")
+          elif all_variants_sign_preserved:
+              md.append("The sign pattern survived, but the BIC side is not clean enough. Keep this as a partial robustness result.")
+          else:
+              md.append("The mapped pattern did not survive robustness stress. No stronger claim is allowed.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `mapped_refit_robustness_input_rows_v3_25.csv`")
+          md.append("- `mapped_refit_robustness_variants_v3_25.csv`")
+          md.append("- `desi_scaled_duplicate_audit_v3_25.csv`")
+          md.append("- `mapped_refit_robustness_audit_v3_25.csv`")
+          md.append("- `tairid_cosmology_v3_25_mapped_refit_robustness_audit.json`")
+          md.append("- `tairid_cosmology_v3_25_mapped_refit_robustness_audit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_25_mapped_refit_robustness_audit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.25 mapped refit robustness audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-25-mapped-refit-robustness-audit
+          path: artifacts/tairid_cosmology_v3_25/
