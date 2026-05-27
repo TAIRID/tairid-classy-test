@@ -1,0 +1,831 @@
+name: Run TAIRID Regime Activation Threshold Audit v3.6 Inline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-regime-activation-threshold-audit-v3-6-inline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy matplotlib
+
+      - name: Create and run TAIRID v3.6 inline script
+        run: |
+          cat > run_tairid_regime_activation_threshold_audit_v3_6_inline.py <<'PY'
+          #!/usr/bin/env python3
+          """
+          TAIRID Regime Activation / Threshold Audit v3.6 Inline
+
+          Why this test exists:
+          v3.3.3 rejected the frozen low-z gate as a supernova distance correction.
+          v3.4 rejected the frozen low-z gate as a BAO/CMB ruler correction.
+          v3.5 confirmed that the better next lane is growth-vs-geometry, not one gate
+          forced onto every cosmology surface.
+
+          v3.6 asks the next TAIRID-shaped question:
+              Do new variables appear to become load-bearing only after thresholds,
+              or does ordinary smooth drift explain the surfaces just as well?
+
+          This test DOES:
+              - fetch and parse Pantheon+SH0ES supernova distance rows,
+              - fit a baseline flat-LCDM SN geometry shape with a free intercept,
+              - scan redshift thresholds for step/hinge/post-threshold bases,
+              - compare threshold activation against smooth one-parameter drift by AIC/BIC,
+              - fetch DESI BAO mean/cov files to build ruler-threshold coverage,
+              - preserve the prior rule that the frozen low-z gate is not a correction term,
+              - carry forward growth-vs-geometry split anchors from v3.5.
+
+          This test DOES NOT:
+              - validate TAIRID,
+              - prove H0 correction,
+              - prove new physics,
+              - disprove standard cosmology,
+              - fit a full cosmology likelihood,
+              - reintroduce the frozen gate as a correction,
+              - claim a physical phase transition from a threshold scan.
+
+          Truth boundary:
+          v3.6 is a regime-activation audit only.
+          """
+
+          import csv
+          import json
+          import math
+          import re
+          import traceback
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import matplotlib.pyplot as plt
+          import numpy as np
+
+          OUTDIR = Path("tairid_regime_activation_threshold_audit_v3_6_inline_outputs")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOAD_DIR = OUTDIR / "downloaded"
+          DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+          C_LIGHT = 299792.458
+          H0_SHAPE = 70.0
+
+          PANTHEON_REPO = "PantheonPlusSH0ES/DataRelease"
+          PANTHEON_BRANCHES = ["main", "master"]
+          PANTHEON_DISTANCE_PATH = "Pantheon+_Data/4_DISTANCES_AND_COVAR/Pantheon+SH0ES.dat"
+          PANTHEON_COV_PATH = "Pantheon+_Data/4_DISTANCES_AND_COVAR/Pantheon+SH0ES_STAT+SYS.cov"
+
+          BAO_REPO = "CobayaSampler/bao_data"
+          BAO_BRANCHES = ["master", "main"]
+          BAO_TARGETS = [
+              {"label": "BGS_z0.1_0.4", "mean": "desi_2024_gaussian_bao_BGS_BRIGHT-21.5_GCcomb_z0.1-0.4_mean.txt", "cov": "desi_2024_gaussian_bao_BGS_BRIGHT-21.5_GCcomb_z0.1-0.4_cov.txt"},
+              {"label": "LRG_z0.4_0.6", "mean": "desi_2024_gaussian_bao_LRG_GCcomb_z0.4-0.6_mean.txt", "cov": "desi_2024_gaussian_bao_LRG_GCcomb_z0.4-0.6_cov.txt"},
+              {"label": "LRG_z0.6_0.8", "mean": "desi_2024_gaussian_bao_LRG_GCcomb_z0.6-0.8_mean.txt", "cov": "desi_2024_gaussian_bao_LRG_GCcomb_z0.6-0.8_cov.txt"},
+              {"label": "LRG_ELG_z0.8_1.1", "mean": "desi_2024_gaussian_bao_LRG+ELG_LOPnotqso_GCcomb_z0.8-1.1_mean.txt", "cov": "desi_2024_gaussian_bao_LRG+ELG_LOPnotqso_GCcomb_z0.8-1.1_cov.txt"},
+              {"label": "ELG_z1.1_1.6", "mean": "desi_2024_gaussian_bao_ELG_LOPnotqso_GCcomb_z1.1-1.6_mean.txt", "cov": "desi_2024_gaussian_bao_ELG_LOPnotqso_GCcomb_z1.1-1.6_cov.txt"},
+              {"label": "QSO_z0.8_2.1", "mean": "desi_2024_gaussian_bao_QSO_GCcomb_z0.8-2.1_mean.txt", "cov": "desi_2024_gaussian_bao_QSO_GCcomb_z0.8-2.1_cov.txt"},
+              {"label": "LYA_z2.33", "mean": "desi_2024_gaussian_bao_Lya_GCcomb_mean.txt", "cov": "desi_2024_gaussian_bao_Lya_GCcomb_cov.txt"},
+          ]
+
+          PRIOR_LOCKS = {
+              "v3_3_3": "frozen_gate_not_supported_as_sn_distance_pressure_term",
+              "v3_4": "frozen_gate_rejected_as_bao_cmb_ruler_term",
+              "v3_5": "growth_geometry_split_confirmed_as_next_test_lane_not_validation",
+              "rule": "Frozen low-z gate remains diagnostic only. It is not used as a correction in v3.6.",
+          }
+
+          GEOMETRY_ANCHORS = [
+              {"surface": "H0_EARLY_CMB_INFERRED", "family": "geometry", "value": 67.36, "sigma": 0.54},
+              {"surface": "H0_LOCAL_DISTANCE_LADDER", "family": "geometry", "value": 73.04, "sigma": 1.04},
+          ]
+
+          GROWTH_ANCHORS = [
+              {"surface": "PLANCK_2018_S8", "family": "growth", "value": 0.832, "sigma": 0.013},
+              {"surface": "DES_Y3_OPTIMIZED_S8", "family": "growth", "value": 0.772, "sigma": 0.017},
+              {"surface": "KIDS_1000_FIDUCIAL_S8", "family": "growth", "value": 0.759, "sigma": 0.0225},
+              {"surface": "KIDS_1000_UPDATED_S8", "family": "growth", "value": 0.776, "sigma": 0.028},
+          ]
+
+          CLAIMS = {
+              "test_name": "TAIRID Regime Activation / Threshold Audit v3.6 Inline",
+              "primary_question": "Do threshold-activated variables become load-bearing, or does smooth drift explain the surface just as well?",
+              "truth_boundary": "Regime-activation audit only; no validation, no H0 correction, no new physics.",
+          }
+
+
+          def json_default(obj):
+              if isinstance(obj, (np.integer,)):
+                  return int(obj)
+              if isinstance(obj, (np.floating,)):
+                  return float(obj)
+              if isinstance(obj, np.ndarray):
+                  return obj.tolist()
+              return str(obj)
+
+
+          def write_json(path, obj):
+              path.write_text(json.dumps(obj, indent=2, default=json_default), encoding="utf-8")
+
+
+          def write_csv(path, rows):
+              if not rows:
+                  path.write_text("", encoding="utf-8")
+                  return
+              fields = []
+              seen = set()
+              for row in rows:
+                  for key in row:
+                      if key not in seen:
+                          fields.append(key)
+                          seen.add(key)
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+
+          def safe_name(text):
+              return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text)).strip("_")[:180]
+
+
+          def raw_url(repo, branch, repo_path):
+              return f"https://raw.githubusercontent.com/{repo}/{branch}/{repo_path}"
+
+
+          def fetch_text(repo, branches, repo_path, timeout=120):
+              errors = []
+              for branch in branches:
+                  url = raw_url(repo, branch, repo_path)
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v3.6-regime-activation-audit"})
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          data = response.read()
+                      text = data.decode("utf-8", errors="replace")
+                      if text.lower().lstrip().startswith("<!doctype html") or "404: not found" in text.lower()[:200]:
+                          errors.append({"branch": branch, "url": url, "error": "html_or_not_found_payload"})
+                          continue
+                      return {"status": "downloaded", "branch": branch, "url": url, "bytes": len(data), "text": text, "errors": errors}
+                  except Exception as exc:
+                      errors.append({"branch": branch, "url": url, "error": repr(exc)})
+              return {"status": "failed", "branch": None, "url": None, "bytes": 0, "text": "", "errors": errors}
+
+
+          def to_float(value):
+              try:
+                  out = float(str(value).replace("D", "E"))
+              except Exception:
+                  return None
+              return out if math.isfinite(out) else None
+
+
+          def numeric_tokens(text):
+              vals = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  for tok in stripped.split():
+                      val = to_float(tok)
+                      if val is not None:
+                          vals.append(val)
+              return vals
+
+
+          def parse_distance_table(text):
+              lines = [line.strip() for line in text.splitlines() if line.strip()]
+              if not lines:
+                  return {"columns": [], "rows": []}
+              columns = lines[0].split()
+              float_cols = {
+                  "zHD", "zHDERR", "zCMB", "zCMBERR", "zHEL", "zHELERR",
+                  "m_b_corr", "m_b_corr_err_DIAG", "MU_SH0ES", "MU_SH0ES_ERR_DIAG",
+                  "CEPH_DIST", "IS_CALIBRATOR", "USED_IN_SH0ES_HF", "HOST_LOGMASS",
+              }
+              rows = []
+              for idx, line in enumerate(lines[1:]):
+                  parts = line.split()
+                  if len(parts) < len(columns):
+                      continue
+                  row = dict(zip(columns, parts[:len(columns)]))
+                  row["row_index"] = idx
+                  for key in float_cols:
+                      if key in row:
+                          val = to_float(row[key])
+                          if val is not None:
+                              row[key] = val
+                  rows.append(row)
+              return {"columns": columns, "rows": rows}
+
+
+          def parse_cov_shape(text):
+              vals = numeric_tokens(text)
+              first = None
+              if vals:
+                  try:
+                      first = int(float(vals[0]))
+                  except Exception:
+                      first = None
+              expected = first * first if first is not None else None
+              return {
+                  "dimension": first,
+                  "payload_count_after_first": len(vals) - 1 if vals else 0,
+                  "expected_square": expected,
+                  "shape_valid": expected is not None and len(vals) - 1 == expected,
+              }
+
+
+          def select_sn_rows(rows):
+              selected = []
+              for row in rows:
+                  z = row.get("zHD")
+                  mu = row.get("MU_SH0ES")
+                  sig = row.get("MU_SH0ES_ERR_DIAG")
+                  if z is None or mu is None or sig is None:
+                      continue
+                  if not (0.01 < float(z) < 2.5 and float(sig) > 0):
+                      continue
+                  if int(float(row.get("IS_CALIBRATOR", 0))) == 1:
+                      continue
+                  selected.append(row)
+              return selected
+
+
+          def e_model(z, om, w=-1.0):
+              z = np.asarray(z, dtype=float)
+              mat = om * (1.0 + z) ** 3
+              de = (1.0 - om) * (1.0 + z) ** (3.0 * (1.0 + w))
+              return np.sqrt(np.maximum(mat + de, 1e-12))
+
+
+          def cumulative_trapezoid(y, x):
+              y = np.asarray(y, dtype=float)
+              x = np.asarray(x, dtype=float)
+              if len(y) < 2:
+                  return np.zeros_like(y)
+              area = (x[1:] - x[:-1]) * (y[1:] + y[:-1]) * 0.5
+              return np.concatenate([[0.0], np.cumsum(area)])
+
+
+          def distance_modulus(z_values, om, w=-1.0):
+              z_values = np.asarray(z_values, dtype=float)
+              zmax = max(0.02, float(np.max(z_values)) * 1.001)
+              grid = np.linspace(0.0, zmax, 5000)
+              integral = cumulative_trapezoid(1.0 / e_model(grid, om, w), grid)
+              dc = C_LIGHT / H0_SHAPE * np.interp(z_values, grid, integral)
+              dl = (1.0 + z_values) * np.maximum(dc, 1e-12)
+              return 5.0 * np.log10(dl) + 25.0
+
+
+          def weighted_linear_fit(y, weights, basis=None):
+              y = np.asarray(y, dtype=float)
+              w = np.asarray(weights, dtype=float)
+              if basis is None:
+                  intercept = float(np.average(y, weights=w))
+                  pred = np.full_like(y, intercept)
+                  params = {"intercept": intercept, "amplitude": None}
+              else:
+                  x = np.asarray(basis, dtype=float)
+                  x_mean = np.average(x, weights=w)
+                  x_centered = x - x_mean
+                  x_var = np.average(x_centered * x_centered, weights=w)
+                  if x_var <= 1e-14:
+                      x_scaled = np.zeros_like(x_centered)
+                  else:
+                      x_scaled = x_centered / math.sqrt(x_var)
+                  X = np.column_stack([np.ones_like(y), x_scaled])
+                  sw = np.sqrt(w)
+                  coef = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)[0]
+                  pred = X @ coef
+                  params = {"intercept": float(coef[0]), "amplitude": float(coef[1])}
+              resid = y - pred
+              chi2 = float(np.sum(w * resid * resid))
+              return params, pred, resid, chi2
+
+
+          def fit_baseline_lcdm(z, mu, sigma):
+              weights = 1.0 / np.maximum(sigma, 1e-6) ** 2
+              best = None
+              grid_rows = []
+              for om in np.linspace(0.10, 0.50, 81):
+                  shape = distance_modulus(z, om, -1.0)
+                  params, pred_offset, resid, chi2 = weighted_linear_fit(mu - shape, weights)
+                  row = {
+                      "model": "flat_lcdm_baseline",
+                      "Omega_m": float(om),
+                      "intercept": params["intercept"],
+                      "chi2": chi2,
+                      "n": int(len(z)),
+                      "k_params": 2,
+                  }
+                  grid_rows.append(row)
+                  if best is None or chi2 < best["chi2"]:
+                      best = dict(row)
+                      best["_shape"] = shape
+                      best["_offset"] = pred_offset
+                      best["_resid"] = resid
+              n = best["n"]
+              k = best["k_params"]
+              best["aic"] = float(best["chi2"] + 2 * k)
+              best["bic"] = float(best["chi2"] + k * math.log(n))
+              best["chi2_per_dof"] = float(best["chi2"] / max(n - k, 1))
+              public = {key: val for key, val in best.items() if not key.startswith("_")}
+              return public, grid_rows, best
+
+
+          def bic_aic(chi2, n, k):
+              return float(chi2 + k * math.log(n)), float(chi2 + 2 * k)
+
+
+          def threshold_bases(z, zt):
+              logz = np.log1p(z)
+              logzt = math.log1p(float(zt))
+              return {
+                  "step_after_threshold": (z >= zt).astype(float),
+                  "linear_hinge_after_threshold": np.maximum(0.0, z - zt),
+                  "log_hinge_after_threshold": np.maximum(0.0, logz - logzt),
+              }
+
+
+          def smooth_bases(z):
+              logz = np.log1p(z)
+              return {
+                  "smooth_log1p_z": logz,
+                  "smooth_z": z,
+                  "smooth_z_squared": z * z,
+              }
+
+
+          def run_regime_scan(z, mu, sigma, baseline_best):
+              weights = 1.0 / np.maximum(sigma, 1e-6) ** 2
+              shape = baseline_best["_shape"]
+              y = mu - shape
+              n = int(len(z))
+              scan_rows = []
+
+              base_public = {
+                  "model": "flat_lcdm_baseline",
+                  "basis_type": "none",
+                  "threshold_z": None,
+                  "Omega_m": baseline_best["Omega_m"],
+                  "chi2": baseline_best["chi2"],
+                  "k_params": 2,
+                  "n": n,
+                  "bic": baseline_best["bic"],
+                  "aic": baseline_best["aic"],
+                  "delta_bic_vs_baseline": 0.0,
+                  "amplitude": None,
+              }
+
+              for name, basis in smooth_bases(z).items():
+                  params, pred, resid, chi2 = weighted_linear_fit(y, weights, basis)
+                  bic, aic = bic_aic(chi2, n, 3)
+                  scan_rows.append({
+                      "model": "smooth_one_variable_drift",
+                      "basis_type": name,
+                      "threshold_z": None,
+                      "Omega_m": baseline_best["Omega_m"],
+                      "chi2": chi2,
+                      "k_params": 3,
+                      "n": n,
+                      "bic": bic,
+                      "aic": aic,
+                      "delta_bic_vs_baseline": bic - baseline_best["bic"],
+                      "amplitude": params["amplitude"],
+                  })
+
+              threshold_candidates = np.unique(np.quantile(z, np.linspace(0.10, 0.90, 41)))
+              for zt in threshold_candidates:
+                  for name, basis in threshold_bases(z, float(zt)).items():
+                      params, pred, resid, chi2 = weighted_linear_fit(y, weights, basis)
+                      bic, aic = bic_aic(chi2, n, 3)
+                      scan_rows.append({
+                          "model": "threshold_activated_variable",
+                          "basis_type": name,
+                          "threshold_z": float(zt),
+                          "Omega_m": baseline_best["Omega_m"],
+                          "chi2": chi2,
+                          "k_params": 3,
+                          "n": n,
+                          "bic": bic,
+                          "aic": aic,
+                          "delta_bic_vs_baseline": bic - baseline_best["bic"],
+                          "amplitude": params["amplitude"],
+                      })
+
+              all_rows = [base_public] + sorted(scan_rows, key=lambda r: (r["bic"], r["aic"]))
+              best_smooth = min([r for r in scan_rows if r["model"] == "smooth_one_variable_drift"], key=lambda r: r["bic"])
+              best_threshold = min([r for r in scan_rows if r["model"] == "threshold_activated_variable"], key=lambda r: r["bic"])
+
+              result = {
+                  "baseline": base_public,
+                  "best_smooth": best_smooth,
+                  "best_threshold": best_threshold,
+                  "threshold_beats_baseline_by_bic": best_threshold["delta_bic_vs_baseline"] <= -6.0,
+                  "threshold_beats_smooth_by_bic": best_threshold["bic"] <= best_smooth["bic"] - 2.0,
+                  "smooth_beats_baseline_by_bic": best_smooth["delta_bic_vs_baseline"] <= -6.0,
+                  "interpretation": "Threshold activation is only follow-up-worthy if it beats baseline and smooth drift after penalty.",
+                  "truth_boundary": "SN threshold scan only; not proof of a physical phase transition.",
+              }
+              return result, all_rows
+
+
+          def z_eff_from_name(name, label):
+              m = re.search(r"z([0-9.]+)-([0-9.]+)", name)
+              if m:
+                  return (float(m.group(1)) + float(m.group(2))) / 2.0
+              if "Lya" in name or "LYA" in label:
+                  return 2.33
+              if "QSO" in name:
+                  return 1.49
+              return None
+
+
+          def parse_covariance_diag(text):
+              vals = numeric_tokens(text)
+              if not vals:
+                  return {"dimension": None, "diagonal": [], "shape_status": "no_numeric_values"}
+              first = int(vals[0]) if abs(vals[0] - int(vals[0])) < 1e-9 else None
+              if first is not None and len(vals) - 1 == first * first:
+                  arr = np.asarray(vals[1:], dtype=float).reshape((first, first))
+                  return {"dimension": first, "diagonal": np.diag(arr).tolist(), "shape_status": "dimension_prefix_square"}
+              root = int(round(math.sqrt(len(vals))))
+              if root * root == len(vals):
+                  arr = np.asarray(vals, dtype=float).reshape((root, root))
+                  return {"dimension": root, "diagonal": np.diag(arr).tolist(), "shape_status": "plain_square"}
+              return {"dimension": None, "diagonal": [], "shape_status": f"not_square_numeric_count_{len(vals)}"}
+
+
+          def build_bao_threshold_surface():
+              download_rows = []
+              surface_rows = []
+              for target in BAO_TARGETS:
+                  label = target["label"]
+                  mean_fetch = fetch_text(BAO_REPO, BAO_BRANCHES, target["mean"], timeout=90)
+                  cov_fetch = fetch_text(BAO_REPO, BAO_BRANCHES, target["cov"], timeout=90)
+                  for kind, fetched, path in [("mean", mean_fetch, target["mean"]), ("cov", cov_fetch, target["cov"])]:
+                      download_rows.append({
+                          "label": label,
+                          "kind": kind,
+                          "path": path,
+                          "status": fetched["status"],
+                          "branch": fetched["branch"],
+                          "url": fetched["url"],
+                          "bytes": fetched["bytes"],
+                          "errors": json.dumps(fetched["errors"], default=json_default),
+                      })
+                      if fetched["status"] == "downloaded":
+                          (DOWNLOAD_DIR / safe_name(path)).write_text(fetched["text"], encoding="utf-8")
+                  mean_vals = numeric_tokens(mean_fetch["text"]) if mean_fetch["status"] == "downloaded" else []
+                  cov_info = parse_covariance_diag(cov_fetch["text"]) if cov_fetch["status"] == "downloaded" else {"dimension": None, "diagonal": [], "shape_status": "not_downloaded"}
+                  z_eff = z_eff_from_name(target["mean"], label)
+                  frac_precisions = []
+                  diag = cov_info.get("diagonal", [])
+                  for i, mean_val in enumerate(mean_vals):
+                      if i < len(diag) and abs(mean_val) > 0 and diag[i] >= 0:
+                          frac_precisions.append(math.sqrt(max(float(diag[i]), 0.0)) / abs(float(mean_val)))
+                  surface_rows.append({
+                      "label": label,
+                      "z_eff": z_eff,
+                      "mean_status": mean_fetch["status"],
+                      "cov_status": cov_fetch["status"],
+                      "mean_numeric_count": len(mean_vals),
+                      "cov_dimension": cov_info.get("dimension"),
+                      "cov_shape_status": cov_info.get("shape_status"),
+                      "median_fractional_precision_estimate": float(np.median(frac_precisions)) if frac_precisions else None,
+                      "regime_band": "low_z_geometry" if z_eff is not None and z_eff < 0.7 else ("mid_z_ruler" if z_eff is not None and z_eff < 1.6 else "high_z_ruler"),
+                      "truth_boundary": "BAO threshold coverage only; not a BAO likelihood fit.",
+                  })
+              summary = {
+                  "bao_surface_count": len(surface_rows),
+                  "downloaded_mean_count": sum(1 for r in surface_rows if r["mean_status"] == "downloaded"),
+                  "downloaded_cov_count": sum(1 for r in surface_rows if r["cov_status"] == "downloaded"),
+                  "precision_surface_count": sum(1 for r in surface_rows if r["median_fractional_precision_estimate"] is not None),
+                  "regime_bands_present": sorted(set(r["regime_band"] for r in surface_rows if r.get("regime_band"))),
+                  "truth_boundary": "Coverage map only.",
+              }
+              return summary, download_rows, surface_rows
+
+
+          def sigma_tension(a_value, a_sigma, b_value, b_sigma):
+              denom = math.sqrt(float(a_sigma) ** 2 + float(b_sigma) ** 2)
+              if denom <= 0:
+                  return None
+              return abs(float(a_value) - float(b_value)) / denom
+
+
+          def build_growth_geometry_split():
+              early_h0, local_h0 = GEOMETRY_ANCHORS
+              h0_delta = local_h0["value"] - early_h0["value"]
+              h0_sigma = sigma_tension(local_h0["value"], local_h0["sigma"], early_h0["value"], early_h0["sigma"])
+              planck = GROWTH_ANCHORS[0]
+              growth_rows = []
+              for anchor in GROWTH_ANCHORS[1:]:
+                  delta = anchor["value"] - planck["value"]
+                  tension = sigma_tension(anchor["value"], anchor["sigma"], planck["value"], planck["sigma"])
+                  growth_rows.append({
+                      "surface": f"{anchor['surface']}_VS_{planck['surface']}",
+                      "late_minus_early": delta,
+                      "sigma_tension": tension,
+                      "direction": "late_growth_lower_than_early" if delta < 0 else "late_growth_not_lower",
+                  })
+              split = {
+                  "geometry_h0_late_minus_early": h0_delta,
+                  "geometry_h0_sigma_tension": h0_sigma,
+                  "geometry_direction": "late_local_higher_than_early" if h0_delta > 0 else "late_local_not_higher",
+                  "growth_pressures": growth_rows,
+                  "growth_late_lower_count": sum(1 for r in growth_rows if r["direction"] == "late_growth_lower_than_early"),
+                  "growth_tension_count_ge_1p8sigma": sum(1 for r in growth_rows if r["sigma_tension"] is not None and r["sigma_tension"] >= 1.8),
+                  "split_pattern_detected": h0_sigma is not None and h0_sigma >= 4.0 and h0_delta > 0 and sum(1 for r in growth_rows if r["direction"] == "late_growth_lower_than_early") >= 2,
+                  "truth_boundary": "Declared anchor split only; not a cosmology fit.",
+              }
+              return split
+
+
+          def decide(sn_threshold, bao_summary, split):
+              prior_locks_ok = (
+                  PRIOR_LOCKS["v3_3_3"] == "frozen_gate_not_supported_as_sn_distance_pressure_term"
+                  and PRIOR_LOCKS["v3_4"] == "frozen_gate_rejected_as_bao_cmb_ruler_term"
+              )
+              threshold_sn_followup = sn_threshold["threshold_beats_baseline_by_bic"] and sn_threshold["threshold_beats_smooth_by_bic"]
+              bao_coverage_ok = bao_summary["downloaded_mean_count"] >= 5 and bao_summary["downloaded_cov_count"] >= 5
+              growth_split_ok = split["split_pattern_detected"]
+              gates = [
+                  {"gate": "G1_prior_bad_gate_routes_remain_closed", "passed": prior_locks_ok, "evidence": PRIOR_LOCKS},
+                  {"gate": "G2_sn_threshold_scan_completed", "passed": sn_threshold["baseline"]["n"] >= 1000, "evidence": {"n": sn_threshold["baseline"]["n"]}},
+                  {"gate": "G3_sn_threshold_activation_beats_smooth_drift", "passed": threshold_sn_followup, "evidence": sn_threshold},
+                  {"gate": "G4_bao_threshold_coverage_available", "passed": bao_coverage_ok, "evidence": bao_summary},
+                  {"gate": "G5_growth_geometry_split_preserved", "passed": growth_split_ok, "evidence": split},
+                  {"gate": "G6_no_validation_claim_allowed", "passed": True, "evidence": {"validation_claim": False, "h0_correction_claim": False, "new_physics_claim": False}},
+              ]
+              failed = [g["gate"] for g in gates if not g["passed"]]
+
+              if threshold_sn_followup and bao_coverage_ok and growth_split_ok:
+                  status = "regime_activation_supported_by_sn_threshold_and_cross_surface_split_not_validation"
+                  readiness = 9
+                  next_wall = "Build v3.7 as a real-data regime model with separate reach and consolidation variables."
+              elif bao_coverage_ok and growth_split_ok:
+                  status = "regime_activation_supported_cross_surface_not_sn_distance"
+                  readiness = 8
+                  next_wall = "Do not claim SN threshold activation. Move to growth/geometry real-data surface builder with BAO coverage."
+              elif growth_split_ok:
+                  status = "regime_activation_partial_growth_geometry_only"
+                  readiness = 7
+                  next_wall = "Add real BAO/SN threshold coverage before modeling."
+              else:
+                  status = "regime_activation_not_ready"
+                  readiness = 5
+                  next_wall = "Threshold/cross-surface evidence is not strong enough to escalate."
+
+              return {
+                  "final_status": status,
+                  "readiness_score_0_to_10": readiness,
+                  "next_wall": next_wall,
+                  "failed_gates": failed,
+                  "gates": gates,
+                  "truth_boundary": CLAIMS["truth_boundary"],
+              }
+
+
+          def make_plots(scan_rows, bao_rows, split):
+              try:
+                  threshold_rows = [r for r in scan_rows if r["model"] == "threshold_activated_variable" and r["threshold_z"] is not None]
+                  if threshold_rows:
+                      labels = sorted(set(r["basis_type"] for r in threshold_rows))
+                      plt.figure(figsize=(10, 5))
+                      for label in labels:
+                          xs = [r["threshold_z"] for r in threshold_rows if r["basis_type"] == label]
+                          ys = [r["delta_bic_vs_baseline"] for r in threshold_rows if r["basis_type"] == label]
+                          plt.plot(xs, ys, marker="o", linewidth=1, markersize=3, label=label)
+                      plt.axhline(0.0, linewidth=1)
+                      plt.axhline(-6.0, linewidth=1)
+                      plt.xlabel("threshold redshift")
+                      plt.ylabel("Delta BIC vs baseline")
+                      plt.title("v3.6 SN threshold activation scan")
+                      plt.legend(fontsize=7)
+                      plt.tight_layout()
+                      plt.savefig(OUTDIR / "sn_threshold_activation_scan_v3_6_inline.png", dpi=160)
+                      plt.close()
+
+                  usable_bao = [r for r in bao_rows if r["z_eff"] is not None]
+                  if usable_bao:
+                      x = np.arange(len(usable_bao))
+                      labels = [r["label"] for r in usable_bao]
+                      zvals = [r["z_eff"] for r in usable_bao]
+                      plt.figure(figsize=(10, 5))
+                      plt.bar(x, zvals)
+                      plt.xticks(x, labels, rotation=35, ha="right")
+                      plt.ylabel("effective redshift")
+                      plt.title("v3.6 BAO threshold coverage")
+                      plt.tight_layout()
+                      plt.savefig(OUTDIR / "bao_threshold_coverage_v3_6_inline.png", dpi=160)
+                      plt.close()
+
+                  growth = split["growth_pressures"]
+                  labels = ["H0"] + [r["surface"].replace("_VS_PLANCK_2018_S8", "") for r in growth]
+                  sigmas = [split["geometry_h0_sigma_tension"]] + [r["sigma_tension"] for r in growth]
+                  x = np.arange(len(labels))
+                  plt.figure(figsize=(10, 5))
+                  plt.bar(x, sigmas)
+                  plt.xticks(x, labels, rotation=35, ha="right")
+                  plt.ylabel("sigma tension")
+                  plt.title("v3.6 reach/consolidation pressure anchors")
+                  plt.tight_layout()
+                  plt.savefig(OUTDIR / "reach_consolidation_pressure_anchors_v3_6_inline.png", dpi=160)
+                  plt.close()
+              except Exception as exc:
+                  write_json(OUTDIR / "plot_error_v3_6_inline.json", {"error": repr(exc), "traceback": traceback.format_exc()})
+
+
+          def write_handoff(decision, sn_threshold, split):
+              lines = [
+                  "# TAIRID v3.6 Inline Handoff",
+                  "",
+                  "## Current status",
+                  "",
+                  f"- Final status: `{decision['final_status']}`",
+                  f"- Readiness score: `{decision['readiness_score_0_to_10']}/10`",
+                  f"- Next wall: {decision['next_wall']}",
+                  "",
+                  "## What v3.6 tested",
+                  "",
+                  "- It did not reintroduce the frozen gate as a correction.",
+                  "- It scanned whether SN residuals prefer threshold-activated variables over smooth drift.",
+                  "- It mapped BAO redshift/ruler coverage for later threshold work.",
+                  "- It preserved the growth-vs-geometry split as reach/consolidation separation.",
+                  "",
+                  "## SN threshold result",
+                  "",
+                  f"- Best threshold basis: `{sn_threshold['best_threshold']['basis_type']}`",
+                  f"- Best threshold z: `{sn_threshold['best_threshold']['threshold_z']}`",
+                  f"- Threshold ΔBIC vs baseline: `{sn_threshold['best_threshold']['delta_bic_vs_baseline']}`",
+                  f"- Threshold beats smooth drift: `{sn_threshold['threshold_beats_smooth_by_bic']}`",
+                  "",
+                  "## Growth/geometry split",
+                  "",
+                  f"- Split pattern detected: `{split['split_pattern_detected']}`",
+                  f"- Geometry H0 tension: `{split['geometry_h0_sigma_tension']}`",
+                  f"- Growth late-lower count: `{split['growth_late_lower_count']}`",
+                  "",
+                  "## Truth boundary",
+                  "",
+                  "- v3.6 is a regime-activation audit only.",
+                  "- It does not validate TAIRID.",
+                  "- It does not prove H0 correction.",
+                  "- It does not prove new physics.",
+                  "- It does not prove a physical phase transition.",
+                  "",
+                  "## Next test",
+                  "",
+              ]
+              if decision["readiness_score_0_to_10"] >= 8:
+                  lines.append("Build v3.7 — Reach/Consolidation Surface Builder. Use separate variables for geometry reach and growth consolidation rather than one global correction.")
+              else:
+                  lines.append("Add stronger threshold data before modeling.")
+              lines.append("")
+              return "\n".join(lines)
+
+
+          def main():
+              print("TAIRID Regime Activation / Threshold Audit v3.6 Inline starting.")
+              print("Boundary: regime-activation audit only; no validation, no H0 claim, no new physics claim.")
+
+              write_json(OUTDIR / "claims_v3_6_inline.json", CLAIMS)
+              write_json(OUTDIR / "prior_locks_v3_6_inline.json", PRIOR_LOCKS)
+
+              distance_fetch = fetch_text(PANTHEON_REPO, PANTHEON_BRANCHES, PANTHEON_DISTANCE_PATH, timeout=120)
+              cov_fetch = fetch_text(PANTHEON_REPO, PANTHEON_BRANCHES, PANTHEON_COV_PATH, timeout=180)
+              write_csv(OUTDIR / "pantheon_download_ledger_v3_6_inline.csv", [
+                  {"path": PANTHEON_DISTANCE_PATH, "status": distance_fetch["status"], "branch": distance_fetch["branch"], "url": distance_fetch["url"], "bytes": distance_fetch["bytes"], "errors": json.dumps(distance_fetch["errors"], default=json_default)},
+                  {"path": PANTHEON_COV_PATH, "status": cov_fetch["status"], "branch": cov_fetch["branch"], "url": cov_fetch["url"], "bytes": cov_fetch["bytes"], "errors": json.dumps(cov_fetch["errors"], default=json_default)},
+              ])
+
+              if distance_fetch["status"] == "downloaded":
+                  (DOWNLOAD_DIR / safe_name(PANTHEON_DISTANCE_PATH)).write_text(distance_fetch["text"], encoding="utf-8")
+              if cov_fetch["status"] == "downloaded":
+                  (DOWNLOAD_DIR / safe_name(PANTHEON_COV_PATH)).write_text(cov_fetch["text"], encoding="utf-8")
+
+              distance = parse_distance_table(distance_fetch["text"])
+              cov_shape = parse_cov_shape(cov_fetch["text"])
+              write_json(OUTDIR / "pantheon_covariance_shape_v3_6_inline.json", cov_shape)
+
+              sn_rows = select_sn_rows(distance["rows"])
+              if len(sn_rows) < 1000:
+                  raise RuntimeError(f"Not enough SN rows selected: {len(sn_rows)}")
+
+              z = np.asarray([float(r["zHD"]) for r in sn_rows], dtype=float)
+              mu = np.asarray([float(r["MU_SH0ES"]) for r in sn_rows], dtype=float)
+              sigma = np.asarray([float(r["MU_SH0ES_ERR_DIAG"]) for r in sn_rows], dtype=float)
+
+              baseline_public, baseline_grid, baseline_best = fit_baseline_lcdm(z, mu, sigma)
+              sn_threshold, scan_rows = run_regime_scan(z, mu, sigma, baseline_best)
+              write_csv(OUTDIR / "sn_lcdm_baseline_grid_v3_6_inline.csv", baseline_grid)
+              write_csv(OUTDIR / "sn_regime_activation_scan_v3_6_inline.csv", scan_rows)
+              write_json(OUTDIR / "sn_regime_activation_result_v3_6_inline.json", sn_threshold)
+
+              bao_summary, bao_downloads, bao_rows = build_bao_threshold_surface()
+              write_csv(OUTDIR / "bao_download_ledger_v3_6_inline.csv", bao_downloads)
+              write_csv(OUTDIR / "bao_threshold_surface_rows_v3_6_inline.csv", bao_rows)
+              write_json(OUTDIR / "bao_threshold_surface_summary_v3_6_inline.json", bao_summary)
+
+              split = build_growth_geometry_split()
+              write_json(OUTDIR / "growth_geometry_split_v3_6_inline.json", split)
+
+              decision = decide(sn_threshold, bao_summary, split)
+              write_json(OUTDIR / "decision_v3_6_inline.json", decision)
+
+              make_plots(scan_rows, bao_rows, split)
+
+              handoff = write_handoff(decision, sn_threshold, split)
+              (OUTDIR / "next_thread_handoff_after_v3_6_inline.md").write_text(handoff, encoding="utf-8")
+              (OUTDIR / "next_thread_handoff_after_v3_6_inline.txt").write_text(handoff, encoding="utf-8")
+
+              summary = {
+                  "test_name": CLAIMS["test_name"],
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "boundary": CLAIMS["truth_boundary"],
+                  "prior_locks": PRIOR_LOCKS,
+                  "sn_surface": {
+                      "selected_noncalibrator_count": len(sn_rows),
+                      "z_min": float(np.min(z)),
+                      "z_max": float(np.max(z)),
+                      "sigma_source": "MU_SH0ES_ERR_DIAG only; full covariance parsed for shape availability but not used in threshold prototype.",
+                  },
+                  "sn_regime_activation": sn_threshold,
+                  "bao_threshold_surface": bao_summary,
+                  "growth_geometry_split": split,
+                  "decision": decision,
+                  "interpretation": {
+                      "what_success_means": "A threshold/regime lane is worth larger follow-up.",
+                      "what_success_does_not_mean": "It does not prove a physical phase transition or validate TAIRID.",
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  },
+              }
+              write_json(OUTDIR / "regime_activation_threshold_audit_v3_6_inline_summary.json", summary)
+
+              with open(OUTDIR / "regime_activation_threshold_audit_v3_6_inline_summary.txt", "w", encoding="utf-8") as f:
+                  f.write("TAIRID Regime Activation / Threshold Audit v3.6 Inline\n\n")
+                  f.write("Boundary: regime-activation audit only. No validation. No H0 claim. No new physics claim.\n\n")
+                  f.write(f"Final status: {decision['final_status']}\n")
+                  f.write(f"Readiness score: {decision['readiness_score_0_to_10']}/10\n")
+                  f.write(f"Next wall: {decision['next_wall']}\n\n")
+                  f.write("SN regime activation result:\n")
+                  f.write(json.dumps(sn_threshold, indent=2, default=json_default) + "\n\n")
+                  f.write("BAO threshold surface summary:\n")
+                  f.write(json.dumps(bao_summary, indent=2, default=json_default) + "\n\n")
+                  f.write("Growth geometry split:\n")
+                  f.write(json.dumps(split, indent=2, default=json_default) + "\n\n")
+                  f.write("Failed gates:\n")
+                  f.write(json.dumps(decision["failed_gates"], indent=2, default=json_default) + "\n\n")
+                  f.write("Truth boundary:\n")
+                  f.write("- This does not prove TAIRID.\n")
+                  f.write("- This does not prove H0 correction.\n")
+                  f.write("- This does not prove new physics.\n")
+                  f.write("- This does not prove a physical phase transition.\n")
+                  f.write("- This only audits whether threshold/regime activation is a valid next lane.\n")
+
+              print("TAIRID Regime Activation / Threshold Audit v3.6 Inline complete.")
+              print(f"Final status: {decision['final_status']}")
+              print(f"Readiness score: {decision['readiness_score_0_to_10']}/10")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  OUTDIR.mkdir(parents=True, exist_ok=True)
+                  summary = {
+                      "test_name": CLAIMS["test_name"],
+                      "created_utc": datetime.now(timezone.utc).isoformat(),
+                      "final_status": "regime_activation_threshold_audit_v3_6_inline_runtime_failed",
+                      "error": repr(exc),
+                      "traceback": traceback.format_exc(),
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  }
+                  write_json(OUTDIR / "regime_activation_threshold_audit_v3_6_inline_summary.json", summary)
+                  print(summary["traceback"])
+                  raise
+          PY
+
+          python run_tairid_regime_activation_threshold_audit_v3_6_inline.py
+
+      - name: Upload inline outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-regime-activation-threshold-audit-v3-6-inline-output
+          path: |
+            tairid_regime_activation_threshold_audit_v3_6_inline_outputs/**
