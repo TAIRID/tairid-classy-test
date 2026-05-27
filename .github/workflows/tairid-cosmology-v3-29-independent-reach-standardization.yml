@@ -1,0 +1,890 @@
+name: TAIRID Cosmology v3.29 Independent Reach Standardization
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-standardization:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.29 independent reach standardization audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_29
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_29")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_29_independent_reach_standardization"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This standardizes independent non-DESI reach diagnostics ingested in v3.28 and repaired in v3.28.1.",
+              "eBOSS and BOSS BAO products remain independent reach/ruler diagnostics.",
+              "TDCOSMO Ddt rows remain independent time-delay reach diagnostics.",
+              "TDCOSMO Dd fields remain unavailable in this table and are not fabricated.",
+              "Standardization does not make any row a model anchor.",
+              "A pass only means the independent reach ledger is ready for a later eligibility audit."
+          ]
+
+          EBOSS_PRODUCTS = [
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_QSO",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR12_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              }
+          ]
+
+          BOSS_PRODUCTS = {
+              "archive_url": "https://data.sdss.org/sas/dr10/boss/papers/clustering/Anderson_2013_CMASSDR11_LOWZDR11_cosmomc.tar.gz",
+              "cmass_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/CMASSDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat",
+              "lowz_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/LOWZDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+          }
+
+          TDCOSMO_PRODUCTS = {
+              "posterior_table_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv",
+              "processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_processed.pkl",
+              "om_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed.pkl",
+              "om_kappa_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed_with_kappa.pkl"
+          }
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.29-independent-reach-standardization/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def load_numeric_matrix(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lines = [
+                  line for line in text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+              if not lines:
+                  raise RuntimeError(f"No numeric lines found in {path}")
+              return np.loadtxt(io.StringIO("\n".join(lines)))
+
+          def parse_bao_data_table(path):
+              rows = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+
+                  try:
+                      z = float(parts[0])
+                      value = float(parts[1])
+                  except Exception:
+                      continue
+
+                  observable = parts[2]
+                  rows.append({
+                      "z": z,
+                      "value": value,
+                      "observable": observable
+                  })
+
+              return rows
+
+          def parse_float_or_none(value):
+              if value is None:
+                  return None
+
+              text = str(value).strip()
+              if text in ["", "-", "--", "nan", "NaN", "NAN", "None", "null"]:
+                  return None
+
+              try:
+                  x = float(text)
+              except Exception:
+                  return None
+
+              if not math.isfinite(x):
+                  return None
+
+              return x
+
+          def classify_bao_observable(observable):
+              lower = observable.lower()
+
+              if "dm" in lower:
+                  return {
+                      "standardized_reach_family": "bao_transverse_reach",
+                      "standardized_observable": "DM_over_rd",
+                      "reach_axis": "transverse_comoving_reach",
+                      "unit_family": "dimensionless_distance_over_ruler"
+                  }
+
+              if "dh" in lower:
+                  return {
+                      "standardized_reach_family": "bao_radial_reach",
+                      "standardized_observable": "DH_over_rd",
+                      "reach_axis": "radial_hubble_reach",
+                      "unit_family": "dimensionless_distance_over_ruler"
+                  }
+
+              return {
+                  "standardized_reach_family": "bao_unclassified_reach",
+                  "standardized_observable": observable,
+                  "reach_axis": "bao_unclassified",
+                  "unit_family": "dimensionless_or_source_native"
+              }
+
+          def standard_row(
+              source,
+              family,
+              source_role,
+              standardized_reach_family,
+              reach_axis,
+              standardized_observable,
+              value,
+              sigma,
+              z_effective,
+              z_lens="",
+              z_source="",
+              covariance_available=False,
+              posterior_table_available=False,
+              source_native_parameter="",
+              boundary_note=""
+          ):
+              value = float(value)
+              sigma = float(sigma)
+
+              fractional_sigma = sigma / abs(value) if value != 0 else None
+              precision_weight = 1.0 / (fractional_sigma ** 2) if fractional_sigma and fractional_sigma > 0 else None
+
+              return {
+                  "source": source,
+                  "surface": "reach_geometry",
+                  "family": family,
+                  "source_role": source_role,
+                  "standardized_reach_family": standardized_reach_family,
+                  "reach_axis": reach_axis,
+                  "standardized_observable": standardized_observable,
+                  "source_native_parameter": source_native_parameter,
+                  "z_effective": z_effective,
+                  "z_lens": z_lens,
+                  "z_source": z_source,
+                  "value": value,
+                  "sigma": sigma,
+                  "fractional_sigma": fractional_sigma if fractional_sigma is not None else "",
+                  "precision_weight_from_fractional_sigma": precision_weight if precision_weight is not None else "",
+                  "covariance_available": covariance_available,
+                  "posterior_table_available": posterior_table_available,
+                  "standardization_pass": value > 0 and sigma > 0,
+                  "included_in_model": False,
+                  "model_anchor_allowed_now": False,
+                  "diagnostic_only": True,
+                  "boundary_note": boundary_note
+              }
+
+          def ingest_and_standardize_eboss():
+              eboss_dir = DOWNLOADS / "SDSS_eBOSS_DR16"
+              eboss_dir.mkdir(parents=True, exist_ok=True)
+
+              rows = []
+              source_rows = []
+              downloads = []
+
+              for product in EBOSS_PRODUCTS:
+                  data_path = eboss_dir / safe_name(product["data_url"])
+                  cov_path = eboss_dir / safe_name(product["cov_url"])
+
+                  downloads.append(download(product["data_url"], data_path))
+                  downloads.append(download(product["cov_url"], cov_path))
+
+                  data_rows = parse_bao_data_table(data_path)
+                  cov = load_numeric_matrix(cov_path)
+
+                  if cov.ndim == 0:
+                      cov = cov.reshape((1, 1))
+                  elif cov.ndim == 1:
+                      cov = cov.reshape((1, -1))
+
+                  covariance_match = cov.ndim == 2 and cov.shape[0] == cov.shape[1] == len(data_rows)
+
+                  for i, data_row in enumerate(data_rows):
+                      if not covariance_match:
+                          continue
+
+                      diag = float(cov[i, i])
+                      sigma = math.sqrt(diag) if diag >= 0 else None
+                      if sigma is None:
+                          continue
+
+                      cls = classify_bao_observable(data_row["observable"])
+
+                      rows.append(standard_row(
+                          source=product["source"],
+                          family=product["family"],
+                          source_role=product["role"],
+                          standardized_reach_family=cls["standardized_reach_family"],
+                          reach_axis=cls["reach_axis"],
+                          standardized_observable=cls["standardized_observable"],
+                          source_native_parameter=data_row["observable"],
+                          value=data_row["value"],
+                          sigma=sigma,
+                          z_effective=data_row["z"],
+                          covariance_available=True,
+                          posterior_table_available=False,
+                          boundary_note="Standardized eBOSS BAO D_M/r_d or D_H/r_d row. Diagnostic only; not model-anchor eligible."
+                      ))
+
+                  source_rows.append({
+                      "source": product["source"],
+                      "family": product["family"],
+                      "source_role": product["role"],
+                      "native_row_count": len(data_rows),
+                      "standardized_row_count": sum(1 for r in rows if r["family"] == product["family"]),
+                      "covariance_dimension": f"{int(cov.shape[0])}x{int(cov.shape[1])}",
+                      "covariance_match": covariance_match,
+                      "standardization_pass": covariance_match and len(data_rows) > 0
+                  })
+
+              return rows, source_rows, downloads
+
+          def parse_archive_bao_member(tf, member_name):
+              member = next((m for m in tf.getmembers() if m.name.endswith(member_name)), None)
+              if member is None:
+                  raise RuntimeError(f"Archive member not found: {member_name}")
+
+              f = tf.extractfile(member)
+              if f is None:
+                  raise RuntimeError(f"Could not extract member: {member_name}")
+
+              text = f.read().decode("utf-8", errors="replace")
+              rows = []
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  nums = []
+                  for p in stripped.split():
+                      try:
+                          nums.append(float(p))
+                      except Exception:
+                          pass
+
+                  if len(nums) >= 3:
+                      rows.append({
+                          "z": nums[0],
+                          "value": nums[1],
+                          "sigma": nums[2],
+                          "raw_line": stripped
+                      })
+
+              return rows
+
+          def ingest_and_standardize_boss():
+              boss_dir = DOWNLOADS / "BOSS_DR12_BAO"
+              boss_dir.mkdir(parents=True, exist_ok=True)
+
+              archive_path = boss_dir / safe_name(BOSS_PRODUCTS["archive_url"])
+              cmass_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["cmass_cov_url"])
+              lowz_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["lowz_cov_url"])
+
+              downloads = [
+                  download(BOSS_PRODUCTS["archive_url"], archive_path),
+                  download(BOSS_PRODUCTS["cmass_cov_url"], cmass_cov_path),
+                  download(BOSS_PRODUCTS["lowz_cov_url"], lowz_cov_path)
+              ]
+
+              with tarfile.open(archive_path, "r:*") as tf:
+                  cmass_rows = parse_archive_bao_member(tf, "data/sdss_DR11CMASS_bao.txt")
+                  lowz_rows = parse_archive_bao_member(tf, "data/sdss_DR11LOWZ_bao.txt")
+
+              cmass_cov = load_numeric_matrix(cmass_cov_path)
+              lowz_cov = load_numeric_matrix(lowz_cov_path)
+
+              rows = []
+              source_rows = []
+
+              for family, native_rows, cov in [
+                  ("BOSS_DR11_CMASS_archive_BAO", cmass_rows, cmass_cov),
+                  ("BOSS_DR11_LOWZ_archive_BAO", lowz_rows, lowz_cov)
+              ]:
+                  cov_shape = f"{int(cov.shape[0])}x{int(cov.shape[1])}" if cov.ndim == 2 else str(cov.shape)
+                  covariance_shape_available = cov.ndim == 2 and cov.shape[0] == cov.shape[1]
+
+                  for native in native_rows:
+                      rows.append(standard_row(
+                          source="BOSS_DR12_BAO",
+                          family=family,
+                          source_role="pre_DESI_BOSS_archive_BAO",
+                          standardized_reach_family="bao_archive_isotropic_reach",
+                          reach_axis="isotropic_or_archive_bao_reach",
+                          standardized_observable="BAO_archive_native_scalar",
+                          source_native_parameter="BAO_archive_observable",
+                          value=native["value"],
+                          sigma=native["sigma"],
+                          z_effective=native["z"],
+                          covariance_available=covariance_shape_available,
+                          posterior_table_available=False,
+                          boundary_note="Standardized older BOSS archive BAO scalar. Diagnostic only; covariance shape recorded but not used as full likelihood."
+                      ))
+
+                  source_rows.append({
+                      "source": "BOSS_DR12_BAO",
+                      "family": family,
+                      "source_role": "pre_DESI_BOSS_archive_BAO",
+                      "native_row_count": len(native_rows),
+                      "standardized_row_count": len(native_rows),
+                      "covariance_dimension": cov_shape,
+                      "covariance_match": covariance_shape_available,
+                      "standardization_pass": len(native_rows) > 0 and covariance_shape_available
+                  })
+
+              return rows, source_rows, downloads
+
+          def ingest_and_standardize_tdcosmo():
+              td_dir = DOWNLOADS / "TDCOSMO_2020"
+              td_dir.mkdir(parents=True, exist_ok=True)
+
+              table_path = td_dir / safe_name(TDCOSMO_PRODUCTS["posterior_table_url"])
+              downloads = [download(TDCOSMO_PRODUCTS["posterior_table_url"], table_path)]
+
+              binary_records = []
+              for key in ["processed_pkl_url", "om_processed_pkl_url", "om_kappa_processed_pkl_url"]:
+                  url = TDCOSMO_PRODUCTS[key]
+                  path = td_dir / safe_name(url)
+                  record = download(url, path)
+                  downloads.append(record)
+                  binary_records.append({
+                      "product": key,
+                      "url": url,
+                      "path": str(path),
+                      "size_bytes": record["size_bytes"],
+                      "shape_only": True,
+                      "boundary": "Binary posterior product downloaded for later source-specific parser; not parsed in v3.29."
+                  })
+
+              with table_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                  reader = csv.DictReader(f)
+                  table_rows = list(reader)
+                  fieldnames = reader.fieldnames or []
+
+              required = ["name", "z_lens", "z_source", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma", "flag"]
+              missing = [c for c in required if c not in fieldnames]
+              if missing:
+                  raise RuntimeError(f"TDCOSMO posterior table missing columns: {missing}")
+
+              rows = []
+              skipped_rows = []
+              invalid_flag_count = 0
+              valid_dd_count = 0
+
+              for i, row in enumerate(table_rows):
+                  name = row.get("name", f"row_{i}")
+                  flag = parse_float_or_none(row.get("flag"))
+                  z_lens = parse_float_or_none(row.get("z_lens"))
+                  z_source = parse_float_or_none(row.get("z_source"))
+                  ddt_mean = parse_float_or_none(row.get("Ddt_mean"))
+                  ddt_sigma = parse_float_or_none(row.get("Ddt_sigma"))
+                  dd_mean = parse_float_or_none(row.get("Dd_mean"))
+                  dd_sigma = parse_float_or_none(row.get("Dd_sigma"))
+
+                  if flag is not None and flag < 0:
+                      invalid_flag_count += 1
+
+                  if dd_mean is not None and dd_sigma is not None and dd_sigma > 0:
+                      valid_dd_count += 1
+
+                  if z_lens is None or z_source is None or ddt_mean is None or ddt_sigma is None or ddt_sigma <= 0:
+                      skipped_rows.append({
+                          "name": name,
+                          "row_index": i,
+                          "reason": "missing_or_invalid_required_Ddt_fields",
+                          "flag": row.get("flag"),
+                          "Ddt_mean": row.get("Ddt_mean"),
+                          "Ddt_sigma": row.get("Ddt_sigma"),
+                          "Dd_mean": row.get("Dd_mean"),
+                          "Dd_sigma": row.get("Dd_sigma")
+                      })
+                      continue
+
+                  rows.append(standard_row(
+                      source="TDCOSMO_2020",
+                      family="TDCOSMO_time_delay",
+                      source_role="hierarchical_time_delay_posterior_table",
+                      standardized_reach_family="time_delay_distance_reach",
+                      reach_axis="time_delay_path_reach",
+                      standardized_observable="Ddt_time_delay_distance",
+                      source_native_parameter="Ddt_mean_Ddt_sigma",
+                      value=ddt_mean,
+                      sigma=ddt_sigma,
+                      z_effective=z_lens,
+                      z_lens=z_lens,
+                      z_source=z_source,
+                      covariance_available=False,
+                      posterior_table_available=True,
+                      boundary_note="Standardized TDCOSMO Ddt time-delay distance row. Diagnostic only; not model-anchor eligible."
+                  ) | {
+                      "lens_name": name,
+                      "tdcosmo_flag": flag if flag is not None else ""
+                  })
+
+              source_rows = [{
+                  "source": "TDCOSMO_2020",
+                  "family": "TDCOSMO_time_delay",
+                  "source_role": "hierarchical_time_delay_posterior_table",
+                  "native_row_count": len(table_rows),
+                  "standardized_row_count": len(rows),
+                  "skipped_row_count": len(skipped_rows),
+                  "invalid_flag_count": invalid_flag_count,
+                  "valid_Dd_row_count": valid_dd_count,
+                  "binary_shape_product_count": len(binary_records),
+                  "covariance_dimension": "",
+                  "covariance_match": False,
+                  "posterior_table_available": True,
+                  "standardization_pass": len(rows) >= 10
+              }]
+
+              return rows, source_rows, skipped_rows, binary_records, downloads
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_28_status": "independent_reach_ingestion_partial_pass_ready_for_v3_29_standardization",
+                  "v3_28_1_status": "tdcosmo_parser_fix_passed_ready_for_v3_29_standardization"
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.29 independent reach standardization")
+          print("Truth boundary: standardization only; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+          standardized_rows = []
+          source_summary_rows = []
+          skipped_rows = []
+          binary_rows = []
+
+          try:
+              rows, source_rows, downloads = ingest_and_standardize_eboss()
+              standardized_rows.extend(rows)
+              source_summary_rows.extend(source_rows)
+              inventory["source_results"]["SDSS_eBOSS_DR16"] = {
+                  "standardization_pass": all(r["standardization_pass"] for r in source_rows),
+                  "standardized_row_count": len(rows),
+                  "source_family_count": len(source_rows),
+                  "download_count": len(downloads),
+                  "boundary": "eBOSS BAO rows standardized as independent reach/ruler diagnostics only."
+              }
+              print(f"eBOSS standardized rows: {len(rows)}")
+          except Exception as e:
+              failed_gates.append("eboss_standardization_failed")
+              inventory["source_results"]["SDSS_eBOSS_DR16"] = {
+                  "standardization_pass": False,
+                  "error": f"{type(e).__name__}: {e}"
+              }
+              print(f"eBOSS failed: {type(e).__name__}: {e}")
+
+          try:
+              rows, source_rows, downloads = ingest_and_standardize_boss()
+              standardized_rows.extend(rows)
+              source_summary_rows.extend(source_rows)
+              inventory["source_results"]["BOSS_DR12_BAO"] = {
+                  "standardization_pass": all(r["standardization_pass"] for r in source_rows),
+                  "standardized_row_count": len(rows),
+                  "source_family_count": len(source_rows),
+                  "download_count": len(downloads),
+                  "boundary": "BOSS BAO archive rows standardized as older independent reach/ruler diagnostics only."
+              }
+              print(f"BOSS standardized rows: {len(rows)}")
+          except Exception as e:
+              failed_gates.append("boss_standardization_failed")
+              inventory["source_results"]["BOSS_DR12_BAO"] = {
+                  "standardization_pass": False,
+                  "error": f"{type(e).__name__}: {e}"
+              }
+              print(f"BOSS failed: {type(e).__name__}: {e}")
+
+          try:
+              rows, source_rows, skipped, binaries, downloads = ingest_and_standardize_tdcosmo()
+              standardized_rows.extend(rows)
+              source_summary_rows.extend(source_rows)
+              skipped_rows.extend(skipped)
+              binary_rows.extend(binaries)
+              inventory["source_results"]["TDCOSMO_2020"] = {
+                  "standardization_pass": all(r["standardization_pass"] for r in source_rows),
+                  "standardized_row_count": len(rows),
+                  "source_family_count": len(source_rows),
+                  "skipped_row_count": len(skipped),
+                  "binary_shape_product_count": len(binaries),
+                  "download_count": len(downloads),
+                  "boundary": "TDCOSMO Ddt rows standardized as independent time-delay reach diagnostics only."
+              }
+              print(f"TDCOSMO standardized rows: {len(rows)}")
+          except Exception as e:
+              failed_gates.append("tdcosmo_standardization_failed")
+              inventory["source_results"]["TDCOSMO_2020"] = {
+                  "standardization_pass": False,
+                  "error": f"{type(e).__name__}: {e}"
+              }
+              print(f"TDCOSMO failed: {type(e).__name__}: {e}")
+
+          ledger_csv = OUTDIR / "independent_reach_standardized_ledger_v3_29.csv"
+          ledger_fields = sorted({key for row in standardized_rows for key in row.keys()}) if standardized_rows else [
+              "source", "surface", "family", "source_role", "standardized_reach_family",
+              "reach_axis", "standardized_observable", "value", "sigma",
+              "fractional_sigma", "standardization_pass", "model_anchor_allowed_now"
+          ]
+
+          with ledger_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=ledger_fields)
+              writer.writeheader()
+              for row in standardized_rows:
+                  writer.writerow({k: row.get(k, "") for k in ledger_fields})
+
+          source_csv = OUTDIR / "independent_reach_standardization_source_summary_v3_29.csv"
+          source_fields = sorted({key for row in source_summary_rows for key in row.keys()}) if source_summary_rows else [
+              "source", "family", "source_role", "native_row_count", "standardized_row_count", "standardization_pass"
+          ]
+
+          with source_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=source_fields)
+              writer.writeheader()
+              for row in source_summary_rows:
+                  writer.writerow({k: row.get(k, "") for k in source_fields})
+
+          skipped_csv = OUTDIR / "independent_reach_standardization_skipped_rows_v3_29.csv"
+          skipped_fields = ["name", "row_index", "reason", "flag", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma"]
+
+          with skipped_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=skipped_fields)
+              writer.writeheader()
+              for row in skipped_rows:
+                  writer.writerow({k: row.get(k, "") for k in skipped_fields})
+
+          binary_csv = OUTDIR / "independent_reach_standardization_binary_shape_products_v3_29.csv"
+          binary_fields = ["product", "url", "path", "size_bytes", "shape_only", "boundary"]
+
+          with binary_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=binary_fields)
+              writer.writeheader()
+              for row in binary_rows:
+                  writer.writerow({k: row.get(k, "") for k in binary_fields})
+
+          family_summary_rows = []
+          families = sorted(set(row["standardized_reach_family"] for row in standardized_rows))
+
+          for family in families:
+              rows = [r for r in standardized_rows if r["standardized_reach_family"] == family]
+              frac = [
+                  float(r["fractional_sigma"])
+                  for r in rows
+                  if str(r.get("fractional_sigma", "")) not in ["", "nan"]
+              ]
+              zvals = [
+                  float(r["z_effective"])
+                  for r in rows
+                  if str(r.get("z_effective", "")) not in ["", "nan"]
+              ]
+
+              family_summary_rows.append({
+                  "standardized_reach_family": family,
+                  "row_count": len(rows),
+                  "source_count": len(set(r["source"] for r in rows)),
+                  "source_list": ";".join(sorted(set(r["source"] for r in rows))),
+                  "mean_fractional_sigma": float(np.mean(frac)) if frac else "",
+                  "min_fractional_sigma": float(np.min(frac)) if frac else "",
+                  "max_fractional_sigma": float(np.max(frac)) if frac else "",
+                  "min_z_effective": float(np.min(zvals)) if zvals else "",
+                  "max_z_effective": float(np.max(zvals)) if zvals else "",
+                  "all_diagnostic_only": all(r["diagnostic_only"] is True for r in rows),
+                  "all_model_anchor_blocked": all(r["model_anchor_allowed_now"] is False for r in rows)
+              })
+
+          family_csv = OUTDIR / "independent_reach_standardized_family_summary_v3_29.csv"
+          with family_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "standardized_reach_family", "row_count", "source_count", "source_list",
+                  "mean_fractional_sigma", "min_fractional_sigma", "max_fractional_sigma",
+                  "min_z_effective", "max_z_effective", "all_diagnostic_only", "all_model_anchor_blocked"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in family_summary_rows:
+                  writer.writerow(row)
+
+          pass_sources = [
+              name for name, result in inventory["source_results"].items()
+              if result.get("standardization_pass") is True
+          ]
+
+          model_anchor_violations = [
+              row for row in standardized_rows
+              if row.get("model_anchor_allowed_now") is not False
+          ]
+
+          standardization_fail_rows = [
+              row for row in standardized_rows
+              if row.get("standardization_pass") is not True
+          ]
+
+          if len(pass_sources) < 3:
+              failed_gates.append("fewer_than_three_sources_standardized")
+
+          if len(standardized_rows) < 20:
+              failed_gates.append("standardized_independent_reach_ledger_too_small")
+
+          if len(families) < 3:
+              failed_gates.append("fewer_than_three_standardized_reach_families")
+
+          if model_anchor_violations:
+              failed_gates.append("model_anchor_promotion_violation")
+
+          if standardization_fail_rows:
+              failed_gates.append("standardization_failed_rows_present")
+
+          audit_rows = [
+              {
+                  "audit_gate": "three_independent_sources_standardized",
+                  "pass": len(pass_sources) >= 3,
+                  "value": ";".join(pass_sources),
+                  "boundary": "eBOSS, BOSS, and TDCOSMO must all standardize before eligibility audit."
+              },
+              {
+                  "audit_gate": "standardized_ledger_large_enough",
+                  "pass": len(standardized_rows) >= 20,
+                  "value": len(standardized_rows),
+                  "boundary": "Expected eBOSS/BOSS BAO rows plus repaired TDCOSMO Ddt rows."
+              },
+              {
+                  "audit_gate": "multiple_reach_families_present",
+                  "pass": len(families) >= 3,
+                  "value": ";".join(families),
+                  "boundary": "Independent reach should remain family-specific, not collapsed into one surface."
+              },
+              {
+                  "audit_gate": "tdcosmo_dd_missing_preserved",
+                  "pass": inventory["source_results"].get("TDCOSMO_2020", {}).get("standardization_pass") is True and len(skipped_rows) >= 1,
+                  "value": f"skipped={len(skipped_rows)}",
+                  "boundary": "Unavailable Dd fields remain missing; Ddt is the usable lane."
+              },
+              {
+                  "audit_gate": "no_model_anchor_promotion",
+                  "pass": len(model_anchor_violations) == 0,
+                  "value": len(model_anchor_violations),
+                  "boundary": "Standardization does not promote rows to model anchors."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed in v3.29."
+              }
+          ]
+
+          audit_csv = OUTDIR / "independent_reach_standardization_audit_v3_29.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          if not failed_gates:
+              readiness_label = "independent_reach_standardization_passed_ready_for_v3_30_eligibility_audit"
+          else:
+              readiness_label = "independent_reach_standardization_needs_followup"
+
+          next_step = (
+              "Build v3.30 independent reach eligibility audit: decide which standardized reach families can become candidate reach anchors, while preserving diagnostic-only boundaries and comparing against the existing KiDS growth lane."
+              if not failed_gates
+              else "Inspect failed v3.29 standardization gates before eligibility audit."
+          )
+
+          inventory["standardized_row_count"] = len(standardized_rows)
+          inventory["source_summary_row_count"] = len(source_summary_rows)
+          inventory["standardized_reach_family_count"] = len(families)
+          inventory["standardized_reach_families"] = families
+          inventory["pass_sources"] = pass_sources
+          inventory["skipped_row_count"] = len(skipped_rows)
+          inventory["binary_shape_product_count"] = len(binary_rows)
+          inventory["model_anchor_violation_count"] = len(model_anchor_violations)
+          inventory["output_files"] = {
+              "standardized_ledger": str(ledger_csv),
+              "source_summary": str(source_csv),
+              "family_summary": str(family_csv),
+              "skipped_rows": str(skipped_csv),
+              "binary_shape_products": str(binary_csv),
+              "audit": str(audit_csv)
+          }
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "pass_sources": pass_sources,
+              "standardized_row_count": len(standardized_rows),
+              "standardized_reach_family_count": len(families),
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_29_independent_reach_standardization.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.29 — Independent Reach Standardization")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.29 standardizes independent non-DESI reach diagnostics into shared reach-family roles.")
+          md.append("")
+          md.append("- eBOSS BAO rows become transverse/radial BAO reach diagnostics.")
+          md.append("- BOSS archive rows become older isotropic/archive BAO reach diagnostics.")
+          md.append("- TDCOSMO Ddt rows become time-delay path reach diagnostics.")
+          md.append("- TDCOSMO Dd missing fields remain missing.")
+          md.append("")
+          md.append("No row is promoted to model-anchor status.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Passing sources: `{', '.join(pass_sources) if pass_sources else 'none'}`")
+          md.append(f"- Standardized rows: `{len(standardized_rows)}`")
+          md.append(f"- Standardized reach families: `{len(families)}`")
+          md.append(f"- Reach families: `{', '.join(families) if families else 'none'}`")
+          md.append(f"- TDCOSMO skipped rows: `{len(skipped_rows)}`")
+          md.append(f"- Model-anchor violations: `{len(model_anchor_violations)}`")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_standardized_ledger_v3_29.csv`")
+          md.append("- `independent_reach_standardization_source_summary_v3_29.csv`")
+          md.append("- `independent_reach_standardized_family_summary_v3_29.csv`")
+          md.append("- `independent_reach_standardization_skipped_rows_v3_29.csv`")
+          md.append("- `independent_reach_standardization_binary_shape_products_v3_29.csv`")
+          md.append("- `independent_reach_standardization_audit_v3_29.csv`")
+          md.append("- `tairid_cosmology_v3_29_independent_reach_standardization.json`")
+          md.append("- `tairid_cosmology_v3_29_independent_reach_standardization.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_29_independent_reach_standardization.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.29 independent reach standardization artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-29-independent-reach-standardization
+          path: artifacts/tairid_cosmology_v3_29/
