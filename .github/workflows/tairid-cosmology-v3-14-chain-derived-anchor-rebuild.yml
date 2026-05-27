@@ -1,0 +1,842 @@
+name: TAIRID Cosmology v3.14 Chain-Derived Anchor Rebuild
+
+on:
+  workflow_dispatch:
+
+jobs:
+  chain-derived-anchor-rebuild:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.14 chain-derived anchor rebuild
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_14
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import shutil
+          import statistics
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_14")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_14_chain_derived_anchor_rebuild"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full TAIRID cosmological model.",
+              "This does not replace full likelihood analyses.",
+              "This rebuilds the anchor ledger from direct source files where possible.",
+              "KiDS-1000 chain-derived S8 rows are treated as growth/consolidation anchors.",
+              "Pantheon+SH0ES covariance redshift bins are treated as reach/geometry diagnostics only, not H0 anchors.",
+              "The Planck-like S8 reference is a configurable comparison anchor, not a full Planck likelihood.",
+              "A pass means the prototype ledger no longer depends on hand-entered KiDS growth summary anchors."
+          ]
+
+          URLS = {
+              "pantheon_table": "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES.dat",
+              "pantheon_cov": "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES_STAT%2BSYS.cov",
+              "kids_tarball": "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_cosmic_shear_data_release.tgz"
+          }
+
+          KIDS_STATS = ["xipm", "bp", "cosebis"]
+
+          PLANCK_LIKE_S8_REFERENCE = 0.834
+          PLANCK_LIKE_S8_SIGMA = 0.016
+
+          FIDUCIAL_H0 = 70.0
+          FIDUCIAL_OMEGA_M = 0.30
+          C_LIGHT_KM_S = 299792.458
+
+          PANTHEON_BINS = [
+              (0.001, 0.010),
+              (0.010, 0.023),
+              (0.023, 0.050),
+              (0.050, 0.100),
+              (0.100, 0.200),
+              (0.200, 0.500),
+              (0.500, 1.000),
+              (1.000, 2.500)
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=180):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.14-chain-derived-anchor-rebuild/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def safe_float(value):
+              try:
+                  x = float(value)
+                  if math.isnan(x) or math.isinf(x):
+                      return None
+                  return x
+              except Exception:
+                  return None
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              sorter = np.argsort(values)
+              values = values[sorter]
+              weights = weights[sorter]
+
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def parse_pantheon_table(path):
+              with open(path, "r", encoding="utf-8", errors="replace") as f:
+                  header = f.readline().strip().split()
+                  rows = []
+                  for line in f:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      parts = line.split()
+                      if len(parts) == len(header):
+                          rows.append(dict(zip(header, parts)))
+
+              required = [
+                  "CID", "zHD", "zCMB", "zHEL",
+                  "MU_SH0ES", "MU_SH0ES_ERR_DIAG",
+                  "IS_CALIBRATOR", "USED_IN_SH0ES_HF"
+              ]
+              missing = [c for c in required if c not in header]
+
+              normalized = []
+              for i, row in enumerate(rows):
+                  normalized.append({
+                      "row_index": i,
+                      "CID": row.get("CID"),
+                      "zHD": safe_float(row.get("zHD")),
+                      "zCMB": safe_float(row.get("zCMB")),
+                      "zHEL": safe_float(row.get("zHEL")),
+                      "MU_SH0ES": safe_float(row.get("MU_SH0ES")),
+                      "MU_SH0ES_ERR_DIAG": safe_float(row.get("MU_SH0ES_ERR_DIAG")),
+                      "IS_CALIBRATOR": int(float(row.get("IS_CALIBRATOR", 0))),
+                      "USED_IN_SH0ES_HF": int(float(row.get("USED_IN_SH0ES_HF", 0)))
+                  })
+
+              return header, normalized, missing
+
+          def parse_pantheon_covariance(path, n_expected):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              arr = np.fromstring(text, sep=" ")
+
+              if arr.size < 2:
+                  raise RuntimeError("Pantheon covariance file did not parse into numeric values.")
+
+              n = int(arr[0])
+              values = arr[1:]
+
+              if n != n_expected:
+                  raise RuntimeError(f"Pantheon covariance dimension {n} does not match table rows {n_expected}.")
+              if values.size != n * n:
+                  raise RuntimeError(f"Pantheon covariance has {values.size} values after dimension; expected {n*n}.")
+
+              cov = values.reshape((n, n))
+              diag = np.diag(cov)
+
+              if int(np.sum(diag > 0)) != n:
+                  raise RuntimeError("Pantheon covariance diagonal has non-positive entries.")
+
+              return cov, {
+                  "dimension": int(n),
+                  "diag_positive_count": int(np.sum(diag > 0)),
+                  "symmetry_max_abs_delta": float(np.max(np.abs(cov - cov.T))),
+                  "diag_min": float(np.min(diag)),
+                  "diag_max": float(np.max(diag))
+              }
+
+          def lcdm_mu(z_values, h0=FIDUCIAL_H0, omega_m=FIDUCIAL_OMEGA_M):
+              z_values = np.asarray(z_values, dtype=float)
+              out = np.zeros_like(z_values)
+
+              def e_inv(z):
+                  return 1.0 / math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+              for i, z in enumerate(z_values):
+                  if z <= 0:
+                      out[i] = np.nan
+                      continue
+
+                  n = 600
+                  xs = np.linspace(0.0, z, n + 1)
+                  ys = np.array([e_inv(float(x)) for x in xs])
+                  h = z / n
+                  integral = h / 3.0 * (
+                      ys[0]
+                      + ys[-1]
+                      + 4.0 * np.sum(ys[1:-1:2])
+                      + 2.0 * np.sum(ys[2:-2:2])
+                  )
+
+                  d_l_mpc = (C_LIGHT_KM_S / h0) * (1.0 + z) * integral
+                  out[i] = 5.0 * math.log10(d_l_mpc) + 25.0
+
+              return out
+
+          def solve_covariance_weighted_offset(residuals, cov):
+              ones = np.ones(len(residuals))
+              inv_cov_residuals = np.linalg.solve(cov, residuals)
+              inv_cov_ones = np.linalg.solve(cov, ones)
+
+              numerator = float(ones @ inv_cov_residuals)
+              denominator = float(ones @ inv_cov_ones)
+
+              if denominator <= 0:
+                  raise RuntimeError("Invalid GLS denominator for SN intercept fit.")
+
+              offset = numerator / denominator
+              offset_sigma = math.sqrt(1.0 / denominator)
+              centered = residuals - offset
+
+              chi2 = float(centered @ np.linalg.solve(cov, centered))
+              dof = int(len(residuals) - 1)
+
+              return offset, offset_sigma, centered, chi2, dof
+
+          def covariance_weighted_bin_mean(values, cov_sub):
+              n = len(values)
+              ones = np.ones(n)
+
+              inv_cov_values = np.linalg.solve(cov_sub, values)
+              inv_cov_ones = np.linalg.solve(cov_sub, ones)
+
+              denominator = float(ones @ inv_cov_ones)
+              if denominator <= 0:
+                  raise RuntimeError("Invalid bin GLS denominator.")
+
+              mean = float((ones @ inv_cov_values) / denominator)
+              sigma = math.sqrt(1.0 / denominator)
+              z_score = mean / sigma if sigma > 0 else None
+
+              return mean, sigma, z_score
+
+          def build_pantheon_reach_diagnostic(rows, cov):
+              z = np.array([r["zHD"] for r in rows], dtype=float)
+              mu_obs = np.array([r["MU_SH0ES"] for r in rows], dtype=float)
+
+              if not np.all(np.isfinite(z)) or not np.all(np.isfinite(mu_obs)):
+                  raise RuntimeError("Pantheon rows contain non-finite zHD or MU_SH0ES.")
+
+              mu_fid = lcdm_mu(z)
+              if not np.all(np.isfinite(mu_fid)):
+                  raise RuntimeError("LCDM fiducial mu produced non-finite values.")
+
+              raw_residual = mu_obs - mu_fid
+              offset, offset_sigma, centered_residual, chi2, dof = solve_covariance_weighted_offset(raw_residual, cov)
+
+              bin_rows = []
+              for lo, hi in PANTHEON_BINS:
+                  idx = np.where((z >= lo) & (z < hi))[0]
+                  if len(idx) == 0:
+                      bin_rows.append({
+                          "surface": "reach_geometry",
+                          "source": "PantheonPlus_SH0ES",
+                          "entry_type": "covariance_diagnostic_only",
+                          "z_min": lo,
+                          "z_max": hi,
+                          "count": 0,
+                          "mean_z": None,
+                          "pressure_value_z": None,
+                          "sign": "empty",
+                          "model_anchor_allowed": False,
+                          "reason_not_model_anchor": "empty bin"
+                      })
+                      continue
+
+                  cov_sub = cov[np.ix_(idx, idx)]
+                  vals = centered_residual[idx]
+                  mean, sigma, z_score = covariance_weighted_bin_mean(vals, cov_sub)
+
+                  sign = "positive" if z_score > 0 else "negative" if z_score < 0 else "zero"
+
+                  bin_rows.append({
+                      "surface": "reach_geometry",
+                      "source": "PantheonPlus_SH0ES",
+                      "entry_type": "covariance_diagnostic_only",
+                      "z_min": lo,
+                      "z_max": hi,
+                      "count": int(len(idx)),
+                      "mean_z": float(np.mean(z[idx])),
+                      "cov_weighted_mean_centered_residual": mean,
+                      "cov_weighted_sigma": sigma,
+                      "pressure_value_z": z_score,
+                      "sign": sign,
+                      "model_anchor_allowed": False,
+                      "reason_not_model_anchor": "SN covariance residual-shape diagnostic after intercept fit; not H0 or BAO/CMB reach anchor"
+                  })
+
+              path = OUTDIR / "pantheon_reach_diagnostic_bins_not_h0_anchor.csv"
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "surface", "source", "entry_type",
+                      "z_min", "z_max", "count", "mean_z",
+                      "cov_weighted_mean_centered_residual",
+                      "cov_weighted_sigma", "pressure_value_z", "sign",
+                      "model_anchor_allowed", "reason_not_model_anchor"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in bin_rows:
+                      writer.writerow(row)
+
+              finite_z = [
+                  r["pressure_value_z"]
+                  for r in bin_rows
+                  if r["pressure_value_z"] is not None and math.isfinite(float(r["pressure_value_z"]))
+              ]
+
+              sign_counts = {
+                  "positive": sum(1 for r in bin_rows if r["sign"] == "positive"),
+                  "negative": sum(1 for r in bin_rows if r["sign"] == "negative"),
+                  "zero": sum(1 for r in bin_rows if r["sign"] == "zero"),
+                  "empty": sum(1 for r in bin_rows if r["sign"] == "empty")
+              }
+
+              return {
+                  "surface": "reach_geometry",
+                  "source": "PantheonPlus_SH0ES",
+                  "diagnostic_table": str(path),
+                  "row_count": len(rows),
+                  "finite_bin_count": len(finite_z),
+                  "sign_counts": sign_counts,
+                  "gls_intercept_offset": offset,
+                  "gls_intercept_offset_sigma": offset_sigma,
+                  "chi2_after_intercept_fit": chi2,
+                  "dof_after_intercept_fit": dof,
+                  "chi2_per_dof_after_intercept_fit": chi2 / dof if dof > 0 else None,
+                  "model_anchor_allowed": False,
+                  "reason_not_model_anchor": "Pantheon covariance bins are retained as reach diagnostics only; they are not promoted to H0 correction."
+              }
+
+          def safe_extract_tar(tar_path):
+              extract_dir = OUTDIR / "kids_1000_extracted"
+              extract_dir.mkdir(parents=True, exist_ok=True)
+
+              with tarfile.open(tar_path, "r:gz") as tf:
+                  safe_members = []
+                  for member in tf.getmembers():
+                      target = (extract_dir / member.name).resolve()
+                      if str(target).startswith(str(extract_dir.resolve())):
+                          safe_members.append(member)
+                  tf.extractall(extract_dir, members=safe_members)
+
+              candidates = [
+                  p for p in extract_dir.iterdir()
+                  if p.is_dir() and "KiDS1000" in p.name and "shear_data_release" in p.name
+              ]
+
+              if not candidates:
+                  raise RuntimeError("Could not find KiDS1000 extracted base directory.")
+
+              return candidates[0]
+
+          def read_chain_file(path):
+              with open(path, "r", encoding="utf-8", errors="replace") as f:
+                  first_line = f.readline().strip()
+
+              if not first_line.startswith("#"):
+                  raise RuntimeError(f"Chain file has no header line: {path}")
+
+              header = first_line.replace("#", "").split()
+              data = np.loadtxt(path, comments="#")
+
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+
+              if data.shape[1] != len(header):
+                  raise RuntimeError(f"Chain column mismatch for {path}: data has {data.shape[1]}, header has {len(header)}")
+
+              nsample = None
+              with open(path, "r", encoding="utf-8", errors="replace") as f:
+                  tail = f.readlines()[-10:]
+
+              for line in tail:
+                  m = re.search(r"#nsample\s*=\s*(\d+)", line)
+                  if m:
+                      nsample = int(m.group(1))
+
+              if nsample is not None and 0 < nsample <= data.shape[0]:
+                  data_used = data[-nsample:, :]
+              else:
+                  data_used = data
+
+              return header, data_used, nsample
+
+          def build_kids_chain_growth_anchors(kids_tar_path):
+              kids_base = safe_extract_tar(kids_tar_path)
+              anchor_rows = []
+              best_rows = []
+
+              for stat in KIDS_STATS:
+                  chain_path = kids_base / "chains_and_config_files" / "main_chains_iterative_covariance" / stat / "chain" / "output_multinest_C.txt"
+
+                  if not chain_path.exists():
+                      raise RuntimeError(f"Missing KiDS chain file: {chain_path}")
+
+                  header, data, nsample = read_chain_file(chain_path)
+                  col = {name: i for i, name in enumerate(header)}
+
+                  if "COSMOLOGICAL_PARAMETERS--S_8" not in col:
+                      raise RuntimeError(f"S8 column missing from {chain_path}")
+
+                  s8 = data[:, col["COSMOLOGICAL_PARAMETERS--S_8"]]
+                  weights = data[:, col["weight"]] if "weight" in col else np.ones(len(s8))
+
+                  q16, q50, q84 = weighted_quantile(s8, weights, [0.16, 0.50, 0.84])
+                  sigma = (q84 - q16) / 2.0
+                  combined_sigma = math.sqrt(sigma ** 2 + PLANCK_LIKE_S8_SIGMA ** 2)
+                  pressure_z = (q50 - PLANCK_LIKE_S8_REFERENCE) / combined_sigma
+
+                  sign = "negative" if pressure_z < 0 else "positive" if pressure_z > 0 else "zero"
+
+                  anchor_rows.append({
+                      "surface": "consolidation_growth",
+                      "source": "KiDS_1000",
+                      "entry_type": "chain_derived_growth_anchor",
+                      "statistic": stat,
+                      "sample_rows_used": int(data.shape[0]),
+                      "nsample_marker": nsample,
+                      "s8_q16": q16,
+                      "s8_q50": q50,
+                      "s8_q84": q84,
+                      "s8_sigma_half_width": sigma,
+                      "comparison_reference": "Planck_like_S8_configurable_anchor_not_full_likelihood",
+                      "planck_like_s8_reference": PLANCK_LIKE_S8_REFERENCE,
+                      "planck_like_s8_sigma": PLANCK_LIKE_S8_SIGMA,
+                      "pressure_value_z": pressure_z,
+                      "sign": sign,
+                      "model_anchor_allowed": True,
+                      "anchor_limit": "same-survey KiDS statistics are not independent; use as family members, not three independent surveys"
+                  })
+
+                  if "post" in col:
+                      best_idx = int(np.argmax(data[:, col["post"]]))
+                      best_rows.append({
+                          "statistic": stat,
+                          "best_post_index": best_idx,
+                          "best_post": float(data[best_idx, col["post"]]),
+                          "best_like": float(data[best_idx, col["like"]]) if "like" in col else None,
+                          "best_S8": float(data[best_idx, col["COSMOLOGICAL_PARAMETERS--S_8"]]),
+                          "best_sigma8": float(data[best_idx, col["COSMOLOGICAL_PARAMETERS--SIGMA_8"]]) if "COSMOLOGICAL_PARAMETERS--SIGMA_8" in col else None,
+                          "best_omega_m": float(data[best_idx, col["COSMOLOGICAL_PARAMETERS--OMEGA_M"]]) if "COSMOLOGICAL_PARAMETERS--OMEGA_M" in col else None
+                      })
+
+              anchor_path = OUTDIR / "kids_chain_derived_growth_anchors.csv"
+              with anchor_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "surface", "source", "entry_type", "statistic",
+                      "sample_rows_used", "nsample_marker",
+                      "s8_q16", "s8_q50", "s8_q84", "s8_sigma_half_width",
+                      "comparison_reference", "planck_like_s8_reference", "planck_like_s8_sigma",
+                      "pressure_value_z", "sign", "model_anchor_allowed", "anchor_limit"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in anchor_rows:
+                      writer.writerow(row)
+
+              best_path = OUTDIR / "kids_chain_best_posterior_rows.csv"
+              with best_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "statistic", "best_post_index", "best_post",
+                      "best_like", "best_S8", "best_sigma8", "best_omega_m"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in best_rows:
+                      writer.writerow(row)
+
+              s8_medians = [r["s8_q50"] for r in anchor_rows]
+              sigmas = [r["s8_sigma_half_width"] for r in anchor_rows]
+              pressures = [r["pressure_value_z"] for r in anchor_rows]
+
+              unweighted_s8_mean = float(np.mean(s8_medians))
+              unweighted_s8_sigma_spread = float(np.std(s8_medians, ddof=1)) if len(s8_medians) > 1 else 0.0
+
+              inverse_variance_weights = np.array([1.0 / (s ** 2) for s in sigmas])
+              weighted_s8_mean = float(np.sum(np.array(s8_medians) * inverse_variance_weights) / np.sum(inverse_variance_weights))
+              weighted_s8_internal_sigma = float(math.sqrt(1.0 / np.sum(inverse_variance_weights)))
+
+              combined_sigma_for_weighted = math.sqrt(weighted_s8_internal_sigma ** 2 + PLANCK_LIKE_S8_SIGMA ** 2)
+              weighted_pressure_z = (weighted_s8_mean - PLANCK_LIKE_S8_REFERENCE) / combined_sigma_for_weighted
+
+              family_summary = {
+                  "surface": "consolidation_growth",
+                  "source": "KiDS_1000",
+                  "entry_type": "same_survey_family_summary_not_independent_combined_likelihood",
+                  "stat_count": len(anchor_rows),
+                  "all_statistics_negative": all(p < 0 for p in pressures),
+                  "unweighted_s8_mean": unweighted_s8_mean,
+                  "unweighted_s8_sample_spread": unweighted_s8_sigma_spread,
+                  "inverse_variance_weighted_s8_mean_diagnostic": weighted_s8_mean,
+                  "inverse_variance_internal_sigma_diagnostic": weighted_s8_internal_sigma,
+                  "weighted_pressure_vs_planck_like_z_diagnostic": weighted_pressure_z,
+                  "mean_pressure_z": float(np.mean(pressures)),
+                  "min_pressure_z": float(np.min(pressures)),
+                  "max_pressure_z": float(np.max(pressures)),
+                  "model_anchor_allowed": True,
+                  "anchor_limit": "KiDS xipm, bp, and cosebis share survey/data family; do not treat as three fully independent surveys"
+              }
+
+              family_path = OUTDIR / "kids_growth_family_summary.csv"
+              with family_path.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = list(family_summary.keys())
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerow(family_summary)
+
+              return {
+                  "anchors": anchor_rows,
+                  "best_rows": best_rows,
+                  "family_summary": family_summary,
+                  "anchor_table": str(anchor_path),
+                  "best_posterior_table": str(best_path),
+                  "family_summary_table": str(family_path)
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_13_status": "covariance_aware_two_source_prototype_passed_ready_for_v3_14_full_anchor_rebuild",
+                  "v3_13_next_allowed_step": "Build v3.14 full anchor rebuild: replace hand-entered growth anchors with chain-derived S8 anchors and keep Pantheon covariance residual-shape diagnostics separate from H0 claims."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "downloads": {},
+              "pantheon_reach_diagnostic": {},
+              "kids_growth_anchor_rebuild": {},
+              "surface_anchor_ledger": [],
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.14 chain-derived anchor rebuild")
+          print("Truth boundary: anchor ledger rebuild only; no validation claim.")
+          print()
+
+          failed = []
+
+          pantheon_dir = DOWNLOADS / "PantheonPlus_SH0ES"
+          kids_dir = DOWNLOADS / "KiDS_1000"
+          pantheon_dir.mkdir(parents=True, exist_ok=True)
+          kids_dir.mkdir(parents=True, exist_ok=True)
+
+          pantheon_table_path = pantheon_dir / "PantheonPlusSH0ES.dat"
+          pantheon_cov_path = pantheon_dir / "PantheonPlusSH0ES_STAT_SYS.cov"
+          kids_tar_path = kids_dir / "KiDS1000_cosmic_shear_data_release.tgz"
+
+          try:
+              inventory["downloads"]["pantheon_table"] = download(URLS["pantheon_table"], pantheon_table_path)
+              inventory["downloads"]["pantheon_cov"] = download(URLS["pantheon_cov"], pantheon_cov_path)
+              inventory["downloads"]["kids_tarball"] = download(URLS["kids_tarball"], kids_tar_path)
+          except Exception as e:
+              failed.append("download_failed")
+              inventory["download_error"] = f"{type(e).__name__}: {e}"
+
+          try:
+              header, pantheon_rows, missing = parse_pantheon_table(pantheon_table_path)
+              if missing:
+                  raise RuntimeError(f"Pantheon required columns missing: {missing}")
+
+              cov, cov_summary = parse_pantheon_covariance(pantheon_cov_path, len(pantheon_rows))
+              pantheon_diag = build_pantheon_reach_diagnostic(pantheon_rows, cov)
+              pantheon_diag["covariance_summary"] = cov_summary
+              pantheon_diag["header_column_count"] = len(header)
+
+              inventory["pantheon_reach_diagnostic"] = pantheon_diag
+
+              inventory["surface_anchor_ledger"].append({
+                  "surface": "reach_geometry",
+                  "source": "PantheonPlus_SH0ES",
+                  "entry_type": "covariance_diagnostic_only",
+                  "model_anchor_allowed": False,
+                  "direct_source_derived": True,
+                  "hand_entered_anchor": False,
+                  "pressure_direction_claim_allowed": False,
+                  "result_summary": f"finite_bins={pantheon_diag['finite_bin_count']}; chi2_per_dof={pantheon_diag['chi2_per_dof_after_intercept_fit']}",
+                  "boundary": "kept separate from H0/reach-positive claims"
+              })
+
+              print("Pantheon+SH0ES reach diagnostic:")
+              print(f"  finite bins: {pantheon_diag['finite_bin_count']}")
+              print(f"  sign counts: {pantheon_diag['sign_counts']}")
+              print(f"  chi2/dof: {pantheon_diag['chi2_per_dof_after_intercept_fit']}")
+              print(f"  model anchor allowed: {pantheon_diag['model_anchor_allowed']}")
+              print()
+
+          except Exception as e:
+              failed.append("pantheon_reach_diagnostic_failed")
+              inventory["pantheon_reach_diagnostic"] = {
+                  "surface": "reach_geometry",
+                  "source": "PantheonPlus_SH0ES",
+                  "error": f"{type(e).__name__}: {e}",
+                  "model_anchor_allowed": False
+              }
+              print(f"Pantheon reach diagnostic failed: {type(e).__name__}: {e}")
+              print()
+
+          try:
+              kids_rebuild = build_kids_chain_growth_anchors(kids_tar_path)
+              inventory["kids_growth_anchor_rebuild"] = kids_rebuild
+
+              for row in kids_rebuild["anchors"]:
+                  inventory["surface_anchor_ledger"].append({
+                      "surface": row["surface"],
+                      "source": row["source"],
+                      "entry_type": row["entry_type"],
+                      "statistic": row["statistic"],
+                      "model_anchor_allowed": row["model_anchor_allowed"],
+                      "direct_source_derived": True,
+                      "hand_entered_anchor": False,
+                      "pressure_direction_claim_allowed": True,
+                      "pressure_value_z": row["pressure_value_z"],
+                      "sign": row["sign"],
+                      "result_summary": f"S8_q50={row['s8_q50']}; pressure_z={row['pressure_value_z']}",
+                      "boundary": row["anchor_limit"]
+                  })
+
+              family = kids_rebuild["family_summary"]
+              inventory["surface_anchor_ledger"].append({
+                  "surface": family["surface"],
+                  "source": family["source"],
+                  "entry_type": family["entry_type"],
+                  "model_anchor_allowed": family["model_anchor_allowed"],
+                  "direct_source_derived": True,
+                  "hand_entered_anchor": False,
+                  "pressure_direction_claim_allowed": True,
+                  "pressure_value_z": family["mean_pressure_z"],
+                  "sign": "negative" if family["mean_pressure_z"] < 0 else "positive_or_zero",
+                  "result_summary": f"all_negative={family['all_statistics_negative']}; mean_pressure_z={family['mean_pressure_z']}",
+                  "boundary": family["anchor_limit"]
+              })
+
+              print("KiDS-1000 chain-derived growth anchor rebuild:")
+              print(f"  anchor rows: {len(kids_rebuild['anchors'])}")
+              print(f"  all statistics negative: {family['all_statistics_negative']}")
+              print(f"  mean pressure z: {family['mean_pressure_z']}")
+              print(f"  unweighted S8 mean: {family['unweighted_s8_mean']}")
+              print()
+
+          except Exception as e:
+              failed.append("kids_chain_growth_anchor_rebuild_failed")
+              inventory["kids_growth_anchor_rebuild"] = {
+                  "surface": "consolidation_growth",
+                  "source": "KiDS_1000",
+                  "error": f"{type(e).__name__}: {e}"
+              }
+              print(f"KiDS growth anchor rebuild failed: {type(e).__name__}: {e}")
+              print()
+
+          ledger_path = OUTDIR / "surface_anchor_ledger_rebuilt_v3_14.csv"
+          ledger_fields = [
+              "surface", "source", "entry_type", "statistic",
+              "model_anchor_allowed", "direct_source_derived",
+              "hand_entered_anchor", "pressure_direction_claim_allowed",
+              "pressure_value_z", "sign", "result_summary", "boundary"
+          ]
+
+          with ledger_path.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=ledger_fields)
+              writer.writeheader()
+              for row in inventory["surface_anchor_ledger"]:
+                  writer.writerow({k: row.get(k) for k in ledger_fields})
+
+          hand_entered_anchor_count = sum(1 for r in inventory["surface_anchor_ledger"] if r.get("hand_entered_anchor") is True)
+          growth_anchor_rows = [
+              r for r in inventory["surface_anchor_ledger"]
+              if r.get("surface") == "consolidation_growth"
+              and r.get("entry_type") == "chain_derived_growth_anchor"
+          ]
+          growth_negative_count = sum(1 for r in growth_anchor_rows if r.get("sign") == "negative")
+          reach_model_anchor_count = sum(
+              1 for r in inventory["surface_anchor_ledger"]
+              if r.get("surface") == "reach_geometry" and r.get("model_anchor_allowed") is True
+          )
+
+          kids_ok = (
+              "kids_chain_growth_anchor_rebuild_failed" not in failed
+              and len(growth_anchor_rows) == len(KIDS_STATS)
+              and growth_negative_count == len(KIDS_STATS)
+          )
+
+          pantheon_ok = (
+              "pantheon_reach_diagnostic_failed" not in failed
+              and reach_model_anchor_count == 0
+          )
+
+          anchor_rebuild_ok = (
+              kids_ok
+              and pantheon_ok
+              and hand_entered_anchor_count == 0
+          )
+
+          if anchor_rebuild_ok:
+              readiness_label = "chain_derived_anchor_rebuild_passed_ready_for_v3_15_raw_product_expansion"
+          elif kids_ok and not pantheon_ok:
+              readiness_label = "kids_growth_anchor_rebuild_passed_pantheon_diagnostic_boundary_needs_followup"
+          elif pantheon_ok and not kids_ok:
+              readiness_label = "pantheon_boundary_passed_kids_growth_anchor_rebuild_needs_followup"
+          else:
+              readiness_label = "chain_derived_anchor_rebuild_failed_manual_followup_needed"
+
+          inventory["gate_result"] = {
+              "failed_gates": failed,
+              "readiness_label": readiness_label,
+              "pantheon_reach_diagnostic_pass": pantheon_ok,
+              "kids_growth_anchor_rebuild_pass": kids_ok,
+              "hand_entered_anchor_count": hand_entered_anchor_count,
+              "growth_anchor_rows": len(growth_anchor_rows),
+              "growth_negative_count": growth_negative_count,
+              "reach_model_anchor_count": reach_model_anchor_count,
+              "model_claim_allowed": False,
+              "next_allowed_step": (
+                  "Build v3.15 raw product expansion: add source-specific product discovery for DES Y3, HSC Y3, DESI DR1 BAO, and Planck so the ledger can expand beyond Pantheon+SH0ES and KiDS-1000."
+                  if anchor_rebuild_ok
+                  else "Fix failed anchor rebuild or boundary separation before expanding sources."
+              )
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_14_chain_derived_anchor_rebuild.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.14 — Chain-Derived Anchor Rebuild")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed) if failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.14 rebuilds the anchor ledger from direct source files where possible.")
+          md.append("")
+          md.append("- KiDS-1000 chain rows become source-derived growth/consolidation anchors.")
+          md.append("- Pantheon+SH0ES covariance bins remain reach/geometry diagnostics only.")
+          md.append("- Pantheon is not promoted into an H0 correction or reach-positive proof.")
+          md.append("- No full cosmological model is fitted.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append("| Gate | Result |")
+          md.append("|---|---:|")
+          md.append(f"| Pantheon reach diagnostic boundary passed | {pantheon_ok} |")
+          md.append(f"| KiDS chain-derived growth anchor rebuild passed | {kids_ok} |")
+          md.append(f"| Hand-entered anchor count | {hand_entered_anchor_count} |")
+          md.append(f"| Growth anchor rows | {len(growth_anchor_rows)} |")
+          md.append(f"| Growth negative count | {growth_negative_count} |")
+          md.append(f"| Reach model-anchor count | {reach_model_anchor_count} |")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append(
+              "If this passes, the growth/consolidation side is now rebuilt from KiDS-1000 chains instead of hand-entered KiDS summary anchors. "
+              "The reach/geometry side is kept cleaner because Pantheon+SH0ES is retained as a covariance-aware residual diagnostic, not promoted into an H0 or ruler correction."
+          )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(inventory["gate_result"]["next_allowed_step"])
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `kids_chain_derived_growth_anchors.csv`")
+          md.append("- `kids_growth_family_summary.csv`")
+          md.append("- `kids_chain_best_posterior_rows.csv`")
+          md.append("- `pantheon_reach_diagnostic_bins_not_h0_anchor.csv`")
+          md.append("- `surface_anchor_ledger_rebuilt_v3_14.csv`")
+          md.append("- `tairid_cosmology_v3_14_chain_derived_anchor_rebuild.json`")
+          md.append("- `tairid_cosmology_v3_14_chain_derived_anchor_rebuild.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_14_chain_derived_anchor_rebuild.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed or not anchor_rebuild_ok:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.14 chain-derived anchor rebuild artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-14-chain-derived-anchor-rebuild
+          path: artifacts/tairid_cosmology_v3_14/
