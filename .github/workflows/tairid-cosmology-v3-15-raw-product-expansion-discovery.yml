@@ -1,0 +1,621 @@
+name: TAIRID Cosmology v3.15 Raw Product Expansion Discovery
+
+on:
+  workflow_dispatch:
+
+jobs:
+  raw-product-expansion-discovery:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.15 raw product expansion discovery
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_15
+
+          python - <<'PY'
+          import csv
+          import html
+          import json
+          import re
+          import sys
+          import time
+          import urllib.parse
+          import urllib.request
+          import urllib.error
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_15")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_15_raw_product_expansion_discovery"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not ingest full likelihoods yet.",
+              "This is a raw-product discovery and expansion-readiness test.",
+              "The purpose is to locate direct or semi-direct products for DES Y3, HSC Y3, DESI DR1 BAO, and Planck.",
+              "Any discovered source must pass later source-specific shape and ingestion tests before becoming a model anchor."
+          ]
+
+          SOURCES = [
+              {
+                  "source": "DES_Y3",
+                  "surface": "consolidation_growth",
+                  "target_type": "weak-lensing / 3x2pt products",
+                  "seed_urls": [
+                      "https://www.darkenergysurvey.org/des-year-3-cosmology-results-papers/",
+                      "https://des.ncsa.illinois.edu/releases/y3a2"
+                  ],
+                  "expected": [
+                      "chains",
+                      "covariance",
+                      "data vectors",
+                      "2pt / 3x2pt products",
+                      "likelihood support"
+                  ]
+              },
+              {
+                  "source": "HSC_Y3",
+                  "surface": "consolidation_growth",
+                  "target_type": "weak-lensing / cosmic shear products",
+                  "seed_urls": [
+                      "https://hsc-release.mtk.nao.ac.jp/doc/index.php/wly3/",
+                      "https://hsc-release.mtk.nao.ac.jp/doc/index.php/s19a-shape-catalog-pdr3/"
+                  ],
+                  "expected": [
+                      "shape catalog",
+                      "cosmic shear products",
+                      "covariance",
+                      "chains or likelihood support",
+                      "SACC / FITS / data vectors"
+                  ]
+              },
+              {
+                  "source": "DESI_DR1_BAO",
+                  "surface": "reach_geometry",
+                  "target_type": "BAO chains and posterior products",
+                  "seed_urls": [
+                      "https://data.desi.lbl.gov/doc/releases/dr1/vac/bao-cosmo-params/",
+                      "https://data.desi.lbl.gov/doc/releases/dr1/",
+                      "https://data.desi.lbl.gov/public/dr1/"
+                  ],
+                  "expected": [
+                      "BAO chains",
+                      "posterior maximization results",
+                      "cosmology products",
+                      "covariance or likelihood support"
+                  ]
+              },
+              {
+                  "source": "Planck_2018",
+                  "surface": "cmb_reference",
+                  "target_type": "CMB chains, likelihoods, parameters, covariance products",
+                  "seed_urls": [
+                      "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/",
+                      "https://pla.esac.esa.int/",
+                      "https://lambda.gsfc.nasa.gov/product/planck/curr/planck_prod_esa.html"
+                  ],
+                  "expected": [
+                      "chains",
+                      "cosmological parameters",
+                      "likelihood products",
+                      "power spectra",
+                      "noise covariance"
+                  ]
+              }
+          ]
+
+          PRODUCT_TERMS = [
+              "chain", "chains", "mcmc", "posterior", "posteriors",
+              "covariance", "covmat", "cov", "likelihood", "sacc",
+              "fits", "fit", "tgz", "tar", "tar.gz", "zip", "gz",
+              "dat", "txt", "csv", "2pt", "3x2pt", "cosmosis",
+              "multinest", "bao", "planck", "plik", "clik",
+              "parameter", "parameters", "sigma8", "s8", "omega",
+              "data_vector", "datavector", "power", "spectra"
+          ]
+
+          DIRECT_EXTENSIONS = [
+              ".tgz", ".tar", ".tar.gz", ".gz", ".zip",
+              ".fits", ".fit", ".sacc", ".cov", ".dat",
+              ".txt", ".csv", ".tsv", ".paramnames",
+              ".chain", ".ini", ".yaml", ".yml", ".npy", ".npz"
+          ]
+
+          BLOCKED_EXTENSIONS = [
+              ".png", ".jpg", ".jpeg", ".gif", ".svg",
+              ".css", ".js", ".ico", ".woff", ".woff2", ".ttf"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def normalize(text):
+              return re.sub(r"\s+", " ", text or "").strip()
+
+          def is_probably_binary_url(url):
+              path = urllib.parse.urlparse(url).path.lower()
+              return any(path.endswith(ext) for ext in DIRECT_EXTENSIONS)
+
+          def is_blocked_url(url):
+              path = urllib.parse.urlparse(url).path.lower()
+              return any(path.endswith(ext) for ext in BLOCKED_EXTENSIONS)
+
+          def product_term_hits(text):
+              lower = (text or "").lower()
+              return sorted({term for term in PRODUCT_TERMS if term in lower})
+
+          def fetch_url(url, max_bytes=180000, timeout=35):
+              result = {
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "final_url": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "bytes_read": 0,
+                  "text": "",
+                  "error": None,
+                  "checked_at_utc": now_iso()
+              }
+
+              headers = {
+                  "User-Agent": "TAIRID-v3.15-product-discovery/1.0",
+                  "Accept": "*/*",
+                  "Range": f"bytes=0-{max_bytes - 1}"
+              }
+
+              try:
+                  req = urllib.request.Request(url, headers=headers, method="GET")
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", None)
+                      body = resp.read(max_bytes)
+                      content_type = resp.headers.get("Content-Type")
+                      content_length = resp.headers.get("Content-Length")
+
+                      text = ""
+                      if content_type is None or any(x in content_type.lower() for x in ["text", "html", "json", "xml", "csv"]):
+                          text = body.decode("utf-8", errors="replace")
+                      else:
+                          text = body[:4096].decode("utf-8", errors="replace")
+
+                      result.update({
+                          "ok": status is not None and 200 <= status < 400,
+                          "status": status,
+                          "final_url": resp.geturl(),
+                          "content_type": content_type,
+                          "content_length": content_length,
+                          "bytes_read": len(body),
+                          "text": text
+                      })
+
+              except urllib.error.HTTPError as e:
+                  try:
+                      body = e.read(max_bytes)
+                  except Exception:
+                      body = b""
+                  result.update({
+                      "ok": False,
+                      "status": e.code,
+                      "content_type": e.headers.get("Content-Type") if e.headers else None,
+                      "content_length": e.headers.get("Content-Length") if e.headers else None,
+                      "bytes_read": len(body),
+                      "text": body.decode("utf-8", errors="replace")[:4096],
+                      "error": f"HTTPError: {e.code} {getattr(e, 'reason', '')}"
+                  })
+
+              except Exception as e:
+                  result.update({
+                      "ok": False,
+                      "error": f"{type(e).__name__}: {e}"
+                  })
+
+              return result
+
+          def extract_links(base_url, text):
+              links = []
+              if not text:
+                  return links
+
+              # href="..."
+              for match in re.finditer(r'''href\s*=\s*["']([^"']+)["']''', text, flags=re.IGNORECASE):
+                  raw = html.unescape(match.group(1)).strip()
+                  if not raw or raw.startswith("#") or raw.startswith("mailto:") or raw.startswith("javascript:"):
+                      continue
+                  absolute = urllib.parse.urljoin(base_url, raw)
+                  links.append(absolute)
+
+              # Plain directory-style URLs sometimes appear in text.
+              for match in re.finditer(r'''https?://[^\s<>"']+''', text):
+                  absolute = html.unescape(match.group(0)).strip().rstrip(").,;")
+                  links.append(absolute)
+
+              deduped = []
+              seen = set()
+              for link in links:
+                  if is_blocked_url(link):
+                      continue
+                  if link not in seen:
+                      seen.add(link)
+                      deduped.append(link)
+              return deduped
+
+          def score_candidate(url, context_text):
+              combined = f"{url} {context_text}"
+              hits = product_term_hits(combined)
+              direct = is_probably_binary_url(url)
+
+              score = 0
+              if direct:
+                  score += 3
+              score += min(len(hits), 6)
+
+              lower_url = url.lower()
+              if any(x in lower_url for x in ["chain", "cov", "likelihood", "bao", "sacc", "fits", "cosmosis", "planck", "plik", "clik"]):
+                  score += 3
+
+              if any(x in lower_url for x in ["download", "data", "release", "products", "vac"]):
+                  score += 1
+
+              return score, hits, direct
+
+          def classify_source(source, seed_results, candidates):
+              reachable_seeds = [r for r in seed_results if r["ok"]]
+              direct_candidates = [c for c in candidates if c["direct_resource"]]
+              strong_candidates = [c for c in candidates if c["candidate_score"] >= 5]
+              product_hits = sorted({hit for c in candidates for hit in c["product_hits"]})
+
+              has_chain = any(h in product_hits for h in ["chain", "chains", "mcmc", "posterior", "posteriors", "multinest"])
+              has_cov = any(h in product_hits for h in ["covariance", "covmat", "cov"])
+              has_likelihood = any(h in product_hits for h in ["likelihood", "cosmosis", "plik", "clik"])
+              has_data_vector = any(h in product_hits for h in ["data_vector", "datavector", "sacc", "fits", "2pt", "3x2pt"])
+              has_bao = "bao" in product_hits
+              has_planck = "planck" in product_hits
+
+              if len(direct_candidates) >= 2 and (has_chain or has_cov or has_likelihood or has_data_vector or has_bao or has_planck):
+                  status = "direct_product_candidates_found_ready_for_shape_probe"
+                  score = 3
+              elif len(strong_candidates) >= 2:
+                  status = "strong_product_links_found_ready_for_targeted_followup"
+                  score = 2
+              elif reachable_seeds:
+                  status = "official_pages_reachable_product_links_need_manual_or_source_specific_extraction"
+                  score = 1
+              else:
+                  status = "not_reachable_from_ci_probe"
+                  score = 0
+
+              return {
+                  "source": source["source"],
+                  "surface": source["surface"],
+                  "target_type": source["target_type"],
+                  "discovery_status": status,
+                  "readiness_score_0_to_3": score,
+                  "reachable_seed_count": len(reachable_seeds),
+                  "candidate_count": len(candidates),
+                  "direct_candidate_count": len(direct_candidates),
+                  "strong_candidate_count": len(strong_candidates),
+                  "product_hits": product_hits,
+                  "signals": {
+                      "chain_or_posterior_signal": has_chain,
+                      "covariance_signal": has_cov,
+                      "likelihood_signal": has_likelihood,
+                      "data_vector_signal": has_data_vector,
+                      "bao_signal": has_bao,
+                      "planck_signal": has_planck
+                  },
+                  "expected_products": source["expected"]
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_14_status": "chain_derived_anchor_rebuild_passed_ready_for_v3_15_raw_product_expansion",
+                  "v3_14_next_allowed_step": "Build v3.15 raw product expansion: add source-specific product discovery for DES Y3, HSC Y3, DESI DR1 BAO, and Planck."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": [],
+              "seed_page_probes": [],
+              "candidate_links": [],
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.15 raw product expansion discovery")
+          print("Truth boundary: discovery only; no model fit; no validation claim.")
+          print()
+
+          for source in SOURCES:
+              print(f"Checking {source['source']} [{source['surface']}]")
+              seed_results = []
+              all_candidates = []
+
+              for seed in source["seed_urls"]:
+                  seed_probe = fetch_url(seed)
+                  seed_record = {
+                      "source": source["source"],
+                      "surface": source["surface"],
+                      "seed_url": seed,
+                      "ok": seed_probe["ok"],
+                      "status": seed_probe["status"],
+                      "final_url": seed_probe["final_url"],
+                      "content_type": seed_probe["content_type"],
+                      "content_length": seed_probe["content_length"],
+                      "bytes_read": seed_probe["bytes_read"],
+                      "product_hits": product_term_hits(seed_probe["text"]),
+                      "error": seed_probe["error"]
+                  }
+
+                  seed_results.append(seed_record)
+                  inventory["seed_page_probes"].append(seed_record)
+
+                  print(f"  seed {seed_probe['status']} ok={seed_probe['ok']} {seed}")
+
+                  if seed_probe["ok"]:
+                      links = extract_links(seed_probe["final_url"] or seed, seed_probe["text"])
+
+                      for link in links:
+                          score, hits, direct = score_candidate(link, seed_probe["text"][:4000])
+                          if score <= 0:
+                              continue
+
+                          all_candidates.append({
+                              "source": source["source"],
+                              "surface": source["surface"],
+                              "parent_seed": seed,
+                              "candidate_url": link,
+                              "candidate_score": score,
+                              "product_hits": hits,
+                              "direct_resource": direct,
+                              "probed": False,
+                              "probe_ok": None,
+                              "probe_status": None,
+                              "probe_content_type": None,
+                              "probe_content_length": None,
+                              "probe_error": None
+                          })
+
+                  time.sleep(0.25)
+
+              # Deduplicate and keep top candidates.
+              deduped = {}
+              for cand in all_candidates:
+                  url = cand["candidate_url"]
+                  if url not in deduped or cand["candidate_score"] > deduped[url]["candidate_score"]:
+                      deduped[url] = cand
+
+              top_candidates = sorted(
+                  deduped.values(),
+                  key=lambda c: (-c["candidate_score"], c["candidate_url"])
+              )[:60]
+
+              # Probe only strongest/direct candidates to avoid huge downloads.
+              for cand in top_candidates[:20]:
+                  if cand["candidate_score"] < 3 and not cand["direct_resource"]:
+                      continue
+
+                  probe = fetch_url(cand["candidate_url"], max_bytes=32768, timeout=30)
+                  cand["probed"] = True
+                  cand["probe_ok"] = probe["ok"]
+                  cand["probe_status"] = probe["status"]
+                  cand["probe_content_type"] = probe["content_type"]
+                  cand["probe_content_length"] = probe["content_length"]
+                  cand["probe_error"] = probe["error"]
+
+                  # Add text hits from the probed target without storing full text.
+                  more_hits = product_term_hits(probe["text"])
+                  cand["product_hits"] = sorted(set(cand["product_hits"]) | set(more_hits))
+
+                  time.sleep(0.20)
+
+              inventory["candidate_links"].extend(top_candidates)
+              summary = classify_source(source, seed_results, top_candidates)
+              inventory["source_summaries"].append(summary)
+
+              print(f"  => {summary['discovery_status']} score={summary['readiness_score_0_to_3']}")
+              print(f"     candidates={summary['candidate_count']} direct={summary['direct_candidate_count']} strong={summary['strong_candidate_count']}")
+              print()
+
+          # Write candidate CSV.
+          candidates_csv = OUTDIR / "raw_product_candidate_links_v3_15.csv"
+          with candidates_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "parent_seed", "candidate_url",
+                  "candidate_score", "product_hits", "direct_resource",
+                  "probed", "probe_ok", "probe_status",
+                  "probe_content_type", "probe_content_length", "probe_error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for c in inventory["candidate_links"]:
+                  row = dict(c)
+                  row["product_hits"] = ";".join(row.get("product_hits", []))
+                  writer.writerow({k: row.get(k) for k in fieldnames})
+
+          # Write seed page CSV.
+          seed_csv = OUTDIR / "raw_product_seed_page_probes_v3_15.csv"
+          with seed_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "seed_url", "ok", "status",
+                  "final_url", "content_type", "content_length",
+                  "bytes_read", "product_hits", "error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for r in inventory["seed_page_probes"]:
+                  row = dict(r)
+                  row["product_hits"] = ";".join(row.get("product_hits", []))
+                  writer.writerow(row)
+
+          # Write summary CSV.
+          summary_csv = OUTDIR / "raw_product_expansion_summary_v3_15.csv"
+          with summary_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "target_type",
+                  "discovery_status", "readiness_score_0_to_3",
+                  "reachable_seed_count", "candidate_count",
+                  "direct_candidate_count", "strong_candidate_count",
+                  "product_hits",
+                  "chain_or_posterior_signal",
+                  "covariance_signal",
+                  "likelihood_signal",
+                  "data_vector_signal",
+                  "bao_signal",
+                  "planck_signal"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+
+              for s in inventory["source_summaries"]:
+                  writer.writerow({
+                      "source": s["source"],
+                      "surface": s["surface"],
+                      "target_type": s["target_type"],
+                      "discovery_status": s["discovery_status"],
+                      "readiness_score_0_to_3": s["readiness_score_0_to_3"],
+                      "reachable_seed_count": s["reachable_seed_count"],
+                      "candidate_count": s["candidate_count"],
+                      "direct_candidate_count": s["direct_candidate_count"],
+                      "strong_candidate_count": s["strong_candidate_count"],
+                      "product_hits": ";".join(s["product_hits"]),
+                      "chain_or_posterior_signal": s["signals"]["chain_or_posterior_signal"],
+                      "covariance_signal": s["signals"]["covariance_signal"],
+                      "likelihood_signal": s["signals"]["likelihood_signal"],
+                      "data_vector_signal": s["signals"]["data_vector_signal"],
+                      "bao_signal": s["signals"]["bao_signal"],
+                      "planck_signal": s["signals"]["planck_signal"]
+                  })
+
+          direct_ready = [
+              s for s in inventory["source_summaries"]
+              if s["discovery_status"] == "direct_product_candidates_found_ready_for_shape_probe"
+          ]
+          followup_ready = [
+              s for s in inventory["source_summaries"]
+              if s["readiness_score_0_to_3"] >= 2
+          ]
+          reachable = [
+              s for s in inventory["source_summaries"]
+              if s["readiness_score_0_to_3"] >= 1
+          ]
+
+          failed_gates = []
+          if len(reachable) < 3:
+              failed_gates.append("fewer_than_three_sources_reachable")
+          if len(followup_ready) < 1:
+              failed_gates.append("no_source_ready_for_targeted_followup")
+
+          if not failed_gates and len(direct_ready) >= 2:
+              readiness_label = "raw_product_expansion_discovery_passed_multiple_sources_ready_for_shape_probe"
+          elif not failed_gates and len(followup_ready) >= 1:
+              readiness_label = "raw_product_expansion_discovery_partial_pass_targeted_followup_ready"
+          else:
+              readiness_label = "raw_product_expansion_discovery_needs_manual_source_followup"
+
+          next_targets = [
+              s["source"] for s in sorted(
+                  inventory["source_summaries"],
+                  key=lambda x: (-x["readiness_score_0_to_3"], x["source"])
+              )
+              if s["readiness_score_0_to_3"] >= 2
+          ]
+
+          if not next_targets:
+              next_step = "Manually inspect the official source pages and add explicit product URLs before v3.16."
+          else:
+              next_step = "Build v3.16 source-specific shape probes for: " + ", ".join(next_targets) + "."
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "reachable_source_count": len(reachable),
+              "followup_ready_source_count": len(followup_ready),
+              "direct_ready_source_count": len(direct_ready),
+              "direct_ready_sources": [s["source"] for s in direct_ready],
+              "followup_ready_sources": next_targets,
+              "model_claim_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_15_raw_product_expansion_discovery.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.15 — Raw Product Expansion Discovery")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.15 expands beyond the two already-ingested sources by discovering raw or semi-raw product paths for DES Y3, HSC Y3, DESI DR1 BAO, and Planck.")
+          md.append("")
+          md.append("This test does not download large science products. It probes seed pages, extracts candidate links, scores them, and identifies the next source-specific shape-probe targets.")
+          md.append("")
+          md.append("## Source summary")
+          md.append("")
+          md.append("| Source | Surface | Status | Score | Reachable seeds | Candidates | Direct | Strong |")
+          md.append("|---|---|---:|---:|---:|---:|---:|---:|")
+          for s in inventory["source_summaries"]:
+              md.append(
+                  f"| {s['source']} | {s['surface']} | `{s['discovery_status']}` | "
+                  f"{s['readiness_score_0_to_3']} | {s['reachable_seed_count']} | "
+                  f"{s['candidate_count']} | {s['direct_candidate_count']} | {s['strong_candidate_count']} |"
+              )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `raw_product_candidate_links_v3_15.csv`")
+          md.append("- `raw_product_seed_page_probes_v3_15.csv`")
+          md.append("- `raw_product_expansion_summary_v3_15.csv`")
+          md.append("- `tairid_cosmology_v3_15_raw_product_expansion_discovery.json`")
+          md.append("- `tairid_cosmology_v3_15_raw_product_expansion_discovery.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_15_raw_product_expansion_discovery.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.15 raw product expansion discovery artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-15-raw-product-expansion-discovery
+          path: artifacts/tairid_cosmology_v3_15/
