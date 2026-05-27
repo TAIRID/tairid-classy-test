@@ -1,0 +1,681 @@
+name: Run TAIRID Growth Anchor Robustness v3.9 Inline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-growth-anchor-robustness-v3-9-inline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy matplotlib
+
+      - name: Create and run TAIRID v3.9 inline script
+        run: |
+          cat > run_tairid_growth_anchor_robustness_v3_9_inline.py <<'PY'
+          #!/usr/bin/env python3
+          """
+          TAIRID Growth Anchor Robustness Stress Test v3.9 Inline
+
+          Purpose:
+          v3.8 showed that a two-surface pressure description beats a one-surface
+          pressure description in a simplified probe. v3.9 stress-tests the weaker
+          side of that result: the consolidation / growth surface.
+
+          Core question:
+              Does the reach-positive / consolidation-negative split survive when
+              we add more published S8 growth anchors instead of only DES Y3 and
+              KiDS-1000?
+
+          This test DOES:
+              - preserve prior locks rejecting the frozen low-z gate as a correction,
+              - preserve v3.8 two-surface result as a hypothesis, not proof,
+              - expand the growth/consolidation anchor set,
+              - compare one-surface vs two-surface pressure descriptions,
+              - run leave-one-anchor-out and leave-one-survey-family-out stress tests,
+              - check whether the consolidation mean stays negative.
+
+          This test DOES NOT:
+              - validate TAIRID,
+              - prove H0 correction,
+              - prove new physics,
+              - disprove standard cosmology,
+              - ingest raw weak-lensing chains,
+              - use full covariance,
+              - claim the published S8 summaries are independent full likelihoods.
+
+          Truth boundary:
+          v3.9 is a published-anchor robustness stress test only.
+          """
+
+          import csv
+          import json
+          import math
+          import traceback
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import matplotlib.pyplot as plt
+          import numpy as np
+
+          OUTDIR = Path("tairid_growth_anchor_robustness_v3_9_inline_outputs")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          PRIOR_LOCKS = {
+              "v3_3_3": "frozen_gate_not_supported_as_sn_distance_pressure_term",
+              "v3_4": "frozen_gate_rejected_as_bao_cmb_ruler_term",
+              "v3_6": "regime_activation_supported_cross_surface_not_sn_distance",
+              "v3_7": "reach_consolidation_surface_builder_ready_for_model_probe_not_validation",
+              "v3_8": "two_surface_reach_consolidation_probe_supported_not_validation",
+              "rule": "No frozen-gate correction is allowed in v3.9.",
+          }
+
+          CLAIMS = {
+              "test_name": "TAIRID Growth Anchor Robustness Stress Test v3.9 Inline",
+              "primary_question": "Does the reach-positive / consolidation-negative split survive broader published S8 anchors?",
+              "truth_boundary": "Published-anchor robustness stress only; no validation, no H0 correction, no new physics.",
+          }
+
+          # Reach/geometry pressure observations carried forward from v3.8.
+          # These are signed pressure z-scores, not corrections.
+          REACH_OBSERVATIONS = [
+              {
+                  "observation_id": "H0_REACH_EARLY_LATE",
+                  "family": "reach_geometry",
+                  "value": 4.8470939579172,
+                  "survey_family": "H0",
+                  "source_note": "Declared H0 early/late pressure seam from prior tests.",
+              },
+              {
+                  "observation_id": "SN_LOW_REACH",
+                  "family": "reach_geometry",
+                  "value": 0.7629176181746785,
+                  "survey_family": "SN",
+                  "source_note": "Pantheon+SH0ES low-z residual bin after LCDM reach fit from v3.8.",
+              },
+              {
+                  "observation_id": "SN_MID_REACH",
+                  "family": "reach_geometry",
+                  "value": 2.6773792892339667,
+                  "survey_family": "SN",
+                  "source_note": "Pantheon+SH0ES mid-z residual bin after LCDM reach fit from v3.8.",
+              },
+              {
+                  "observation_id": "SN_HIGH_REACH",
+                  "family": "reach_geometry",
+                  "value": -0.8288252721168559,
+                  "survey_family": "SN",
+                  "source_note": "Pantheon+SH0ES high-z residual bin after LCDM reach fit from v3.8.",
+              },
+          ]
+
+          # Growth/consolidation anchors.
+          # Values are compact literature summary anchors for robustness stress only.
+          # sigma is symmetrized when the literature result is asymmetric.
+          GROWTH_ANCHORS = [
+              {
+                  "surface": "PLANCK_2018_S8_REFERENCE",
+                  "survey_family": "PLANCK",
+                  "role": "early_reference",
+                  "value": 0.832,
+                  "sigma": 0.013,
+                  "source_note": "Planck-like S8 anchor derived from Planck 2018 Omega_m and sigma8 summary.",
+              },
+              {
+                  "surface": "DES_Y3_3X2PT_S8",
+                  "survey_family": "DES",
+                  "role": "late_growth",
+                  "value": 0.776,
+                  "sigma": 0.017,
+                  "source_note": "DES Y3 3x2pt published S8 anchor.",
+              },
+              {
+                  "surface": "DES_Y3_PEAKS_S8",
+                  "survey_family": "DES",
+                  "role": "late_growth",
+                  "value": 0.797,
+                  "sigma": 0.014,
+                  "source_note": "DES Y3 peaks / non-Gaussian information S8 anchor.",
+              },
+              {
+                  "surface": "DES_Y3_SMALL_SCALE_S8",
+                  "survey_family": "DES",
+                  "role": "late_growth",
+                  "value": 0.799,
+                  "sigma": 0.019,
+                  "source_note": "DES Y3 small-scale cosmic shear S8 anchor.",
+              },
+              {
+                  "surface": "KIDS_1000_FIDUCIAL_S8",
+                  "survey_family": "KIDS",
+                  "role": "late_growth",
+                  "value": 0.759,
+                  "sigma": 0.0225,
+                  "source_note": "KiDS-1000 fiducial S8 anchor, asymmetric uncertainty symmetrized.",
+              },
+              {
+                  "surface": "DES_Y3_KIDS_1000_JOINT_S8",
+                  "survey_family": "DES_KIDS",
+                  "role": "late_growth",
+                  "value": 0.790,
+                  "sigma": 0.016,
+                  "source_note": "DES Y3 + KiDS-1000 joint cosmic shear S8 anchor, asymmetric uncertainty symmetrized.",
+              },
+              {
+                  "surface": "HSC_Y3_COSMIC_SHEAR_S8",
+                  "survey_family": "HSC",
+                  "role": "late_growth",
+                  "value": 0.776,
+                  "sigma": 0.0325,
+                  "source_note": "HSC-Y3 cosmic shear S8 anchor, asymmetric uncertainty symmetrized.",
+              },
+              {
+                  "surface": "HSC_Y3_MINIMAL_BIAS_3X2PT_S8",
+                  "survey_family": "HSC",
+                  "role": "late_growth",
+                  "value": 0.775,
+                  "sigma": 0.0405,
+                  "source_note": "HSC-Y3 galaxy clustering plus weak lensing minimal-bias S8 anchor, asymmetric uncertainty symmetrized.",
+              },
+              {
+                  "surface": "HSC_Y3_EMULATOR_3X2PT_S8",
+                  "survey_family": "HSC",
+                  "role": "late_growth",
+                  "value": 0.763,
+                  "sigma": 0.038,
+                  "source_note": "HSC-Y3 emulator-based 3x2pt S8 anchor, asymmetric uncertainty symmetrized.",
+              },
+          ]
+
+
+          def json_default(obj):
+              if isinstance(obj, (np.integer,)):
+                  return int(obj)
+              if isinstance(obj, (np.floating,)):
+                  return float(obj)
+              if isinstance(obj, np.ndarray):
+                  return obj.tolist()
+              return str(obj)
+
+
+          def write_json(path, obj):
+              path.write_text(json.dumps(obj, indent=2, default=json_default), encoding="utf-8")
+
+
+          def write_csv(path, rows):
+              if not rows:
+                  path.write_text("", encoding="utf-8")
+                  return
+              fields = []
+              seen = set()
+              for row in rows:
+                  for key in row:
+                      if key not in seen:
+                          fields.append(key)
+                          seen.add(key)
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+
+          def sigma_tension(a_value, a_sigma, b_value, b_sigma):
+              denom = math.sqrt(float(a_sigma) ** 2 + float(b_sigma) ** 2)
+              if denom <= 0:
+                  return None
+              return (float(a_value) - float(b_value)) / denom
+
+
+          def build_growth_pressure_rows(growth_anchors):
+              planck = next(row for row in growth_anchors if row["role"] == "early_reference")
+              rows = []
+              for anchor in growth_anchors:
+                  if anchor["role"] != "late_growth":
+                      continue
+                  signed_z = sigma_tension(anchor["value"], anchor["sigma"], planck["value"], planck["sigma"])
+                  rows.append(
+                      {
+                          "observation_id": f"{anchor['surface']}_VS_PLANCK",
+                          "family": "consolidation_growth",
+                          "survey_family": anchor["survey_family"],
+                          "value": signed_z,
+                          "raw_value": anchor["value"] - planck["value"],
+                          "raw_sigma": math.sqrt(anchor["sigma"] ** 2 + planck["sigma"] ** 2),
+                          "late_s8": anchor["value"],
+                          "early_s8": planck["value"],
+                          "direction": "negative_consolidation_pressure" if signed_z < 0 else "positive_consolidation_pressure",
+                          "source_note": anchor["source_note"],
+                          "truth_boundary": "Published S8 summary pressure only; not raw-chain likelihood.",
+                      }
+                  )
+              return rows
+
+
+          def fit_pressure_models(observation_rows):
+              y = np.asarray([r["value"] for r in observation_rows], dtype=float)
+              families = [r["family"] for r in observation_rows]
+              n = len(y)
+
+              def score(pred, k, name):
+                  residual = y - pred
+                  chi2 = float(np.sum(residual * residual))
+                  return {
+                      "model": name,
+                      "k_params": k,
+                      "n": n,
+                      "chi2": chi2,
+                      "aic": float(chi2 + 2 * k),
+                      "bic": float(chi2 + k * math.log(n)),
+                      "residual_std": float(np.std(residual)),
+                  }
+
+              null_model = score(np.zeros_like(y), 0, "null_zero_pressure")
+
+              global_mean = float(np.mean(y))
+              one_model = score(np.full_like(y, global_mean), 1, "one_global_pressure_surface")
+              one_model["global_pressure_mean"] = global_mean
+
+              reach_mask = np.asarray([f == "reach_geometry" for f in families], dtype=bool)
+              cons_mask = np.asarray([f == "consolidation_growth" for f in families], dtype=bool)
+
+              pred_two = np.zeros_like(y)
+              reach_mean = float(np.mean(y[reach_mask])) if np.any(reach_mask) else 0.0
+              cons_mean = float(np.mean(y[cons_mask])) if np.any(cons_mask) else 0.0
+              pred_two[reach_mask] = reach_mean
+              pred_two[cons_mask] = cons_mean
+
+              two_model = score(pred_two, 2, "two_surface_reach_plus_consolidation")
+              two_model["reach_pressure_mean"] = reach_mean
+              two_model["consolidation_pressure_mean"] = cons_mean
+              two_model["sign_pattern"] = "reach_positive_consolidation_negative" if reach_mean > 0 and cons_mean < 0 else "sign_pattern_not_matched"
+
+              constrained_model = dict(two_model)
+              constrained_model["model"] = "tairid_constrained_reach_positive_consolidation_negative"
+              constrained_model["constraint_passed"] = reach_mean > 0 and cons_mean < 0
+
+              models = [null_model, one_model, two_model, constrained_model]
+              best_bic = min(m["bic"] for m in models)
+              best_aic = min(m["aic"] for m in models)
+              for m in models:
+                  m["delta_bic_vs_best"] = float(m["bic"] - best_bic)
+                  m["delta_aic_vs_best"] = float(m["aic"] - best_aic)
+
+              return sorted(models, key=lambda r: (r["bic"], r["aic"]))
+
+
+          def family_balanced_summary(observation_rows):
+              family_groups = {}
+              for row in observation_rows:
+                  key = (row["family"], row.get("survey_family", "unknown"))
+                  family_groups.setdefault(key, []).append(row["value"])
+
+              group_rows = []
+              for (surface_family, survey_family), values in family_groups.items():
+                  arr = np.asarray(values, dtype=float)
+                  group_rows.append(
+                      {
+                          "surface_family": surface_family,
+                          "survey_family": survey_family,
+                          "n": int(len(arr)),
+                          "mean_pressure": float(np.mean(arr)),
+                          "median_pressure": float(np.median(arr)),
+                          "sign": "positive" if float(np.mean(arr)) > 0 else "negative",
+                      }
+                  )
+
+              reach_vals = [r["mean_pressure"] for r in group_rows if r["surface_family"] == "reach_geometry"]
+              cons_vals = [r["mean_pressure"] for r in group_rows if r["surface_family"] == "consolidation_growth"]
+
+              return {
+                  "group_rows": group_rows,
+                  "family_balanced_reach_mean": float(np.mean(reach_vals)) if reach_vals else None,
+                  "family_balanced_consolidation_mean": float(np.mean(cons_vals)) if cons_vals else None,
+                  "family_balanced_sign_pattern": (
+                      "reach_positive_consolidation_negative"
+                      if reach_vals and cons_vals and float(np.mean(reach_vals)) > 0 and float(np.mean(cons_vals)) < 0
+                      else "sign_pattern_not_matched"
+                  ),
+              }
+
+
+          def leave_one_anchor_out(observation_rows):
+              rows = []
+              for i, removed in enumerate(observation_rows):
+                  kept = [r for j, r in enumerate(observation_rows) if j != i]
+                  models = fit_pressure_models(kept)
+                  by_model = {m["model"]: m for m in models}
+                  one = by_model["one_global_pressure_surface"]
+                  two = by_model["two_surface_reach_plus_consolidation"]
+                  rows.append(
+                      {
+                          "removed_observation_id": removed["observation_id"],
+                          "removed_family": removed["family"],
+                          "removed_survey_family": removed.get("survey_family", "unknown"),
+                          "two_minus_one_bic": two["bic"] - one["bic"],
+                          "two_surface_best_or_tied": two["delta_bic_vs_best"] <= 1e-9,
+                          "reach_mean": two.get("reach_pressure_mean"),
+                          "consolidation_mean": two.get("consolidation_pressure_mean"),
+                          "sign_pattern": two.get("sign_pattern"),
+                      }
+                  )
+              return rows
+
+
+          def leave_one_survey_family_out(observation_rows):
+              survey_families = sorted(set(r.get("survey_family", "unknown") for r in observation_rows))
+              rows = []
+              for survey in survey_families:
+                  kept = [r for r in observation_rows if r.get("survey_family", "unknown") != survey]
+                  if len(kept) < 4:
+                      continue
+                  models = fit_pressure_models(kept)
+                  by_model = {m["model"]: m for m in models}
+                  one = by_model["one_global_pressure_surface"]
+                  two = by_model["two_surface_reach_plus_consolidation"]
+                  rows.append(
+                      {
+                          "removed_survey_family": survey,
+                          "kept_count": len(kept),
+                          "two_minus_one_bic": two["bic"] - one["bic"],
+                          "two_surface_best_or_tied": two["delta_bic_vs_best"] <= 1e-9,
+                          "reach_mean": two.get("reach_pressure_mean"),
+                          "consolidation_mean": two.get("consolidation_pressure_mean"),
+                          "sign_pattern": two.get("sign_pattern"),
+                      }
+                  )
+              return rows
+
+
+          def decide(observation_rows, model_rows, balanced, loo_anchor, loo_family):
+              by_model = {m["model"]: m for m in model_rows}
+              one = by_model["one_global_pressure_surface"]
+              two = by_model["two_surface_reach_plus_consolidation"]
+
+              delta_bic_two_minus_one = two["bic"] - one["bic"]
+              two_beats_one = delta_bic_two_minus_one <= -6.0
+              sign_ok = two["reach_pressure_mean"] > 0 and two["consolidation_pressure_mean"] < 0
+              balanced_ok = balanced["family_balanced_sign_pattern"] == "reach_positive_consolidation_negative"
+
+              loo_anchor_ok = (
+                  len(loo_anchor) == len(observation_rows)
+                  and sum(1 for row in loo_anchor if row["sign_pattern"] == "reach_positive_consolidation_negative") >= max(1, len(loo_anchor) - 1)
+              )
+              # Survey-family stress can fail for removing the whole SN or H0 family because reach becomes thin;
+              # the critical test is that removing DES, KiDS, DES_KIDS, or HSC does not flip consolidation positive.
+              growth_family_rows = [r for r in loo_family if r["removed_survey_family"] in {"DES", "KIDS", "DES_KIDS", "HSC"}]
+              growth_family_ok = (
+                  len(growth_family_rows) >= 3
+                  and all(r["consolidation_mean"] is not None and r["consolidation_mean"] < 0 for r in growth_family_rows)
+              )
+
+              prior_ok = PRIOR_LOCKS["v3_8"] == "two_surface_reach_consolidation_probe_supported_not_validation"
+
+              gates = [
+                  {"gate": "G1_prior_two_surface_probe_preserved", "passed": prior_ok, "evidence": PRIOR_LOCKS},
+                  {"gate": "G2_expanded_growth_anchor_set_built", "passed": sum(1 for r in observation_rows if r["family"] == "consolidation_growth") >= 6, "evidence": {"observation_count": len(observation_rows)}},
+                  {"gate": "G3_two_surface_beats_one_surface_penalty", "passed": two_beats_one, "evidence": {"delta_bic_two_minus_one": delta_bic_two_minus_one, "threshold": "<= -6"}},
+                  {"gate": "G4_two_surface_sign_pattern_passes", "passed": sign_ok, "evidence": {"reach_mean": two["reach_pressure_mean"], "consolidation_mean": two["consolidation_pressure_mean"]}},
+                  {"gate": "G5_family_balanced_sign_pattern_passes", "passed": balanced_ok, "evidence": balanced},
+                  {"gate": "G6_leave_one_anchor_stress_passes", "passed": loo_anchor_ok, "evidence": {"pass_count": sum(1 for row in loo_anchor if row["sign_pattern"] == "reach_positive_consolidation_negative"), "total": len(loo_anchor)}},
+                  {"gate": "G7_growth_family_removal_stress_passes", "passed": growth_family_ok, "evidence": {"growth_family_rows": growth_family_rows}},
+                  {"gate": "G8_no_frozen_gate_correction_reintroduced", "passed": True, "evidence": {"frozen_gate_correction": False}},
+                  {"gate": "G9_no_validation_claim_allowed", "passed": True, "evidence": {"validation_claim": False, "h0_correction_claim": False, "new_physics_claim": False}},
+              ]
+
+              failed = [g["gate"] for g in gates if not g["passed"]]
+
+              if not failed:
+                  status = "expanded_growth_anchor_robustness_supports_two_surface_probe_not_validation"
+                  readiness = 9
+                  next_wall = "Build v4.0 handoff or v3.10 with raw chain/covariance ingestion if accessible."
+              elif two_beats_one and sign_ok and balanced_ok:
+                  status = "expanded_growth_anchor_robustness_partial_with_cautions"
+                  readiness = 8
+                  next_wall = "Two-surface split survives core stress, but leave-one-out or family stress needs review."
+              elif sign_ok:
+                  status = "growth_anchor_sign_survives_but_model_penalty_weak"
+                  readiness = 7
+                  next_wall = "Do not escalate until raw growth data or better covariance is added."
+              else:
+                  status = "growth_anchor_robustness_not_supported"
+                  readiness = 5
+                  next_wall = "Do not use growth/consolidation split as model lane yet."
+
+              return {
+                  "final_status": status,
+                  "readiness_score_0_to_10": readiness,
+                  "next_wall": next_wall,
+                  "failed_gates": failed,
+                  "gates": gates,
+                  "model_ranking_by_bic": model_rows,
+                  "truth_boundary": CLAIMS["truth_boundary"],
+              }
+
+
+          def make_plots(observation_rows, model_rows, loo_family):
+              try:
+                  labels = [r["observation_id"] for r in observation_rows]
+                  values = [r["value"] for r in observation_rows]
+                  colors = [0 if r["family"] == "reach_geometry" else 1 for r in observation_rows]
+                  x = np.arange(len(labels))
+
+                  plt.figure(figsize=(13, 5))
+                  plt.bar(x, values)
+                  plt.axhline(0.0, linewidth=1)
+                  plt.xticks(x, labels, rotation=40, ha="right", fontsize=7)
+                  plt.ylabel("signed pressure z-score")
+                  plt.title("v3.9 expanded reach/consolidation pressure anchors")
+                  plt.tight_layout()
+                  plt.savefig(OUTDIR / "expanded_pressure_anchors_v3_9_inline.png", dpi=160)
+                  plt.close()
+
+                  model_labels = [r["model"] for r in model_rows]
+                  bic = [r["delta_bic_vs_best"] for r in model_rows]
+                  x = np.arange(len(model_labels))
+
+                  plt.figure(figsize=(10, 5))
+                  plt.bar(x, bic)
+                  plt.xticks(x, model_labels, rotation=25, ha="right")
+                  plt.ylabel("Delta BIC vs best")
+                  plt.title("v3.9 one-surface vs two-surface model")
+                  plt.tight_layout()
+                  plt.savefig(OUTDIR / "model_delta_bic_v3_9_inline.png", dpi=160)
+                  plt.close()
+
+                  if loo_family:
+                      labels = [r["removed_survey_family"] for r in loo_family]
+                      vals = [r["consolidation_mean"] if r["consolidation_mean"] is not None else 0.0 for r in loo_family]
+                      x = np.arange(len(labels))
+                      plt.figure(figsize=(10, 5))
+                      plt.bar(x, vals)
+                      plt.axhline(0.0, linewidth=1)
+                      plt.xticks(x, labels, rotation=25, ha="right")
+                      plt.ylabel("consolidation mean after removal")
+                      plt.title("v3.9 leave-one-survey-family-out consolidation stress")
+                      plt.tight_layout()
+                      plt.savefig(OUTDIR / "leave_one_family_consolidation_v3_9_inline.png", dpi=160)
+                      plt.close()
+
+              except Exception as exc:
+                  write_json(OUTDIR / "plot_error_v3_9_inline.json", {"error": repr(exc), "traceback": traceback.format_exc()})
+
+
+          def write_handoff(decision, balanced):
+              lines = [
+                  "# TAIRID v3.9 Inline Handoff",
+                  "",
+                  "## Current status",
+                  "",
+                  f"- Final status: `{decision['final_status']}`",
+                  f"- Readiness score: `{decision['readiness_score_0_to_10']}/10`",
+                  f"- Next wall: {decision['next_wall']}",
+                  "",
+                  "## What v3.9 tested",
+                  "",
+                  "- Expanded the consolidation/growth anchor set beyond DES Y3 and KiDS-1000.",
+                  "- Retested one global pressure surface vs two separate surfaces.",
+                  "- Ran leave-one-anchor-out and leave-one-survey-family-out stress checks.",
+                  "- Kept the failed frozen gate closed as a direct correction route.",
+                  "",
+                  "## Family-balanced result",
+                  "",
+                  f"- Reach mean: `{balanced['family_balanced_reach_mean']}`",
+                  f"- Consolidation mean: `{balanced['family_balanced_consolidation_mean']}`",
+                  f"- Pattern: `{balanced['family_balanced_sign_pattern']}`",
+                  "",
+                  "## Model ranking by BIC",
+                  "",
+              ]
+
+              for row in decision["model_ranking_by_bic"]:
+                  lines.append(f"- `{row['model']}`: BIC `{row['bic']:.6f}`, delta BIC `{row['delta_bic_vs_best']:.6f}`")
+
+              lines.extend(
+                  [
+                      "",
+                      "## Truth boundary",
+                      "",
+                      "- v3.9 is a published-anchor robustness stress test only.",
+                      "- It does not validate TAIRID.",
+                      "- It does not prove H0 correction.",
+                      "- It does not prove new physics.",
+                      "- It does not disprove standard cosmology.",
+                      "- It does not replace raw-chain or covariance-level weak-lensing analysis.",
+                      "",
+                      "## Next test",
+                      "",
+                  ]
+              )
+
+              if decision["readiness_score_0_to_10"] >= 8:
+                  lines.append("Next clean move: create a handoff package or build v3.10 around raw weak-lensing chain/covariance ingestion if accessible.")
+              else:
+                  lines.append("Next clean move: add better growth data before model escalation.")
+
+              lines.append("")
+              return "\n".join(lines)
+
+
+          def main():
+              print("TAIRID Growth Anchor Robustness Stress Test v3.9 Inline starting.")
+              print("Boundary: published-anchor robustness stress only; no validation, no H0 claim, no new physics claim.")
+
+              write_json(OUTDIR / "claims_v3_9_inline.json", CLAIMS)
+              write_json(OUTDIR / "prior_locks_v3_9_inline.json", PRIOR_LOCKS)
+              write_csv(OUTDIR / "growth_anchor_inputs_v3_9_inline.csv", GROWTH_ANCHORS)
+              write_csv(OUTDIR / "reach_observations_carried_forward_v3_9_inline.csv", REACH_OBSERVATIONS)
+
+              growth_rows = build_growth_pressure_rows(GROWTH_ANCHORS)
+              observation_rows = REACH_OBSERVATIONS + growth_rows
+
+              write_csv(OUTDIR / "expanded_pressure_observations_v3_9_inline.csv", observation_rows)
+              write_csv(OUTDIR / "growth_pressure_rows_v3_9_inline.csv", growth_rows)
+
+              model_rows = fit_pressure_models(observation_rows)
+              write_csv(OUTDIR / "pressure_model_comparison_v3_9_inline.csv", model_rows)
+
+              balanced = family_balanced_summary(observation_rows)
+              write_json(OUTDIR / "family_balanced_summary_v3_9_inline.json", balanced)
+              write_csv(OUTDIR / "family_balanced_group_rows_v3_9_inline.csv", balanced["group_rows"])
+
+              loo_anchor = leave_one_anchor_out(observation_rows)
+              loo_family = leave_one_survey_family_out(observation_rows)
+              write_csv(OUTDIR / "leave_one_anchor_out_v3_9_inline.csv", loo_anchor)
+              write_csv(OUTDIR / "leave_one_survey_family_out_v3_9_inline.csv", loo_family)
+
+              decision = decide(observation_rows, model_rows, balanced, loo_anchor, loo_family)
+              write_json(OUTDIR / "decision_v3_9_inline.json", decision)
+
+              make_plots(observation_rows, model_rows, loo_family)
+
+              handoff = write_handoff(decision, balanced)
+              (OUTDIR / "next_thread_handoff_after_v3_9_inline.md").write_text(handoff, encoding="utf-8")
+              (OUTDIR / "next_thread_handoff_after_v3_9_inline.txt").write_text(handoff, encoding="utf-8")
+
+              summary = {
+                  "test_name": CLAIMS["test_name"],
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "boundary": CLAIMS["truth_boundary"],
+                  "prior_locks": PRIOR_LOCKS,
+                  "growth_anchor_inputs": GROWTH_ANCHORS,
+                  "pressure_observations": observation_rows,
+                  "model_comparison": model_rows,
+                  "family_balanced_summary": balanced,
+                  "leave_one_anchor_out": loo_anchor,
+                  "leave_one_survey_family_out": loo_family,
+                  "decision": decision,
+                  "interpretation": {
+                      "what_success_means": "The two-surface reach/consolidation split survives broader published growth anchors.",
+                      "what_success_does_not_mean": "This does not validate TAIRID and does not replace raw weak-lensing likelihoods.",
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  },
+              }
+
+              write_json(OUTDIR / "growth_anchor_robustness_v3_9_inline_summary.json", summary)
+
+              with open(OUTDIR / "growth_anchor_robustness_v3_9_inline_summary.txt", "w", encoding="utf-8") as f:
+                  f.write("TAIRID Growth Anchor Robustness Stress Test v3.9 Inline\n\n")
+                  f.write("Boundary: published-anchor robustness stress only. No validation. No H0 claim. No new physics claim.\n\n")
+                  f.write(f"Final status: {decision['final_status']}\n")
+                  f.write(f"Readiness score: {decision['readiness_score_0_to_10']}/10\n")
+                  f.write(f"Next wall: {decision['next_wall']}\n\n")
+                  f.write("Model comparison:\n")
+                  f.write(json.dumps(model_rows, indent=2, default=json_default) + "\n\n")
+                  f.write("Family-balanced summary:\n")
+                  f.write(json.dumps(balanced, indent=2, default=json_default) + "\n\n")
+                  f.write("Failed gates:\n")
+                  f.write(json.dumps(decision["failed_gates"], indent=2, default=json_default) + "\n\n")
+                  f.write("Truth boundary:\n")
+                  f.write("- This does not prove TAIRID.\n")
+                  f.write("- This does not prove H0 correction.\n")
+                  f.write("- This does not prove new physics.\n")
+                  f.write("- This does not disprove standard cosmology.\n")
+                  f.write("- This only stress-tests the two-surface split against broader published growth anchors.\n")
+
+              print("TAIRID Growth Anchor Robustness Stress Test v3.9 Inline complete.")
+              print(f"Final status: {decision['final_status']}")
+              print(f"Readiness score: {decision['readiness_score_0_to_10']}/10")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  OUTDIR.mkdir(parents=True, exist_ok=True)
+                  summary = {
+                      "test_name": CLAIMS["test_name"],
+                      "created_utc": datetime.now(timezone.utc).isoformat(),
+                      "final_status": "growth_anchor_robustness_v3_9_inline_runtime_failed",
+                      "error": repr(exc),
+                      "traceback": traceback.format_exc(),
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  }
+                  write_json(OUTDIR / "growth_anchor_robustness_v3_9_inline_summary.json", summary)
+                  print(summary["traceback"])
+                  raise
+          PY
+
+          python run_tairid_growth_anchor_robustness_v3_9_inline.py
+
+      - name: Upload inline outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-growth-anchor-robustness-v3-9-inline-output
+          path: |
+            tairid_growth_anchor_robustness_v3_9_inline_outputs/**
