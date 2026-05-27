@@ -1,0 +1,465 @@
+name: TAIRID Cosmology v3.28.1 TDCOSMO Parser Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tdcosmo-parser-fix:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.28.1 TDCOSMO parser fix
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_28_1
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import shutil
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_28_1")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_28_1_tdcosmo_parser_fix"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This fixes the v3.28 TDCOSMO parser failure caused by '-' missing-value fields.",
+              "TDCOSMO time-delay distance rows are ingested as independent reach diagnostics only.",
+              "Unavailable Dd angular-diameter distance fields are recorded as missing, not treated as failure.",
+              "Binary posterior products are downloaded as shape-only companions and are not parsed here.",
+              "A pass only means TDCOSMO is ready to join the v3.29 standardization audit.",
+              "No row may be promoted to model-anchor status in this workflow."
+          ]
+
+          TDCOSMO_PRODUCTS = {
+              "posterior_table_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv",
+              "processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_processed.pkl",
+              "om_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed.pkl",
+              "om_kappa_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed_with_kappa.pkl"
+          }
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.28.1-tdcosmo-parser-fix/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def parse_float_or_none(value):
+              if value is None:
+                  return None
+
+              text = str(value).strip()
+              if text in ["", "-", "--", "nan", "NaN", "NAN", "None", "null"]:
+                  return None
+
+              try:
+                  x = float(text)
+              except Exception:
+                  return None
+
+              if not math.isfinite(x):
+                  return None
+
+              return x
+
+          def ingest_tdcosmo():
+              td_dir = DOWNLOADS / "TDCOSMO_2020"
+              td_dir.mkdir(parents=True, exist_ok=True)
+
+              table_path = td_dir / safe_name(TDCOSMO_PRODUCTS["posterior_table_url"])
+              downloads = [download(TDCOSMO_PRODUCTS["posterior_table_url"], table_path)]
+
+              binary_records = []
+              for key in ["processed_pkl_url", "om_processed_pkl_url", "om_kappa_processed_pkl_url"]:
+                  url = TDCOSMO_PRODUCTS[key]
+                  path = td_dir / safe_name(url)
+                  record = download(url, path)
+                  downloads.append(record)
+                  binary_records.append({
+                      "product": key,
+                      "url": url,
+                      "path": str(path),
+                      "size_bytes": record["size_bytes"],
+                      "shape_only": True,
+                      "boundary": "Binary posterior product downloaded for later source-specific parser; not parsed in v3.28.1."
+                  })
+
+              with table_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                  reader = csv.DictReader(f)
+                  rows = list(reader)
+                  fieldnames = reader.fieldnames or []
+
+              required = ["name", "z_lens", "z_source", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma", "flag"]
+              missing = [c for c in required if c not in fieldnames]
+              if missing:
+                  raise RuntimeError(f"TDCOSMO posterior table missing columns: {missing}")
+
+              ledger_rows = []
+              skipped_rows = []
+
+              valid_ddt_count = 0
+              valid_dd_count = 0
+              invalid_flag_count = 0
+
+              for i, row in enumerate(rows):
+                  name = row.get("name", f"row_{i}")
+                  flag = parse_float_or_none(row.get("flag"))
+
+                  z_lens = parse_float_or_none(row.get("z_lens"))
+                  z_source = parse_float_or_none(row.get("z_source"))
+
+                  ddt_mean = parse_float_or_none(row.get("Ddt_mean"))
+                  ddt_sigma = parse_float_or_none(row.get("Ddt_sigma"))
+
+                  dd_mean = parse_float_or_none(row.get("Dd_mean"))
+                  dd_sigma = parse_float_or_none(row.get("Dd_sigma"))
+
+                  if flag is not None and flag < 0:
+                      invalid_flag_count += 1
+
+                  if z_lens is None or z_source is None:
+                      skipped_rows.append({
+                          "name": name,
+                          "row_index": i,
+                          "reason": "missing_z_lens_or_z_source",
+                          "flag": row.get("flag"),
+                          "Ddt_mean": row.get("Ddt_mean"),
+                          "Ddt_sigma": row.get("Ddt_sigma"),
+                          "Dd_mean": row.get("Dd_mean"),
+                          "Dd_sigma": row.get("Dd_sigma")
+                      })
+                      continue
+
+                  if ddt_mean is not None and ddt_sigma is not None and ddt_sigma > 0:
+                      valid_ddt_count += 1
+                      ledger_rows.append({
+                          "source": "TDCOSMO_2020",
+                          "surface": "reach_geometry",
+                          "family": "TDCOSMO_time_delay",
+                          "entry_role": "independent_time_delay_reach_diagnostic",
+                          "parameter": "Ddt_time_delay_distance",
+                          "lens_name": name,
+                          "row_index": i,
+                          "z_lens": z_lens,
+                          "z_source": z_source,
+                          "value": ddt_mean,
+                          "sigma": ddt_sigma,
+                          "flag": flag if flag is not None else "",
+                          "covariance_available": False,
+                          "posterior_table_available": True,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "boundary_note": "Valid TDCOSMO time-delay distance row; ingested only, not promoted."
+                      })
+                  else:
+                      skipped_rows.append({
+                          "name": name,
+                          "row_index": i,
+                          "reason": "missing_or_invalid_Ddt_mean_or_Ddt_sigma",
+                          "flag": row.get("flag"),
+                          "Ddt_mean": row.get("Ddt_mean"),
+                          "Ddt_sigma": row.get("Ddt_sigma"),
+                          "Dd_mean": row.get("Dd_mean"),
+                          "Dd_sigma": row.get("Dd_sigma")
+                      })
+
+                  if dd_mean is not None and dd_sigma is not None and dd_sigma > 0:
+                      valid_dd_count += 1
+                      ledger_rows.append({
+                          "source": "TDCOSMO_2020",
+                          "surface": "reach_geometry",
+                          "family": "TDCOSMO_time_delay",
+                          "entry_role": "independent_angular_diameter_reach_diagnostic",
+                          "parameter": "Dd_angular_diameter_distance",
+                          "lens_name": name,
+                          "row_index": i,
+                          "z_lens": z_lens,
+                          "z_source": z_source,
+                          "value": dd_mean,
+                          "sigma": dd_sigma,
+                          "flag": flag if flag is not None else "",
+                          "covariance_available": False,
+                          "posterior_table_available": True,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "boundary_note": "Valid TDCOSMO angular-diameter distance row; ingested only, not promoted."
+                      })
+
+              source_rows = [{
+                  "source": "TDCOSMO_2020",
+                  "family": "TDCOSMO_time_delay",
+                  "role": "hierarchical_time_delay_posterior_table",
+                  "table_row_count": len(rows),
+                  "valid_Ddt_row_count": valid_ddt_count,
+                  "valid_Dd_row_count": valid_dd_count,
+                  "skipped_row_count": len(skipped_rows),
+                  "invalid_flag_count": invalid_flag_count,
+                  "binary_shape_product_count": len(binary_records),
+                  "ingestion_pass": valid_ddt_count >= 10,
+                  "boundary": "Dd fields are unavailable in this table and are recorded as missing; Ddt rows are the usable reach diagnostic."
+              }]
+
+              return {
+                  "source": "TDCOSMO_2020",
+                  "surface": "reach_geometry",
+                  "ingestion_pass": valid_ddt_count >= 10,
+                  "ledger_rows": ledger_rows,
+                  "source_rows": source_rows,
+                  "skipped_rows": skipped_rows,
+                  "binary_records": binary_records,
+                  "download_count": len(downloads),
+                  "downloads": downloads,
+                  "boundary": "TDCOSMO time-delay distance rows ingested as independent reach diagnostics after missing-value parser repair."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_28_status": "independent_reach_ingestion_partial_pass_ready_for_v3_29_standardization",
+                  "v3_28_issue": "TDCOSMO parser failed on '-' missing-value fields in Dd_mean / Dd_sigma.",
+                  "v3_28_pass_sources": ["SDSS_eBOSS_DR16", "BOSS_DR12_BAO"]
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.28.1 TDCOSMO parser fix")
+          print("Truth boundary: parser repair and ingestion only; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+
+          try:
+              result = ingest_tdcosmo()
+              inventory["source_results"]["TDCOSMO_2020"] = {
+                  k: v for k, v in result.items()
+                  if k not in ["ledger_rows", "source_rows", "skipped_rows", "downloads", "binary_records"]
+              }
+          except Exception as e:
+              failed_gates.append("tdcosmo_parser_fix_exception")
+              result = {
+                  "source": "TDCOSMO_2020",
+                  "surface": "reach_geometry",
+                  "ingestion_pass": False,
+                  "ledger_rows": [],
+                  "source_rows": [],
+                  "skipped_rows": [],
+                  "binary_records": [],
+                  "error": f"{type(e).__name__}: {e}",
+                  "boundary": "TDCOSMO parser fix failed; no model claim allowed."
+              }
+              inventory["source_results"]["TDCOSMO_2020"] = result
+
+          ledger_csv = OUTDIR / "tdcosmo_parser_fix_ledger_v3_28_1.csv"
+          ledger_fields = sorted({key for row in result["ledger_rows"] for key in row.keys()}) if result["ledger_rows"] else [
+              "source", "surface", "family", "entry_role", "parameter", "lens_name", "row_index",
+              "z_lens", "z_source", "value", "sigma", "flag", "covariance_available",
+              "posterior_table_available", "included_in_model", "model_anchor_allowed_now", "boundary_note"
+          ]
+
+          with ledger_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=ledger_fields)
+              writer.writeheader()
+              for row in result["ledger_rows"]:
+                  writer.writerow({k: row.get(k, "") for k in ledger_fields})
+
+          source_csv = OUTDIR / "tdcosmo_parser_fix_source_summary_v3_28_1.csv"
+          source_fields = sorted({key for row in result["source_rows"] for key in row.keys()}) if result["source_rows"] else [
+              "source", "family", "role", "table_row_count", "valid_Ddt_row_count",
+              "valid_Dd_row_count", "skipped_row_count", "invalid_flag_count",
+              "binary_shape_product_count", "ingestion_pass", "boundary"
+          ]
+
+          with source_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=source_fields)
+              writer.writeheader()
+              for row in result["source_rows"]:
+                  writer.writerow({k: row.get(k, "") for k in source_fields})
+
+          skipped_csv = OUTDIR / "tdcosmo_parser_fix_skipped_rows_v3_28_1.csv"
+          skipped_fields = ["name", "row_index", "reason", "flag", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma"]
+
+          with skipped_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=skipped_fields)
+              writer.writeheader()
+              for row in result["skipped_rows"]:
+                  writer.writerow({k: row.get(k, "") for k in skipped_fields})
+
+          binary_csv = OUTDIR / "tdcosmo_parser_fix_binary_shape_products_v3_28_1.csv"
+          binary_fields = ["product", "url", "path", "size_bytes", "shape_only", "boundary"]
+
+          with binary_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=binary_fields)
+              writer.writeheader()
+              for row in result["binary_records"]:
+                  writer.writerow({k: row.get(k, "") for k in binary_fields})
+
+          if result.get("ingestion_pass") is not True:
+              failed_gates.append("tdcosmo_valid_ddt_rows_below_threshold")
+
+          valid_ddt_rows = 0
+          valid_dd_rows = 0
+          skipped_count = 0
+          if result.get("source_rows"):
+              valid_ddt_rows = int(result["source_rows"][0].get("valid_Ddt_row_count", 0))
+              valid_dd_rows = int(result["source_rows"][0].get("valid_Dd_row_count", 0))
+              skipped_count = int(result["source_rows"][0].get("skipped_row_count", 0))
+
+          if not failed_gates:
+              readiness_label = "tdcosmo_parser_fix_passed_ready_for_v3_29_standardization"
+          else:
+              readiness_label = "tdcosmo_parser_fix_needs_followup_before_standardization"
+
+          next_step = (
+              "Build v3.29 independent reach standardization audit using v3.28 eBOSS/BOSS outputs plus repaired v3.28.1 TDCOSMO Ddt rows, without promoting any row to model-anchor status."
+              if not failed_gates
+              else "Inspect TDCOSMO skipped rows and table schema before v3.29 standardization."
+          )
+
+          inventory["ledger_row_count"] = len(result["ledger_rows"])
+          inventory["valid_Ddt_row_count"] = valid_ddt_rows
+          inventory["valid_Dd_row_count"] = valid_dd_rows
+          inventory["skipped_row_count"] = skipped_count
+          inventory["binary_shape_product_count"] = len(result["binary_records"])
+          inventory["output_files"] = {
+              "ledger": str(ledger_csv),
+              "source_summary": str(source_csv),
+              "skipped_rows": str(skipped_csv),
+              "binary_shape_products": str(binary_csv)
+          }
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "tdcosmo_ingestion_pass": result.get("ingestion_pass") is True,
+              "ledger_row_count": len(result["ledger_rows"]),
+              "valid_Ddt_row_count": valid_ddt_rows,
+              "valid_Dd_row_count": valid_dd_rows,
+              "skipped_row_count": skipped_count,
+              "binary_shape_product_count": len(result["binary_records"]),
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_28_1_tdcosmo_parser_fix.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.28.1 — TDCOSMO Parser Fix")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this fixes")
+          md.append("")
+          md.append("v3.28 failed the TDCOSMO lane because the table uses `-` for unavailable `Dd_mean` / `Dd_sigma` values. v3.28.1 treats those as missing and ingests valid `Ddt_mean` / `Ddt_sigma` time-delay distance rows.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- TDCOSMO ingestion pass: `{result.get('ingestion_pass')}`")
+          md.append(f"- Ledger rows: `{len(result['ledger_rows'])}`")
+          md.append(f"- Valid Ddt rows: `{valid_ddt_rows}`")
+          md.append(f"- Valid Dd rows: `{valid_dd_rows}`")
+          md.append(f"- Skipped rows: `{skipped_count}`")
+          md.append(f"- Binary shape products recorded: `{len(result['binary_records'])}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append("The usable TDCOSMO reach product here is the time-delay distance lane. The angular-diameter distance fields are unavailable in this table and should remain missing unless a later parser uses the binary posterior products.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tdcosmo_parser_fix_ledger_v3_28_1.csv`")
+          md.append("- `tdcosmo_parser_fix_source_summary_v3_28_1.csv`")
+          md.append("- `tdcosmo_parser_fix_skipped_rows_v3_28_1.csv`")
+          md.append("- `tdcosmo_parser_fix_binary_shape_products_v3_28_1.csv`")
+          md.append("- `tairid_cosmology_v3_28_1_tdcosmo_parser_fix.json`")
+          md.append("- `tairid_cosmology_v3_28_1_tdcosmo_parser_fix.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_28_1_tdcosmo_parser_fix.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.28.1 TDCOSMO parser fix artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-28-1-tdcosmo-parser-fix
+          path: artifacts/tairid_cosmology_v3_28_1/
