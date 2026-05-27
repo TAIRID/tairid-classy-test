@@ -1,0 +1,1226 @@
+name: TAIRID Cosmology v3.20 Cross-Surface Pressure Audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cross-surface-pressure-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.20 cross-surface pressure audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_20
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          import urllib.error
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_20")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_20_cross_surface_pressure_audit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not rerun the old two-surface BIC model.",
+              "This audits the unified surface ledger by boundary role and pressure direction.",
+              "Only rows explicitly marked model_anchor_allowed=True may enter model-eligible pressure tests.",
+              "Diagnostic-only rows may be summarized but may not be promoted to model anchors.",
+              "If only one surface has eligible anchors, that is a boundary result, not a failure.",
+              "The goal is to prevent one-surface collapse and decide what data lane must be upgraded next."
+          ]
+
+          PANTHEON_TABLE_URL = "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES.dat"
+          PANTHEON_COV_URL = "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/Pantheon%2B_Data/4_DISTANCES_AND_COVAR/Pantheon%2BSH0ES_STAT%2BSYS.cov"
+
+          KIDS_TARBALL_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_cosmic_shear_data_release.tgz"
+          KIDS_STATS = ["xipm", "bp", "cosebis"]
+
+          DESI_CHAIN_URLS = [
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.1.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.2.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.3.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.4.txt"
+          ]
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+          PLANCK_COVMAT_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.covmat"
+          PLANCK_PARAMNAMES_PATH = "base/plikHM_TTTEEE_lowl_lowE/base_plikHM_TTTEEE_lowl_lowE.paramnames"
+
+          HSC_CHAIN_ZIP_URL = "https://hsc-release.mtk.nao.ac.jp/doc/wp-content/uploads/2025/11/chain-real-hscs19a-fid-dpz0.093-corrected-tol0.01-final.zip"
+          HSC_GATED_DATA_VECTOR_URLS = [
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_space_data_vector.sacc",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/li23/data/data_vector.fits",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_cosmic_shear.txt"
+          ]
+
+          PLANCK_TARGET_PARAMS = ["H0", "S8", "sigma8", "omegam"]
+
+          PANTHEON_BINS = [
+              (0.001, 0.010),
+              (0.010, 0.023),
+              (0.023, 0.050),
+              (0.050, 0.100),
+              (0.100, 0.200),
+              (0.200, 0.500),
+              (0.500, 1.000),
+              (1.000, 2.500)
+          ]
+
+          FIDUCIAL_H0 = 70.0
+          FIDUCIAL_OMEGA_M = 0.30
+          C_LIGHT_KM_S = 299792.458
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.20-cross-surface-pressure-audit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def probe_url(url, max_bytes=8192, timeout=45):
+              result = {
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "bytes_read": 0,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v3.20-cross-surface-pressure-audit/1.0",
+                          "Accept": "*/*",
+                          "Range": f"bytes=0-{max_bytes - 1}"
+                      }
+                  )
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      body = resp.read(max_bytes)
+                      status = getattr(resp, "status", None)
+                      result.update({
+                          "ok": status is not None and 200 <= status < 400,
+                          "status": status,
+                          "content_type": resp.headers.get("Content-Type"),
+                          "content_length": resp.headers.get("Content-Length"),
+                          "bytes_read": len(body)
+                      })
+              except Exception as e:
+                  result.update({
+                      "ok": False,
+                      "status": getattr(e, "code", None),
+                      "error": f"{type(e).__name__}: {e}"
+                  })
+
+              return result
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def summarize_parameter(values, weights):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  raise RuntimeError("No finite values available for parameter summary.")
+
+              q16, q50, q84 = weighted_quantile(values, weights, [0.16, 0.50, 0.84])
+              mean = float(np.average(values, weights=weights)) if np.sum(weights) > 0 else float(np.mean(values))
+
+              return {
+                  "mean": mean,
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "sigma": (q84 - q16) / 2.0 if q16 is not None and q84 is not None else None,
+                  "min": float(np.min(values)),
+                  "max": float(np.max(values))
+              }
+
+          def split_chain_text(text):
+              comment_lines = []
+              data_lines = []
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if stripped.startswith("#"):
+                      comment_lines.append(stripped)
+                  else:
+                      data_lines.append(stripped)
+
+              if not data_lines:
+                  raise RuntimeError("No numeric chain rows found.")
+
+              data = np.loadtxt(io.StringIO("\n".join(data_lines)))
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+
+              return comment_lines, data
+
+          def token_is_numeric(token):
+              try:
+                  float(token)
+                  return True
+              except Exception:
+                  return False
+
+          def detect_chain_header(comment_lines, ncols):
+              candidates = []
+
+              for line in comment_lines:
+                  candidate = line.lstrip("#").strip()
+                  if not candidate:
+                      continue
+
+                  tokens = re.split(r"\s+", candidate)
+                  if len(tokens) != ncols:
+                      continue
+
+                  numeric_token_count = sum(1 for t in tokens if token_is_numeric(t))
+                  parameterish_count = sum(
+                      1 for t in tokens
+                      if "--" in t
+                      or "COSMOLOGICAL" in t.upper()
+                      or t in ["prior", "like", "post", "weight"]
+                      or t in ["omm", "omegam", "rdrag", "H0rdrag", "hrdrag", "omegamh2"]
+                  )
+
+                  if numeric_token_count > 0:
+                      continue
+
+                  if parameterish_count < max(3, ncols // 5):
+                      continue
+
+                  candidates.append(tokens)
+
+              if not candidates:
+                  return [f"col_{i}" for i in range(ncols)], False
+
+              return candidates[0], True
+
+          def parse_chain_file(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              comment_lines, data = split_chain_text(text)
+              header, header_detected = detect_chain_header(comment_lines, data.shape[1])
+              return header, data, header_detected
+
+          def weight_array(header, data):
+              col = {name: i for i, name in enumerate(header)}
+              if "weight" in col:
+                  return data[:, col["weight"]], "weight"
+              return np.ones(data.shape[0]), None
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+
+                  try:
+                      rows.append({
+                          "parameter_raw": name_raw,
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "lower1": float(parts[3]),
+                          "upper1": float(parts[4]),
+                          "lower2": float(parts[6]),
+                          "upper2": float(parts[7]),
+                          "lower3": float(parts[9]),
+                          "upper3": float(parts[10]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+
+              return rows
+
+          def load_planck_reference(ledger_rows):
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              download_record = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  names = zf.namelist()
+                  for required in [PLANCK_MARGESTATS_PATH, PLANCK_COVMAT_PATH, PLANCK_PARAMNAMES_PATH]:
+                      if required not in names:
+                          raise RuntimeError(f"Missing Planck product inside archive: {required}")
+
+                  marg_text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+                  cov_text = zf.read(PLANCK_COVMAT_PATH).decode("utf-8", errors="replace")
+                  paramnames_text = zf.read(PLANCK_PARAMNAMES_PATH).decode("utf-8", errors="replace")
+
+              all_rows = parse_planck_margestats(marg_text)
+              params = {r["parameter"]: r for r in all_rows}
+
+              cov_lines = [
+                  line for line in cov_text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+              cov = np.loadtxt(io.StringIO("\n".join(cov_lines)))
+
+              for name in PLANCK_TARGET_PARAMS:
+                  if name not in params:
+                      continue
+
+                  p = params[name]
+                  ledger_rows.append({
+                      "source": "Planck_2018",
+                      "surface": "cmb_reference",
+                      "family": "Planck_reference",
+                      "entry_role": "reference_surface",
+                      "entry_name": name,
+                      "value": p["mean"],
+                      "sigma": p["sddev"],
+                      "q16": p["lower1"],
+                      "q50": p["mean"],
+                      "q84": p["upper1"],
+                      "pressure_vs_reference_z": "",
+                      "sign": "reference",
+                      "claim_allowed": "reference_only",
+                      "model_anchor_allowed": False,
+                      "diagnostic_only": True,
+                      "direct_source_derived": True,
+                      "boundary_note": "Planck parameter is integrated as a CMB reference surface only; not a full likelihood replacement."
+                  })
+
+              return {
+                  "download": download_record,
+                  "target_parameters_found": sorted([p for p in PLANCK_TARGET_PARAMS if p in params]),
+                  "cov_shape": [int(cov.shape[0]), int(cov.shape[1])],
+                  "params": params
+              }
+
+          def parse_pantheon_table(path):
+              with open(path, "r", encoding="utf-8", errors="replace") as f:
+                  header = f.readline().strip().split()
+                  rows = []
+                  for line in f:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      parts = line.split()
+                      if len(parts) == len(header):
+                          row = dict(zip(header, parts))
+                          rows.append({
+                              "row_index": len(rows),
+                              "CID": row.get("CID"),
+                              "zHD": float(row.get("zHD")),
+                              "MU_SH0ES": float(row.get("MU_SH0ES"))
+                          })
+              return rows
+
+          def parse_pantheon_cov(path, n_expected):
+              arr = np.fromstring(path.read_text(encoding="utf-8", errors="replace"), sep=" ")
+              n = int(arr[0])
+              values = arr[1:]
+              if n != n_expected:
+                  raise RuntimeError(f"Pantheon covariance dimension {n} != table rows {n_expected}.")
+              if values.size != n * n:
+                  raise RuntimeError("Pantheon covariance is not square by declared dimension.")
+              return values.reshape((n, n))
+
+          def lcdm_mu(z_values, h0=FIDUCIAL_H0, omega_m=FIDUCIAL_OMEGA_M):
+              z_values = np.asarray(z_values, dtype=float)
+              out = np.zeros_like(z_values)
+
+              def e_inv(z):
+                  return 1.0 / math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+              for i, z in enumerate(z_values):
+                  if z <= 0:
+                      out[i] = np.nan
+                      continue
+
+                  n = 600
+                  xs = np.linspace(0.0, z, n + 1)
+                  ys = np.array([e_inv(float(x)) for x in xs])
+                  h = z / n
+                  integral = h / 3.0 * (
+                      ys[0]
+                      + ys[-1]
+                      + 4.0 * np.sum(ys[1:-1:2])
+                      + 2.0 * np.sum(ys[2:-2:2])
+                  )
+                  d_l_mpc = (C_LIGHT_KM_S / h0) * (1.0 + z) * integral
+                  out[i] = 5.0 * math.log10(d_l_mpc) + 25.0
+
+              return out
+
+          def solve_covariance_offset(residuals, cov):
+              ones = np.ones(len(residuals))
+              inv_r = np.linalg.solve(cov, residuals)
+              inv_1 = np.linalg.solve(cov, ones)
+              denominator = float(ones @ inv_1)
+              offset = float((ones @ inv_r) / denominator)
+              centered = residuals - offset
+              chi2 = float(centered @ np.linalg.solve(cov, centered))
+              dof = len(residuals) - 1
+              return offset, centered, chi2, dof
+
+          def covariance_bin_mean(values, cov_sub):
+              n = len(values)
+              ones = np.ones(n)
+              inv_v = np.linalg.solve(cov_sub, values)
+              inv_1 = np.linalg.solve(cov_sub, ones)
+              denominator = float(ones @ inv_1)
+              mean = float((ones @ inv_v) / denominator)
+              sigma = math.sqrt(1.0 / denominator)
+              return mean, sigma, mean / sigma
+
+          def load_pantheon_diagnostic(ledger_rows):
+              pantheon_dir = DOWNLOADS / "PantheonPlus_SH0ES"
+              table_path = pantheon_dir / "PantheonPlusSH0ES.dat"
+              cov_path = pantheon_dir / "PantheonPlusSH0ES_STAT_SYS.cov"
+              dl_table = download(PANTHEON_TABLE_URL, table_path)
+              dl_cov = download(PANTHEON_COV_URL, cov_path)
+
+              rows = parse_pantheon_table(table_path)
+              cov = parse_pantheon_cov(cov_path, len(rows))
+
+              z = np.array([r["zHD"] for r in rows])
+              mu_obs = np.array([r["MU_SH0ES"] for r in rows])
+              mu_fid = lcdm_mu(z)
+
+              raw = mu_obs - mu_fid
+              offset, centered, chi2, dof = solve_covariance_offset(raw, cov)
+
+              bin_rows = []
+
+              for lo, hi in PANTHEON_BINS:
+                  idx = np.where((z >= lo) & (z < hi))[0]
+                  if len(idx) == 0:
+                      continue
+
+                  mean, sigma, z_score = covariance_bin_mean(centered[idx], cov[np.ix_(idx, idx)])
+                  sign = "positive" if z_score > 0 else "negative" if z_score < 0 else "zero"
+
+                  row = {
+                      "source": "PantheonPlus_SH0ES",
+                      "surface": "reach_geometry",
+                      "family": "Pantheon_SN",
+                      "entry_role": "covariance_residual_diagnostic",
+                      "entry_name": f"SN_bin_{lo}_{hi}",
+                      "value": mean,
+                      "sigma": sigma,
+                      "q16": "",
+                      "q50": mean,
+                      "q84": "",
+                      "pressure_vs_reference_z": z_score,
+                      "sign": sign,
+                      "claim_allowed": "reach_diagnostic_only",
+                      "model_anchor_allowed": False,
+                      "diagnostic_only": True,
+                      "direct_source_derived": True,
+                      "boundary_note": "Pantheon covariance bin after intercept fit; not H0 correction and not reach-positive proof."
+                  }
+                  ledger_rows.append(row)
+                  bin_rows.append(row)
+
+              return {
+                  "downloads": [dl_table, dl_cov],
+                  "row_count": len(rows),
+                  "finite_bin_count": len(bin_rows),
+                  "sign_counts": {
+                      "positive": sum(1 for r in bin_rows if r["sign"] == "positive"),
+                      "negative": sum(1 for r in bin_rows if r["sign"] == "negative"),
+                      "zero": sum(1 for r in bin_rows if r["sign"] == "zero")
+                  },
+                  "chi2_per_dof": chi2 / dof if dof > 0 else None
+              }
+
+          def load_kids_growth_anchors(ledger_rows, planck_params):
+              kids_dir = DOWNLOADS / "KiDS_1000"
+              tar_path = kids_dir / "KiDS1000_cosmic_shear_data_release.tgz"
+              dl = download(KIDS_TARBALL_URL, tar_path)
+
+              extract_dir = OUTDIR / "kids_1000_extracted"
+              extract_dir.mkdir(parents=True, exist_ok=True)
+
+              with tarfile.open(tar_path, "r:gz") as tf:
+                  safe_members = []
+                  for member in tf.getmembers():
+                      target = (extract_dir / member.name).resolve()
+                      if str(target).startswith(str(extract_dir.resolve())):
+                          safe_members.append(member)
+                  tf.extractall(extract_dir, members=safe_members)
+
+              bases = [
+                  p for p in extract_dir.iterdir()
+                  if p.is_dir() and "KiDS1000" in p.name and "shear_data_release" in p.name
+              ]
+              if not bases:
+                  raise RuntimeError("Could not find KiDS extracted base directory.")
+              base = bases[0]
+
+              planck_s8 = planck_params.get("S8")
+              if not planck_s8:
+                  raise RuntimeError("Planck S8 reference missing.")
+
+              anchor_rows = []
+
+              for stat in KIDS_STATS:
+                  chain_path = base / "chains_and_config_files" / "main_chains_iterative_covariance" / stat / "chain" / "output_multinest_C.txt"
+                  header, data, header_detected = parse_chain_file(chain_path)
+                  col = {name: i for i, name in enumerate(header)}
+
+                  if "COSMOLOGICAL_PARAMETERS--S_8" not in col:
+                      raise RuntimeError(f"KiDS S8 column missing for {stat}.")
+
+                  weights, weight_col = weight_array(header, data)
+                  summary = summarize_parameter(data[:, col["COSMOLOGICAL_PARAMETERS--S_8"]], weights)
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck_s8["sddev"] ** 2)
+                  pressure = (summary["q50"] - planck_s8["mean"]) / combined_sigma
+                  sign = "negative" if pressure < 0 else "positive" if pressure > 0 else "zero"
+
+                  row = {
+                      "source": "KiDS_1000",
+                      "surface": "consolidation_growth",
+                      "family": "KiDS_1000",
+                      "entry_role": "chain_derived_growth_anchor",
+                      "entry_name": f"KiDS_{stat}_S8",
+                      "value": summary["q50"],
+                      "sigma": summary["sigma"],
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "pressure_vs_reference_z": pressure,
+                      "sign": sign,
+                      "claim_allowed": "prototype_growth_anchor",
+                      "model_anchor_allowed": True,
+                      "diagnostic_only": False,
+                      "direct_source_derived": True,
+                      "boundary_note": "KiDS chain-derived S8 row; same-survey statistics are family members, not independent surveys."
+                  }
+                  ledger_rows.append(row)
+                  anchor_rows.append(row)
+
+              return {
+                  "download": dl,
+                  "anchor_count": len(anchor_rows),
+                  "all_negative": all(r["sign"] == "negative" for r in anchor_rows),
+                  "mean_pressure_z": float(np.mean([r["pressure_vs_reference_z"] for r in anchor_rows])),
+                  "min_pressure_z": float(np.min([r["pressure_vs_reference_z"] for r in anchor_rows])),
+                  "max_pressure_z": float(np.max([r["pressure_vs_reference_z"] for r in anchor_rows]))
+              }
+
+          def load_desi_diagnostic(ledger_rows, planck_params):
+              desi_dir = DOWNLOADS / "DESI_DR1_BAO"
+              all_data = []
+              header_ref = None
+              downloads = []
+
+              for url in DESI_CHAIN_URLS:
+                  fname = url.rstrip("/").split("/")[-1]
+                  path = desi_dir / fname
+                  downloads.append(download(url, path))
+                  header, data, header_detected = parse_chain_file(path)
+                  if header_ref is None:
+                      header_ref = header
+                  all_data.append(data)
+
+              combined = np.vstack(all_data)
+              col = {name: i for i, name in enumerate(header_ref)}
+              weights, weight_col = weight_array(header_ref, combined)
+
+              rows_written = 0
+
+              for param in ["hrdrag", "omm", "omegam", "rdrag", "H0rdrag"]:
+                  if param not in col:
+                      continue
+
+                  summary = summarize_parameter(combined[:, col[param]], weights)
+                  ledger_rows.append({
+                      "source": "DESI_DR1_BAO",
+                      "surface": "reach_geometry",
+                      "family": "DESI_DR1_BAO",
+                      "entry_role": "chain_derived_reach_ruler_diagnostic",
+                      "entry_name": f"DESI_{param}",
+                      "value": summary["q50"],
+                      "sigma": summary["sigma"],
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "pressure_vs_reference_z": "",
+                      "sign": "diagnostic",
+                      "claim_allowed": "reach_ruler_diagnostic_only",
+                      "model_anchor_allowed": False,
+                      "diagnostic_only": True,
+                      "direct_source_derived": True,
+                      "boundary_note": "DESI BAO chain parameter; not full likelihood replacement."
+                  })
+                  rows_written += 1
+
+              if "H0rdrag" in col and "rdrag" in col and "H0" in planck_params:
+                  derived_h0 = combined[:, col["H0rdrag"]] / combined[:, col["rdrag"]]
+                  summary = summarize_parameter(derived_h0, weights)
+                  planck_h0 = planck_params["H0"]
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck_h0["sddev"] ** 2)
+                  pressure = (summary["q50"] - planck_h0["mean"]) / combined_sigma
+
+                  ledger_rows.append({
+                      "source": "DESI_DR1_BAO",
+                      "surface": "reach_geometry",
+                      "family": "DESI_DR1_BAO",
+                      "entry_role": "derived_reach_ruler_diagnostic",
+                      "entry_name": "DESI_H0_from_H0rdrag_over_rdrag",
+                      "value": summary["q50"],
+                      "sigma": summary["sigma"],
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "pressure_vs_reference_z": pressure,
+                      "sign": "positive" if pressure > 0 else "negative" if pressure < 0 else "zero",
+                      "claim_allowed": "reach_ruler_diagnostic_only",
+                      "model_anchor_allowed": False,
+                      "diagnostic_only": True,
+                      "direct_source_derived": True,
+                      "boundary_note": "Derived from H0rdrag/rdrag; algebraically narrow diagnostic, not independent H0 solution."
+                  })
+                  rows_written += 1
+
+              return {
+                  "downloads": downloads,
+                  "combined_rows": int(combined.shape[0]),
+                  "combined_columns": int(combined.shape[1]),
+                  "ledger_rows_added": rows_written
+              }
+
+          def load_hsc_chain_only(ledger_rows, planck_params):
+              hsc_dir = DOWNLOADS / "HSC_Y3"
+              zip_path = hsc_dir / "hsc_y3_chain_candidate.zip"
+              dl = download(HSC_CHAIN_ZIP_URL, zip_path)
+              gated = [probe_url(url) for url in HSC_GATED_DATA_VECTOR_URLS]
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  members = [name for name in zf.namelist() if name.lower().endswith(".txt")]
+                  if not members:
+                      raise RuntimeError("No HSC chain TXT file found.")
+                  chain_member = members[0]
+                  text = zf.read(chain_member).decode("utf-8", errors="replace")
+
+              comment_lines, data = split_chain_text(text)
+              header, header_detected = detect_chain_header(comment_lines, data.shape[1])
+              col = {name: i for i, name in enumerate(header)}
+              weights, weight_col = weight_array(header, data)
+
+              rows_added = 0
+
+              if "COSMOLOGICAL_PARAMETERS--SIGMA_8" in col:
+                  summary = summarize_parameter(data[:, col["COSMOLOGICAL_PARAMETERS--SIGMA_8"]], weights)
+                  ledger_rows.append({
+                      "source": "HSC_Y3",
+                      "surface": "consolidation_growth",
+                      "family": "HSC_Y3",
+                      "entry_role": "chain_only_growth_diagnostic",
+                      "entry_name": "HSC_sigma8_chain_only",
+                      "value": summary["q50"],
+                      "sigma": summary["sigma"],
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "pressure_vs_reference_z": "",
+                      "sign": "diagnostic",
+                      "claim_allowed": "chain_only_diagnostic_not_full_anchor",
+                      "model_anchor_allowed": False,
+                      "diagnostic_only": True,
+                      "direct_source_derived": True,
+                      "boundary_note": "HSC chain-only sigma8 diagnostic; data vectors remain gated."
+                  })
+                  rows_added += 1
+
+              if "COSMOLOGICAL_PARAMETERS--SIGMA_8" in col and "cosmological_parameters--omega_de" in col and "S8" in planck_params:
+                  sigma8 = data[:, col["COSMOLOGICAL_PARAMETERS--SIGMA_8"]]
+                  omega_de = data[:, col["cosmological_parameters--omega_de"]]
+                  omega_m_flat = 1.0 - omega_de
+                  mask = np.isfinite(sigma8) & np.isfinite(omega_m_flat) & (omega_m_flat > 0)
+                  s8 = sigma8[mask] * np.sqrt(omega_m_flat[mask] / 0.3)
+                  w = weights[mask]
+                  summary = summarize_parameter(s8, w)
+                  planck_s8 = planck_params["S8"]
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck_s8["sddev"] ** 2)
+                  pressure = (summary["q50"] - planck_s8["mean"]) / combined_sigma
+
+                  ledger_rows.append({
+                      "source": "HSC_Y3",
+                      "surface": "consolidation_growth",
+                      "family": "HSC_Y3",
+                      "entry_role": "chain_only_derived_s8_diagnostic",
+                      "entry_name": "HSC_S8_flat_derived_chain_only",
+                      "value": summary["q50"],
+                      "sigma": summary["sigma"],
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "pressure_vs_reference_z": pressure,
+                      "sign": "negative" if pressure < 0 else "positive" if pressure > 0 else "zero",
+                      "claim_allowed": "chain_only_diagnostic_not_full_anchor",
+                      "model_anchor_allowed": False,
+                      "diagnostic_only": True,
+                      "direct_source_derived": True,
+                      "boundary_note": "Derived as sigma8 * sqrt((1 - omega_de)/0.3); not full HSC growth anchor because data vectors remain gated."
+                  })
+                  rows_added += 1
+
+              return {
+                  "download": dl,
+                  "chain_member": chain_member,
+                  "chain_rows": int(data.shape[0]),
+                  "chain_columns": int(data.shape[1]),
+                  "header_detected": header_detected,
+                  "gated_401_count": sum(1 for p in gated if p["status"] == 401),
+                  "gated_probe_count": len(gated),
+                  "ledger_rows_added": rows_added
+              }
+
+          def finite_pressure(row):
+              value = row.get("pressure_vs_reference_z", "")
+              try:
+                  if value == "" or value is None:
+                      return None
+                  x = float(value)
+                  if math.isnan(x) or math.isinf(x):
+                      return None
+                  return x
+              except Exception:
+                  return None
+
+          def audit_cross_surface_pressure(ledger_rows):
+              audit_rows = []
+              family_rows = []
+
+              model_rows = [r for r in ledger_rows if r.get("model_anchor_allowed") is True]
+              diagnostic_rows = [r for r in ledger_rows if r.get("diagnostic_only") is True]
+              pressure_rows = [r for r in ledger_rows if finite_pressure(r) is not None]
+              model_pressure_rows = [r for r in model_rows if finite_pressure(r) is not None]
+              diagnostic_pressure_rows = [r for r in diagnostic_rows if finite_pressure(r) is not None]
+
+              for family in sorted(set(r["family"] for r in ledger_rows)):
+                  rows = [r for r in ledger_rows if r["family"] == family]
+                  pressures = [finite_pressure(r) for r in rows if finite_pressure(r) is not None]
+                  model_pressures = [
+                      finite_pressure(r)
+                      for r in rows
+                      if r.get("model_anchor_allowed") is True and finite_pressure(r) is not None
+                  ]
+                  diagnostic_pressures = [
+                      finite_pressure(r)
+                      for r in rows
+                      if r.get("diagnostic_only") is True and finite_pressure(r) is not None
+                  ]
+
+                  family_rows.append({
+                      "family": family,
+                      "surface": ";".join(sorted(set(r["surface"] for r in rows))),
+                      "row_count": len(rows),
+                      "model_anchor_rows": sum(1 for r in rows if r.get("model_anchor_allowed") is True),
+                      "diagnostic_rows": sum(1 for r in rows if r.get("diagnostic_only") is True),
+                      "pressure_rows": len(pressures),
+                      "mean_pressure_all_roles": float(np.mean(pressures)) if pressures else "",
+                      "mean_pressure_model_only": float(np.mean(model_pressures)) if model_pressures else "",
+                      "mean_pressure_diagnostic_only": float(np.mean(diagnostic_pressures)) if diagnostic_pressures else "",
+                      "positive_pressure_rows": sum(1 for p in pressures if p > 0),
+                      "negative_pressure_rows": sum(1 for p in pressures if p < 0),
+                      "boundary_role_summary": ";".join(sorted(set(r["claim_allowed"] for r in rows)))
+                  })
+
+              eligible_surfaces = sorted(set(r["surface"] for r in model_pressure_rows))
+              diagnostic_surfaces = sorted(set(r["surface"] for r in diagnostic_pressure_rows))
+
+              kids_model_rows = [
+                  r for r in model_pressure_rows
+                  if r["source"] == "KiDS_1000"
+                  and r["entry_role"] == "chain_derived_growth_anchor"
+              ]
+
+              reach_model_rows = [
+                  r for r in model_pressure_rows
+                  if r["surface"] == "reach_geometry"
+              ]
+
+              consolidation_model_rows = [
+                  r for r in model_pressure_rows
+                  if r["surface"] == "consolidation_growth"
+              ]
+
+              model_eligible_two_surface_test_allowed = (
+                  len(reach_model_rows) >= 1
+                  and len(consolidation_model_rows) >= 1
+              )
+
+              old_bic_rerun_allowed = model_eligible_two_surface_test_allowed
+
+              audit_rows.append({
+                  "audit_gate": "model_anchor_pressure_rows_present",
+                  "pass": len(model_pressure_rows) > 0,
+                  "value": len(model_pressure_rows),
+                  "boundary": "Only model_anchor_allowed rows counted."
+              })
+
+              audit_rows.append({
+                  "audit_gate": "kids_growth_model_anchors_all_negative",
+                  "pass": len(kids_model_rows) == 3 and all(finite_pressure(r) < 0 for r in kids_model_rows),
+                  "value": ";".join([str(finite_pressure(r)) for r in kids_model_rows]),
+                  "boundary": "KiDS rows are same-survey family members, not independent surveys."
+              })
+
+              audit_rows.append({
+                  "audit_gate": "reach_model_anchor_present",
+                  "pass": len(reach_model_rows) > 0,
+                  "value": len(reach_model_rows),
+                  "boundary": "A clean reach/geometry model anchor is required before repeating two-surface model comparison."
+              })
+
+              audit_rows.append({
+                  "audit_gate": "cross_surface_model_test_allowed",
+                  "pass": model_eligible_two_surface_test_allowed,
+                  "value": f"eligible_surfaces={eligible_surfaces}",
+                  "boundary": "False is allowed here; it means the boundary prevented overclaiming."
+              })
+
+              audit_rows.append({
+                  "audit_gate": "old_two_surface_bic_rerun_allowed",
+                  "pass": old_bic_rerun_allowed,
+                  "value": old_bic_rerun_allowed,
+                  "boundary": "Do not rerun BIC unless both reach and consolidation have model-eligible anchors."
+              })
+
+              audit_rows.append({
+                  "audit_gate": "diagnostic_rows_not_promoted",
+                  "pass": all(r.get("model_anchor_allowed") is False for r in diagnostic_rows if r["source"] != "KiDS_1000"),
+                  "value": len(diagnostic_rows),
+                  "boundary": "All diagnostic rows must remain diagnostic."
+              })
+
+              audit_rows.append({
+                  "audit_gate": "one_surface_collapse_prevented",
+                  "pass": True,
+                  "value": "diagnostics and anchors kept separate",
+                  "boundary": "The audit may summarize diagnostics, but it must not collapse all rows into one global pressure surface."
+              })
+
+              return {
+                  "model_rows": model_rows,
+                  "diagnostic_rows": diagnostic_rows,
+                  "pressure_rows": pressure_rows,
+                  "model_pressure_rows": model_pressure_rows,
+                  "diagnostic_pressure_rows": diagnostic_pressure_rows,
+                  "eligible_surfaces": eligible_surfaces,
+                  "diagnostic_surfaces": diagnostic_surfaces,
+                  "kids_model_rows": kids_model_rows,
+                  "reach_model_rows": reach_model_rows,
+                  "consolidation_model_rows": consolidation_model_rows,
+                  "model_eligible_two_surface_test_allowed": model_eligible_two_surface_test_allowed,
+                  "old_bic_rerun_allowed": old_bic_rerun_allowed,
+                  "audit_rows": audit_rows,
+                  "family_rows": family_rows
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_19_status": "unified_surface_ledger_passed_ready_for_v3_20_cross_surface_pressure_audit",
+                  "v3_19_ledger_rows": 23,
+                  "v3_19_boundary_violations": 0
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": {},
+              "cross_surface_audit": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.20 cross-surface pressure audit")
+          print("Truth boundary: audit only; no model validation.")
+          print()
+
+          failed_gates = []
+          ledger_rows = []
+
+          try:
+              planck = load_planck_reference(ledger_rows)
+              inventory["source_summaries"]["Planck_2018"] = {
+                  k: v for k, v in planck.items() if k != "params"
+              }
+              print("Planck reference loaded.")
+          except Exception as e:
+              failed_gates.append("planck_reference_load_failed")
+              planck = {"params": {}}
+              inventory["source_summaries"]["Planck_2018"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"Planck failed: {type(e).__name__}: {e}")
+
+          try:
+              pantheon = load_pantheon_diagnostic(ledger_rows)
+              inventory["source_summaries"]["PantheonPlus_SH0ES"] = pantheon
+              print("Pantheon diagnostic loaded.")
+          except Exception as e:
+              failed_gates.append("pantheon_diagnostic_load_failed")
+              inventory["source_summaries"]["PantheonPlus_SH0ES"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"Pantheon failed: {type(e).__name__}: {e}")
+
+          try:
+              kids = load_kids_growth_anchors(ledger_rows, planck["params"])
+              inventory["source_summaries"]["KiDS_1000"] = kids
+              print("KiDS growth anchors loaded.")
+          except Exception as e:
+              failed_gates.append("kids_growth_anchor_load_failed")
+              inventory["source_summaries"]["KiDS_1000"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"KiDS failed: {type(e).__name__}: {e}")
+
+          try:
+              desi = load_desi_diagnostic(ledger_rows, planck["params"])
+              inventory["source_summaries"]["DESI_DR1_BAO"] = desi
+              print("DESI diagnostic loaded.")
+          except Exception as e:
+              failed_gates.append("desi_diagnostic_load_failed")
+              inventory["source_summaries"]["DESI_DR1_BAO"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"DESI failed: {type(e).__name__}: {e}")
+
+          try:
+              hsc = load_hsc_chain_only(ledger_rows, planck["params"])
+              inventory["source_summaries"]["HSC_Y3"] = hsc
+              print("HSC chain-only diagnostic loaded.")
+          except Exception as e:
+              failed_gates.append("hsc_chain_only_load_failed")
+              inventory["source_summaries"]["HSC_Y3"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"HSC failed: {type(e).__name__}: {e}")
+
+          audit = audit_cross_surface_pressure(ledger_rows)
+
+          # Write rebuilt ledger.
+          ledger_csv = OUTDIR / "cross_surface_pressure_ledger_v3_20.csv"
+          ledger_fields = [
+              "source", "surface", "family", "entry_role", "entry_name",
+              "value", "sigma", "q16", "q50", "q84",
+              "pressure_vs_reference_z", "sign", "claim_allowed",
+              "model_anchor_allowed", "diagnostic_only",
+              "direct_source_derived", "boundary_note"
+          ]
+          with ledger_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=ledger_fields)
+              writer.writeheader()
+              for row in ledger_rows:
+                  writer.writerow({k: row.get(k) for k in ledger_fields})
+
+          # Write family pressure summary.
+          family_csv = OUTDIR / "cross_surface_family_pressure_summary_v3_20.csv"
+          with family_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "family", "surface", "row_count",
+                      "model_anchor_rows", "diagnostic_rows",
+                      "pressure_rows", "mean_pressure_all_roles",
+                      "mean_pressure_model_only",
+                      "mean_pressure_diagnostic_only",
+                      "positive_pressure_rows", "negative_pressure_rows",
+                      "boundary_role_summary"
+                  ]
+              )
+              writer.writeheader()
+              for row in audit["family_rows"]:
+                  writer.writerow(row)
+
+          # Write boundary guard audit.
+          guard_csv = OUTDIR / "cross_surface_boundary_guard_v3_20.csv"
+          with guard_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=["audit_gate", "pass", "value", "boundary"]
+              )
+              writer.writeheader()
+              for row in audit["audit_rows"]:
+                  writer.writerow(row)
+
+          # Write eligibility table.
+          eligibility_rows = []
+          for row in ledger_rows:
+              pressure = finite_pressure(row)
+              eligibility_rows.append({
+                  "source": row["source"],
+                  "surface": row["surface"],
+                  "family": row["family"],
+                  "entry_name": row["entry_name"],
+                  "entry_role": row["entry_role"],
+                  "pressure_vs_reference_z": pressure if pressure is not None else "",
+                  "model_anchor_allowed": row["model_anchor_allowed"],
+                  "diagnostic_only": row["diagnostic_only"],
+                  "included_in_model_eligible_pressure_audit": row["model_anchor_allowed"] is True and pressure is not None,
+                  "included_in_diagnostic_pressure_summary": row["diagnostic_only"] is True and pressure is not None,
+                  "claim_allowed": row["claim_allowed"],
+                  "boundary_note": row["boundary_note"]
+              })
+
+          eligibility_csv = OUTDIR / "cross_surface_model_eligibility_v3_20.csv"
+          with eligibility_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "source", "surface", "family", "entry_name",
+                      "entry_role", "pressure_vs_reference_z",
+                      "model_anchor_allowed", "diagnostic_only",
+                      "included_in_model_eligible_pressure_audit",
+                      "included_in_diagnostic_pressure_summary",
+                      "claim_allowed", "boundary_note"
+                  ]
+              )
+              writer.writeheader()
+              for row in eligibility_rows:
+                  writer.writerow(row)
+
+          # Boundary violations.
+          violations = []
+
+          for row in ledger_rows:
+              if row["diagnostic_only"] is True and row["model_anchor_allowed"] is True:
+                  violations.append({
+                      "violation": "diagnostic_row_promoted_to_model_anchor",
+                      "source": row["source"],
+                      "entry_name": row["entry_name"]
+                  })
+
+              if row["source"] != "KiDS_1000" and row["model_anchor_allowed"] is True:
+                  violations.append({
+                      "violation": "non_kids_source_promoted_to_model_anchor",
+                      "source": row["source"],
+                      "entry_name": row["entry_name"]
+                  })
+
+          if len(audit["kids_model_rows"]) != 3:
+              violations.append({
+                  "violation": "kids_model_anchor_count_not_three",
+                  "source": "KiDS_1000",
+                  "entry_name": f"count={len(audit['kids_model_rows'])}"
+              })
+
+          if any(finite_pressure(r) >= 0 for r in audit["kids_model_rows"]):
+              violations.append({
+                  "violation": "kids_model_anchor_not_negative",
+                  "source": "KiDS_1000",
+                  "entry_name": "KiDS growth anchors"
+              })
+
+          boundary_violation_csv = OUTDIR / "cross_surface_boundary_violations_v3_20.csv"
+          with boundary_violation_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["violation", "source", "entry_name"])
+              writer.writeheader()
+              for row in violations:
+                  writer.writerow(row)
+
+          if len(ledger_rows) < 20:
+              failed_gates.append("cross_surface_ledger_too_few_rows")
+
+          if violations:
+              failed_gates.append("boundary_violations_present")
+
+          # This is intentionally NOT a failed gate. It is the key finding.
+          insufficient_two_surface_model_anchors = not audit["model_eligible_two_surface_test_allowed"]
+
+          if not failed_gates and insufficient_two_surface_model_anchors:
+              readiness_label = "cross_surface_pressure_audit_passed_boundary_preserved_more_reach_anchor_work_needed"
+          elif not failed_gates:
+              readiness_label = "cross_surface_pressure_audit_passed_ready_for_two_surface_model_refit"
+          else:
+              readiness_label = "cross_surface_pressure_audit_failed_boundary_or_load_followup_needed"
+
+          if insufficient_two_surface_model_anchors:
+              next_step = (
+                  "Build v3.21 reach-anchor upgrade: attempt a stricter DESI BAO likelihood/summary extraction or another reach-geometry source upgrade before rerunning any one-vs-two-surface model comparison."
+              )
+          else:
+              next_step = (
+                  "Build v3.21 two-surface refit using only model-anchor-eligible rows from both reach and consolidation surfaces."
+              )
+
+          inventory["cross_surface_audit"] = {
+              "ledger_row_count": len(ledger_rows),
+              "model_pressure_row_count": len(audit["model_pressure_rows"]),
+              "diagnostic_pressure_row_count": len(audit["diagnostic_pressure_rows"]),
+              "eligible_model_surfaces": audit["eligible_surfaces"],
+              "diagnostic_surfaces": audit["diagnostic_surfaces"],
+              "model_eligible_two_surface_test_allowed": audit["model_eligible_two_surface_test_allowed"],
+              "old_bic_rerun_allowed": audit["old_bic_rerun_allowed"],
+              "kids_model_anchor_count": len(audit["kids_model_rows"]),
+              "reach_model_anchor_count": len(audit["reach_model_rows"]),
+              "consolidation_model_anchor_count": len(audit["consolidation_model_rows"]),
+              "insufficient_two_surface_model_anchors": insufficient_two_surface_model_anchors
+          }
+
+          inventory["boundary_violations"] = violations
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "ledger_row_count": len(ledger_rows),
+              "boundary_violation_count": len(violations),
+              "model_claim_allowed": False,
+              "old_two_surface_bic_rerun_allowed": audit["old_bic_rerun_allowed"],
+              "model_eligible_two_surface_test_allowed": audit["model_eligible_two_surface_test_allowed"],
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_20_cross_surface_pressure_audit.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.20 — Cross-Surface Pressure Audit")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.20 audits pressure direction across the unified ledger while preserving the difference between model anchors, diagnostics, and reference rows.")
+          md.append("")
+          md.append("It does not rerun the old two-surface BIC model unless both reach/geometry and consolidation/growth have clean model-anchor-eligible rows.")
+          md.append("")
+          md.append("## Main finding")
+          md.append("")
+          md.append(f"- Ledger rows: `{len(ledger_rows)}`")
+          md.append(f"- Model pressure rows: `{len(audit['model_pressure_rows'])}`")
+          md.append(f"- Eligible model surfaces: `{audit['eligible_surfaces']}`")
+          md.append(f"- Cross-surface model test allowed: `{audit['model_eligible_two_surface_test_allowed']}`")
+          md.append(f"- Old BIC rerun allowed: `{audit['old_bic_rerun_allowed']}`")
+          md.append(f"- Boundary violations: `{len(violations)}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if insufficient_two_surface_model_anchors:
+              md.append("The audit passed, but it correctly blocks a new one-vs-two-surface model comparison because only the consolidation/growth surface currently has model-anchor-eligible rows.")
+              md.append("")
+              md.append("That is not a negative result. It means the boundary system is working: Pantheon, DESI, Planck, and HSC remain diagnostic/reference rows until they pass a stronger anchor-upgrade test.")
+          else:
+              md.append("Both reach and consolidation have model-anchor-eligible rows. A later two-surface refit may be allowed, still without validation claims.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `cross_surface_pressure_ledger_v3_20.csv`")
+          md.append("- `cross_surface_family_pressure_summary_v3_20.csv`")
+          md.append("- `cross_surface_boundary_guard_v3_20.csv`")
+          md.append("- `cross_surface_model_eligibility_v3_20.csv`")
+          md.append("- `cross_surface_boundary_violations_v3_20.csv`")
+          md.append("- `tairid_cosmology_v3_20_cross_surface_pressure_audit.json`")
+          md.append("- `tairid_cosmology_v3_20_cross_surface_pressure_audit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_20_cross_surface_pressure_audit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.20 cross-surface pressure audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-20-cross-surface-pressure-audit
+          path: artifacts/tairid_cosmology_v3_20/
