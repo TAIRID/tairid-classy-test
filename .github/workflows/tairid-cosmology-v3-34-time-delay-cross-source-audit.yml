@@ -1,0 +1,1094 @@
+name: TAIRID Cosmology v3.34 Time-Delay Cross-Source Audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  time-delay-cross-source-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.34 time-delay cross-source audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_34
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_34")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_34_time_delay_cross_source_audit"
+
+          C_LIGHT_KM_S = 299792.458
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This compares TDCOSMO and H0LiCOW as independent time-delay reach lanes.",
+              "TDCOSMO Ddt rows remain diagnostic-only.",
+              "H0LiCOW distance posterior rows remain diagnostic-only.",
+              "Cross-source agreement is not model validation.",
+              "Cross-source disagreement is not a TAIRID failure by itself.",
+              "All pressure coordinates use a declared Planck flat-LCDM diagnostic reference.",
+              "The declared reference is a coordinate system, not a full likelihood.",
+              "No row may be promoted to model-anchor status in this workflow.",
+              "A pass only means the time-delay lane has been classified as shared-positive, mixed, or source-specific."
+          ]
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          TDCOSMO_PRODUCTS = {
+              "posterior_table_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv"
+          }
+
+          H0LICOW_RAW_BASE = "https://raw.githubusercontent.com/shsuyu/H0LiCOW-public/master/h0licow_distance_chains/"
+
+          H0LICOW_PRODUCTS = [
+              {
+                  "source": "H0LiCOW",
+                  "family": "HE0435_1223",
+                  "filename": "HE0435_Ddt_AO+HST.dat",
+                  "z_lens": 0.4546,
+                  "z_source": 1.693,
+                  "expected_observable": "Ddt_time_delay_distance"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "family": "J1206_4332",
+                  "filename": "J1206_final.csv",
+                  "z_lens": 0.745,
+                  "z_source": 1.789,
+                  "expected_observable": "Ddt_time_delay_distance"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "family": "PG1115_080",
+                  "filename": "PG1115_AO+HST_Dd_Ddt.dat",
+                  "z_lens": 0.311,
+                  "z_source": 1.722,
+                  "expected_observable": "Ddt_time_delay_distance"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "family": "RXJ1131_1231",
+                  "filename": "RXJ1131_AO+HST_Dd_Ddt.dat",
+                  "z_lens": 0.295,
+                  "z_source": 0.654,
+                  "expected_observable": "Ddt_time_delay_distance"
+              },
+              {
+                  "source": "H0LiCOW",
+                  "family": "WFI2033_4723",
+                  "filename": "wfi2033_dt_bic.dat",
+                  "z_lens": 0.6575,
+                  "z_source": 1.662,
+                  "expected_observable": "Ddt_time_delay_distance"
+              }
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url_or_name):
+              name = url_or_name.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.34-time-delay-cross-source-audit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def parse_float_or_none(value):
+              if value is None:
+                  return None
+
+              text = str(value).strip()
+              if text in ["", "-", "--", "nan", "NaN", "NAN", "None", "null"]:
+                  return None
+
+              try:
+                  x = float(text)
+              except Exception:
+                  return None
+
+              if not math.isfinite(x):
+                  return None
+
+              return x
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+
+                  try:
+                      rows.append({
+                          "parameter_raw": name_raw,
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+                  text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+              marg = {r["parameter"]: r for r in parse_planck_margestats(text)}
+              required = ["H0", "omegam", "rdrag"]
+              missing = [p for p in required if p not in marg]
+              if missing:
+                  raise RuntimeError(f"Missing Planck reference parameters: {missing}")
+
+              return {
+                  "H0": float(marg["H0"]["mean"]),
+                  "omegam": float(marg["omegam"]["mean"]),
+                  "rdrag": float(marg["rdrag"]["mean"])
+              }
+
+          def E_z(z, omega_m):
+              return math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+          def comoving_distance_mpc(z, h0, omega_m):
+              if z <= 0:
+                  return 0.0
+
+              n = 2000
+              if n % 2:
+                  n += 1
+
+              xs = np.linspace(0.0, z, n + 1)
+              ys = np.array([1.0 / E_z(float(x), omega_m) for x in xs])
+              h = z / n
+
+              integral = h / 3.0 * (
+                  ys[0]
+                  + ys[-1]
+                  + 4.0 * np.sum(ys[1:-1:2])
+                  + 2.0 * np.sum(ys[2:-2:2])
+              )
+
+              return C_LIGHT_KM_S / h0 * integral
+
+          def angular_diameter_distance_mpc(z, h0, omega_m):
+              return comoving_distance_mpc(z, h0, omega_m) / (1.0 + z)
+
+          def angular_diameter_between_mpc(z_lens, z_source, h0, omega_m):
+              if z_source <= z_lens:
+                  return None
+
+              dc_lens = comoving_distance_mpc(z_lens, h0, omega_m)
+              dc_source = comoving_distance_mpc(z_source, h0, omega_m)
+
+              return (dc_source - dc_lens) / (1.0 + z_source)
+
+          def reference_ddt_mpc(z_lens, z_source, planck):
+              d_l = angular_diameter_distance_mpc(z_lens, planck["H0"], planck["omegam"])
+              d_s = angular_diameter_distance_mpc(z_source, planck["H0"], planck["omegam"])
+              d_ls = angular_diameter_between_mpc(z_lens, z_source, planck["H0"], planck["omegam"])
+
+              if d_ls is None or d_ls <= 0:
+                  return None
+
+              return (1.0 + z_lens) * d_l * d_s / d_ls
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def summarize_distribution(values, weights=None):
+              values = np.asarray(values, dtype=float)
+              if weights is None:
+                  weights = np.ones_like(values)
+              else:
+                  weights = np.asarray(weights, dtype=float)
+
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  raise RuntimeError("No finite values available for distribution summary.")
+
+              q16, q50, q84 = weighted_quantile(values, weights, [0.16, 0.50, 0.84])
+              sigma = (q84 - q16) / 2.0 if q16 is not None and q84 is not None else None
+
+              return {
+                  "mean": float(np.average(values, weights=weights)) if np.sum(weights) > 0 else float(np.mean(values)),
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "sigma": sigma,
+                  "row_count": int(len(values)),
+                  "min": float(np.min(values)),
+                  "max": float(np.max(values))
+              }
+
+          def tokenize_line(line):
+              return [t for t in re.split(r"[\s,;]+", line.strip()) if t]
+
+          def parse_numeric_table(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              header_tokens = []
+              rows = []
+
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+
+                  if line.startswith("#"):
+                      candidate = line.lstrip("#").strip()
+                      tokens = tokenize_line(candidate)
+                      if tokens and not header_tokens:
+                          numeric_count = sum(1 for t in tokens if parse_float_or_none(t) is not None)
+                          if numeric_count < len(tokens):
+                              header_tokens = tokens
+                      continue
+
+                  tokens = tokenize_line(line)
+                  floats = []
+                  numeric_count = 0
+
+                  for token in tokens:
+                      x = parse_float_or_none(token)
+                      if x is not None:
+                          floats.append(x)
+                          numeric_count += 1
+
+                  if numeric_count >= 1:
+                      rows.append(floats)
+                  elif tokens and not header_tokens:
+                      header_tokens = tokens
+
+              if not rows:
+                  raise RuntimeError(f"No numeric rows found in {path}")
+
+              lengths = [len(r) for r in rows]
+              common_len = Counter(lengths).most_common(1)[0][0]
+              clean_rows = [r for r in rows if len(r) == common_len]
+
+              if len(clean_rows) < 5:
+                  raise RuntimeError(f"Too few clean numeric rows in {path}")
+
+              data = np.asarray(clean_rows, dtype=float)
+
+              return header_tokens, data
+
+          def infer_ddt_and_weight_columns(header_tokens, data):
+              ncols = data.shape[1]
+
+              ddt_idx = None
+              weight_idx = None
+
+              if header_tokens and len(header_tokens) == ncols:
+                  lowered = [h.lower() for h in header_tokens]
+
+                  for i, name in enumerate(lowered):
+                      if "ddt" in name or "d_dt" in name or "deltat" in name:
+                          ddt_idx = i
+                          break
+
+                  for i, name in enumerate(lowered):
+                      if any(term in name for term in ["weight", "prob", "pdf", "like"]):
+                          weight_idx = i
+                          break
+
+              if ddt_idx is None:
+                  candidates = []
+                  for i in range(ncols):
+                      col = data[:, i]
+                      finite = col[np.isfinite(col)]
+                      if len(finite) == 0:
+                          continue
+
+                      med = float(np.median(finite))
+                      if 100.0 <= med <= 50000.0:
+                          candidates.append((i, med))
+
+                  if not candidates:
+                      raise RuntimeError("Could not infer a Ddt-like distance column.")
+
+                  # Ddt is usually the larger distance-like column when both Dd and Ddt are present.
+                  ddt_idx = sorted(candidates, key=lambda x: x[1], reverse=True)[0][0]
+
+              if weight_idx is None and ncols >= 2:
+                  possible_weight_cols = []
+                  for i in range(ncols):
+                      if i == ddt_idx:
+                          continue
+
+                      col = data[:, i]
+                      finite = col[np.isfinite(col)]
+
+                      if len(finite) == 0:
+                          continue
+
+                      if np.all(finite >= 0):
+                          med = float(np.median(finite))
+                          maxv = float(np.max(finite))
+                          if med < 100.0 and maxv > 0:
+                              possible_weight_cols.append((i, med, maxv))
+
+                  if possible_weight_cols:
+                      # Prefer a small nonnegative probability/PDF-like column.
+                      weight_idx = sorted(possible_weight_cols, key=lambda x: x[1])[0][0]
+
+              return ddt_idx, weight_idx
+
+          def load_h0licow_rows(planck):
+              outdir = DOWNLOADS / "H0LiCOW"
+              outdir.mkdir(parents=True, exist_ok=True)
+
+              rows = []
+              source_rows = []
+              skipped_rows = []
+
+              for product in H0LICOW_PRODUCTS:
+                  quoted = urllib.parse.quote(product["filename"], safe="")
+                  url = H0LICOW_RAW_BASE + quoted
+                  path = outdir / safe_name(product["filename"])
+
+                  try:
+                      dl = download(url, path)
+                      header_tokens, data = parse_numeric_table(path)
+                      ddt_idx, weight_idx = infer_ddt_and_weight_columns(header_tokens, data)
+
+                      ddt_values = data[:, ddt_idx]
+
+                      # Unit fence: if a posterior is unexpectedly in Gpc-like units, convert to Mpc.
+                      unit_adjustment = "none"
+                      if np.nanmedian(ddt_values) < 100.0:
+                          ddt_values = ddt_values * 1000.0
+                          unit_adjustment = "gpc_to_mpc_assumption"
+
+                      weights = data[:, weight_idx] if weight_idx is not None else np.ones_like(ddt_values)
+                      summary = summarize_distribution(ddt_values, weights)
+
+                      reference = reference_ddt_mpc(product["z_lens"], product["z_source"], planck)
+                      if reference is None or summary["sigma"] is None or summary["sigma"] <= 0:
+                          pressure_z = None
+                          pressure_sign = "unmapped"
+                          finite_pressure = False
+                      else:
+                          pressure_z = (summary["q50"] - reference) / summary["sigma"]
+                          pressure_sign = "positive" if pressure_z > 0 else "negative" if pressure_z < 0 else "zero"
+                          finite_pressure = math.isfinite(pressure_z)
+
+                      rows.append({
+                          "source": "H0LiCOW",
+                          "surface": "reach_geometry",
+                          "time_delay_lane": "h0licow_distance_posterior",
+                          "family": product["family"],
+                          "filename": product["filename"],
+                          "download_url": url,
+                          "z_lens": product["z_lens"],
+                          "z_source": product["z_source"],
+                          "standardized_observable": "Ddt_time_delay_distance",
+                          "value_q16": summary["q16"],
+                          "value_q50": summary["q50"],
+                          "value_q84": summary["q84"],
+                          "sigma": summary["sigma"],
+                          "sample_mean": summary["mean"],
+                          "sample_count": summary["row_count"],
+                          "reference_value": reference if reference is not None else "",
+                          "pressure_z": pressure_z if pressure_z is not None else "",
+                          "pressure_sign": pressure_sign,
+                          "finite_pressure": finite_pressure,
+                          "abs_pressure_z": abs(pressure_z) if pressure_z is not None else "",
+                          "large_pressure_flag_abs_gt_5": bool(pressure_z is not None and abs(pressure_z) > 5.0),
+                          "extreme_pressure_flag_abs_gt_10": bool(pressure_z is not None and abs(pressure_z) > 10.0),
+                          "ddt_column_index": ddt_idx,
+                          "weight_column_index": weight_idx if weight_idx is not None else "",
+                          "header_tokens": ";".join(header_tokens),
+                          "unit_adjustment": unit_adjustment,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "diagnostic_only": True,
+                          "boundary_note": "H0LiCOW Ddt posterior mapped against Planck flat-LCDM diagnostic reference. Not a model anchor."
+                      })
+
+                      source_rows.append({
+                          "source": "H0LiCOW",
+                          "family": product["family"],
+                          "downloaded": True,
+                          "mapped": finite_pressure,
+                          "file_size_bytes": dl["size_bytes"],
+                          "numeric_shape": f"{data.shape[0]}x{data.shape[1]}",
+                          "ddt_column_index": ddt_idx,
+                          "weight_column_index": weight_idx if weight_idx is not None else "",
+                          "unit_adjustment": unit_adjustment,
+                          "error": ""
+                      })
+
+                  except Exception as e:
+                      skipped_rows.append({
+                          "source": "H0LiCOW",
+                          "family": product["family"],
+                          "filename": product["filename"],
+                          "reason": f"{type(e).__name__}: {e}"
+                      })
+
+                      source_rows.append({
+                          "source": "H0LiCOW",
+                          "family": product["family"],
+                          "downloaded": False,
+                          "mapped": False,
+                          "file_size_bytes": "",
+                          "numeric_shape": "",
+                          "ddt_column_index": "",
+                          "weight_column_index": "",
+                          "unit_adjustment": "",
+                          "error": f"{type(e).__name__}: {e}"
+                      })
+
+              return rows, source_rows, skipped_rows
+
+          def load_tdcosmo_rows(planck):
+              td_dir = DOWNLOADS / "TDCOSMO_2020"
+              td_dir.mkdir(parents=True, exist_ok=True)
+              table_path = td_dir / safe_name(TDCOSMO_PRODUCTS["posterior_table_url"])
+              download(TDCOSMO_PRODUCTS["posterior_table_url"], table_path)
+
+              with table_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                  reader = csv.DictReader(f)
+                  table_rows = list(reader)
+                  fieldnames = reader.fieldnames or []
+
+              required = ["name", "z_lens", "z_source", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma", "flag"]
+              missing = [c for c in required if c not in fieldnames]
+              if missing:
+                  raise RuntimeError(f"TDCOSMO posterior table missing columns: {missing}")
+
+              rows = []
+              skipped = []
+              missing_dd_count = 0
+
+              for i, row in enumerate(table_rows):
+                  name = row.get("name", f"row_{i}")
+                  flag = parse_float_or_none(row.get("flag"))
+                  z_lens = parse_float_or_none(row.get("z_lens"))
+                  z_source = parse_float_or_none(row.get("z_source"))
+                  ddt_mean = parse_float_or_none(row.get("Ddt_mean"))
+                  ddt_sigma = parse_float_or_none(row.get("Ddt_sigma"))
+                  dd_mean = parse_float_or_none(row.get("Dd_mean"))
+                  dd_sigma = parse_float_or_none(row.get("Dd_sigma"))
+
+                  if dd_mean is None or dd_sigma is None:
+                      missing_dd_count += 1
+
+                  if flag is not None and flag < 0:
+                      skipped.append({
+                          "source": "TDCOSMO_2020",
+                          "name": name,
+                          "row_index": i,
+                          "reason": "negative_flag",
+                          "flag": row.get("flag")
+                      })
+                      continue
+
+                  if z_lens is None or z_source is None or ddt_mean is None or ddt_sigma is None or ddt_sigma <= 0:
+                      skipped.append({
+                          "source": "TDCOSMO_2020",
+                          "name": name,
+                          "row_index": i,
+                          "reason": "missing_or_invalid_Ddt_fields",
+                          "flag": row.get("flag")
+                      })
+                      continue
+
+                  reference = reference_ddt_mpc(z_lens, z_source, planck)
+                  if reference is None:
+                      pressure_z = None
+                      pressure_sign = "unmapped"
+                      finite_pressure = False
+                  else:
+                      pressure_z = (ddt_mean - reference) / ddt_sigma
+                      pressure_sign = "positive" if pressure_z > 0 else "negative" if pressure_z < 0 else "zero"
+                      finite_pressure = math.isfinite(pressure_z)
+
+                  rows.append({
+                      "source": "TDCOSMO_2020",
+                      "surface": "reach_geometry",
+                      "time_delay_lane": "tdcosmo_posterior_table",
+                      "family": "TDCOSMO_time_delay",
+                      "lens_name": name,
+                      "row_index": i,
+                      "z_lens": z_lens,
+                      "z_source": z_source,
+                      "standardized_observable": "Ddt_time_delay_distance",
+                      "value_q16": "",
+                      "value_q50": ddt_mean,
+                      "value_q84": "",
+                      "sigma": ddt_sigma,
+                      "sample_mean": ddt_mean,
+                      "sample_count": 1,
+                      "reference_value": reference if reference is not None else "",
+                      "pressure_z": pressure_z if pressure_z is not None else "",
+                      "pressure_sign": pressure_sign,
+                      "finite_pressure": finite_pressure,
+                      "abs_pressure_z": abs(pressure_z) if pressure_z is not None else "",
+                      "large_pressure_flag_abs_gt_5": bool(pressure_z is not None and abs(pressure_z) > 5.0),
+                      "extreme_pressure_flag_abs_gt_10": bool(pressure_z is not None and abs(pressure_z) > 10.0),
+                      "tdcosmo_flag": flag if flag is not None else "",
+                      "included_in_model": False,
+                      "model_anchor_allowed_now": False,
+                      "diagnostic_only": True,
+                      "boundary_note": "TDCOSMO Ddt row mapped against Planck flat-LCDM diagnostic reference. Not a model anchor."
+                  })
+
+              return rows, skipped, missing_dd_count, len(table_rows)
+
+          def summarize_lane(rows, lane_name):
+              finite = [r for r in rows if r.get("finite_pressure") is True]
+              pressures = [float(r["pressure_z"]) for r in finite]
+
+              if pressures:
+                  mean_pressure = float(np.mean(pressures))
+                  median_pressure = float(np.median(pressures))
+                  min_pressure = float(np.min(pressures))
+                  max_pressure = float(np.max(pressures))
+                  sign_from_mean = "positive" if mean_pressure > 0 else "negative" if mean_pressure < 0 else "zero"
+              else:
+                  mean_pressure = ""
+                  median_pressure = ""
+                  min_pressure = ""
+                  max_pressure = ""
+                  sign_from_mean = "unmapped"
+
+              return {
+                  "time_delay_lane": lane_name,
+                  "row_count": len(rows),
+                  "finite_pressure_count": len(finite),
+                  "mean_pressure_z": mean_pressure,
+                  "median_pressure_z": median_pressure,
+                  "min_pressure_z": min_pressure,
+                  "max_pressure_z": max_pressure,
+                  "positive_count": sum(1 for p in pressures if p > 0),
+                  "negative_count": sum(1 for p in pressures if p < 0),
+                  "large_abs_gt_5_count": sum(1 for p in pressures if abs(p) > 5.0),
+                  "extreme_abs_gt_10_count": sum(1 for p in pressures if abs(p) > 10.0),
+                  "sign_from_mean": sign_from_mean,
+                  "signs_present": ";".join(sorted(set(r["pressure_sign"] for r in finite))),
+                  "model_anchor_allowed": False,
+                  "boundary_note": "Lane summary only. No refit and no model claim."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_33_status": "reach_subsurface_reference_sensitivity_passed_time_delay_cross_source_audit_needed",
+                  "v3_33_key_result": "TDCOSMO remained positive under reference and sigma/filter sensitivity; BAO stayed separate."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.34 time-delay cross-source audit")
+          print("Truth boundary: cross-source diagnostic audit only; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_results"]["Planck_2018"] = {
+                  "load_pass": True,
+                  "H0": planck["H0"],
+                  "omegam": planck["omegam"],
+                  "rdrag": planck["rdrag"],
+                  "boundary": "Diagnostic reference coordinate system only."
+              }
+              print("Planck reference loaded.")
+          except Exception as e:
+              planck = None
+              failed_gates.append("planck_reference_load_failed")
+              inventory["source_results"]["Planck_2018"] = {
+                  "load_pass": False,
+                  "error": f"{type(e).__name__}: {e}"
+              }
+              print(f"Planck failed: {type(e).__name__}: {e}")
+
+          td_rows = []
+          td_skipped = []
+          td_missing_dd_count = 0
+          td_table_row_count = 0
+
+          if planck is not None:
+              try:
+                  td_rows, td_skipped, td_missing_dd_count, td_table_row_count = load_tdcosmo_rows(planck)
+                  inventory["source_results"]["TDCOSMO_2020"] = {
+                      "load_pass": len(td_rows) >= 10,
+                      "mapped_row_count": len(td_rows),
+                      "skipped_row_count": len(td_skipped),
+                      "missing_Dd_field_count": td_missing_dd_count,
+                      "table_row_count": td_table_row_count,
+                      "boundary": "TDCOSMO Ddt rows loaded as one time-delay diagnostic lane."
+                  }
+                  print(f"TDCOSMO mapped rows: {len(td_rows)}")
+              except Exception as e:
+                  failed_gates.append("tdcosmo_load_failed")
+                  inventory["source_results"]["TDCOSMO_2020"] = {
+                      "load_pass": False,
+                      "error": f"{type(e).__name__}: {e}"
+                  }
+                  print(f"TDCOSMO failed: {type(e).__name__}: {e}")
+
+          h0licow_rows = []
+          h0licow_source_rows = []
+          h0licow_skipped = []
+
+          if planck is not None:
+              try:
+                  h0licow_rows, h0licow_source_rows, h0licow_skipped = load_h0licow_rows(planck)
+                  inventory["source_results"]["H0LiCOW"] = {
+                      "load_pass": len(h0licow_rows) >= 4,
+                      "mapped_row_count": len(h0licow_rows),
+                      "source_product_count": len(h0licow_source_rows),
+                      "skipped_product_count": len(h0licow_skipped),
+                      "boundary": "H0LiCOW distance posteriors loaded as independent time-delay diagnostic lane."
+                  }
+                  print(f"H0LiCOW mapped rows: {len(h0licow_rows)}")
+              except Exception as e:
+                  failed_gates.append("h0licow_load_failed")
+                  inventory["source_results"]["H0LiCOW"] = {
+                      "load_pass": False,
+                      "error": f"{type(e).__name__}: {e}"
+                  }
+                  print(f"H0LiCOW failed: {type(e).__name__}: {e}")
+
+          td_summary = summarize_lane(td_rows, "TDCOSMO_2020_Ddt")
+          h0licow_summary = summarize_lane(h0licow_rows, "H0LiCOW_Ddt_posteriors")
+
+          shared_positive = (
+              td_summary["sign_from_mean"] == "positive"
+              and h0licow_summary["sign_from_mean"] == "positive"
+              and h0licow_summary["finite_pressure_count"] >= 4
+          )
+
+          mixed_h0licow = (
+              h0licow_summary["positive_count"] > 0
+              and h0licow_summary["negative_count"] > 0
+          )
+
+          source_specific_positive = (
+              td_summary["sign_from_mean"] == "positive"
+              and h0licow_summary["sign_from_mean"] != "positive"
+              and h0licow_summary["finite_pressure_count"] >= 4
+          )
+
+          cross_source_classification = (
+              "shared_positive_time_delay_candidate_not_validation"
+              if shared_positive
+              else "mixed_h0licow_time_delay_followup_needed"
+              if mixed_h0licow
+              else "tdcosmo_source_specific_positive_followup_needed"
+              if source_specific_positive
+              else "time_delay_cross_source_inconclusive_followup_needed"
+          )
+
+          all_rows = td_rows + h0licow_rows
+
+          row_csv = OUTDIR / "time_delay_cross_source_rows_v3_34.csv"
+          row_fields = sorted({k for row in all_rows for k in row.keys()}) if all_rows else [
+              "source", "time_delay_lane", "pressure_z", "pressure_sign", "model_anchor_allowed_now"
+          ]
+
+          with row_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=row_fields)
+              writer.writeheader()
+              for row in all_rows:
+                  writer.writerow({k: row.get(k, "") for k in row_fields})
+
+          h0licow_source_csv = OUTDIR / "h0licow_source_product_summary_v3_34.csv"
+          h0licow_source_fields = [
+              "source", "family", "downloaded", "mapped", "file_size_bytes",
+              "numeric_shape", "ddt_column_index", "weight_column_index",
+              "unit_adjustment", "error"
+          ]
+
+          with h0licow_source_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=h0licow_source_fields)
+              writer.writeheader()
+              for row in h0licow_source_rows:
+                  writer.writerow({k: row.get(k, "") for k in h0licow_source_fields})
+
+          skipped_csv = OUTDIR / "time_delay_cross_source_skipped_rows_v3_34.csv"
+          skipped_fields = ["source", "family", "filename", "name", "row_index", "reason", "flag"]
+
+          with skipped_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=skipped_fields)
+              writer.writeheader()
+              for row in h0licow_skipped + td_skipped:
+                  writer.writerow({k: row.get(k, "") for k in skipped_fields})
+
+          summary_rows = [
+              td_summary,
+              h0licow_summary,
+              {
+                  "time_delay_lane": "cross_source_classification",
+                  "row_count": len(all_rows),
+                  "finite_pressure_count": td_summary["finite_pressure_count"] + h0licow_summary["finite_pressure_count"],
+                  "mean_pressure_z": "",
+                  "median_pressure_z": "",
+                  "min_pressure_z": "",
+                  "max_pressure_z": "",
+                  "positive_count": "",
+                  "negative_count": "",
+                  "large_abs_gt_5_count": "",
+                  "extreme_abs_gt_10_count": "",
+                  "sign_from_mean": cross_source_classification,
+                  "signs_present": "",
+                  "model_anchor_allowed": False,
+                  "boundary_note": "Classification only. This does not validate TAIRID or permit refit."
+              }
+          ]
+
+          summary_csv = OUTDIR / "time_delay_cross_source_summary_v3_34.csv"
+          summary_fields = [
+              "time_delay_lane", "row_count", "finite_pressure_count",
+              "mean_pressure_z", "median_pressure_z", "min_pressure_z", "max_pressure_z",
+              "positive_count", "negative_count", "large_abs_gt_5_count",
+              "extreme_abs_gt_10_count", "sign_from_mean", "signs_present",
+              "model_anchor_allowed", "boundary_note"
+          ]
+
+          with summary_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=summary_fields)
+              writer.writeheader()
+              for row in summary_rows:
+                  writer.writerow({k: row.get(k, "") for k in summary_fields})
+
+          model_anchor_violations = [
+              row for row in all_rows
+              if row.get("model_anchor_allowed_now") is not False
+          ]
+
+          diagnostic_violations = [
+              row for row in all_rows
+              if row.get("diagnostic_only") is not True
+          ]
+
+          if len(td_rows) < 10:
+              failed_gates.append("tdcosmo_time_delay_rows_below_threshold")
+
+          if len(h0licow_rows) < 4:
+              failed_gates.append("h0licow_distance_posterior_rows_below_threshold")
+
+          if td_summary["finite_pressure_count"] < 10:
+              failed_gates.append("tdcosmo_finite_pressure_count_below_threshold")
+
+          if h0licow_summary["finite_pressure_count"] < 4:
+              failed_gates.append("h0licow_finite_pressure_count_below_threshold")
+
+          if model_anchor_violations:
+              failed_gates.append("model_anchor_promotion_violation")
+
+          if diagnostic_violations:
+              failed_gates.append("diagnostic_boundary_violation")
+
+          audit_rows = [
+              {
+                  "audit_gate": "planck_reference_loaded",
+                  "pass": planck is not None,
+                  "value": json.dumps(inventory["source_results"].get("Planck_2018", {}), sort_keys=True),
+                  "boundary": "Reference is diagnostic only."
+              },
+              {
+                  "audit_gate": "tdcosmo_time_delay_lane_loaded",
+                  "pass": len(td_rows) >= 10,
+                  "value": len(td_rows),
+                  "boundary": "TDCOSMO remains the v3.33 baseline time-delay lane."
+              },
+              {
+                  "audit_gate": "h0licow_distance_posterior_lane_loaded",
+                  "pass": len(h0licow_rows) >= 4,
+                  "value": len(h0licow_rows),
+                  "boundary": "H0LiCOW is the independent non-TDCOSMO time-delay lane."
+              },
+              {
+                  "audit_gate": "cross_source_direction_classified",
+                  "pass": cross_source_classification != "time_delay_cross_source_inconclusive_followup_needed",
+                  "value": cross_source_classification,
+                  "boundary": "Classification is diagnostic, not validation."
+              },
+              {
+                  "audit_gate": "shared_positive_time_delay_candidate",
+                  "pass": shared_positive,
+                  "value": shared_positive,
+                  "boundary": "False does not fail the workflow; it means source-specific followup is needed."
+              },
+              {
+                  "audit_gate": "mixed_h0licow_recorded",
+                  "pass": True,
+                  "value": mixed_h0licow,
+                  "boundary": "Mixed H0LiCOW signs must be recorded, not hidden."
+              },
+              {
+                  "audit_gate": "tdcosmo_missing_Dd_fields_preserved",
+                  "pass": td_missing_dd_count >= 1,
+                  "value": td_missing_dd_count,
+                  "boundary": "Unavailable TDCOSMO Dd fields remain fenced."
+              },
+              {
+                  "audit_gate": "no_model_anchor_promotion",
+                  "pass": len(model_anchor_violations) == 0,
+                  "value": len(model_anchor_violations),
+                  "boundary": "Cross-source audit does not promote rows to model anchors."
+              },
+              {
+                  "audit_gate": "all_time_delay_rows_remain_diagnostic",
+                  "pass": len(diagnostic_violations) == 0,
+                  "value": len(diagnostic_violations),
+                  "boundary": "All time-delay rows remain diagnostic-only."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed in v3.34."
+              }
+          ]
+
+          audit_csv = OUTDIR / "time_delay_cross_source_audit_v3_34.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failures = [
+              gate for gate in failed_gates
+              if gate not in []
+          ]
+
+          if hard_failures:
+              readiness_label = "time_delay_cross_source_audit_needs_source_followup"
+          elif shared_positive:
+              readiness_label = "time_delay_cross_source_audit_passed_shared_positive_candidate_not_validation"
+          elif mixed_h0licow:
+              readiness_label = "time_delay_cross_source_audit_passed_mixed_h0licow_followup_needed"
+          elif source_specific_positive:
+              readiness_label = "time_delay_cross_source_audit_passed_tdcosmo_source_specific_followup_needed"
+          else:
+              readiness_label = "time_delay_cross_source_audit_passed_inconclusive_followup_needed"
+
+          if hard_failures:
+              next_step = "Inspect failed v3.34 source parsing gates before any follow-up."
+          elif shared_positive:
+              next_step = "Build v3.35 time-delay semantics audit: compare TDCOSMO and H0LiCOW Ddt product definitions, uncertainty handling, and lens-by-lens pressure before any refit."
+          elif mixed_h0licow:
+              next_step = "Build v3.35 H0LiCOW lens-level semantics audit: determine why the independent time-delay lane is mixed before comparing to TDCOSMO."
+          else:
+              next_step = "Build v3.35 TDCOSMO source-specific semantics audit: test whether TDCOSMO's positive Ddt pressure is product-specific before any refit."
+
+          inventory["tdcosmo_summary"] = td_summary
+          inventory["h0licow_summary"] = h0licow_summary
+          inventory["shared_positive"] = shared_positive
+          inventory["mixed_h0licow"] = mixed_h0licow
+          inventory["source_specific_positive"] = source_specific_positive
+          inventory["cross_source_classification"] = cross_source_classification
+          inventory["model_anchor_violation_count"] = len(model_anchor_violations)
+          inventory["diagnostic_violation_count"] = len(diagnostic_violations)
+          inventory["tdcosmo_missing_Dd_field_count"] = td_missing_dd_count
+          inventory["output_files"] = {
+              "time_delay_rows": str(row_csv),
+              "h0licow_source_summary": str(h0licow_source_csv),
+              "skipped_rows": str(skipped_csv),
+              "cross_source_summary": str(summary_csv),
+              "audit": str(audit_csv)
+          }
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "cross_source_classification": cross_source_classification,
+              "tdcosmo_mean_pressure_z": td_summary["mean_pressure_z"],
+              "h0licow_mean_pressure_z": h0licow_summary["mean_pressure_z"],
+              "shared_positive": shared_positive,
+              "mixed_h0licow": mixed_h0licow,
+              "source_specific_positive": source_specific_positive,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_34_time_delay_cross_source_audit.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.34 — Time-Delay Cross-Source Audit")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.34 compares the TDCOSMO time-delay reach lane against the independent H0LiCOW distance-posterior lane.")
+          md.append("")
+          md.append("It does not refit, validate, or promote any row to model-anchor status.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- TDCOSMO mapped rows: `{len(td_rows)}`")
+          md.append(f"- H0LiCOW mapped rows: `{len(h0licow_rows)}`")
+          md.append(f"- TDCOSMO mean pressure: `{td_summary['mean_pressure_z']}`")
+          md.append(f"- H0LiCOW mean pressure: `{h0licow_summary['mean_pressure_z']}`")
+          md.append(f"- Shared positive: `{shared_positive}`")
+          md.append(f"- Mixed H0LiCOW: `{mixed_h0licow}`")
+          md.append(f"- Source-specific positive: `{source_specific_positive}`")
+          md.append(f"- Classification: `{cross_source_classification}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if shared_positive:
+              md.append("Both time-delay lanes point positive against the same diagnostic reference. That is not validation, but it means the time-delay-positive lane is no longer only a TDCOSMO artifact.")
+          elif mixed_h0licow:
+              md.append("TDCOSMO remains positive, while H0LiCOW is mixed. The next step should inspect H0LiCOW lens-level semantics before any comparison or refit.")
+          elif source_specific_positive:
+              md.append("TDCOSMO remains positive, while H0LiCOW does not share the same direction. Treat the TDCOSMO pressure as source-specific until semantics are audited.")
+          else:
+              md.append("The cross-source comparison is inconclusive. No stronger claim is allowed.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `time_delay_cross_source_rows_v3_34.csv`")
+          md.append("- `h0licow_source_product_summary_v3_34.csv`")
+          md.append("- `time_delay_cross_source_skipped_rows_v3_34.csv`")
+          md.append("- `time_delay_cross_source_summary_v3_34.csv`")
+          md.append("- `time_delay_cross_source_audit_v3_34.csv`")
+          md.append("- `tairid_cosmology_v3_34_time_delay_cross_source_audit.json`")
+          md.append("- `tairid_cosmology_v3_34_time_delay_cross_source_audit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_34_time_delay_cross_source_audit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failures:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.34 time-delay cross-source audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-34-time-delay-cross-source-audit
+          path: artifacts/tairid_cosmology_v3_34/
