@@ -1,0 +1,762 @@
+name: TAIRID Cosmology v3.26 Independent Reach Source Search
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-source-search:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.26 independent reach source search
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_26
+
+          python - <<'PY'
+          import csv
+          import html
+          import json
+          import re
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_26")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_26_independent_reach_source_search"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This searches for independent non-DESI reach/geometry source products.",
+              "DESI is intentionally excluded because v3.25 already showed its mapped reach rows are scaled counterparts.",
+              "Discovery of a source product does not make it a model anchor.",
+              "A pass only means one or more independent reach-source lanes are ready for targeted ingestion."
+          ]
+
+          SOURCES = [
+              {
+                  "source": "PantheonPlus_SH0ES",
+                  "surface": "reach_geometry",
+                  "lane": "local_ladder_sn_reach",
+                  "seed_urls": [
+                      "https://api.github.com/repos/PantheonPlusSH0ES/DataRelease/contents/SH0ES_Data",
+                      "https://api.github.com/repos/PantheonPlusSH0ES/DataRelease/contents/Cosmology",
+                      "https://github.com/PantheonPlusSH0ES/DataRelease"
+                  ],
+                  "expected_products": [
+                      "SH0ES data",
+                      "H0 / local-ladder products",
+                      "chains",
+                      "cosmology inputs",
+                      "CosmoSIS likelihoods"
+                  ]
+              },
+              {
+                  "source": "H0LiCOW",
+                  "surface": "reach_geometry",
+                  "lane": "strong_lens_time_delay_reach",
+                  "seed_urls": [
+                      "https://shsuyu.github.io/H0LiCOW/site/h0licow_data.html"
+                  ],
+                  "expected_products": [
+                      "time-delay distance posteriors",
+                      "angular-diameter distance posteriors",
+                      "H0 inference notebook",
+                      "lens posterior files"
+                  ]
+              },
+              {
+                  "source": "TDCOSMO_2020",
+                  "surface": "reach_geometry",
+                  "lane": "hierarchical_time_delay_cosmography",
+                  "seed_urls": [
+                      "https://api.github.com/repos/TDCOSMO/hierarchy_analysis_2020_public/contents",
+                      "https://github.com/TDCOSMO/hierarchy_analysis_2020_public"
+                  ],
+                  "expected_products": [
+                      "hierarchical time-delay cosmography pipeline",
+                      "posterior samples",
+                      "configuration files",
+                      "distance / H0 inference products"
+                  ]
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "surface": "reach_geometry",
+                  "lane": "pre_DESI_bao_likelihoods",
+                  "seed_urls": [
+                      "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/",
+                      "https://www.sdss4.org/surveys/eboss/"
+                  ],
+                  "expected_products": [
+                      "BAO likelihoods",
+                      "covariance matrices",
+                      "CosmoMC chains",
+                      "DR16 cosmology products"
+                  ]
+              },
+              {
+                  "source": "BOSS_DR12_BAO",
+                  "surface": "reach_geometry",
+                  "lane": "pre_DESI_boss_bao",
+                  "seed_urls": [
+                      "https://data.sdss.org/sas/dr12/boss/papers/clustering/",
+                      "https://www.sdss3.org/science/boss_publications.php"
+                  ],
+                  "expected_products": [
+                      "BAO measurements",
+                      "covariance matrices",
+                      "likelihoods",
+                      "BOSS DR12 clustering products"
+                  ]
+              }
+          ]
+
+          PRODUCT_TERMS = [
+              "h0", "hubble", "sh0es", "cepheid", "pantheon",
+              "bao", "rdrag", "rd", "dv", "dm", "dh",
+              "time-delay", "timedelay", "time_delay", "tdcosmo", "h0licow",
+              "posterior", "posteriors", "chain", "chains", "mcmc", "cosmomc",
+              "likelihood", "covariance", "covmat", "cov", "distances",
+              "angular", "diameter", "cosmosis", "ini", "yaml", "json",
+              "txt", "dat", "csv", "fits", "zip", "gz", "tar", "tgz",
+              "pkl", "pickle", "npy", "npz", "samples", "notebook", "ipynb"
+          ]
+
+          DIRECT_EXTENSIONS = [
+              ".txt", ".dat", ".csv", ".tsv", ".json", ".yaml", ".yml",
+              ".ini", ".paramnames", ".covmat", ".cov", ".chain",
+              ".zip", ".gz", ".tar", ".tgz", ".tar.gz",
+              ".fits", ".fit", ".npy", ".npz", ".pkl", ".pickle",
+              ".ipynb"
+          ]
+
+          BLOCKED_EXTENSIONS = [
+              ".png", ".jpg", ".jpeg", ".gif", ".svg",
+              ".css", ".js", ".ico", ".woff", ".woff2", ".ttf"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def is_blocked_url(url):
+              path = urllib.parse.urlparse(url).path.lower()
+              return any(path.endswith(ext) for ext in BLOCKED_EXTENSIONS)
+
+          def is_direct_file_url(url):
+              path = urllib.parse.urlparse(url).path.lower()
+              return any(path.endswith(ext) for ext in DIRECT_EXTENSIONS)
+
+          def looks_like_directory_url(url):
+              path = urllib.parse.urlparse(url).path
+              if path.endswith("/"):
+                  return True
+              last = path.rstrip("/").split("/")[-1]
+              return "." not in last
+
+          def term_hits(text):
+              lower = (text or "").lower()
+              return sorted({term for term in PRODUCT_TERMS if term in lower})
+
+          def fetch_url(url, max_bytes=180000, timeout=45):
+              result = {
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "final_url": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "bytes_read": 0,
+                  "text": "",
+                  "json": None,
+                  "error": None,
+                  "checked_at_utc": now_iso()
+              }
+
+              headers = {
+                  "User-Agent": "TAIRID-v3.26-independent-reach-source-search/1.0",
+                  "Accept": "*/*",
+                  "Range": f"bytes=0-{max_bytes - 1}"
+              }
+
+              try:
+                  req = urllib.request.Request(url, headers=headers, method="GET")
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      body = resp.read(max_bytes)
+                      ctype = resp.headers.get("Content-Type")
+                      status = getattr(resp, "status", None)
+                      text = body.decode("utf-8", errors="replace")
+
+                      parsed_json = None
+                      if "json" in (ctype or "").lower() or url.startswith("https://api.github.com/"):
+                          try:
+                              parsed_json = json.loads(text)
+                          except Exception:
+                              parsed_json = None
+
+                      result.update({
+                          "ok": status is not None and 200 <= status < 400,
+                          "status": status,
+                          "final_url": resp.geturl(),
+                          "content_type": ctype,
+                          "content_length": resp.headers.get("Content-Length"),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "json": parsed_json
+                      })
+
+              except urllib.error.HTTPError as e:
+                  try:
+                      body = e.read(max_bytes)
+                  except Exception:
+                      body = b""
+
+                  result.update({
+                      "ok": False,
+                      "status": e.code,
+                      "content_type": e.headers.get("Content-Type") if e.headers else None,
+                      "content_length": e.headers.get("Content-Length") if e.headers else None,
+                      "bytes_read": len(body),
+                      "text": body.decode("utf-8", errors="replace")[:8192],
+                      "error": f"HTTPError: {e.code} {getattr(e, 'reason', '')}"
+                  })
+
+              except Exception as e:
+                  result.update({
+                      "ok": False,
+                      "error": f"{type(e).__name__}: {e}"
+                  })
+
+              return result
+
+          def extract_html_links(base_url, text):
+              links = []
+              if not text:
+                  return links
+
+              for match in re.finditer(r'''href\s*=\s*["']([^"']+)["']''', text, flags=re.IGNORECASE):
+                  raw = html.unescape(match.group(1)).strip()
+                  if not raw or raw.startswith("#") or raw.startswith("mailto:") or raw.startswith("javascript:"):
+                      continue
+                  links.append(urllib.parse.urljoin(base_url, raw))
+
+              for match in re.finditer(r'''https?://[^\s<>"']+''', text):
+                  links.append(html.unescape(match.group(0)).strip().rstrip(").,;"))
+
+              deduped = []
+              seen = set()
+              for link in links:
+                  if is_blocked_url(link):
+                      continue
+                  if link not in seen:
+                      seen.add(link)
+                      deduped.append(link)
+
+              return deduped
+
+          def extract_github_api_links(seed_url, parsed_json):
+              links = []
+
+              if isinstance(parsed_json, list):
+                  for item in parsed_json:
+                      if not isinstance(item, dict):
+                          continue
+
+                      item_type = item.get("type")
+                      download_url = item.get("download_url")
+                      html_url = item.get("html_url")
+                      api_url = item.get("url")
+                      name = item.get("name", "")
+
+                      if item_type == "file":
+                          if download_url:
+                              links.append(download_url)
+                          elif html_url:
+                              links.append(html_url)
+
+                      elif item_type == "dir":
+                          if api_url:
+                              links.append(api_url)
+                          elif html_url:
+                              links.append(html_url)
+
+                      if name and html_url:
+                          links.append(html_url)
+
+              elif isinstance(parsed_json, dict):
+                  download_url = parsed_json.get("download_url")
+                  html_url = parsed_json.get("html_url")
+                  api_url = parsed_json.get("url")
+
+                  for link in [download_url, html_url, api_url]:
+                      if link:
+                          links.append(link)
+
+              deduped = []
+              seen = set()
+              for link in links:
+                  if link not in seen and not is_blocked_url(link):
+                      seen.add(link)
+                      deduped.append(link)
+
+              return deduped
+
+          def score_candidate(source_name, url, context_text):
+              combined = f"{source_name} {url} {context_text}"
+              hits = term_hits(combined)
+              direct = is_direct_file_url(url)
+              lower = combined.lower()
+
+              score = 0
+              if direct:
+                  score += 3
+
+              score += min(len(hits), 8)
+
+              high_value_terms = [
+                  "h0", "sh0es", "time-delay", "timedelay", "tdcosmo", "h0licow",
+                  "posterior", "chain", "mcmc", "likelihood", "covariance",
+                  "bao", "rdrag", "cosmomc", "cosmosis"
+              ]
+
+              for term in high_value_terms:
+                  if term in lower:
+                      score += 2
+
+              if any(x in lower for x in ["readme", "paper", "publication", "logo", "image"]):
+                  score -= 2
+
+              if any(x in lower for x in ["desi", "dr1/vac/dr1/bao-cosmo-params"]):
+                  # The point of v3.26 is independent non-DESI reach search.
+                  score -= 10
+
+              return score, hits, direct
+
+          def classify_source(source, seed_records, candidates):
+              reachable_seeds = [r for r in seed_records if r["ok"]]
+              direct_candidates = [c for c in candidates if c["direct_resource"]]
+              strong_candidates = [c for c in candidates if c["candidate_score"] >= 8]
+              medium_candidates = [c for c in candidates if c["candidate_score"] >= 5]
+              hits = sorted({h for c in candidates for h in c["product_hits"]})
+
+              has_h0_signal = any(h in hits for h in ["h0", "hubble", "sh0es"])
+              has_bao_signal = any(h in hits for h in ["bao", "rdrag", "rd", "dv", "dm", "dh"])
+              has_lens_signal = any(h in hits for h in ["time-delay", "timedelay", "time_delay", "tdcosmo", "h0licow"])
+              has_chain_signal = any(h in hits for h in ["chain", "chains", "mcmc", "cosmomc", "posterior", "posteriors", "samples"])
+              has_cov_signal = any(h in hits for h in ["covariance", "covmat", "cov"])
+              has_likelihood_signal = "likelihood" in hits or "cosmosis" in hits
+
+              if len(strong_candidates) >= 2 and (has_h0_signal or has_bao_signal or has_lens_signal):
+                  status = "independent_reach_product_candidates_found_ready_for_shape_probe"
+                  readiness = 3
+              elif len(medium_candidates) >= 2:
+                  status = "medium_reach_product_candidates_found_targeted_followup_needed"
+                  readiness = 2
+              elif reachable_seeds:
+                  status = "source_reachable_but_product_links_need_manual_followup"
+                  readiness = 1
+              else:
+                  status = "source_not_reachable_from_ci_probe"
+                  readiness = 0
+
+              return {
+                  "source": source["source"],
+                  "surface": source["surface"],
+                  "lane": source["lane"],
+                  "discovery_status": status,
+                  "readiness_score_0_to_3": readiness,
+                  "reachable_seed_count": len(reachable_seeds),
+                  "candidate_count": len(candidates),
+                  "direct_candidate_count": len(direct_candidates),
+                  "strong_candidate_count": len(strong_candidates),
+                  "medium_candidate_count": len(medium_candidates),
+                  "product_hits": hits,
+                  "signals": {
+                      "h0_signal": has_h0_signal,
+                      "bao_signal": has_bao_signal,
+                      "strong_lens_time_delay_signal": has_lens_signal,
+                      "chain_or_posterior_signal": has_chain_signal,
+                      "covariance_signal": has_cov_signal,
+                      "likelihood_signal": has_likelihood_signal
+                  },
+                  "expected_products": source["expected_products"]
+              }
+
+          def crawl_source(source, max_depth=2, max_pages=60):
+              queue = [(url, 0, None) for url in source["seed_urls"]]
+              seen = set()
+              seed_records = []
+              candidates = []
+
+              while queue and len(seen) < max_pages:
+                  url, depth, parent = queue.pop(0)
+                  if url in seen:
+                      continue
+                  seen.add(url)
+
+                  probe = fetch_url(url)
+                  text = probe["text"] or ""
+                  parsed_json = probe["json"]
+
+                  record = {
+                      "source": source["source"],
+                      "surface": source["surface"],
+                      "lane": source["lane"],
+                      "seed_or_page_url": url,
+                      "parent_url": parent,
+                      "depth": depth,
+                      "ok": probe["ok"],
+                      "status": probe["status"],
+                      "final_url": probe["final_url"],
+                      "content_type": probe["content_type"],
+                      "content_length": probe["content_length"],
+                      "bytes_read": probe["bytes_read"],
+                      "product_hits": term_hits(text + " " + url),
+                      "error": probe["error"]
+                  }
+                  seed_records.append(record)
+
+                  if not probe["ok"]:
+                      continue
+
+                  if url.startswith("https://api.github.com/"):
+                      links = extract_github_api_links(url, parsed_json)
+                  else:
+                      links = extract_html_links(probe["final_url"] or url, text)
+
+                  for link in links:
+                      if is_blocked_url(link):
+                          continue
+
+                      score, hits, direct = score_candidate(source["source"], link, text[:4000])
+
+                      if score > 0:
+                          candidates.append({
+                              "source": source["source"],
+                              "surface": source["surface"],
+                              "lane": source["lane"],
+                              "parent_url": url,
+                              "candidate_url": link,
+                              "candidate_score": score,
+                              "product_hits": hits,
+                              "direct_resource": direct,
+                              "probed": False,
+                              "probe_ok": None,
+                              "probe_status": None,
+                              "probe_content_type": None,
+                              "probe_content_length": None,
+                              "probe_error": None
+                          })
+
+                      should_crawl = (
+                          depth < max_depth
+                          and not direct
+                          and not link in seen
+                          and (
+                              link.startswith("https://api.github.com/")
+                              or looks_like_directory_url(link)
+                              or "github.com" in urllib.parse.urlparse(link).netloc
+                              or "sdss" in urllib.parse.urlparse(link).netloc
+                              or "h0licow" in link.lower()
+                              or "tdcosmo" in link.lower()
+                          )
+                      )
+
+                      if should_crawl:
+                          queue.append((link, depth + 1, url))
+
+                  time.sleep(0.15)
+
+              # Deduplicate candidate rows, keep highest score.
+              deduped = {}
+              for c in candidates:
+                  key = c["candidate_url"]
+                  if key not in deduped or c["candidate_score"] > deduped[key]["candidate_score"]:
+                      deduped[key] = c
+
+              top = sorted(deduped.values(), key=lambda c: (-c["candidate_score"], c["candidate_url"]))[:80]
+
+              # Probe top candidates lightly.
+              for c in top[:25]:
+                  if c["candidate_score"] < 5 and not c["direct_resource"]:
+                      continue
+
+                  probe = fetch_url(c["candidate_url"], max_bytes=32768, timeout=35)
+                  c["probed"] = True
+                  c["probe_ok"] = probe["ok"]
+                  c["probe_status"] = probe["status"]
+                  c["probe_content_type"] = probe["content_type"]
+                  c["probe_content_length"] = probe["content_length"]
+                  c["probe_error"] = probe["error"]
+
+                  more_hits = term_hits((probe["text"] or "") + " " + c["candidate_url"])
+                  c["product_hits"] = sorted(set(c["product_hits"]) | set(more_hits))
+
+                  time.sleep(0.10)
+
+              return seed_records, top
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_25_status": "mapped_refit_robustness_passed_pattern_survives_duplicate_demotion_not_validation",
+                  "v3_25_next_allowed_step": "Build v3.26 independent reach-source search."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": [],
+              "page_probes": [],
+              "candidate_links": [],
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.26 independent reach source search")
+          print("Truth boundary: discovery only; no refit; no model claim.")
+          print()
+
+          for source in SOURCES:
+              print(f"Searching {source['source']} [{source['lane']}]")
+              try:
+                  seed_records, candidates = crawl_source(source)
+                  summary = classify_source(source, seed_records, candidates)
+              except Exception as e:
+                  seed_records = []
+                  candidates = []
+                  summary = {
+                      "source": source["source"],
+                      "surface": source["surface"],
+                      "lane": source["lane"],
+                      "discovery_status": "source_probe_exception",
+                      "readiness_score_0_to_3": 0,
+                      "reachable_seed_count": 0,
+                      "candidate_count": 0,
+                      "direct_candidate_count": 0,
+                      "strong_candidate_count": 0,
+                      "medium_candidate_count": 0,
+                      "product_hits": [],
+                      "signals": {},
+                      "expected_products": source["expected_products"],
+                      "error": f"{type(e).__name__}: {e}"
+                  }
+
+              inventory["page_probes"].extend(seed_records)
+              inventory["candidate_links"].extend(candidates)
+              inventory["source_summaries"].append(summary)
+
+              print(f"  status: {summary['discovery_status']}")
+              print(f"  score: {summary['readiness_score_0_to_3']}")
+              print(f"  candidates: {summary['candidate_count']}")
+              print()
+
+          # Candidate CSV.
+          candidate_csv = OUTDIR / "independent_reach_candidate_links_v3_26.csv"
+          with candidate_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "lane", "parent_url", "candidate_url",
+                  "candidate_score", "product_hits", "direct_resource",
+                  "probed", "probe_ok", "probe_status",
+                  "probe_content_type", "probe_content_length", "probe_error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in inventory["candidate_links"]:
+                  out = dict(row)
+                  out["product_hits"] = ";".join(out.get("product_hits", []))
+                  writer.writerow({k: out.get(k) for k in fieldnames})
+
+          # Page probe CSV.
+          probe_csv = OUTDIR / "independent_reach_page_probes_v3_26.csv"
+          with probe_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "lane", "seed_or_page_url",
+                  "parent_url", "depth", "ok", "status", "final_url",
+                  "content_type", "content_length", "bytes_read",
+                  "product_hits", "error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in inventory["page_probes"]:
+                  out = dict(row)
+                  out["product_hits"] = ";".join(out.get("product_hits", []))
+                  writer.writerow({k: out.get(k) for k in fieldnames})
+
+          # Summary CSV.
+          summary_csv = OUTDIR / "independent_reach_source_summary_v3_26.csv"
+          with summary_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "lane", "discovery_status",
+                  "readiness_score_0_to_3", "reachable_seed_count",
+                  "candidate_count", "direct_candidate_count",
+                  "strong_candidate_count", "medium_candidate_count",
+                  "product_hits", "h0_signal", "bao_signal",
+                  "strong_lens_time_delay_signal",
+                  "chain_or_posterior_signal", "covariance_signal",
+                  "likelihood_signal", "error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for s in inventory["source_summaries"]:
+                  signals = s.get("signals", {})
+                  writer.writerow({
+                      "source": s.get("source"),
+                      "surface": s.get("surface"),
+                      "lane": s.get("lane"),
+                      "discovery_status": s.get("discovery_status"),
+                      "readiness_score_0_to_3": s.get("readiness_score_0_to_3"),
+                      "reachable_seed_count": s.get("reachable_seed_count"),
+                      "candidate_count": s.get("candidate_count"),
+                      "direct_candidate_count": s.get("direct_candidate_count"),
+                      "strong_candidate_count": s.get("strong_candidate_count"),
+                      "medium_candidate_count": s.get("medium_candidate_count"),
+                      "product_hits": ";".join(s.get("product_hits", [])),
+                      "h0_signal": signals.get("h0_signal"),
+                      "bao_signal": signals.get("bao_signal"),
+                      "strong_lens_time_delay_signal": signals.get("strong_lens_time_delay_signal"),
+                      "chain_or_posterior_signal": signals.get("chain_or_posterior_signal"),
+                      "covariance_signal": signals.get("covariance_signal"),
+                      "likelihood_signal": signals.get("likelihood_signal"),
+                      "error": s.get("error")
+                  })
+
+          ready_sources = [
+              s for s in inventory["source_summaries"]
+              if s.get("readiness_score_0_to_3", 0) >= 3
+          ]
+
+          followup_sources = [
+              s for s in inventory["source_summaries"]
+              if s.get("readiness_score_0_to_3", 0) >= 2
+          ]
+
+          reachable_sources = [
+              s for s in inventory["source_summaries"]
+              if s.get("readiness_score_0_to_3", 0) >= 1
+          ]
+
+          failed_gates = []
+          if len(reachable_sources) < 2:
+              failed_gates.append("fewer_than_two_independent_sources_reachable")
+
+          if len(followup_sources) < 1:
+              failed_gates.append("no_independent_reach_source_ready_for_followup")
+
+          if not failed_gates and len(ready_sources) >= 2:
+              readiness_label = "independent_reach_source_search_passed_multiple_shape_probe_targets_found"
+          elif not failed_gates and len(followup_sources) >= 1:
+              readiness_label = "independent_reach_source_search_partial_pass_targeted_shape_probe_ready"
+          else:
+              readiness_label = "independent_reach_source_search_needs_manual_followup"
+
+          ordered_targets = [
+              s["source"] for s in sorted(
+                  followup_sources,
+                  key=lambda x: (-x.get("readiness_score_0_to_3", 0), x.get("source", ""))
+              )
+          ]
+
+          if ordered_targets:
+              next_step = "Build v3.27 targeted independent reach shape probe for: " + ", ".join(ordered_targets) + "."
+          else:
+              next_step = "Manually add explicit independent reach-source product URLs before v3.27."
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "reachable_source_count": len(reachable_sources),
+              "followup_ready_source_count": len(followup_sources),
+              "shape_probe_ready_source_count": len(ready_sources),
+              "followup_ready_sources": ordered_targets,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_26_independent_reach_source_search.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.26 — Independent Reach Source Search")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.26 searches for an independent non-DESI reach/geometry source after v3.25 showed the DESI mapped reach rows are scaled counterparts.")
+          md.append("")
+          md.append("Sources searched:")
+          md.append("")
+          for s in SOURCES:
+              md.append(f"- `{s['source']}` — {s['lane']}")
+          md.append("")
+          md.append("## Source summary")
+          md.append("")
+          md.append("| Source | Lane | Status | Score | Candidates | Strong | Direct |")
+          md.append("|---|---|---|---:|---:|---:|---:|")
+          for s in inventory["source_summaries"]:
+              md.append(
+                  f"| {s.get('source')} | {s.get('lane')} | `{s.get('discovery_status')}` | "
+                  f"{s.get('readiness_score_0_to_3')} | {s.get('candidate_count')} | "
+                  f"{s.get('strong_candidate_count')} | {s.get('direct_candidate_count')} |"
+              )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_candidate_links_v3_26.csv`")
+          md.append("- `independent_reach_page_probes_v3_26.csv`")
+          md.append("- `independent_reach_source_summary_v3_26.csv`")
+          md.append("- `tairid_cosmology_v3_26_independent_reach_source_search.json`")
+          md.append("- `tairid_cosmology_v3_26_independent_reach_source_search.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_26_independent_reach_source_search.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.26 independent reach source search artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-26-independent-reach-source-search
+          path: artifacts/tairid_cosmology_v3_26/
