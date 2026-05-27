@@ -1,0 +1,1108 @@
+name: TAIRID Cosmology v3.16 Source-Specific Shape Probes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  source-specific-shape-probes:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.16 source-specific shape probes
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_16
+
+          python - <<'PY'
+          import csv
+          import html
+          import json
+          import math
+          import os
+          import re
+          import shutil
+          import tarfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_16")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_16_source_specific_shape_probes"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not ingest full likelihoods yet.",
+              "This is a source-specific product-shape test after v3.15 discovery.",
+              "HSC-Y3, Planck 2018, and DESI DR1 BAO products are probed only for access and file/product structure.",
+              "Any source that passes here still needs a later source-specific ingestion workflow before becoming a model anchor."
+          ]
+
+          MAX_DOWNLOAD_BYTES = 275 * 1024 * 1024
+
+          HSC_OFFICIAL_PAGE = "https://hsc-release.mtk.nao.ac.jp/doc/index.php/wly3/"
+          HSC_CHAIN_ZIP = "https://hsc-release.mtk.nao.ac.jp/doc/wp-content/uploads/2025/11/chain-real-hscs19a-fid-dpz0.093-corrected-tol0.01-final.zip"
+          HSC_GATED_PRODUCTS = [
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_space_data_vector.sacc",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/li23/data/data_vector.fits",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_cosmic_shear.txt"
+          ]
+          HSC_GITHUB_PAGES = [
+              "https://github.com/HSC-S19A-cosmology-analysis/hscs19a3x2pt-likelihood",
+              "https://github.com/ztq1996/hscy3-data-sharing"
+          ]
+
+          PLANCK_ANCILLARY_PAGE = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/"
+
+          DESI_DOC_PAGE = "https://data.desi.lbl.gov/doc/releases/dr1/vac/bao-cosmo-params/"
+          DESI_PUBLIC_BASE = "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/"
+
+          PRODUCT_TERMS = [
+              "chain", "chains", "mcmc", "posterior", "posteriors",
+              "covariance", "covmat", "cov", "likelihood", "sacc",
+              "fits", "fit", "tgz", "tar", "tar.gz", "zip", "gz",
+              "dat", "txt", "csv", "2pt", "3x2pt", "cosmosis",
+              "multinest", "bao", "planck", "plik", "clik",
+              "parameter", "parameters", "sigma8", "s8", "omega",
+              "data_vector", "datavector", "power", "spectra",
+              "cosmoparams", "cosmomc", "iminuit", "cobaya"
+          ]
+
+          DIRECT_EXTENSIONS = [
+              ".tgz", ".tar", ".tar.gz", ".gz", ".zip",
+              ".fits", ".fit", ".sacc", ".cov", ".dat",
+              ".txt", ".csv", ".tsv", ".paramnames",
+              ".chain", ".ini", ".yaml", ".yml", ".npy", ".npz"
+          ]
+
+          TEXT_EXTENSIONS = [
+              ".txt", ".dat", ".csv", ".tsv", ".paramnames",
+              ".ini", ".yaml", ".yml", ".log", ".minimum",
+              ".margestats", ".likestats", ".converge", ".ranges"
+          ]
+
+          BLOCKED_EXTENSIONS = [
+              ".png", ".jpg", ".jpeg", ".gif", ".svg",
+              ".css", ".js", ".ico", ".woff", ".woff2", ".ttf"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def normalize(text):
+              return re.sub(r"\s+", " ", text or "").strip()
+
+          def product_hits(text):
+              lower = (text or "").lower()
+              return sorted({term for term in PRODUCT_TERMS if term in lower})
+
+          def is_blocked_url(url):
+              path = urllib.parse.urlparse(url).path.lower()
+              return any(path.endswith(ext) for ext in BLOCKED_EXTENSIONS)
+
+          def is_direct_file_url(url):
+              path = urllib.parse.urlparse(url).path.lower()
+              return any(path.endswith(ext) for ext in DIRECT_EXTENSIONS)
+
+          def looks_like_directory_url(url):
+              parsed = urllib.parse.urlparse(url)
+              path = parsed.path
+              if path.endswith("/"):
+                  return True
+              last = path.rstrip("/").split("/")[-1]
+              return "." not in last
+
+          def fetch_url(url, max_bytes=131072, timeout=40, use_range=True):
+              result = {
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "final_url": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "bytes_read": 0,
+                  "text": "",
+                  "error": None,
+                  "checked_at_utc": now_iso()
+              }
+
+              headers = {
+                  "User-Agent": "TAIRID-v3.16-source-specific-shape-probe/1.0",
+                  "Accept": "*/*"
+              }
+              if use_range:
+                  headers["Range"] = f"bytes=0-{max_bytes - 1}"
+
+              try:
+                  req = urllib.request.Request(url, headers=headers, method="GET")
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      body = resp.read(max_bytes)
+                      ctype = resp.headers.get("Content-Type")
+                      text = ""
+
+                      if ctype is None or any(x in ctype.lower() for x in ["text", "html", "json", "xml", "csv"]):
+                          text = body.decode("utf-8", errors="replace")
+                      else:
+                          text = body[:8192].decode("utf-8", errors="replace")
+
+                      status = getattr(resp, "status", None)
+
+                      result.update({
+                          "ok": status is not None and 200 <= status < 400,
+                          "status": status,
+                          "final_url": resp.geturl(),
+                          "content_type": ctype,
+                          "content_length": resp.headers.get("Content-Length"),
+                          "bytes_read": len(body),
+                          "text": text
+                      })
+
+              except urllib.error.HTTPError as e:
+                  try:
+                      body = e.read(max_bytes)
+                  except Exception:
+                      body = b""
+
+                  result.update({
+                      "ok": False,
+                      "status": e.code,
+                      "content_type": e.headers.get("Content-Type") if e.headers else None,
+                      "content_length": e.headers.get("Content-Length") if e.headers else None,
+                      "bytes_read": len(body),
+                      "text": body.decode("utf-8", errors="replace")[:8192],
+                      "error": f"HTTPError: {e.code} {getattr(e, 'reason', '')}"
+                  })
+
+              except Exception as e:
+                  result.update({
+                      "ok": False,
+                      "error": f"{type(e).__name__}: {e}"
+                  })
+
+              return result
+
+          def extract_links(base_url, text):
+              links = []
+              if not text:
+                  return links
+
+              for match in re.finditer(r'''href\s*=\s*["']([^"']+)["']''', text, flags=re.IGNORECASE):
+                  raw = html.unescape(match.group(1)).strip()
+                  if not raw or raw.startswith("#") or raw.startswith("mailto:") or raw.startswith("javascript:"):
+                      continue
+                  links.append(urllib.parse.urljoin(base_url, raw))
+
+              for match in re.finditer(r'''https?://[^\s<>"']+''', text):
+                  links.append(html.unescape(match.group(0)).strip().rstrip(").,;"))
+
+              deduped = []
+              seen = set()
+              for link in links:
+                  if is_blocked_url(link):
+                      continue
+                  if link not in seen:
+                      seen.add(link)
+                      deduped.append(link)
+
+              return deduped
+
+          def download_capped(url, path, max_bytes=MAX_DOWNLOAD_BYTES, timeout=240):
+              result = {
+                  "url": url,
+                  "path": str(path),
+                  "downloaded": False,
+                  "skipped": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "size_bytes": 0,
+                  "error": None
+              }
+
+              headers = {
+                  "User-Agent": "TAIRID-v3.16-source-specific-shape-probe/1.0",
+                  "Accept": "*/*"
+              }
+
+              try:
+                  req = urllib.request.Request(url, headers=headers, method="GET")
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", None)
+                      ctype = resp.headers.get("Content-Type")
+                      clen = resp.headers.get("Content-Length")
+
+                      result["status"] = status
+                      result["content_type"] = ctype
+                      result["content_length"] = clen
+
+                      if status is None or not (200 <= status < 400):
+                          raise RuntimeError(f"HTTP status {status}")
+
+                      if clen is not None:
+                          try:
+                              clen_int = int(clen)
+                              if clen_int > max_bytes:
+                                  result["skipped"] = True
+                                  result["error"] = f"content_length_exceeds_cap:{clen_int}>{max_bytes}"
+                                  return result
+                          except Exception:
+                              pass
+
+                      path.parent.mkdir(parents=True, exist_ok=True)
+
+                      read_total = 0
+                      with open(path, "wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              read_total += len(chunk)
+                              if read_total > max_bytes:
+                                  f.close()
+                                  try:
+                                      path.unlink()
+                                  except Exception:
+                                      pass
+                                  result["skipped"] = True
+                                  result["error"] = f"download_exceeds_cap:{read_total}>{max_bytes}"
+                                  return result
+                              f.write(chunk)
+
+                      result["downloaded"] = True
+                      result["size_bytes"] = path.stat().st_size
+                      return result
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+                  return result
+
+          def extension_of(name):
+              lower = name.lower()
+              for ext in sorted(DIRECT_EXTENSIONS + TEXT_EXTENSIONS, key=len, reverse=True):
+                  if lower.endswith(ext):
+                      return ext
+              return Path(lower).suffix or "[none]"
+
+          def summarize_text_sample(name, data):
+              text = data.decode("utf-8", errors="replace")
+              lines = [line.strip() for line in text.splitlines() if line.strip()]
+              header_like = ""
+              numeric_rows = 0
+              max_numeric_cols = 0
+
+              for line in lines[:120]:
+                  clean = line.lstrip("#").strip()
+                  if not clean:
+                      continue
+
+                  parts = clean.replace(",", " ").split()
+                  numeric_count = 0
+                  for p in parts:
+                      try:
+                          float(p)
+                          numeric_count += 1
+                      except Exception:
+                          pass
+
+                  if numeric_count >= max(2, len(parts) // 2):
+                      numeric_rows += 1
+                      max_numeric_cols = max(max_numeric_cols, numeric_count)
+                  elif not header_like and any(t in clean.lower() for t in PRODUCT_TERMS):
+                      header_like = clean[:300]
+
+              return {
+                  "member": name,
+                  "sample_bytes": len(data),
+                  "line_count_sample": len(lines),
+                  "numeric_rows_in_sample": numeric_rows,
+                  "max_numeric_columns_in_sample": max_numeric_cols,
+                  "product_hits": product_hits(text),
+                  "header_like": header_like[:300],
+                  "s8_signal": bool(re.search(r"\bS[_-]?8\b|sigma[_-]?8|SIGMA_8", text, flags=re.IGNORECASE)),
+                  "omega_signal": bool(re.search(r"omega|OMEGA|omegam|Omega_m", text, flags=re.IGNORECASE)),
+                  "posterior_signal": bool(re.search(r"posterior|post|like|loglike|weight", text, flags=re.IGNORECASE))
+              }
+
+          def inspect_zip_archive(path, max_members_to_sample=30):
+              result = {
+                  "archive_type": "zip",
+                  "path": str(path),
+                  "valid_archive": False,
+                  "member_count": 0,
+                  "total_uncompressed_size_bytes": 0,
+                  "extension_counts": {},
+                  "relevant_member_count": 0,
+                  "chain_like_member_count": 0,
+                  "covariance_like_member_count": 0,
+                  "parameter_like_member_count": 0,
+                  "s8_signal_member_count": 0,
+                  "text_table_sample_count": 0,
+                  "sampled_text_members": [],
+                  "largest_members": [],
+                  "error": None
+              }
+
+              try:
+                  with zipfile.ZipFile(path, "r") as zf:
+                      infos = [i for i in zf.infolist() if not i.is_dir()]
+                      result["valid_archive"] = True
+                      result["member_count"] = len(infos)
+                      result["total_uncompressed_size_bytes"] = int(sum(i.file_size for i in infos))
+
+                      ext_counter = Counter(extension_of(i.filename) for i in infos)
+                      result["extension_counts"] = dict(sorted(ext_counter.items()))
+
+                      largest = sorted(infos, key=lambda x: x.file_size, reverse=True)[:20]
+                      result["largest_members"] = [
+                          {
+                              "member": i.filename,
+                              "size_bytes": int(i.file_size),
+                              "extension": extension_of(i.filename),
+                              "product_hits": product_hits(i.filename)
+                          }
+                          for i in largest
+                      ]
+
+                      relevant = []
+                      for i in infos:
+                          hits = product_hits(i.filename)
+                          lower = i.filename.lower()
+                          if hits or any(x in lower for x in ["chain", "mcmc", "posterior", "param", "plik", "s8", "sigma8", "omega", "cov"]):
+                              relevant.append(i)
+
+                      result["relevant_member_count"] = len(relevant)
+                      result["chain_like_member_count"] = sum(1 for i in infos if any(x in i.filename.lower() for x in ["chain", "mcmc", "posterior", "sample"]))
+                      result["covariance_like_member_count"] = sum(1 for i in infos if any(x in i.filename.lower() for x in ["cov", "covmat", "covariance"]))
+                      result["parameter_like_member_count"] = sum(1 for i in infos if any(x in i.filename.lower() for x in ["param", "cosmoparams", "base", "omeg", "plik"]))
+
+                      sampled = 0
+                      for i in relevant + infos:
+                          if sampled >= max_members_to_sample:
+                              break
+                          if i.file_size > 8 * 1024 * 1024:
+                              continue
+                          ext = extension_of(i.filename).lower()
+                          if ext not in TEXT_EXTENSIONS and ext not in [".chain"]:
+                              continue
+
+                          try:
+                              data = zf.read(i.filename)[:65536]
+                              sample_summary = summarize_text_sample(i.filename, data)
+                              result["sampled_text_members"].append(sample_summary)
+                              sampled += 1
+                          except Exception:
+                              continue
+
+                      result["text_table_sample_count"] = len(result["sampled_text_members"])
+                      result["s8_signal_member_count"] = sum(1 for s in result["sampled_text_members"] if s["s8_signal"])
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+
+              return result
+
+          def inspect_tar_archive(path, max_members_to_sample=30):
+              result = {
+                  "archive_type": "tar",
+                  "path": str(path),
+                  "valid_archive": False,
+                  "member_count": 0,
+                  "total_uncompressed_size_bytes": 0,
+                  "extension_counts": {},
+                  "relevant_member_count": 0,
+                  "chain_like_member_count": 0,
+                  "covariance_like_member_count": 0,
+                  "parameter_like_member_count": 0,
+                  "s8_signal_member_count": 0,
+                  "text_table_sample_count": 0,
+                  "sampled_text_members": [],
+                  "largest_members": [],
+                  "error": None
+              }
+
+              try:
+                  with tarfile.open(path, "r:*") as tf:
+                      infos = [i for i in tf.getmembers() if i.isfile()]
+                      result["valid_archive"] = True
+                      result["member_count"] = len(infos)
+                      result["total_uncompressed_size_bytes"] = int(sum(i.size for i in infos))
+
+                      ext_counter = Counter(extension_of(i.name) for i in infos)
+                      result["extension_counts"] = dict(sorted(ext_counter.items()))
+
+                      largest = sorted(infos, key=lambda x: x.size, reverse=True)[:20]
+                      result["largest_members"] = [
+                          {
+                              "member": i.name,
+                              "size_bytes": int(i.size),
+                              "extension": extension_of(i.name),
+                              "product_hits": product_hits(i.name)
+                          }
+                          for i in largest
+                      ]
+
+                      relevant = []
+                      for i in infos:
+                          hits = product_hits(i.name)
+                          lower = i.name.lower()
+                          if hits or any(x in lower for x in ["chain", "mcmc", "posterior", "param", "plik", "s8", "sigma8", "omega", "cov"]):
+                              relevant.append(i)
+
+                      result["relevant_member_count"] = len(relevant)
+                      result["chain_like_member_count"] = sum(1 for i in infos if any(x in i.name.lower() for x in ["chain", "mcmc", "posterior", "sample"]))
+                      result["covariance_like_member_count"] = sum(1 for i in infos if any(x in i.name.lower() for x in ["cov", "covmat", "covariance"]))
+                      result["parameter_like_member_count"] = sum(1 for i in infos if any(x in i.name.lower() for x in ["param", "cosmoparams", "base", "omeg", "plik"]))
+
+                      sampled = 0
+                      for i in relevant + infos:
+                          if sampled >= max_members_to_sample:
+                              break
+                          if i.size > 8 * 1024 * 1024:
+                              continue
+                          ext = extension_of(i.name).lower()
+                          if ext not in TEXT_EXTENSIONS and ext not in [".chain"]:
+                              continue
+
+                          try:
+                              extracted = tf.extractfile(i)
+                              if extracted is None:
+                                  continue
+                              data = extracted.read(65536)
+                              sample_summary = summarize_text_sample(i.name, data)
+                              result["sampled_text_members"].append(sample_summary)
+                              sampled += 1
+                          except Exception:
+                              continue
+
+                      result["text_table_sample_count"] = len(result["sampled_text_members"])
+                      result["s8_signal_member_count"] = sum(1 for s in result["sampled_text_members"] if s["s8_signal"])
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+
+              return result
+
+          def inspect_archive_by_extension(path):
+              lower = str(path).lower()
+              if lower.endswith(".zip"):
+                  return inspect_zip_archive(path)
+              if lower.endswith(".tar") or lower.endswith(".tar.gz") or lower.endswith(".tgz") or lower.endswith(".gz"):
+                  # Some .gz files may not be tar archives; tarfile will report that cleanly.
+                  return inspect_tar_archive(path)
+              return {
+                  "archive_type": "unknown",
+                  "path": str(path),
+                  "valid_archive": False,
+                  "error": "unsupported_archive_extension"
+              }
+
+          def shape_status(score, passed, partial_reason=None):
+              if passed:
+                  return "shape_probe_passed"
+              if partial_reason:
+                  return f"partial_shape_probe_{partial_reason}"
+              return "shape_probe_failed"
+
+          def probe_hsc():
+              hsc_dir = DOWNLOADS / "HSC_Y3"
+              hsc_dir.mkdir(parents=True, exist_ok=True)
+
+              official = fetch_url(HSC_OFFICIAL_PAGE)
+              gated_probes = []
+              for url in HSC_GATED_PRODUCTS:
+                  gated_probes.append(fetch_url(url, max_bytes=32768))
+
+              github_probes = []
+              for url in HSC_GITHUB_PAGES:
+                  github_probes.append(fetch_url(url, max_bytes=65536))
+
+              chain_zip_path = hsc_dir / "hsc_y3_chain_candidate.zip"
+              download_result = download_capped(HSC_CHAIN_ZIP, chain_zip_path)
+
+              archive_shape = None
+              if download_result["downloaded"]:
+                  archive_shape = inspect_zip_archive(chain_zip_path)
+
+              gated_status_counts = Counter(str(p["status"]) for p in gated_probes)
+              gated_401_count = sum(1 for p in gated_probes if p["status"] == 401)
+
+              chain_pass = (
+                  archive_shape is not None
+                  and archive_shape.get("valid_archive") is True
+                  and archive_shape.get("member_count", 0) > 0
+                  and (
+                      archive_shape.get("chain_like_member_count", 0) > 0
+                      or archive_shape.get("s8_signal_member_count", 0) > 0
+                      or archive_shape.get("text_table_sample_count", 0) > 0
+                  )
+              )
+
+              official_ok = official["ok"] is True
+              github_ok_count = sum(1 for p in github_probes if p["ok"])
+
+              pass_flag = chain_pass and official_ok
+
+              if pass_flag and gated_401_count > 0:
+                  status = "hsc_chain_shape_passed_data_vectors_gated"
+              elif pass_flag:
+                  status = "hsc_chain_shape_passed"
+              else:
+                  status = "hsc_shape_probe_partial_or_failed"
+
+              return {
+                  "source": "HSC_Y3",
+                  "surface": "consolidation_growth",
+                  "status": status,
+                  "shape_pass": pass_flag,
+                  "official_page_ok": official_ok,
+                  "gated_product_status_counts": dict(gated_status_counts),
+                  "gated_401_count": gated_401_count,
+                  "github_pages_ok_count": github_ok_count,
+                  "chain_zip_download": download_result,
+                  "chain_zip_shape": archive_shape,
+                  "model_anchor_allowed": False,
+                  "next_use": "HSC chain product can be inspected, but archive data vectors appear gated in this probe; keep as follow-up until direct data-vector access is resolved."
+              }
+
+          def find_planck_cosmoparams_candidates(page_text, page_url):
+              links = extract_links(page_url, page_text)
+              candidates = []
+
+              for link in links:
+                  lower = link.lower()
+                  combined = lower + " cosmoparams base plikhm ttteee lowl lowe cosmological parameters"
+                  score = 0
+
+                  if "cosmoparams" in lower:
+                      score += 5
+                  if "plik" in lower:
+                      score += 3
+                  if "ttteee" in lower:
+                      score += 3
+                  if "lowl" in lower or "lowe" in lower:
+                      score += 2
+                  if "base" in lower:
+                      score += 1
+                  if is_direct_file_url(link):
+                      score += 3
+                  if any(term in lower for term in ["beam", "biasmap", "corrmap", "rimo", "mask", "leakage"]):
+                      score -= 8
+
+                  hits = product_hits(combined)
+                  if score > 0:
+                      candidates.append({
+                          "url": link,
+                          "score": score,
+                          "direct_resource": is_direct_file_url(link),
+                          "product_hits": hits
+                      })
+
+              # If page text names the product but the link extractor missed it, keep page itself as fallback.
+              candidates = sorted(candidates, key=lambda x: (-x["score"], x["url"]))
+
+              seen = set()
+              deduped = []
+              for c in candidates:
+                  if c["url"] not in seen:
+                      seen.add(c["url"])
+                      deduped.append(c)
+
+              return deduped[:20]
+
+          def probe_planck():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              planck_dir.mkdir(parents=True, exist_ok=True)
+
+              page = fetch_url(PLANCK_ANCILLARY_PAGE, max_bytes=262144)
+              candidates = find_planck_cosmoparams_candidates(page["text"], page["final_url"] or PLANCK_ANCILLARY_PAGE)
+
+              probe_records = []
+              for c in candidates[:8]:
+                  p = fetch_url(c["url"], max_bytes=32768)
+                  rec = dict(c)
+                  rec.update({
+                      "probe_ok": p["ok"],
+                      "probe_status": p["status"],
+                      "probe_content_type": p["content_type"],
+                      "probe_content_length": p["content_length"],
+                      "probe_error": p["error"]
+                  })
+                  probe_records.append(rec)
+
+              download_result = None
+              archive_shape = None
+              chosen = None
+
+              for c in candidates:
+                  if not c["direct_resource"]:
+                      continue
+
+                  fname = urllib.parse.urlparse(c["url"]).path.rstrip("/").split("/")[-1] or "planck_cosmoparams_product"
+                  target = planck_dir / fname
+
+                  download_result = download_capped(c["url"], target, max_bytes=MAX_DOWNLOAD_BYTES)
+                  chosen = c
+
+                  if download_result["downloaded"]:
+                      archive_shape = inspect_archive_by_extension(target)
+                      break
+
+                  # Try next candidate if this one is too large or inaccessible.
+                  time.sleep(0.25)
+
+              product_candidate_found = len(candidates) > 0
+              archive_pass = (
+                  archive_shape is not None
+                  and archive_shape.get("valid_archive") is True
+                  and archive_shape.get("member_count", 0) > 0
+                  and (
+                      archive_shape.get("parameter_like_member_count", 0) > 0
+                      or archive_shape.get("chain_like_member_count", 0) > 0
+                      or archive_shape.get("text_table_sample_count", 0) > 0
+                  )
+              )
+
+              pass_flag = page["ok"] and product_candidate_found and (archive_pass or len(probe_records) > 0)
+
+              if archive_pass:
+                  status = "planck_cosmoparams_archive_shape_passed"
+              elif product_candidate_found:
+                  status = "planck_cosmoparams_candidate_found_download_or_archive_followup_needed"
+              else:
+                  status = "planck_cosmoparams_candidate_not_found"
+
+              return {
+                  "source": "Planck_2018",
+                  "surface": "cmb_reference",
+                  "status": status,
+                  "shape_pass": pass_flag,
+                  "ancillary_page_ok": page["ok"],
+                  "cosmoparams_candidate_count": len(candidates),
+                  "chosen_candidate": chosen,
+                  "candidate_probes": probe_records,
+                  "download_result": download_result,
+                  "archive_shape": archive_shape,
+                  "model_anchor_allowed": False,
+                  "next_use": "Use as CMB reference product-shape lane only; do not replace a full Planck likelihood with a simple anchor."
+              }
+
+          def score_desi_file(url):
+              lower = url.lower()
+              score = 0
+              hits = product_hits(lower)
+
+              if any(x in lower for x in ["cobaya", "mcmc", "chain", "posterior"]):
+                  score += 5
+              if any(x in lower for x in ["iminuit", "minimum", "bestfit", "best_fit", "minimize"]):
+                  score += 4
+              if any(x in lower for x in ["bao", "desi_2024", "desidr1"]):
+                  score += 3
+              if any(x in lower for x in ["cov", "covmat", "likelihood", "param", "omega", "h0", "omegam"]):
+                  score += 2
+              if is_direct_file_url(url):
+                  score += 2
+
+              return score, hits
+
+          def crawl_desi_directory(base_url, max_depth=5, max_pages=150):
+              queue = [(base_url, 0)]
+              seen_pages = set()
+              directories = []
+              files = []
+
+              base_prefix = base_url.rstrip("/") + "/"
+
+              while queue and len(seen_pages) < max_pages:
+                  url, depth = queue.pop(0)
+                  if url in seen_pages:
+                      continue
+                  seen_pages.add(url)
+
+                  probe = fetch_url(url, max_bytes=196608)
+                  directories.append({
+                      "url": url,
+                      "depth": depth,
+                      "ok": probe["ok"],
+                      "status": probe["status"],
+                      "content_type": probe["content_type"],
+                      "error": probe["error"],
+                      "product_hits": product_hits(probe["text"])
+                  })
+
+                  if not probe["ok"]:
+                      continue
+
+                  links = extract_links(probe["final_url"] or url, probe["text"])
+
+                  for link in links:
+                      if not link.startswith(base_prefix):
+                          continue
+
+                      if link in seen_pages:
+                          continue
+
+                      if looks_like_directory_url(link):
+                          if depth < max_depth:
+                              normalized = link if link.endswith("/") else link + "/"
+                              if normalized not in seen_pages:
+                                  queue.append((normalized, depth + 1))
+                      else:
+                          score, hits = score_desi_file(link)
+                          if score <= 0:
+                              continue
+                          files.append({
+                              "url": link,
+                              "parent_url": url,
+                              "depth": depth,
+                              "score": score,
+                              "direct_resource": is_direct_file_url(link),
+                              "product_hits": hits
+                          })
+
+                  time.sleep(0.1)
+
+              # If the base did not expose the two known folders through links, explicitly test them.
+              for forced in [urllib.parse.urljoin(base_prefix, "cobaya/"), urllib.parse.urljoin(base_prefix, "iminuit/")]:
+                  if forced not in seen_pages:
+                      probe = fetch_url(forced, max_bytes=196608)
+                      directories.append({
+                          "url": forced,
+                          "depth": 1,
+                          "ok": probe["ok"],
+                          "status": probe["status"],
+                          "content_type": probe["content_type"],
+                          "error": probe["error"],
+                          "product_hits": product_hits(probe["text"])
+                      })
+
+                      if probe["ok"]:
+                          links = extract_links(probe["final_url"] or forced, probe["text"])
+                          for link in links:
+                              if not link.startswith(base_prefix):
+                                  continue
+                              if looks_like_directory_url(link):
+                                  continue
+                              score, hits = score_desi_file(link)
+                              if score > 0:
+                                  files.append({
+                                      "url": link,
+                                      "parent_url": forced,
+                                      "depth": 1,
+                                      "score": score,
+                                      "direct_resource": is_direct_file_url(link),
+                                      "product_hits": hits
+                                  })
+
+              # Deduplicate files.
+              deduped = {}
+              for f in files:
+                  if f["url"] not in deduped or f["score"] > deduped[f["url"]]["score"]:
+                      deduped[f["url"]] = f
+
+              files = sorted(deduped.values(), key=lambda x: (-x["score"], x["url"]))
+
+              return directories, files
+
+          def probe_desi():
+              doc_page = fetch_url(DESI_DOC_PAGE, max_bytes=196608)
+              directories, files = crawl_desi_directory(DESI_PUBLIC_BASE)
+
+              dir_urls = [d["url"].lower() for d in directories]
+              file_urls = [f["url"].lower() for f in files]
+
+              cobaya_detected = any("/cobaya" in u for u in dir_urls + file_urls) or "cobaya" in (doc_page["text"] or "").lower()
+              iminuit_detected = any("/iminuit" in u for u in dir_urls + file_urls) or "iminuit" in (doc_page["text"] or "").lower()
+
+              top_files = files[:80]
+
+              probed_files = []
+              for f in top_files[:15]:
+                  p = fetch_url(f["url"], max_bytes=65536)
+                  rec = dict(f)
+                  rec.update({
+                      "probe_ok": p["ok"],
+                      "probe_status": p["status"],
+                      "probe_content_type": p["content_type"],
+                      "probe_content_length": p["content_length"],
+                      "probe_error": p["error"],
+                      "probe_product_hits": product_hits(p["text"])
+                  })
+                  probed_files.append(rec)
+                  time.sleep(0.15)
+
+              direct_file_count = sum(1 for f in files if f["direct_resource"])
+              strong_file_count = sum(1 for f in files if f["score"] >= 5)
+
+              pass_flag = (
+                  doc_page["ok"]
+                  and any(d["ok"] for d in directories)
+                  and cobaya_detected
+                  and iminuit_detected
+                  and (direct_file_count > 0 or strong_file_count > 0 or len(directories) >= 2)
+              )
+
+              if pass_flag and direct_file_count > 0:
+                  status = "desi_public_bao_directory_shape_passed_direct_files_found"
+              elif pass_flag:
+                  status = "desi_public_bao_directory_shape_passed_directory_structure_found"
+              else:
+                  status = "desi_public_bao_directory_shape_partial_or_failed"
+
+              return {
+                  "source": "DESI_DR1_BAO",
+                  "surface": "reach_geometry",
+                  "status": status,
+                  "shape_pass": pass_flag,
+                  "doc_page_ok": doc_page["ok"],
+                  "directory_count": len(directories),
+                  "directory_ok_count": sum(1 for d in directories if d["ok"]),
+                  "candidate_file_count": len(files),
+                  "direct_file_count": direct_file_count,
+                  "strong_file_count": strong_file_count,
+                  "cobaya_detected": cobaya_detected,
+                  "iminuit_detected": iminuit_detected,
+                  "top_file_candidates": top_files[:30],
+                  "probed_file_candidates": probed_files,
+                  "directory_records": directories[:80],
+                  "model_anchor_allowed": False,
+                  "next_use": "DESI DR1 BAO has source-specific public-directory structure; next step should target cobaya and iminuit products for ingestion."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_15_status": "raw_product_expansion_discovery_passed_multiple_sources_ready_for_shape_probe",
+                  "v3_15_next_allowed_step": "Build v3.16 source-specific shape probes for: HSC_Y3, Planck_2018, DESI_DR1_BAO."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.16 source-specific shape probes")
+          print("Truth boundary: source-shape probes only; no model fit; no validation claim.")
+          print()
+
+          results = {}
+
+          for name, fn in [
+              ("HSC_Y3", probe_hsc),
+              ("Planck_2018", probe_planck),
+              ("DESI_DR1_BAO", probe_desi)
+          ]:
+              print(f"Running shape probe: {name}")
+              try:
+                  result = fn()
+              except Exception as e:
+                  result = {
+                      "source": name,
+                      "surface": "unknown",
+                      "status": "shape_probe_exception",
+                      "shape_pass": False,
+                      "error": f"{type(e).__name__}: {e}",
+                      "model_anchor_allowed": False
+                  }
+
+              results[name] = result
+              print(f"  status: {result.get('status')}")
+              print(f"  shape_pass: {result.get('shape_pass')}")
+              print()
+
+          inventory["source_results"] = results
+
+          # Write source summary CSV.
+          summary_rows = []
+          for name, r in results.items():
+              summary_rows.append({
+                  "source": name,
+                  "surface": r.get("surface"),
+                  "status": r.get("status"),
+                  "shape_pass": r.get("shape_pass"),
+                  "model_anchor_allowed": r.get("model_anchor_allowed"),
+                  "next_use": r.get("next_use"),
+                  "error": r.get("error")
+              })
+
+          summary_csv = OUTDIR / "source_specific_shape_probe_summary_v3_16.csv"
+          with summary_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "status",
+                  "shape_pass", "model_anchor_allowed",
+                  "next_use", "error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in summary_rows:
+                  writer.writerow(row)
+
+          # DESI candidates CSV.
+          desi = results.get("DESI_DR1_BAO", {})
+          desi_csv = OUTDIR / "desi_dr1_bao_directory_candidates_v3_16.csv"
+          with desi_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "url", "parent_url", "depth", "score",
+                  "direct_resource", "product_hits"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in desi.get("top_file_candidates", []):
+                  out = dict(row)
+                  out["product_hits"] = ";".join(out.get("product_hits", []))
+                  writer.writerow({k: out.get(k) for k in fieldnames})
+
+          # Planck candidates CSV.
+          planck = results.get("Planck_2018", {})
+          planck_csv = OUTDIR / "planck_cosmoparams_candidates_v3_16.csv"
+          with planck_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "url", "score", "direct_resource",
+                  "product_hits", "probe_ok", "probe_status",
+                  "probe_content_type", "probe_content_length", "probe_error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in planck.get("candidate_probes", []):
+                  out = dict(row)
+                  out["product_hits"] = ";".join(out.get("product_hits", []))
+                  writer.writerow({k: out.get(k) for k in fieldnames})
+
+          # HSC gated probe CSV.
+          hsc = results.get("HSC_Y3", {})
+          hsc_csv = OUTDIR / "hsc_y3_gated_product_probe_v3_16.csv"
+          with hsc_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = ["status", "count"]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for status, count in hsc.get("gated_product_status_counts", {}).items():
+                  writer.writerow({"status": status, "count": count})
+
+          passed_sources = [name for name, r in results.items() if r.get("shape_pass") is True]
+          failed_sources = [name for name, r in results.items() if r.get("shape_pass") is not True]
+
+          failed_gates = []
+          if len(passed_sources) < 2:
+              failed_gates.append("fewer_than_two_source_specific_shape_probes_passed")
+
+          if not failed_gates:
+              readiness_label = "source_specific_shape_probes_passed_ready_for_v3_17_targeted_ingestion"
+          else:
+              readiness_label = "source_specific_shape_probes_partial_manual_followup_needed"
+
+          next_targets = []
+          if results.get("DESI_DR1_BAO", {}).get("shape_pass") is True:
+              next_targets.append("DESI_DR1_BAO")
+          if results.get("Planck_2018", {}).get("shape_pass") is True:
+              next_targets.append("Planck_2018")
+          if results.get("HSC_Y3", {}).get("shape_pass") is True:
+              next_targets.append("HSC_Y3_chain_only_followup")
+
+          if next_targets:
+              next_step = (
+                  "Build v3.17 targeted ingestion for: "
+                  + ", ".join(next_targets)
+                  + ". Keep all outputs under truth boundary; no full model claim."
+              )
+          else:
+              next_step = "Manually inspect source product links before attempting v3.17 targeted ingestion."
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "passed_sources": passed_sources,
+              "failed_or_partial_sources": failed_sources,
+              "model_claim_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_16_source_specific_shape_probes.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.16 — Source-Specific Shape Probes")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.16 follows v3.15 by testing source-specific product shapes for HSC-Y3, Planck 2018, and DESI DR1 BAO.")
+          md.append("")
+          md.append("- HSC-Y3: probes the discovered chain ZIP and records gated data-vector status.")
+          md.append("- Planck 2018: filters for cosmological-parameter products rather than irrelevant map/beam FITS files.")
+          md.append("- DESI DR1 BAO: crawls the public BAO cosmology-products directory and checks for `cobaya/` and `iminuit/` structure.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append("| Source | Surface | Shape pass | Status |")
+          md.append("|---|---|---:|---|")
+          for name, r in results.items():
+              md.append(f"| {name} | {r.get('surface')} | {r.get('shape_pass')} | `{r.get('status')}` |")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append("Passing here means the source has enough machine-visible product structure to justify targeted ingestion. It still does not mean the product is a valid TAIRID anchor.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `source_specific_shape_probe_summary_v3_16.csv`")
+          md.append("- `desi_dr1_bao_directory_candidates_v3_16.csv`")
+          md.append("- `planck_cosmoparams_candidates_v3_16.csv`")
+          md.append("- `hsc_y3_gated_product_probe_v3_16.csv`")
+          md.append("- `tairid_cosmology_v3_16_source_specific_shape_probes.json`")
+          md.append("- `tairid_cosmology_v3_16_source_specific_shape_probes.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_16_source_specific_shape_probes.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.16 source-specific shape probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-16-source-specific-shape-probes
+          path: artifacts/tairid_cosmology_v3_16/
