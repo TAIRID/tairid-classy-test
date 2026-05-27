@@ -1,0 +1,1039 @@
+name: TAIRID Cosmology v3.29 Independent Reach Standardization Audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-standardization-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.29 independent reach standardization audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_29
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_29")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_29_independent_reach_standardization_audit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute a universal pressure score across incompatible observables.",
+              "This standardizes independent non-DESI reach diagnostics into role-aware families.",
+              "DESI remains excluded because v3.25 showed the mapped DESI reach rows are scaled counterparts.",
+              "BAO rows, BOSS archive rows, and TDCOSMO Ddt rows are not automatically comparable.",
+              "Standardization does not make any row a model anchor.",
+              "A pass means independent reach rows are organized for a later source-specific pressure-construction audit."
+          ]
+
+          EBOSS_PRODUCTS = [
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_QSO",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR12_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              }
+          ]
+
+          BOSS_PRODUCTS = {
+              "archive_url": "https://data.sdss.org/sas/dr10/boss/papers/clustering/Anderson_2013_CMASSDR11_LOWZDR11_cosmomc.tar.gz",
+              "cmass_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/CMASSDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat",
+              "lowz_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/LOWZDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+          }
+
+          TDCOSMO_PRODUCTS = {
+              "posterior_table_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv",
+              "processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_processed.pkl",
+              "om_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed.pkl",
+              "om_kappa_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed_with_kappa.pkl"
+          }
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.29-independent-reach-standardization-audit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def parse_float_or_none(value):
+              if value is None:
+                  return None
+
+              text = str(value).strip()
+              if text in ["", "-", "--", "nan", "NaN", "NAN", "None", "null"]:
+                  return None
+
+              try:
+                  x = float(text)
+              except Exception:
+                  return None
+
+              if not math.isfinite(x):
+                  return None
+
+              return x
+
+          def load_numeric_matrix(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lines = [
+                  line for line in text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+              if not lines:
+                  raise RuntimeError(f"No numeric lines found in {path}")
+
+              arr = np.loadtxt(io.StringIO("\n".join(lines)))
+
+              if arr.ndim == 0:
+                  arr = arr.reshape((1, 1))
+              elif arr.ndim == 1:
+                  arr = arr.reshape((1, -1))
+
+              return arr
+
+          def parse_bao_data_table(path):
+              rows = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+
+                  try:
+                      z = float(parts[0])
+                      value = float(parts[1])
+                  except Exception:
+                      continue
+
+                  observable = parts[2]
+                  rows.append({
+                      "z": z,
+                      "value": value,
+                      "observable": observable,
+                      "raw_line": stripped
+                  })
+
+              return rows
+
+          def classify_bao_observable(observable):
+              lower = str(observable).lower()
+
+              if "dm" in lower:
+                  return {
+                      "standard_role": "bao_transverse_reach",
+                      "observable_family": "BAO_D_M_over_r_d",
+                      "distance_axis": "transverse",
+                      "standard_unit_role": "dimensionless_distance_over_sound_horizon"
+                  }
+
+              if "dh" in lower:
+                  return {
+                      "standard_role": "bao_radial_reach",
+                      "observable_family": "BAO_D_H_over_r_d",
+                      "distance_axis": "radial",
+                      "standard_unit_role": "dimensionless_distance_over_sound_horizon"
+                  }
+
+              if "dv" in lower:
+                  return {
+                      "standard_role": "bao_isotropic_reach",
+                      "observable_family": "BAO_D_V_over_r_d",
+                      "distance_axis": "isotropic",
+                      "standard_unit_role": "dimensionless_distance_over_sound_horizon"
+                  }
+
+              return {
+                  "standard_role": "bao_reach_ruler_diagnostic",
+                  "observable_family": "BAO_unspecified_distance_over_r_d",
+                  "distance_axis": "unspecified",
+                  "standard_unit_role": "dimensionless_or_source_defined_bao_quantity"
+              }
+
+          def standardize_fractional_sigma(value, sigma):
+              value = parse_float_or_none(value)
+              sigma = parse_float_or_none(sigma)
+
+              if value is None or sigma is None or value == 0:
+                  return None
+
+              return abs(sigma / value)
+
+          def ingest_eboss():
+              eboss_dir = DOWNLOADS / "SDSS_eBOSS_DR16"
+              eboss_dir.mkdir(parents=True, exist_ok=True)
+
+              raw_rows = []
+              source_rows = []
+              downloads = []
+
+              for product in EBOSS_PRODUCTS:
+                  data_path = eboss_dir / safe_name(product["data_url"])
+                  cov_path = eboss_dir / safe_name(product["cov_url"])
+
+                  downloads.append(download(product["data_url"], data_path))
+                  downloads.append(download(product["cov_url"], cov_path))
+
+                  data_rows = parse_bao_data_table(data_path)
+                  cov = load_numeric_matrix(cov_path)
+
+                  cov_rows = int(cov.shape[0])
+                  cov_cols = int(cov.shape[1])
+                  covariance_match = cov_rows == cov_cols == len(data_rows)
+
+                  for i, row in enumerate(data_rows):
+                      sigma = None
+                      if covariance_match:
+                          diag = float(cov[i, i])
+                          sigma = math.sqrt(diag) if diag >= 0 else None
+
+                      raw_rows.append({
+                          "source": product["source"],
+                          "surface": "reach_geometry",
+                          "family": product["family"],
+                          "entry_role": "independent_bao_reach_ruler_diagnostic",
+                          "source_product_role": product["role"],
+                          "parameter": row["observable"],
+                          "z_eff": row["z"],
+                          "value": row["value"],
+                          "sigma": sigma if sigma is not None else "",
+                          "covariance_available": covariance_match,
+                          "covariance_dimension": f"{cov_rows}x{cov_cols}",
+                          "posterior_table_available": False,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "raw_line": row["raw_line"],
+                          "boundary_note": "Independent pre-DESI BAO diagnostic; ingested and standardized only."
+                      })
+
+                  source_rows.append({
+                      "source": product["source"],
+                      "family": product["family"],
+                      "role": product["role"],
+                      "data_row_count": len(data_rows),
+                      "cov_rows": cov_rows,
+                      "cov_cols": cov_cols,
+                      "covariance_match": covariance_match,
+                      "ingestion_pass": len(data_rows) > 0 and covariance_match
+                  })
+
+              return {
+                  "source": "SDSS_eBOSS_DR16",
+                  "ingestion_pass": all(row["ingestion_pass"] for row in source_rows),
+                  "raw_rows": raw_rows,
+                  "source_rows": source_rows,
+                  "download_count": len(downloads),
+                  "downloads": downloads
+              }
+
+          def archive_member_by_suffix(tf, suffix):
+              matches = [m for m in tf.getmembers() if m.isfile() and m.name.endswith(suffix)]
+              if matches:
+                  return matches[0]
+              return None
+
+          def archive_member_contains(tf, tokens):
+              lower_tokens = [t.lower() for t in tokens]
+              matches = []
+              for m in tf.getmembers():
+                  if not m.isfile():
+                      continue
+                  lower = m.name.lower()
+                  if all(t in lower for t in lower_tokens):
+                      matches.append(m)
+              return matches[0] if matches else None
+
+          def parse_archive_bao_rows(tf, member):
+              f = tf.extractfile(member)
+              if f is None:
+                  raise RuntimeError(f"Could not extract member: {member.name}")
+
+              text = f.read().decode("utf-8", errors="replace")
+              rows = []
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  parts = stripped.split()
+                  nums = []
+                  for p in parts:
+                      try:
+                          nums.append(float(p))
+                      except Exception:
+                          pass
+
+                  if len(nums) >= 3:
+                      rows.append({
+                          "z": nums[0],
+                          "value": nums[1],
+                          "sigma": nums[2],
+                          "raw_line": stripped
+                      })
+
+              return rows
+
+          def ingest_boss():
+              boss_dir = DOWNLOADS / "BOSS_DR12_BAO"
+              boss_dir.mkdir(parents=True, exist_ok=True)
+
+              archive_path = boss_dir / safe_name(BOSS_PRODUCTS["archive_url"])
+              cmass_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["cmass_cov_url"])
+              lowz_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["lowz_cov_url"])
+
+              downloads = [
+                  download(BOSS_PRODUCTS["archive_url"], archive_path),
+                  download(BOSS_PRODUCTS["cmass_cov_url"], cmass_cov_path),
+                  download(BOSS_PRODUCTS["lowz_cov_url"], lowz_cov_path)
+              ]
+
+              raw_rows = []
+              source_rows = []
+
+              with tarfile.open(archive_path, "r:*") as tf:
+                  cmass_member = archive_member_by_suffix(tf, "data/sdss_DR11CMASS_bao.txt") or archive_member_contains(tf, ["cmass", "bao"])
+                  lowz_member = archive_member_by_suffix(tf, "data/sdss_DR11LOWZ_bao.txt") or archive_member_contains(tf, ["lowz", "bao"])
+
+                  if cmass_member is None:
+                      raise RuntimeError("Could not find CMASS BAO member in BOSS archive.")
+                  if lowz_member is None:
+                      raise RuntimeError("Could not find LOWZ BAO member in BOSS archive.")
+
+                  cmass_rows = parse_archive_bao_rows(tf, cmass_member)
+                  lowz_rows = parse_archive_bao_rows(tf, lowz_member)
+
+              cmass_cov = load_numeric_matrix(cmass_cov_path)
+              lowz_cov = load_numeric_matrix(lowz_cov_path)
+
+              for family, rows, cov, member_name in [
+                  ("BOSS_DR11_CMASS_archive_BAO", cmass_rows, cmass_cov, cmass_member.name),
+                  ("BOSS_DR11_LOWZ_archive_BAO", lowz_rows, lowz_cov, lowz_member.name)
+              ]:
+                  cov_shape = f"{int(cov.shape[0])}x{int(cov.shape[1])}" if cov.ndim == 2 else str(cov.shape)
+                  cov_ok = cov.ndim == 2 and cov.shape[0] == cov.shape[1]
+
+                  for row in rows:
+                      raw_rows.append({
+                          "source": "BOSS_DR12_BAO",
+                          "surface": "reach_geometry",
+                          "family": family,
+                          "entry_role": "independent_boss_bao_archive_diagnostic",
+                          "source_product_role": "pre_DESI_BOSS_archive_BAO",
+                          "parameter": "BAO_archive_observable",
+                          "z_eff": row["z"],
+                          "value": row["value"],
+                          "sigma": row["sigma"],
+                          "covariance_available": cov_ok,
+                          "covariance_dimension": cov_shape,
+                          "posterior_table_available": False,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "raw_line": row["raw_line"],
+                          "boundary_note": f"Older BOSS BAO archive row from {member_name}; standardized only."
+                      })
+
+                  source_rows.append({
+                      "source": "BOSS_DR12_BAO",
+                      "family": family,
+                      "role": "pre_DESI_BOSS_archive_BAO",
+                      "archive_member": member_name,
+                      "data_row_count": len(rows),
+                      "cov_rows": int(cov.shape[0]) if cov.ndim == 2 else "",
+                      "cov_cols": int(cov.shape[1]) if cov.ndim == 2 else "",
+                      "covariance_match": cov_ok,
+                      "ingestion_pass": len(rows) > 0 and cov_ok
+                  })
+
+              return {
+                  "source": "BOSS_DR12_BAO",
+                  "ingestion_pass": all(row["ingestion_pass"] for row in source_rows),
+                  "raw_rows": raw_rows,
+                  "source_rows": source_rows,
+                  "download_count": len(downloads),
+                  "downloads": downloads
+              }
+
+          def ingest_tdcosmo():
+              td_dir = DOWNLOADS / "TDCOSMO_2020"
+              td_dir.mkdir(parents=True, exist_ok=True)
+
+              table_path = td_dir / safe_name(TDCOSMO_PRODUCTS["posterior_table_url"])
+              downloads = [download(TDCOSMO_PRODUCTS["posterior_table_url"], table_path)]
+
+              binary_records = []
+              for key in ["processed_pkl_url", "om_processed_pkl_url", "om_kappa_processed_pkl_url"]:
+                  url = TDCOSMO_PRODUCTS[key]
+                  path = td_dir / safe_name(url)
+                  record = download(url, path)
+                  downloads.append(record)
+                  binary_records.append({
+                      "product": key,
+                      "url": url,
+                      "path": str(path),
+                      "size_bytes": record["size_bytes"],
+                      "shape_only": True,
+                      "boundary": "Binary posterior product downloaded for later source-specific parser; not parsed in v3.29."
+                  })
+
+              with table_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                  reader = csv.DictReader(f)
+                  rows = list(reader)
+                  fieldnames = reader.fieldnames or []
+
+              required = ["name", "z_lens", "z_source", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma", "flag"]
+              missing = [c for c in required if c not in fieldnames]
+              if missing:
+                  raise RuntimeError(f"TDCOSMO posterior table missing columns: {missing}")
+
+              raw_rows = []
+              skipped_rows = []
+
+              valid_ddt_count = 0
+              valid_dd_count = 0
+              invalid_flag_count = 0
+
+              for i, row in enumerate(rows):
+                  name = row.get("name", f"row_{i}")
+                  flag = parse_float_or_none(row.get("flag"))
+
+                  z_lens = parse_float_or_none(row.get("z_lens"))
+                  z_source = parse_float_or_none(row.get("z_source"))
+
+                  ddt_mean = parse_float_or_none(row.get("Ddt_mean"))
+                  ddt_sigma = parse_float_or_none(row.get("Ddt_sigma"))
+
+                  dd_mean = parse_float_or_none(row.get("Dd_mean"))
+                  dd_sigma = parse_float_or_none(row.get("Dd_sigma"))
+
+                  if flag is not None and flag < 0:
+                      invalid_flag_count += 1
+
+                  if z_lens is None or z_source is None:
+                      skipped_rows.append({
+                          "name": name,
+                          "row_index": i,
+                          "reason": "missing_z_lens_or_z_source",
+                          "flag": row.get("flag")
+                      })
+                      continue
+
+                  if ddt_mean is not None and ddt_sigma is not None and ddt_sigma > 0:
+                      valid_ddt_count += 1
+                      raw_rows.append({
+                          "source": "TDCOSMO_2020",
+                          "surface": "reach_geometry",
+                          "family": "TDCOSMO_time_delay",
+                          "entry_role": "independent_time_delay_reach_diagnostic",
+                          "source_product_role": "hierarchical_time_delay_posterior_table",
+                          "parameter": "Ddt_time_delay_distance",
+                          "lens_name": name,
+                          "row_index": i,
+                          "z_lens": z_lens,
+                          "z_source": z_source,
+                          "z_eff": z_lens,
+                          "value": ddt_mean,
+                          "sigma": ddt_sigma,
+                          "flag": flag if flag is not None else "",
+                          "covariance_available": False,
+                          "posterior_table_available": True,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "raw_line": "",
+                          "boundary_note": "Valid TDCOSMO time-delay distance row; standardized only."
+                      })
+                  else:
+                      skipped_rows.append({
+                          "name": name,
+                          "row_index": i,
+                          "reason": "missing_or_invalid_Ddt_mean_or_Ddt_sigma",
+                          "flag": row.get("flag")
+                      })
+
+                  if dd_mean is not None and dd_sigma is not None and dd_sigma > 0:
+                      valid_dd_count += 1
+                      raw_rows.append({
+                          "source": "TDCOSMO_2020",
+                          "surface": "reach_geometry",
+                          "family": "TDCOSMO_time_delay",
+                          "entry_role": "independent_angular_diameter_reach_diagnostic",
+                          "source_product_role": "hierarchical_time_delay_posterior_table",
+                          "parameter": "Dd_angular_diameter_distance",
+                          "lens_name": name,
+                          "row_index": i,
+                          "z_lens": z_lens,
+                          "z_source": z_source,
+                          "z_eff": z_lens,
+                          "value": dd_mean,
+                          "sigma": dd_sigma,
+                          "flag": flag if flag is not None else "",
+                          "covariance_available": False,
+                          "posterior_table_available": True,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "raw_line": "",
+                          "boundary_note": "Valid TDCOSMO angular-diameter distance row; standardized only."
+                      })
+
+              source_rows = [{
+                  "source": "TDCOSMO_2020",
+                  "family": "TDCOSMO_time_delay",
+                  "role": "hierarchical_time_delay_posterior_table",
+                  "table_row_count": len(rows),
+                  "valid_Ddt_row_count": valid_ddt_count,
+                  "valid_Dd_row_count": valid_dd_count,
+                  "skipped_row_count": len(skipped_rows),
+                  "invalid_flag_count": invalid_flag_count,
+                  "binary_shape_product_count": len(binary_records),
+                  "ingestion_pass": valid_ddt_count >= 10,
+                  "boundary": "Ddt is the usable TDCOSMO reach diagnostic here; Dd remains unavailable unless later binary posterior parsing is added."
+              }]
+
+              return {
+                  "source": "TDCOSMO_2020",
+                  "ingestion_pass": valid_ddt_count >= 10,
+                  "raw_rows": raw_rows,
+                  "source_rows": source_rows,
+                  "skipped_rows": skipped_rows,
+                  "binary_records": binary_records,
+                  "download_count": len(downloads),
+                  "downloads": downloads
+              }
+
+          def standardize_row(row):
+              source = row.get("source", "")
+              parameter = row.get("parameter", "")
+
+              value = parse_float_or_none(row.get("value"))
+              sigma = parse_float_or_none(row.get("sigma"))
+              fractional_sigma = standardize_fractional_sigma(value, sigma)
+
+              if source in ["SDSS_eBOSS_DR16"]:
+                  classification = classify_bao_observable(parameter)
+                  standard_role = classification["standard_role"]
+                  observable_family = classification["observable_family"]
+                  distance_axis = classification["distance_axis"]
+                  standard_unit_role = classification["standard_unit_role"]
+                  standard_surface = "reach_geometry_bao"
+
+              elif source in ["BOSS_DR12_BAO"]:
+                  standard_role = "bao_archive_reach_ruler_diagnostic"
+                  observable_family = "BOSS_archive_BAO_source_defined"
+                  distance_axis = "source_defined"
+                  standard_unit_role = "source_defined_bao_quantity"
+                  standard_surface = "reach_geometry_bao"
+
+              elif source == "TDCOSMO_2020" and parameter == "Ddt_time_delay_distance":
+                  standard_role = "strong_lens_time_delay_reach"
+                  observable_family = "TDCOSMO_Ddt_time_delay_distance"
+                  distance_axis = "time_delay_distance"
+                  standard_unit_role = "distance_mpc_source_units"
+                  standard_surface = "reach_geometry_time_delay"
+
+              elif source == "TDCOSMO_2020" and parameter == "Dd_angular_diameter_distance":
+                  standard_role = "strong_lens_angular_diameter_reach"
+                  observable_family = "TDCOSMO_Dd_angular_diameter_distance"
+                  distance_axis = "angular_diameter_distance"
+                  standard_unit_role = "distance_mpc_source_units"
+                  standard_surface = "reach_geometry_time_delay"
+
+              else:
+                  standard_role = "unmapped_reach_diagnostic"
+                  observable_family = "unmapped"
+                  distance_axis = "unmapped"
+                  standard_unit_role = "source_defined"
+                  standard_surface = "reach_geometry_unmapped"
+
+              return {
+                  "source": source,
+                  "surface": row.get("surface", "reach_geometry"),
+                  "standard_surface": standard_surface,
+                  "family": row.get("family", ""),
+                  "standard_role": standard_role,
+                  "observable_family": observable_family,
+                  "distance_axis": distance_axis,
+                  "standard_unit_role": standard_unit_role,
+                  "entry_role": row.get("entry_role", ""),
+                  "source_product_role": row.get("source_product_role", ""),
+                  "parameter": parameter,
+                  "z_eff": row.get("z_eff", ""),
+                  "z_lens": row.get("z_lens", ""),
+                  "z_source": row.get("z_source", ""),
+                  "lens_name": row.get("lens_name", ""),
+                  "value": value if value is not None else "",
+                  "sigma": sigma if sigma is not None else "",
+                  "fractional_sigma": fractional_sigma if fractional_sigma is not None else "",
+                  "covariance_available": row.get("covariance_available", False),
+                  "posterior_table_available": row.get("posterior_table_available", False),
+                  "pressure_score_built": False,
+                  "pressure_score_allowed_now": False,
+                  "included_in_model": False,
+                  "model_anchor_allowed_now": False,
+                  "diagnostic_only": True,
+                  "raw_line": row.get("raw_line", ""),
+                  "boundary_note": "Standardized independent reach diagnostic. Not pressure-scored and not model-anchor eligible in v3.29."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_28_status": "independent_reach_ingestion_partial_pass_ready_for_v3_29_standardization",
+                  "v3_28_1_status": "tdcosmo_parser_fix_passed_ready_for_v3_29_standardization"
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.29 independent reach standardization audit")
+          print("Truth boundary: standardization only; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+          raw_rows = []
+          source_rows = []
+          tdcosmo_skipped_rows = []
+          binary_rows = []
+          source_errors = {}
+
+          for name, fn in [
+              ("SDSS_eBOSS_DR16", ingest_eboss),
+              ("BOSS_DR12_BAO", ingest_boss),
+              ("TDCOSMO_2020", ingest_tdcosmo)
+          ]:
+              print(f"Ingesting and preparing {name}")
+              try:
+                  result = fn()
+                  inventory["source_results"][name] = {
+                      "source": name,
+                      "ingestion_pass": result["ingestion_pass"],
+                      "raw_row_count": len(result["raw_rows"]),
+                      "source_summary_row_count": len(result["source_rows"]),
+                      "download_count": result["download_count"]
+                  }
+                  raw_rows.extend(result["raw_rows"])
+                  source_rows.extend(result["source_rows"])
+                  tdcosmo_skipped_rows.extend(result.get("skipped_rows", []))
+                  binary_rows.extend(result.get("binary_records", []))
+                  print(f"  pass: {result['ingestion_pass']}")
+                  print(f"  raw rows: {len(result['raw_rows'])}")
+                  print()
+              except Exception as e:
+                  source_errors[name] = f"{type(e).__name__}: {e}"
+                  inventory["source_results"][name] = {
+                      "source": name,
+                      "ingestion_pass": False,
+                      "raw_row_count": 0,
+                      "error": source_errors[name]
+                  }
+                  failed_gates.append(f"{name}_ingestion_failed")
+                  print(f"  failed: {source_errors[name]}")
+                  print()
+
+          standardized_rows = [standardize_row(row) for row in raw_rows]
+
+          raw_csv = OUTDIR / "independent_reach_raw_ingestion_rows_v3_29.csv"
+          raw_fields = sorted({key for row in raw_rows for key in row.keys()}) if raw_rows else ["source", "surface", "family", "parameter", "value", "sigma"]
+
+          with raw_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=raw_fields)
+              writer.writeheader()
+              for row in raw_rows:
+                  writer.writerow({k: row.get(k, "") for k in raw_fields})
+
+          standardized_csv = OUTDIR / "independent_reach_standardized_ledger_v3_29.csv"
+          standardized_fields = [
+              "source", "surface", "standard_surface", "family",
+              "standard_role", "observable_family", "distance_axis",
+              "standard_unit_role", "entry_role", "source_product_role",
+              "parameter", "z_eff", "z_lens", "z_source", "lens_name",
+              "value", "sigma", "fractional_sigma",
+              "covariance_available", "posterior_table_available",
+              "pressure_score_built", "pressure_score_allowed_now",
+              "included_in_model", "model_anchor_allowed_now",
+              "diagnostic_only", "raw_line", "boundary_note"
+          ]
+
+          with standardized_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=standardized_fields)
+              writer.writeheader()
+              for row in standardized_rows:
+                  writer.writerow({k: row.get(k, "") for k in standardized_fields})
+
+          source_csv = OUTDIR / "independent_reach_standardization_source_summary_v3_29.csv"
+          source_fields = sorted({key for row in source_rows for key in row.keys()} | {"error"}) if source_rows else ["source", "ingestion_pass", "error"]
+
+          with source_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=source_fields)
+              writer.writeheader()
+              for row in source_rows:
+                  writer.writerow({k: row.get(k, "") for k in source_fields})
+
+              for name, error in source_errors.items():
+                  writer.writerow({
+                      "source": name,
+                      "ingestion_pass": False,
+                      "error": error
+                  })
+
+          skipped_csv = OUTDIR / "independent_reach_standardization_tdcosmo_skipped_rows_v3_29.csv"
+          skipped_fields = sorted({key for row in tdcosmo_skipped_rows for key in row.keys()}) if tdcosmo_skipped_rows else ["name", "row_index", "reason", "flag"]
+
+          with skipped_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=skipped_fields)
+              writer.writeheader()
+              for row in tdcosmo_skipped_rows:
+                  writer.writerow({k: row.get(k, "") for k in skipped_fields})
+
+          binary_csv = OUTDIR / "independent_reach_standardization_binary_shape_products_v3_29.csv"
+          binary_fields = ["product", "url", "path", "size_bytes", "shape_only", "boundary"]
+
+          with binary_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=binary_fields)
+              writer.writeheader()
+              for row in binary_rows:
+                  writer.writerow({k: row.get(k, "") for k in binary_fields})
+
+          # Family summary.
+          family_rows = []
+          families = sorted(set(row["family"] for row in standardized_rows))
+
+          for family in families:
+              rows = [r for r in standardized_rows if r["family"] == family]
+              frac = [
+                  float(r["fractional_sigma"])
+                  for r in rows
+                  if str(r.get("fractional_sigma", "")) not in ["", "nan", "None"]
+              ]
+              z_vals = [
+                  float(r["z_eff"])
+                  for r in rows
+                  if str(r.get("z_eff", "")) not in ["", "nan", "None"]
+              ]
+
+              family_rows.append({
+                  "family": family,
+                  "source": ";".join(sorted(set(r["source"] for r in rows))),
+                  "standard_surfaces": ";".join(sorted(set(r["standard_surface"] for r in rows))),
+                  "standard_roles": ";".join(sorted(set(r["standard_role"] for r in rows))),
+                  "observable_families": ";".join(sorted(set(r["observable_family"] for r in rows))),
+                  "row_count": len(rows),
+                  "covariance_row_count": sum(1 for r in rows if r["covariance_available"] is True),
+                  "posterior_table_row_count": sum(1 for r in rows if r["posterior_table_available"] is True),
+                  "pressure_score_built_count": sum(1 for r in rows if r["pressure_score_built"] is True),
+                  "model_anchor_count": sum(1 for r in rows if r["model_anchor_allowed_now"] is True),
+                  "mean_fractional_sigma": float(np.mean(frac)) if frac else "",
+                  "min_z_eff": float(np.min(z_vals)) if z_vals else "",
+                  "max_z_eff": float(np.max(z_vals)) if z_vals else "",
+                  "boundary_note": "Family summary for standardization only; no pressure score or model anchor."
+              })
+
+          family_csv = OUTDIR / "independent_reach_standardized_family_summary_v3_29.csv"
+          family_fields = [
+              "family", "source", "standard_surfaces", "standard_roles",
+              "observable_families", "row_count", "covariance_row_count",
+              "posterior_table_row_count", "pressure_score_built_count",
+              "model_anchor_count", "mean_fractional_sigma",
+              "min_z_eff", "max_z_eff", "boundary_note"
+          ]
+
+          with family_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=family_fields)
+              writer.writeheader()
+              for row in family_rows:
+                  writer.writerow(row)
+
+          pass_sources = [
+              name for name, result in inventory["source_results"].items()
+              if result.get("ingestion_pass") is True
+          ]
+
+          source_count = len(pass_sources)
+          row_count = len(standardized_rows)
+          diagnostic_only_count = sum(1 for r in standardized_rows if r["diagnostic_only"] is True)
+          model_anchor_count = sum(1 for r in standardized_rows if r["model_anchor_allowed_now"] is True)
+          pressure_score_count = sum(1 for r in standardized_rows if r["pressure_score_built"] is True)
+          desi_count = sum(1 for r in standardized_rows if "DESI" in r["source"])
+
+          role_count = len(set(r["standard_role"] for r in standardized_rows))
+          standard_surface_count = len(set(r["standard_surface"] for r in standardized_rows))
+
+          audit_rows = [
+              {
+                  "audit_gate": "three_independent_reach_sources_ingested",
+                  "pass": source_count >= 3,
+                  "value": ";".join(pass_sources),
+                  "boundary": "eBOSS, BOSS, and TDCOSMO should all be present after v3.28.1."
+              },
+              {
+                  "audit_gate": "standardized_ledger_large_enough",
+                  "pass": row_count >= 20,
+                  "value": row_count,
+                  "boundary": "Expected at least about twenty independent reach diagnostic rows."
+              },
+              {
+                  "audit_gate": "desi_excluded",
+                  "pass": desi_count == 0,
+                  "value": desi_count,
+                  "boundary": "DESI must remain excluded in independent reach standardization."
+              },
+              {
+                  "audit_gate": "all_rows_diagnostic_only",
+                  "pass": diagnostic_only_count == row_count and model_anchor_count == 0,
+                  "value": f"diagnostic_only={diagnostic_only_count}; model_anchor={model_anchor_count}",
+                  "boundary": "Standardization must not promote rows to model anchors."
+              },
+              {
+                  "audit_gate": "pressure_scores_not_built",
+                  "pass": pressure_score_count == 0,
+                  "value": pressure_score_count,
+                  "boundary": "v3.29 standardizes roles only; no universal pressure score is allowed."
+              },
+              {
+                  "audit_gate": "multiple_standard_roles_present",
+                  "pass": role_count >= 3 and standard_surface_count >= 2,
+                  "value": f"roles={role_count}; surfaces={standard_surface_count}",
+                  "boundary": "The ledger should preserve BAO/time-delay role differences, not collapse them."
+              },
+              {
+                  "audit_gate": "source_errors_absent",
+                  "pass": len(source_errors) == 0,
+                  "value": json.dumps(source_errors, sort_keys=True),
+                  "boundary": "Source errors must be fixed before pressure construction."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed from standardization alone."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          audit_csv = OUTDIR / "independent_reach_standardization_audit_v3_29.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failed = []
+          if source_count < 3:
+              hard_failed.append("fewer_than_three_independent_reach_sources_standardized")
+          if row_count < 20:
+              hard_failed.append("standardized_ledger_too_small")
+          if desi_count != 0:
+              hard_failed.append("desi_rows_leaked_into_independent_standardization")
+          if model_anchor_count != 0:
+              hard_failed.append("model_anchor_promotion_violation")
+          if pressure_score_count != 0:
+              hard_failed.append("pressure_score_built_too_early")
+          if source_errors:
+              hard_failed.append("source_errors_present")
+
+          if not hard_failed:
+              readiness_label = "independent_reach_standardization_passed_ready_for_v3_30_pressure_construction_design"
+          else:
+              readiness_label = "independent_reach_standardization_needs_followup"
+
+          next_step = (
+              "Build v3.30 independent reach pressure-construction design: define source-specific comparison baselines for BAO and time-delay rows without mixing incompatible units or promoting model anchors."
+              if not hard_failed
+              else "Fix v3.29 standardization failures before pressure-construction design."
+          )
+
+          inventory["raw_row_count"] = len(raw_rows)
+          inventory["standardized_row_count"] = row_count
+          inventory["family_count"] = len(family_rows)
+          inventory["pass_sources"] = pass_sources
+          inventory["source_errors"] = source_errors
+          inventory["diagnostic_only_count"] = diagnostic_only_count
+          inventory["model_anchor_count"] = model_anchor_count
+          inventory["pressure_score_count"] = pressure_score_count
+          inventory["standard_role_count"] = role_count
+          inventory["standard_surface_count"] = standard_surface_count
+          inventory["gate_result"] = {
+              "failed_gates": hard_failed,
+              "readiness_label": readiness_label,
+              "pass_sources": pass_sources,
+              "standardized_row_count": row_count,
+              "family_count": len(family_rows),
+              "diagnostic_only_count": diagnostic_only_count,
+              "model_anchor_count": model_anchor_count,
+              "pressure_score_count": pressure_score_count,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_29_independent_reach_standardization_audit.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.29 — Independent Reach Standardization Audit")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.29 re-ingests the independent non-DESI reach lanes and standardizes them into role-aware families.")
+          md.append("")
+          md.append("It keeps BAO transverse/radial/source-defined rows separate from TDCOSMO time-delay distance rows.")
+          md.append("")
+          md.append("It does not compute a universal pressure score, does not run a refit, and does not promote any row to model-anchor status.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Passing sources: `{', '.join(pass_sources) if pass_sources else 'none'}`")
+          md.append(f"- Raw rows: `{len(raw_rows)}`")
+          md.append(f"- Standardized rows: `{row_count}`")
+          md.append(f"- Families: `{len(family_rows)}`")
+          md.append(f"- Standard roles: `{role_count}`")
+          md.append(f"- Standard surfaces: `{standard_surface_count}`")
+          md.append(f"- Diagnostic-only rows: `{diagnostic_only_count}`")
+          md.append(f"- Model-anchor rows: `{model_anchor_count}`")
+          md.append(f"- Pressure scores built: `{pressure_score_count}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not hard_failed:
+              md.append("The independent reach rows are now organized, but they are not yet comparable as one pressure surface. The correct next move is to design source-specific pressure construction, not to refit.")
+          else:
+              md.append("The standardization audit found follow-up issues. No pressure construction or refit is allowed yet.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_raw_ingestion_rows_v3_29.csv`")
+          md.append("- `independent_reach_standardized_ledger_v3_29.csv`")
+          md.append("- `independent_reach_standardization_source_summary_v3_29.csv`")
+          md.append("- `independent_reach_standardized_family_summary_v3_29.csv`")
+          md.append("- `independent_reach_standardization_tdcosmo_skipped_rows_v3_29.csv`")
+          md.append("- `independent_reach_standardization_binary_shape_products_v3_29.csv`")
+          md.append("- `independent_reach_standardization_audit_v3_29.csv`")
+          md.append("- `tairid_cosmology_v3_29_independent_reach_standardization_audit.json`")
+          md.append("- `tairid_cosmology_v3_29_independent_reach_standardization_audit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_29_independent_reach_standardization_audit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.29 independent reach standardization audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-29-independent-reach-standardization-audit
+          path: artifacts/tairid_cosmology_v3_29/
