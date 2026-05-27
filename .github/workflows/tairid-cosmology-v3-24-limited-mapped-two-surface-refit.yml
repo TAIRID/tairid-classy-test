@@ -1,0 +1,918 @@
+name: TAIRID Cosmology v3.24 Limited Mapped Two-Surface Refit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  limited-mapped-two-surface-refit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.24 limited mapped two-surface refit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_24
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_24")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_24_limited_mapped_two_surface_refit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This is not the old unrestricted two-surface BIC test.",
+              "This is a limited mapped prototype using only rows allowed by v3.23.",
+              "DESI H0rdrag and hrdrag are used only as mapped reach/accessibility candidates.",
+              "DESI rdrag remains a ruler-calibration diagnostic and is excluded.",
+              "DESI matter-density rows remain density/constraint diagnostics and are excluded.",
+              "The algebraic DESI H0 diagnostic from H0rdrag/rdrag remains blocked.",
+              "KiDS-1000 S8 rows are used as prototype growth/consolidation anchors.",
+              "A pass means the mapped prototype pattern is recovered, not that TAIRID is proven."
+          ]
+
+          DESI_CHAIN_URLS = [
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.1.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.2.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.3.txt",
+              "https://data.desi.lbl.gov/public/dr1/vac/dr1/bao-cosmo-params/v1.0/cobaya/base/desi-bao-all/chain.4.txt"
+          ]
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          KIDS_TARBALL_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_cosmic_shear_data_release.tgz"
+          KIDS_STATS = ["xipm", "bp", "cosebis"]
+
+          REACH_ALLOWED_DESI = ["H0rdrag", "hrdrag"]
+          DESI_EXCLUDED = ["rdrag", "omegamh2", "omm", "omegam", "H0_derived_from_H0rdrag_over_rdrag"]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.24-limited-mapped-two-surface-refit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def token_is_numeric(token):
+              try:
+                  float(token)
+                  return True
+              except Exception:
+                  return False
+
+          def split_chain_text(text):
+              comment_lines = []
+              data_lines = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if stripped.startswith("#"):
+                      comment_lines.append(stripped)
+                  else:
+                      data_lines.append(stripped)
+
+              if not data_lines:
+                  raise RuntimeError("No numeric chain rows found.")
+
+              data = np.loadtxt(io.StringIO("\n".join(data_lines)))
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+
+              return comment_lines, data
+
+          def detect_chain_header(comment_lines, ncols):
+              candidates = []
+              for line in comment_lines:
+                  candidate = line.lstrip("#").strip()
+                  if not candidate:
+                      continue
+
+                  tokens = re.split(r"\s+", candidate)
+                  if len(tokens) != ncols:
+                      continue
+
+                  numeric_count = sum(1 for t in tokens if token_is_numeric(t))
+                  parameterish_count = sum(
+                      1 for t in tokens
+                      if t in ["weight", "minuslogpost", "minuslogprior", "chi2"]
+                      or t in ["omm", "omegam", "rdrag", "H0rdrag", "hrdrag", "omegamh2"]
+                      or "--" in t
+                      or "COSMOLOGICAL" in t.upper()
+                  )
+
+                  if numeric_count > 0:
+                      continue
+
+                  if parameterish_count < max(3, ncols // 5):
+                      continue
+
+                  candidates.append(tokens)
+
+              if not candidates:
+                  return [f"col_{i}" for i in range(ncols)], False
+
+              return candidates[0], True
+
+          def parse_chain_file(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              comment_lines, data = split_chain_text(text)
+              header, header_detected = detect_chain_header(comment_lines, data.shape[1])
+              return header, data, header_detected
+
+          def weight_array(header, data):
+              col = {name: i for i, name in enumerate(header)}
+              if "weight" in col:
+                  return data[:, col["weight"]], "weight"
+              return np.ones(data.shape[0]), None
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def summarize_parameter(values, weights):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  raise RuntimeError("No finite values available.")
+
+              q16, q50, q84 = weighted_quantile(values, weights, [0.16, 0.50, 0.84])
+              mean = float(np.average(values, weights=weights)) if np.sum(weights) > 0 else float(np.mean(values))
+              sigma = (q84 - q16) / 2.0 if q16 is not None and q84 is not None else None
+
+              return {
+                  "mean": mean,
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "sigma": sigma,
+                  "min": float(np.min(values)),
+                  "max": float(np.max(values)),
+                  "row_count": int(len(values))
+              }
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+
+                  try:
+                      rows.append({
+                          "parameter_raw": name_raw,
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "lower1": float(parts[3]),
+                          "upper1": float(parts[4]),
+                          "lower2": float(parts[6]),
+                          "upper2": float(parts[7]),
+                          "lower3": float(parts[9]),
+                          "upper3": float(parts[10]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              dl = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+                  text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+              rows = parse_planck_margestats(text)
+              marg = {r["parameter"]: r for r in rows}
+
+              required = ["H0", "rdrag", "S8"]
+              missing = [p for p in required if p not in marg]
+              if missing:
+                  raise RuntimeError(f"Missing Planck reference parameters: {missing}")
+
+              return {
+                  "download": dl,
+                  "marginal_rows": marg,
+                  "has_H0": "H0" in marg,
+                  "has_S8": "S8" in marg,
+                  "has_rdrag": "rdrag" in marg
+              }
+
+          def planck_param(planck, param):
+              row = planck["marginal_rows"].get(param)
+              if row is None:
+                  return None
+              return {
+                  "parameter": param,
+                  "mean": float(row["mean"]),
+                  "sigma": float(row["sddev"]),
+                  "source": "Planck_margestats_reference"
+              }
+
+          def planck_product(planck, a, b, product_name, scale=1.0):
+              pa = planck_param(planck, a)
+              pb = planck_param(planck, b)
+              if pa is None or pb is None:
+                  return None
+
+              mean = pa["mean"] * pb["mean"] * scale
+              sigma = scale * math.sqrt(
+                  (pb["mean"] ** 2) * (pa["sigma"] ** 2)
+                  + (pa["mean"] ** 2) * (pb["sigma"] ** 2)
+              )
+
+              return {
+                  "parameter": product_name,
+                  "mean": mean,
+                  "sigma": sigma,
+                  "source": "Planck_margestats_independent_error_fallback"
+              }
+
+          def load_desi_reach_rows(planck):
+              desi_dir = DOWNLOADS / "DESI_DR1_BAO"
+              desi_dir.mkdir(parents=True, exist_ok=True)
+
+              parts = []
+              header_ref = None
+              header_detected_all = True
+              downloads = []
+              shape_rows = []
+
+              for url in DESI_CHAIN_URLS:
+                  fname = url.rstrip("/").split("/")[-1]
+                  path = desi_dir / fname
+                  downloads.append(download(url, path))
+
+                  header, data, header_detected = parse_chain_file(path)
+
+                  if header_ref is None:
+                      header_ref = header
+                  elif len(header) != len(header_ref):
+                      raise RuntimeError(f"DESI header width mismatch in {fname}")
+
+                  parts.append(data)
+                  header_detected_all = header_detected_all and header_detected
+                  shape_rows.append({
+                      "file": fname,
+                      "rows": int(data.shape[0]),
+                      "columns": int(data.shape[1]),
+                      "header_detected": header_detected
+                  })
+
+              data = np.vstack(parts)
+              weights, weight_col = weight_array(header_ref, data)
+              col = {name: i for i, name in enumerate(header_ref)}
+
+              rows = []
+              excluded_rows = []
+
+              for param in REACH_ALLOWED_DESI:
+                  if param not in col:
+                      raise RuntimeError(f"Allowed DESI reach parameter missing: {param}")
+
+                  summary = summarize_parameter(data[:, col[param]], weights)
+
+                  if param == "H0rdrag":
+                      ref = planck_product(planck, "H0", "rdrag", "Planck_H0_times_rdrag")
+                      comparison = "Planck_H0_times_rdrag"
+                  elif param == "hrdrag":
+                      ref = planck_product(planck, "H0", "rdrag", "Planck_h_times_rdrag", scale=0.01)
+                      comparison = "Planck_h_times_rdrag"
+                  else:
+                      ref = None
+                      comparison = ""
+
+                  if ref is None:
+                      raise RuntimeError(f"Planck comparison missing for {param}")
+
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + ref["sigma"] ** 2)
+                  pressure = (summary["q50"] - ref["mean"]) / combined_sigma
+
+                  rows.append({
+                      "surface": "reach_geometry",
+                      "source": "DESI_DR1_BAO",
+                      "family": "DESI_bao_expansion_product",
+                      "entry_role": "mapped_reach_accessibility_candidate",
+                      "parameter": param,
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "sigma": summary["sigma"],
+                      "planck_comparison": comparison,
+                      "planck_reference_value": ref["mean"],
+                      "planck_reference_sigma": ref["sigma"],
+                      "combined_sigma": combined_sigma,
+                      "pressure_z": pressure,
+                      "sign": "positive" if pressure > 0 else "negative" if pressure < 0 else "zero",
+                      "included_in_limited_refit": True,
+                      "model_anchor_allowed_now": True,
+                      "boundary_note": "Allowed by v3.23 as mapped reach/accessibility candidate."
+                  })
+
+              for param in DESI_EXCLUDED:
+                  if param == "H0_derived_from_H0rdrag_over_rdrag":
+                      if "H0rdrag" in col and "rdrag" in col:
+                          h0 = data[:, col["H0rdrag"]] / data[:, col["rdrag"]]
+                          summary = summarize_parameter(h0, weights)
+                          ref = planck_param(planck, "H0")
+                          combined_sigma = math.sqrt(summary["sigma"] ** 2 + ref["sigma"] ** 2)
+                          pressure = (summary["q50"] - ref["mean"]) / combined_sigma
+                          role = "blocked_algebraic_h0_diagnostic"
+                          surface = "blocked"
+                      else:
+                          continue
+                  else:
+                      if param not in col:
+                          continue
+                      summary = summarize_parameter(data[:, col[param]], weights)
+                      pressure = ""
+                      combined_sigma = ""
+                      ref = {"mean": "", "sigma": ""}
+                      role = "excluded_by_v3_23_mapping"
+                      surface = "excluded"
+
+                  excluded_rows.append({
+                      "surface": surface,
+                      "source": "DESI_DR1_BAO",
+                      "family": "excluded_or_blocked",
+                      "entry_role": role,
+                      "parameter": param,
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "sigma": summary["sigma"],
+                      "planck_comparison": "",
+                      "planck_reference_value": ref["mean"],
+                      "planck_reference_sigma": ref["sigma"],
+                      "combined_sigma": combined_sigma,
+                      "pressure_z": pressure,
+                      "sign": "excluded",
+                      "included_in_limited_refit": False,
+                      "model_anchor_allowed_now": False,
+                      "boundary_note": "Excluded or blocked by v3.23 mapping."
+                  })
+
+              return {
+                  "downloads": downloads,
+                  "combined_rows": int(data.shape[0]),
+                  "combined_columns": int(data.shape[1]),
+                  "header_detected_all": header_detected_all,
+                  "weight_column": weight_col,
+                  "shape_rows": shape_rows,
+                  "reach_rows": rows,
+                  "excluded_rows": excluded_rows
+              }
+
+          def load_kids_growth_rows(planck):
+              kids_dir = DOWNLOADS / "KiDS_1000"
+              kids_dir.mkdir(parents=True, exist_ok=True)
+              tar_path = kids_dir / "KiDS1000_cosmic_shear_data_release.tgz"
+              dl = download(KIDS_TARBALL_URL, tar_path)
+
+              extract_dir = OUTDIR / "kids_1000_extracted"
+              extract_dir.mkdir(parents=True, exist_ok=True)
+
+              with tarfile.open(tar_path, "r:gz") as tf:
+                  safe_members = []
+                  for member in tf.getmembers():
+                      target = (extract_dir / member.name).resolve()
+                      if str(target).startswith(str(extract_dir.resolve())):
+                          safe_members.append(member)
+                  tf.extractall(extract_dir, members=safe_members)
+
+              bases = [
+                  p for p in extract_dir.iterdir()
+                  if p.is_dir() and "KiDS1000" in p.name and "shear_data_release" in p.name
+              ]
+              if not bases:
+                  raise RuntimeError("Could not find KiDS extracted base directory.")
+
+              base = bases[0]
+              planck_s8 = planck_param(planck, "S8")
+              rows = []
+
+              for stat in KIDS_STATS:
+                  chain_path = base / "chains_and_config_files" / "main_chains_iterative_covariance" / stat / "chain" / "output_multinest_C.txt"
+                  header, data, header_detected = parse_chain_file(chain_path)
+                  col = {name: i for i, name in enumerate(header)}
+                  if "COSMOLOGICAL_PARAMETERS--S_8" not in col:
+                      raise RuntimeError(f"KiDS S8 column missing for {stat}.")
+
+                  weights, weight_col = weight_array(header, data)
+                  summary = summarize_parameter(data[:, col["COSMOLOGICAL_PARAMETERS--S_8"]], weights)
+                  combined_sigma = math.sqrt(summary["sigma"] ** 2 + planck_s8["sigma"] ** 2)
+                  pressure = (summary["q50"] - planck_s8["mean"]) / combined_sigma
+
+                  rows.append({
+                      "surface": "consolidation_growth",
+                      "source": "KiDS_1000",
+                      "family": "KiDS_1000",
+                      "entry_role": "chain_derived_growth_anchor",
+                      "parameter": f"KiDS_{stat}_S8",
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "sigma": summary["sigma"],
+                      "planck_comparison": "Planck_S8",
+                      "planck_reference_value": planck_s8["mean"],
+                      "planck_reference_sigma": planck_s8["sigma"],
+                      "combined_sigma": combined_sigma,
+                      "pressure_z": pressure,
+                      "sign": "negative" if pressure < 0 else "positive" if pressure > 0 else "zero",
+                      "included_in_limited_refit": True,
+                      "model_anchor_allowed_now": True,
+                      "boundary_note": "KiDS chain-derived S8 row. Same-survey family members, not independent surveys."
+                  })
+
+              return {
+                  "download": dl,
+                  "rows": rows,
+                  "all_negative": all(r["sign"] == "negative" for r in rows),
+                  "mean_pressure_z": float(np.mean([r["pressure_z"] for r in rows]))
+              }
+
+          def fit_constant_model(values, groups=None):
+              y = np.asarray(values, dtype=float)
+              n = len(y)
+              if n == 0:
+                  raise RuntimeError("No values for model fit.")
+
+              if groups is None:
+                  mu = float(np.mean(y))
+                  residuals = y - mu
+                  rss = float(np.sum(residuals ** 2))
+                  k = 1
+                  params = {"global_mean": mu}
+              else:
+                  unique_groups = sorted(set(groups))
+                  residuals = np.zeros_like(y)
+                  params = {}
+                  for g in unique_groups:
+                      idx = [i for i, gg in enumerate(groups) if gg == g]
+                      mu = float(np.mean(y[idx]))
+                      params[f"mean_{g}"] = mu
+                      residuals[idx] = y[idx] - mu
+                  rss = float(np.sum(residuals ** 2))
+                  k = len(unique_groups)
+
+              eps = 1.0e-12
+              rss_for_ic = max(rss, eps)
+              bic = n * math.log(rss_for_ic / n) + k * math.log(n)
+              aic = n * math.log(rss_for_ic / n) + 2 * k
+
+              return {
+                  "n": n,
+                  "k": k,
+                  "rss": rss,
+                  "bic": bic,
+                  "aic": aic,
+                  "params": params
+              }
+
+          def leave_one_out(rows):
+              out = []
+              for i, row in enumerate(rows):
+                  subset = [r for j, r in enumerate(rows) if j != i]
+                  surfaces = sorted(set(r["surface"] for r in subset))
+                  if "reach_geometry" not in surfaces or "consolidation_growth" not in surfaces:
+                      continue
+
+                  reach = [r["pressure_z"] for r in subset if r["surface"] == "reach_geometry"]
+                  growth = [r["pressure_z"] for r in subset if r["surface"] == "consolidation_growth"]
+
+                  out.append({
+                      "removed_parameter": row["parameter"],
+                      "removed_surface": row["surface"],
+                      "remaining_reach_mean": float(np.mean(reach)),
+                      "remaining_growth_mean": float(np.mean(growth)),
+                      "pattern_preserved": float(np.mean(reach)) > 0 and float(np.mean(growth)) < 0
+                  })
+
+              return out
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_23_status": "desi_family_mapping_passed_ready_for_v3_24_limited_mapped_two_surface_refit",
+                  "v3_23_allowed_reach_rows": REACH_ALLOWED_DESI,
+                  "v3_23_excluded_rows": DESI_EXCLUDED
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.24 limited mapped two-surface refit")
+          print("Truth boundary: restricted prototype refit only; no validation claim.")
+          print()
+
+          failed_gates = []
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_summaries"]["Planck_2018"] = {
+                  "has_H0": planck["has_H0"],
+                  "has_S8": planck["has_S8"],
+                  "has_rdrag": planck["has_rdrag"],
+                  "download": planck["download"]
+              }
+              print("Planck loaded.")
+          except Exception as e:
+              failed_gates.append("planck_load_failed")
+              planck = None
+              inventory["source_summaries"]["Planck_2018"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"Planck failed: {type(e).__name__}: {e}")
+
+          try:
+              desi = load_desi_reach_rows(planck)
+              inventory["source_summaries"]["DESI_DR1_BAO"] = {
+                  "combined_rows": desi["combined_rows"],
+                  "combined_columns": desi["combined_columns"],
+                  "header_detected_all": desi["header_detected_all"],
+                  "reach_row_count": len(desi["reach_rows"]),
+                  "excluded_row_count": len(desi["excluded_rows"]),
+                  "weight_column": desi["weight_column"]
+              }
+              print("DESI mapped reach rows loaded.")
+          except Exception as e:
+              failed_gates.append("desi_mapped_reach_load_failed")
+              desi = {"reach_rows": [], "excluded_rows": []}
+              inventory["source_summaries"]["DESI_DR1_BAO"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"DESI failed: {type(e).__name__}: {e}")
+
+          try:
+              kids = load_kids_growth_rows(planck)
+              inventory["source_summaries"]["KiDS_1000"] = {
+                  "row_count": len(kids["rows"]),
+                  "all_negative": kids["all_negative"],
+                  "mean_pressure_z": kids["mean_pressure_z"]
+              }
+              print("KiDS growth rows loaded.")
+          except Exception as e:
+              failed_gates.append("kids_growth_load_failed")
+              kids = {"rows": [], "all_negative": False}
+              inventory["source_summaries"]["KiDS_1000"] = {"error": f"{type(e).__name__}: {e}"}
+              print(f"KiDS failed: {type(e).__name__}: {e}")
+
+          included_rows = desi.get("reach_rows", []) + kids.get("rows", [])
+          excluded_rows = desi.get("excluded_rows", [])
+
+          included_csv = OUTDIR / "limited_mapped_refit_included_rows_v3_24.csv"
+          fields = [
+              "surface", "source", "family", "entry_role", "parameter",
+              "q16", "q50", "q84", "sigma",
+              "planck_comparison", "planck_reference_value", "planck_reference_sigma",
+              "combined_sigma", "pressure_z", "sign",
+              "included_in_limited_refit", "model_anchor_allowed_now", "boundary_note"
+          ]
+
+          with included_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for row in included_rows:
+                  writer.writerow({k: row.get(k) for k in fields})
+
+          excluded_csv = OUTDIR / "limited_mapped_refit_excluded_rows_v3_24.csv"
+          with excluded_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for row in excluded_rows:
+                  writer.writerow({k: row.get(k) for k in fields})
+
+          reach_values = [float(r["pressure_z"]) for r in included_rows if r["surface"] == "reach_geometry"]
+          growth_values = [float(r["pressure_z"]) for r in included_rows if r["surface"] == "consolidation_growth"]
+
+          if len(reach_values) == 0 or len(growth_values) == 0:
+              failed_gates.append("missing_reach_or_growth_rows_for_refit")
+
+          reach_mean = float(np.mean(reach_values)) if reach_values else None
+          growth_mean = float(np.mean(growth_values)) if growth_values else None
+
+          row_level_model = {}
+          family_level = {}
+
+          if reach_values and growth_values:
+              y = [float(r["pressure_z"]) for r in included_rows]
+              groups = [r["surface"] for r in included_rows]
+
+              one_surface = fit_constant_model(y, groups=None)
+              two_surface = fit_constant_model(y, groups=groups)
+
+              row_level_model = {
+                  "one_surface": one_surface,
+                  "two_surface": two_surface,
+                  "delta_bic_two_minus_one": two_surface["bic"] - one_surface["bic"],
+                  "delta_aic_two_minus_one": two_surface["aic"] - one_surface["aic"],
+                  "two_surface_preferred_by_bic": two_surface["bic"] < one_surface["bic"],
+                  "two_surface_preferred_by_aic": two_surface["aic"] < one_surface["aic"],
+                  "boundary_warning": "Row-level fit uses two DESI expansion-product rows and three same-survey KiDS rows. Treat as prototype only."
+              }
+
+              family_level = {
+                  "reach_family_mean": reach_mean,
+                  "growth_family_mean": growth_mean,
+                  "reach_positive": reach_mean > 0,
+                  "growth_negative": growth_mean < 0,
+                  "family_balanced_pattern_preserved": reach_mean > 0 and growth_mean < 0,
+                  "family_balanced_bic_allowed": False,
+                  "boundary_warning": "Family-balanced BIC is not run because there is only one mapped reach family and one growth family."
+              }
+
+          loo_rows = leave_one_out(included_rows)
+          loo_csv = OUTDIR / "limited_mapped_refit_leave_one_out_v3_24.csv"
+          with loo_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "removed_parameter", "removed_surface",
+                      "remaining_reach_mean", "remaining_growth_mean",
+                      "pattern_preserved"
+                  ]
+              )
+              writer.writeheader()
+              for row in loo_rows:
+                  writer.writerow(row)
+
+          audit_rows = []
+
+          audit_rows.append({
+              "audit_gate": "source_loads_completed",
+              "pass": len([g for g in failed_gates if g.endswith("_load_failed")]) == 0,
+              "value": ";".join(failed_gates) if failed_gates else "none",
+              "boundary": "All source loads must complete."
+          })
+
+          audit_rows.append({
+              "audit_gate": "only_v3_23_mapped_reach_rows_included",
+              "pass": sorted([r["parameter"] for r in desi.get("reach_rows", [])]) == sorted(REACH_ALLOWED_DESI),
+              "value": ";".join([r["parameter"] for r in desi.get("reach_rows", [])]),
+              "boundary": "Only DESI H0rdrag and hrdrag may enter reach side."
+          })
+
+          audit_rows.append({
+              "audit_gate": "excluded_desi_rows_not_in_refit",
+              "pass": all(r["included_in_limited_refit"] is False for r in excluded_rows),
+              "value": ";".join([r["parameter"] for r in excluded_rows]),
+              "boundary": "rdrag, density rows, and algebraic H0 remain excluded or blocked."
+          })
+
+          audit_rows.append({
+              "audit_gate": "reach_positive_growth_negative",
+              "pass": reach_mean is not None and growth_mean is not None and reach_mean > 0 and growth_mean < 0,
+              "value": f"reach_mean={reach_mean}; growth_mean={growth_mean}",
+              "boundary": "Mapped reach/accessibility must be positive and growth/consolidation must be negative."
+          })
+
+          audit_rows.append({
+              "audit_gate": "row_level_two_surface_preferred_by_bic",
+              "pass": bool(row_level_model.get("two_surface_preferred_by_bic", False)),
+              "value": row_level_model.get("delta_bic_two_minus_one", ""),
+              "boundary": "Prototype diagnostic only because rows are family-dependent."
+          })
+
+          audit_rows.append({
+              "audit_gate": "family_balanced_pattern_preserved",
+              "pass": bool(family_level.get("family_balanced_pattern_preserved", False)),
+              "value": f"reach={family_level.get('reach_family_mean')}; growth={family_level.get('growth_family_mean')}",
+              "boundary": "Family-balanced sign split is more honest than overusing row-level BIC."
+          })
+
+          audit_rows.append({
+              "audit_gate": "leave_one_out_pattern_preserved",
+              "pass": len(loo_rows) > 0 and all(r["pattern_preserved"] for r in loo_rows),
+              "value": f"{sum(1 for r in loo_rows if r['pattern_preserved'])}/{len(loo_rows)}",
+              "boundary": "Leave-one-out is a small robustness check, not validation."
+          })
+
+          audit_rows.append({
+              "audit_gate": "model_claim_allowed",
+              "pass": False,
+              "value": False,
+              "boundary": "No model claim is allowed even if the mapped prototype pattern is recovered."
+          })
+
+          audit_csv = OUTDIR / "limited_mapped_refit_audit_v3_24.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failures = [g for g in failed_gates if g.endswith("_load_failed") or g == "missing_reach_or_growth_rows_for_refit"]
+
+          mapped_pattern_recovered = (
+              not hard_failures
+              and family_level.get("family_balanced_pattern_preserved") is True
+              and row_level_model.get("two_surface_preferred_by_bic") is True
+              and len(loo_rows) > 0
+              and all(r["pattern_preserved"] for r in loo_rows)
+          )
+
+          if hard_failures:
+              readiness_label = "limited_mapped_two_surface_refit_failed_source_or_row_followup_needed"
+          elif mapped_pattern_recovered:
+              readiness_label = "limited_mapped_two_surface_refit_passed_pattern_recovered_not_validation"
+          else:
+              readiness_label = "limited_mapped_two_surface_refit_completed_pattern_not_robust_enough"
+
+          next_step = (
+              "Build v3.25 mapped-refit robustness audit: test sensitivity to DESI reach-family choice, KiDS family treatment, and duplicate/scaled DESI rows before any stronger claim."
+              if mapped_pattern_recovered
+              else "Do not advance claims. Inspect v3.24 audit outputs and repair source/family mapping before robustness testing."
+          )
+
+          inventory["included_row_count"] = len(included_rows)
+          inventory["excluded_row_count"] = len(excluded_rows)
+          inventory["reach_mean_pressure_z"] = reach_mean
+          inventory["growth_mean_pressure_z"] = growth_mean
+          inventory["row_level_model"] = row_level_model
+          inventory["family_level"] = family_level
+          inventory["leave_one_out"] = loo_rows
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "mapped_pattern_recovered": mapped_pattern_recovered,
+              "included_row_count": len(included_rows),
+              "excluded_row_count": len(excluded_rows),
+              "reach_mean_pressure_z": reach_mean,
+              "growth_mean_pressure_z": growth_mean,
+              "row_level_delta_bic_two_minus_one": row_level_model.get("delta_bic_two_minus_one"),
+              "row_level_two_surface_preferred_by_bic": row_level_model.get("two_surface_preferred_by_bic"),
+              "family_balanced_pattern_preserved": family_level.get("family_balanced_pattern_preserved"),
+              "model_claim_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_24_limited_mapped_two_surface_refit.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.24 — Limited Mapped Two-Surface Refit")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.24 runs the first limited mapped prototype refit after v3.23 allowed only the DESI BAO expansion-product reach family and KiDS growth anchors.")
+          md.append("")
+          md.append("Included rows:")
+          md.append("")
+          md.append("- DESI reach/accessibility: `H0rdrag`, `hrdrag`")
+          md.append("- KiDS growth/consolidation: `xipm`, `bp`, `cosebis`")
+          md.append("")
+          md.append("Excluded rows:")
+          md.append("")
+          md.append("- DESI `rdrag`, `omegamh2`, `omm`, `omegam`")
+          md.append("- DESI algebraic `H0rdrag/rdrag` H0 diagnostic")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Included rows: `{len(included_rows)}`")
+          md.append(f"- Excluded rows: `{len(excluded_rows)}`")
+          md.append(f"- Reach mean pressure: `{reach_mean}`")
+          md.append(f"- Growth mean pressure: `{growth_mean}`")
+          md.append(f"- Row-level delta BIC, two minus one: `{row_level_model.get('delta_bic_two_minus_one')}`")
+          md.append(f"- Row-level two-surface preferred by BIC: `{row_level_model.get('two_surface_preferred_by_bic')}`")
+          md.append(f"- Family-balanced pattern preserved: `{family_level.get('family_balanced_pattern_preserved')}`")
+          md.append(f"- Mapped pattern recovered: `{mapped_pattern_recovered}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if mapped_pattern_recovered:
+              md.append("The limited mapped prototype recovered the expected reach-positive / growth-negative split. This is useful, but it is not validation because the row count is small and the DESI reach rows are scaled counterparts.")
+          else:
+              md.append("The limited mapped prototype did not clear enough robustness gates. No stronger claim is allowed.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `limited_mapped_refit_included_rows_v3_24.csv`")
+          md.append("- `limited_mapped_refit_excluded_rows_v3_24.csv`")
+          md.append("- `limited_mapped_refit_leave_one_out_v3_24.csv`")
+          md.append("- `limited_mapped_refit_audit_v3_24.csv`")
+          md.append("- `tairid_cosmology_v3_24_limited_mapped_two_surface_refit.json`")
+          md.append("- `tairid_cosmology_v3_24_limited_mapped_two_surface_refit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_24_limited_mapped_two_surface_refit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failures:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.24 limited mapped two-surface refit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-24-limited-mapped-two-surface-refit
+          path: artifacts/tairid_cosmology_v3_24/
