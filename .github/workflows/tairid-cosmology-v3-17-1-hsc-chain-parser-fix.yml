@@ -1,0 +1,578 @@
+name: TAIRID Cosmology v3.17.1 HSC Chain Parser Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  hsc-chain-parser-fix:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.17.1 HSC chain parser fix
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_17_1
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import urllib.request
+          import urllib.error
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_17_1")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_17_1_hsc_chain_parser_fix"
+
+          HSC_CHAIN_ZIP_URL = "https://hsc-release.mtk.nao.ac.jp/doc/wp-content/uploads/2025/11/chain-real-hscs19a-fid-dpz0.093-corrected-tol0.01-final.zip"
+
+          HSC_GATED_DATA_VECTOR_URLS = [
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_space_data_vector.sacc",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/li23/data/data_vector.fits",
+              "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_cosmic_shear.txt"
+          ]
+
+          PLANCK_REFERENCE_S8 = 0.834044
+          PLANCK_REFERENCE_S8_SIGMA = 0.015875
+
+          TARGET_PARAMETERS = [
+              "cosmological_parameters--omega_bh2",
+              "cosmological_parameters--omega_ch2",
+              "cosmological_parameters--ln_1010_a_s",
+              "cosmological_parameters--n_s",
+              "cosmological_parameters--omega_de",
+              "COSMOLOGICAL_PARAMETERS--SIGMA_8",
+              "prior",
+              "like",
+              "post",
+              "weight"
+          ]
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This fixes the v3.17 HSC header parser only.",
+              "HSC-Y3 remains chain-only because data-vector products were still gated with 401 responses.",
+              "The derived HSC S8 value is diagnostic only and must not be promoted to a full growth anchor until HSC data-vector/likelihood ingestion is resolved."
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=240):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.17.1-hsc-chain-parser-fix/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def probe_url(url, max_bytes=8192, timeout=40):
+              result = {
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "bytes_read": 0,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v3.17.1-hsc-chain-parser-fix/1.0",
+                          "Accept": "*/*",
+                          "Range": f"bytes=0-{max_bytes - 1}"
+                      }
+                  )
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      body = resp.read(max_bytes)
+                      status = getattr(resp, "status", None)
+                      result.update({
+                          "ok": status is not None and 200 <= status < 400,
+                          "status": status,
+                          "content_type": resp.headers.get("Content-Type"),
+                          "content_length": resp.headers.get("Content-Length"),
+                          "bytes_read": len(body)
+                      })
+              except Exception as e:
+                  result.update({
+                      "ok": False,
+                      "status": getattr(e, "code", None),
+                      "error": f"{type(e).__name__}: {e}"
+                  })
+
+              return result
+
+          def weighted_quantile(values, weights, qs):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights >= 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if len(values) == 0:
+                  return [None for _ in qs]
+
+              if np.sum(weights) <= 0:
+                  weights = np.ones_like(values)
+
+              order = np.argsort(values)
+              values = values[order]
+              weights = weights[order]
+
+              cumulative = np.cumsum(weights)
+              cumulative = cumulative / cumulative[-1]
+
+              return [float(np.interp(q, cumulative, values)) for q in qs]
+
+          def split_chain_text(text):
+              comment_lines = []
+              data_lines = []
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if stripped.startswith("#"):
+                      comment_lines.append(stripped)
+                  else:
+                      data_lines.append(stripped)
+
+              if not data_lines:
+                  raise RuntimeError("No numeric chain rows found.")
+
+              data = np.loadtxt(io.StringIO("\n".join(data_lines)))
+              if data.ndim == 1:
+                  data = data.reshape((1, -1))
+
+              return comment_lines, data
+
+          def token_is_numeric(token):
+              try:
+                  float(token)
+                  return True
+              except Exception:
+                  return False
+
+          def detect_chain_header(comment_lines, ncols):
+              """
+              v3.17 failed because it kept replacing the real first header with later INI/prior lines.
+              This fixed version chooses the first comment line whose token count matches the numeric data width
+              and whose tokens look like parameter names, not prior settings.
+              """
+              candidates = []
+
+              for line in comment_lines:
+                  candidate = line.lstrip("#").strip()
+                  if not candidate:
+                      continue
+
+                  tokens = re.split(r"\s+", candidate)
+
+                  if len(tokens) != ncols:
+                      continue
+
+                  numeric_token_count = sum(1 for t in tokens if token_is_numeric(t))
+                  parameterish_count = sum(
+                      1 for t in tokens
+                      if "--" in t or "COSMOLOGICAL" in t.upper() or t in ["prior", "like", "post", "weight"]
+                  )
+
+                  if numeric_token_count > 0:
+                      continue
+
+                  if parameterish_count < max(3, ncols // 4):
+                      continue
+
+                  candidates.append(tokens)
+
+              if not candidates:
+                  return [f"col_{i}" for i in range(ncols)], False
+
+              return candidates[0], True
+
+          def summarize_parameter(values, weights):
+              q16, q50, q84 = weighted_quantile(values, weights, [0.16, 0.50, 0.84])
+
+              if np.sum(weights) > 0:
+                  mean = float(np.average(values, weights=weights))
+              else:
+                  mean = float(np.mean(values))
+
+              return {
+                  "weighted_mean": mean,
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "min": float(np.min(values)),
+                  "max": float(np.max(values))
+              }
+
+          def ingest_hsc_chain():
+              hsc_dir = DOWNLOADS / "HSC_Y3"
+              hsc_dir.mkdir(parents=True, exist_ok=True)
+
+              zip_path = hsc_dir / "hsc_y3_chain_candidate.zip"
+              download_record = download(HSC_CHAIN_ZIP_URL, zip_path)
+
+              gated_probes = [probe_url(url) for url in HSC_GATED_DATA_VECTOR_URLS]
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  members = [name for name in zf.namelist() if name.lower().endswith(".txt")]
+                  if not members:
+                      raise RuntimeError("No TXT chain file found inside HSC ZIP.")
+                  chain_member = members[0]
+                  text = zf.read(chain_member).decode("utf-8", errors="replace")
+
+              comment_lines, data = split_chain_text(text)
+              header, header_detected = detect_chain_header(comment_lines, data.shape[1])
+              col = {name: i for i, name in enumerate(header)}
+
+              weight_col = col.get("weight")
+              weights = data[:, weight_col] if weight_col is not None else np.ones(data.shape[0])
+
+              parameter_rows = []
+              for param in TARGET_PARAMETERS:
+                  if param not in col:
+                      continue
+
+                  values = data[:, col[param]]
+                  summary = summarize_parameter(values, weights)
+
+                  parameter_rows.append({
+                      "source": "HSC_Y3",
+                      "surface": "consolidation_growth",
+                      "parameter": param,
+                      "row_count": int(data.shape[0]),
+                      "weighted_mean": summary["weighted_mean"],
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "min": summary["min"],
+                      "max": summary["max"],
+                      "weight_column": "weight" if weight_col is not None else None
+                  })
+
+              sigma_key = "COSMOLOGICAL_PARAMETERS--SIGMA_8"
+              omega_de_key = "cosmological_parameters--omega_de"
+
+              derived_rows = []
+
+              if sigma_key in col and omega_de_key in col:
+                  sigma8 = data[:, col[sigma_key]]
+                  omega_de = data[:, col[omega_de_key]]
+                  omega_m_flat = 1.0 - omega_de
+
+                  mask = (
+                      np.isfinite(sigma8)
+                      & np.isfinite(omega_m_flat)
+                      & (omega_m_flat > 0)
+                      & np.isfinite(weights)
+                      & (weights >= 0)
+                  )
+
+                  derived_s8 = sigma8[mask] * np.sqrt(omega_m_flat[mask] / 0.3)
+                  derived_weights = weights[mask]
+
+                  summary = summarize_parameter(derived_s8, derived_weights)
+
+                  sigma_half_width = (
+                      (summary["q84"] - summary["q16"]) / 2.0
+                      if summary["q16"] is not None and summary["q84"] is not None
+                      else None
+                  )
+
+                  combined_sigma = (
+                      math.sqrt(sigma_half_width ** 2 + PLANCK_REFERENCE_S8_SIGMA ** 2)
+                      if sigma_half_width is not None
+                      else None
+                  )
+
+                  pressure_vs_planck = (
+                      (summary["q50"] - PLANCK_REFERENCE_S8) / combined_sigma
+                      if combined_sigma is not None and combined_sigma > 0
+                      else None
+                  )
+
+                  derived_rows.append({
+                      "source": "HSC_Y3",
+                      "surface": "consolidation_growth",
+                      "parameter": "S8_flat_derived_from_sigma8_and_omega_de",
+                      "row_count": int(len(derived_s8)),
+                      "weighted_mean": summary["weighted_mean"],
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "min": summary["min"],
+                      "max": summary["max"],
+                      "weight_column": "weight" if weight_col is not None else None,
+                      "planck_reference_s8": PLANCK_REFERENCE_S8,
+                      "planck_reference_s8_sigma": PLANCK_REFERENCE_S8_SIGMA,
+                      "pressure_vs_planck_reference_z": pressure_vs_planck,
+                      "derivation_boundary": "Computed as sigma8 * sqrt((1 - omega_de)/0.3); diagnostic only until HSC data-vector/likelihood ingestion is resolved."
+                  })
+
+              parameter_csv = OUTDIR / "hsc_y3_chain_parameter_summary_v3_17_1.csv"
+              with parameter_csv.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "source", "surface", "parameter", "row_count",
+                      "weighted_mean", "q16", "q50", "q84",
+                      "min", "max", "weight_column"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in parameter_rows:
+                      writer.writerow(row)
+
+              derived_csv = OUTDIR / "hsc_y3_chain_derived_s8_diagnostic_v3_17_1.csv"
+              with derived_csv.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "source", "surface", "parameter", "row_count",
+                      "weighted_mean", "q16", "q50", "q84",
+                      "min", "max", "weight_column",
+                      "planck_reference_s8", "planck_reference_s8_sigma",
+                      "pressure_vs_planck_reference_z",
+                      "derivation_boundary"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in derived_rows:
+                      writer.writerow(row)
+
+              gated_csv = OUTDIR / "hsc_y3_data_vector_gate_status_v3_17_1.csv"
+              with gated_csv.open("w", newline="", encoding="utf-8") as f:
+                  fieldnames = [
+                      "url", "ok", "status", "content_type",
+                      "content_length", "bytes_read", "error"
+                  ]
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in gated_probes:
+                      writer.writerow(row)
+
+              header_csv = OUTDIR / "hsc_y3_detected_chain_header_v3_17_1.csv"
+              with header_csv.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=["column_index", "column_name"])
+                  writer.writeheader()
+                  for i, name in enumerate(header):
+                      writer.writerow({"column_index": i, "column_name": name})
+
+              gated_401_count = sum(1 for p in gated_probes if p["status"] == 401)
+
+              chain_only_pass = (
+                  data.shape[0] > 1000
+                  and data.shape[1] >= 10
+                  and header_detected
+                  and sigma_key in col
+                  and omega_de_key in col
+                  and len(derived_rows) == 1
+              )
+
+              return {
+                  "source": "HSC_Y3",
+                  "surface": "consolidation_growth",
+                  "chain_only_pass": chain_only_pass,
+                  "model_anchor_allowed": False,
+                  "chain_member": chain_member,
+                  "chain_rows": int(data.shape[0]),
+                  "chain_columns": int(data.shape[1]),
+                  "header_detected": header_detected,
+                  "sigma8_column_found": sigma_key in col,
+                  "omega_de_column_found": omega_de_key in col,
+                  "parameter_summary_rows": len(parameter_rows),
+                  "derived_s8_rows": len(derived_rows),
+                  "gated_probe_count": len(gated_probes),
+                  "gated_401_count": gated_401_count,
+                  "parameter_summary_table": str(parameter_csv),
+                  "derived_s8_diagnostic_table": str(derived_csv),
+                  "data_vector_gate_status_table": str(gated_csv),
+                  "detected_header_table": str(header_csv),
+                  "download": download_record,
+                  "boundary": "HSC-Y3 chain-only diagnostic repaired. Data-vector products remain gated, so this is not a full HSC growth anchor."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_17_status": "targeted_ingestion_partial_pass_ready_for_limited_v3_18_boundary_integration",
+                  "v3_17_issue": "HSC chain downloaded but parser overwrote the real header with a later INI/prior line."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "hsc_result": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.17.1 HSC chain parser fix")
+          print("Truth boundary: parser repair only; no validation claim.")
+          print()
+
+          failed_gates = []
+
+          try:
+              hsc_result = ingest_hsc_chain()
+              inventory["hsc_result"] = hsc_result
+
+              if not hsc_result["chain_only_pass"]:
+                  failed_gates.append("hsc_chain_only_parser_fix_failed")
+
+          except Exception as e:
+              failed_gates.append("hsc_chain_parser_exception")
+              inventory["hsc_result"] = {
+                  "source": "HSC_Y3",
+                  "surface": "consolidation_growth",
+                  "chain_only_pass": False,
+                  "model_anchor_allowed": False,
+                  "error": f"{type(e).__name__}: {e}"
+              }
+
+          if not failed_gates:
+              readiness_label = "hsc_chain_parser_fix_passed_ready_for_v3_18_anchor_boundary_integration"
+          else:
+              readiness_label = "hsc_chain_parser_fix_failed_manual_followup_needed"
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "hsc_chain_only_pass": inventory["hsc_result"].get("chain_only_pass") is True,
+              "hsc_model_anchor_allowed": False,
+              "hsc_data_vectors_gated": inventory["hsc_result"].get("gated_401_count") == inventory["hsc_result"].get("gated_probe_count"),
+              "model_claim_allowed": False,
+              "next_allowed_step": (
+                  "Build v3.18 anchor-boundary integration using DESI and Planck passed v3.17 outputs plus repaired HSC chain-only diagnostic, without promoting HSC beyond chain-only status."
+                  if not failed_gates
+                  else "Inspect HSC header and chain columns manually before v3.18."
+              )
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_17_1_hsc_chain_parser_fix.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          summary_csv = OUTDIR / "hsc_chain_parser_fix_summary_v3_17_1.csv"
+          with summary_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = [
+                  "source", "surface", "chain_only_pass", "model_anchor_allowed",
+                  "chain_rows", "chain_columns", "header_detected",
+                  "sigma8_column_found", "omega_de_column_found",
+                  "parameter_summary_rows", "derived_s8_rows",
+                  "gated_probe_count", "gated_401_count", "boundary", "error"
+              ]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              r = inventory["hsc_result"]
+              writer.writerow({k: r.get(k) for k in fieldnames})
+
+          md = []
+          md.append("# TAIRID Cosmology v3.17.1 — HSC Chain Parser Fix")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this fixes")
+          md.append("")
+          md.append("v3.17 downloaded the HSC-Y3 chain but failed to summarize it because the parser replaced the true first chain header with a later INI/prior line. v3.17.1 fixes the header detection.")
+          md.append("")
+          md.append("## Result")
+          md.append("")
+          r = inventory["hsc_result"]
+          md.append(f"- Chain-only pass: `{r.get('chain_only_pass')}`")
+          md.append(f"- Chain rows: `{r.get('chain_rows')}`")
+          md.append(f"- Chain columns: `{r.get('chain_columns')}`")
+          md.append(f"- Header detected: `{r.get('header_detected')}`")
+          md.append(f"- Sigma8 column found: `{r.get('sigma8_column_found')}`")
+          md.append(f"- Omega_de column found: `{r.get('omega_de_column_found')}`")
+          md.append(f"- Derived S8 diagnostic rows: `{r.get('derived_s8_rows')}`")
+          md.append(f"- Gated data-vector 401 count: `{r.get('gated_401_count')}`")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(inventory["gate_result"]["next_allowed_step"])
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `hsc_y3_chain_parameter_summary_v3_17_1.csv`")
+          md.append("- `hsc_y3_chain_derived_s8_diagnostic_v3_17_1.csv`")
+          md.append("- `hsc_y3_data_vector_gate_status_v3_17_1.csv`")
+          md.append("- `hsc_y3_detected_chain_header_v3_17_1.csv`")
+          md.append("- `hsc_chain_parser_fix_summary_v3_17_1.csv`")
+          md.append("- `tairid_cosmology_v3_17_1_hsc_chain_parser_fix.json`")
+          md.append("- `tairid_cosmology_v3_17_1_hsc_chain_parser_fix.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_17_1_hsc_chain_parser_fix.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.17.1 HSC chain parser fix artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-17-1-hsc-chain-parser-fix
+          path: artifacts/tairid_cosmology_v3_17_1/
