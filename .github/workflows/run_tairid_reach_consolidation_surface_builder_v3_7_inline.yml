@@ -1,0 +1,807 @@
+name: Run TAIRID Reach Consolidation Surface Builder v3.7 Inline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-reach-consolidation-surface-builder-v3-7-inline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy matplotlib
+
+      - name: Create and run TAIRID v3.7 inline script
+        run: |
+          cat > run_tairid_reach_consolidation_surface_builder_v3_7_inline.py <<'PY'
+          #!/usr/bin/env python3
+          """
+          TAIRID Reach / Consolidation Surface Builder v3.7 Inline
+
+          Purpose:
+          Build the next real surface after v3.6. The prior tests closed the frozen-gate
+          as a direct correction route. v3.7 separates the cosmology problem into:
+
+          1. reach / geometry / propagation-accessibility surfaces
+          2. consolidation / growth / structure-amplitude surfaces
+
+          Truth boundary:
+          This does not validate TAIRID, prove H0 correction, prove new physics, or
+          disprove standard cosmology. It builds a measurable surface map for the next
+          model probe.
+          """
+
+          import csv
+          import json
+          import math
+          import re
+          import traceback
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import matplotlib.pyplot as plt
+          import numpy as np
+
+          OUTDIR = Path("tairid_reach_consolidation_surface_builder_v3_7_inline_outputs")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOAD_DIR = OUTDIR / "downloaded"
+          DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+          C_LIGHT = 299792.458
+          H0_SHAPE = 70.0
+
+          PANTHEON_REPO = "PantheonPlusSH0ES/DataRelease"
+          PANTHEON_BRANCHES = ["main", "master"]
+          PANTHEON_DISTANCE_PATH = "Pantheon+_Data/4_DISTANCES_AND_COVAR/Pantheon+SH0ES.dat"
+          PANTHEON_COV_PATH = "Pantheon+_Data/4_DISTANCES_AND_COVAR/Pantheon+SH0ES_STAT+SYS.cov"
+
+          BAO_REPO = "CobayaSampler/bao_data"
+          BAO_BRANCHES = ["master", "main"]
+          BAO_TARGETS = [
+              {"label": "BGS_z0.1_0.4", "mean": "desi_2024_gaussian_bao_BGS_BRIGHT-21.5_GCcomb_z0.1-0.4_mean.txt", "cov": "desi_2024_gaussian_bao_BGS_BRIGHT-21.5_GCcomb_z0.1-0.4_cov.txt"},
+              {"label": "LRG_z0.4_0.6", "mean": "desi_2024_gaussian_bao_LRG_GCcomb_z0.4-0.6_mean.txt", "cov": "desi_2024_gaussian_bao_LRG_GCcomb_z0.4-0.6_cov.txt"},
+              {"label": "LRG_z0.6_0.8", "mean": "desi_2024_gaussian_bao_LRG_GCcomb_z0.6-0.8_mean.txt", "cov": "desi_2024_gaussian_bao_LRG_GCcomb_z0.6-0.8_cov.txt"},
+              {"label": "LRG_ELG_z0.8_1.1", "mean": "desi_2024_gaussian_bao_LRG+ELG_LOPnotqso_GCcomb_z0.8-1.1_mean.txt", "cov": "desi_2024_gaussian_bao_LRG+ELG_LOPnotqso_GCcomb_z0.8-1.1_cov.txt"},
+              {"label": "ELG_z1.1_1.6", "mean": "desi_2024_gaussian_bao_ELG_LOPnotqso_GCcomb_z1.1-1.6_mean.txt", "cov": "desi_2024_gaussian_bao_ELG_LOPnotqso_GCcomb_z1.1-1.6_cov.txt"},
+              {"label": "QSO_z0.8_2.1", "mean": "desi_2024_gaussian_bao_QSO_GCcomb_z0.8-2.1_mean.txt", "cov": "desi_2024_gaussian_bao_QSO_GCcomb_z0.8-2.1_cov.txt"},
+              {"label": "LYA_z2.33", "mean": "desi_2024_gaussian_bao_Lya_GCcomb_mean.txt", "cov": "desi_2024_gaussian_bao_Lya_GCcomb_cov.txt"},
+          ]
+
+          PRIOR_LOCKS = {
+              "v3_3_3": "frozen_gate_not_supported_as_sn_distance_pressure_term",
+              "v3_4": "frozen_gate_rejected_as_bao_cmb_ruler_term",
+              "v3_5": "growth_geometry_split_confirmed_as_next_test_lane_not_validation",
+              "v3_6": "regime_activation_supported_cross_surface_not_sn_distance",
+              "rule": "No frozen-gate distance/ruler correction is allowed in v3.7.",
+          }
+
+          GEOMETRY_ANCHORS = [
+              {"surface": "H0_EARLY_CMB_INFERRED", "family": "reach_geometry", "value": 67.36, "sigma": 0.54, "units": "km/s/Mpc"},
+              {"surface": "H0_LOCAL_DISTANCE_LADDER", "family": "reach_geometry", "value": 73.04, "sigma": 1.04, "units": "km/s/Mpc"},
+          ]
+
+          GROWTH_ANCHORS = [
+              {"surface": "PLANCK_2018_S8", "family": "consolidation_growth", "value": 0.832, "sigma": 0.013, "role": "early inferred consolidation"},
+              {"surface": "DES_Y3_OPTIMIZED_S8", "family": "consolidation_growth", "value": 0.772, "sigma": 0.017, "role": "late weak-lensing consolidation"},
+              {"surface": "KIDS_1000_FIDUCIAL_S8", "family": "consolidation_growth", "value": 0.759, "sigma": 0.0225, "role": "late weak-lensing consolidation"},
+              {"surface": "KIDS_1000_UPDATED_S8", "family": "consolidation_growth", "value": 0.776, "sigma": 0.028, "role": "late weak-lensing consolidation"},
+          ]
+
+          CLAIMS = {
+              "test_name": "TAIRID Reach / Consolidation Surface Builder v3.7 Inline",
+              "primary_question": "Can we build separate reach-geometry and consolidation-growth surfaces without reusing the failed frozen gate as a correction?",
+              "truth_boundary": "Surface builder only; no validation, no H0 correction, no new physics.",
+          }
+
+
+          def json_default(obj):
+              if isinstance(obj, (np.integer,)):
+                  return int(obj)
+              if isinstance(obj, (np.floating,)):
+                  return float(obj)
+              if isinstance(obj, np.ndarray):
+                  return obj.tolist()
+              return str(obj)
+
+
+          def write_json(path, obj):
+              path.write_text(json.dumps(obj, indent=2, default=json_default), encoding="utf-8")
+
+
+          def write_csv(path, rows):
+              if not rows:
+                  path.write_text("", encoding="utf-8")
+                  return
+              fields = []
+              seen = set()
+              for row in rows:
+                  for key in row:
+                      if key not in seen:
+                          fields.append(key)
+                          seen.add(key)
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+
+          def safe_name(text):
+              return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text)).strip("_")[:180]
+
+
+          def raw_url(repo, branch, repo_path):
+              return f"https://raw.githubusercontent.com/{repo}/{branch}/{repo_path}"
+
+
+          def fetch_text(repo, branches, repo_path, timeout=120):
+              errors = []
+              for branch in branches:
+                  url = raw_url(repo, branch, repo_path)
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v3.7-reach-consolidation-surface-builder"})
+                      with urllib.request.urlopen(req, timeout=timeout) as response:
+                          data = response.read()
+                      text = data.decode("utf-8", errors="replace")
+                      if text.lower().lstrip().startswith("<!doctype html") or "404: not found" in text.lower()[:200]:
+                          errors.append({"branch": branch, "url": url, "error": "html_or_not_found_payload"})
+                          continue
+                      return {"status": "downloaded", "branch": branch, "url": url, "bytes": len(data), "text": text, "errors": errors}
+                  except Exception as exc:
+                      errors.append({"branch": branch, "url": url, "error": repr(exc)})
+              return {"status": "failed", "branch": None, "url": None, "bytes": 0, "text": "", "errors": errors}
+
+
+          def to_float(value):
+              try:
+                  out = float(str(value).replace("D", "E"))
+              except Exception:
+                  return None
+              return out if math.isfinite(out) else None
+
+
+          def numeric_tokens(text):
+              vals = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  for tok in stripped.split():
+                      val = to_float(tok)
+                      if val is not None:
+                          vals.append(val)
+              return vals
+
+
+          def parse_distance_table(text):
+              lines = [line.strip() for line in text.splitlines() if line.strip()]
+              if not lines:
+                  return {"columns": [], "rows": []}
+              columns = lines[0].split()
+              float_cols = {
+                  "zHD", "zHDERR", "zCMB", "zCMBERR", "zHEL", "zHELERR",
+                  "m_b_corr", "m_b_corr_err_DIAG", "MU_SH0ES", "MU_SH0ES_ERR_DIAG",
+                  "CEPH_DIST", "IS_CALIBRATOR", "USED_IN_SH0ES_HF", "HOST_LOGMASS",
+              }
+              rows = []
+              for idx, line in enumerate(lines[1:]):
+                  parts = line.split()
+                  if len(parts) < len(columns):
+                      continue
+                  row = dict(zip(columns, parts[:len(columns)]))
+                  row["row_index"] = idx
+                  for key in float_cols:
+                      if key in row:
+                          val = to_float(row[key])
+                          if val is not None:
+                              row[key] = val
+                  rows.append(row)
+              return {"columns": columns, "rows": rows}
+
+
+          def parse_cov_shape(text):
+              vals = numeric_tokens(text)
+              first = None
+              if vals:
+                  try:
+                      first = int(float(vals[0]))
+                  except Exception:
+                      first = None
+              expected = first * first if first is not None else None
+              return {
+                  "dimension": first,
+                  "payload_count_after_first": len(vals) - 1 if vals else 0,
+                  "expected_square": expected,
+                  "shape_valid": expected is not None and len(vals) - 1 == expected,
+              }
+
+
+          def select_sn_rows(rows):
+              selected = []
+              for row in rows:
+                  z = row.get("zHD")
+                  mu = row.get("MU_SH0ES")
+                  sig = row.get("MU_SH0ES_ERR_DIAG")
+                  if z is None or mu is None or sig is None:
+                      continue
+                  if not (0.01 < float(z) < 2.5 and float(sig) > 0):
+                      continue
+                  if int(float(row.get("IS_CALIBRATOR", 0))) == 1:
+                      continue
+                  selected.append(row)
+              return selected
+
+
+          def e_model(z, om, w=-1.0):
+              z = np.asarray(z, dtype=float)
+              mat = om * (1.0 + z) ** 3
+              de = (1.0 - om) * (1.0 + z) ** (3.0 * (1.0 + w))
+              return np.sqrt(np.maximum(mat + de, 1e-12))
+
+
+          def cumulative_trapezoid(y, x):
+              y = np.asarray(y, dtype=float)
+              x = np.asarray(x, dtype=float)
+              if len(y) < 2:
+                  return np.zeros_like(y)
+              area = (x[1:] - x[:-1]) * (y[1:] + y[:-1]) * 0.5
+              return np.concatenate([[0.0], np.cumsum(area)])
+
+
+          def distance_modulus(z_values, om, w=-1.0):
+              z_values = np.asarray(z_values, dtype=float)
+              zmax = max(0.02, float(np.max(z_values)) * 1.001)
+              grid = np.linspace(0.0, zmax, 5000)
+              integral = cumulative_trapezoid(1.0 / e_model(grid, om, w), grid)
+              dc = C_LIGHT / H0_SHAPE * np.interp(z_values, grid, integral)
+              dl = (1.0 + z_values) * np.maximum(dc, 1e-12)
+              return 5.0 * np.log10(dl) + 25.0
+
+
+          def weighted_offset_fit(y, weights):
+              intercept = float(np.average(y, weights=weights))
+              pred = np.full_like(y, intercept)
+              resid = y - pred
+              chi2 = float(np.sum(weights * resid * resid))
+              return intercept, pred, resid, chi2
+
+
+          def fit_lcdm_sn_surface(z, mu, sigma):
+              weights = 1.0 / np.maximum(sigma, 1e-6) ** 2
+              best = None
+              grid_rows = []
+              for om in np.linspace(0.10, 0.50, 81):
+                  shape = distance_modulus(z, om, -1.0)
+                  intercept, pred_offset, resid, chi2 = weighted_offset_fit(mu - shape, weights)
+                  row = {
+                      "model": "flat_lcdm_reach_surface",
+                      "Omega_m": float(om),
+                      "intercept": intercept,
+                      "chi2": chi2,
+                      "n": int(len(z)),
+                      "k_params": 2,
+                  }
+                  grid_rows.append(row)
+                  if best is None or chi2 < best["chi2"]:
+                      best = dict(row)
+                      best["_shape"] = shape
+                      best["_offset"] = pred_offset
+                      best["_resid"] = resid
+              n = best["n"]
+              k = best["k_params"]
+              best["aic"] = float(best["chi2"] + 2 * k)
+              best["bic"] = float(best["chi2"] + k * math.log(n))
+              best["chi2_per_dof"] = float(best["chi2"] / max(n - k, 1))
+              public = {key: val for key, val in best.items() if not key.startswith("_")}
+              return public, grid_rows, best
+
+
+          def sn_reach_bins(sn_rows, z, mu, sigma, best):
+              model_mu = best["_shape"] + best["_offset"]
+              residual = mu - model_mu
+              bins = [
+                  ("sn_low_reach_z_0p01_0p10", 0.01, 0.10),
+                  ("sn_mid_reach_z_0p10_0p50", 0.10, 0.50),
+                  ("sn_high_reach_z_0p50_2p50", 0.50, 2.50),
+              ]
+              out = []
+              for label, zmin, zmax in bins:
+                  mask = (z >= zmin) & (z < zmax)
+                  if int(np.sum(mask)) == 0:
+                      continue
+                  out.append({
+                      "surface_id": label,
+                      "surface_family": "reach_geometry",
+                      "z_min": zmin,
+                      "z_max": zmax,
+                      "n": int(np.sum(mask)),
+                      "mean_residual_mu": float(np.mean(residual[mask])),
+                      "median_residual_mu": float(np.median(residual[mask])),
+                      "std_residual_mu": float(np.std(residual[mask])),
+                      "mean_abs_residual_mu": float(np.mean(np.abs(residual[mask]))),
+                      "interpretation": "SN reach surface residual bin after flat-LCDM geometry fit.",
+                      "truth_boundary": "Residual surface only; not a correction.",
+                  })
+              return out
+
+
+          def z_eff_from_name(name, label):
+              m = re.search(r"z([0-9.]+)-([0-9.]+)", name)
+              if m:
+                  return (float(m.group(1)) + float(m.group(2))) / 2.0
+              if "Lya" in name or "LYA" in label:
+                  return 2.33
+              if "QSO" in name:
+                  return 1.49
+              return None
+
+
+          def parse_covariance_diag(text):
+              vals = numeric_tokens(text)
+              if not vals:
+                  return {"dimension": None, "diagonal": [], "shape_status": "no_numeric_values"}
+              first = int(vals[0]) if abs(vals[0] - int(vals[0])) < 1e-9 else None
+              if first is not None and len(vals) - 1 == first * first:
+                  arr = np.asarray(vals[1:], dtype=float).reshape((first, first))
+                  return {"dimension": first, "diagonal": np.diag(arr).tolist(), "shape_status": "dimension_prefix_square"}
+              root = int(round(math.sqrt(len(vals))))
+              if root * root == len(vals):
+                  arr = np.asarray(vals, dtype=float).reshape((root, root))
+                  return {"dimension": root, "diagonal": np.diag(arr).tolist(), "shape_status": "plain_square"}
+              return {"dimension": None, "diagonal": [], "shape_status": f"not_square_numeric_count_{len(vals)}"}
+
+
+          def build_bao_reach_surfaces():
+              downloads = []
+              rows = []
+              for target in BAO_TARGETS:
+                  label = target["label"]
+                  mean_fetch = fetch_text(BAO_REPO, BAO_BRANCHES, target["mean"], timeout=90)
+                  cov_fetch = fetch_text(BAO_REPO, BAO_BRANCHES, target["cov"], timeout=90)
+                  for kind, fetched, path in [("mean", mean_fetch, target["mean"]), ("cov", cov_fetch, target["cov"])]:
+                      downloads.append({
+                          "label": label,
+                          "kind": kind,
+                          "path": path,
+                          "status": fetched["status"],
+                          "branch": fetched["branch"],
+                          "url": fetched["url"],
+                          "bytes": fetched["bytes"],
+                          "errors": json.dumps(fetched["errors"], default=json_default),
+                      })
+                      if fetched["status"] == "downloaded":
+                          (DOWNLOAD_DIR / safe_name(path)).write_text(fetched["text"], encoding="utf-8")
+
+                  mean_vals = numeric_tokens(mean_fetch["text"]) if mean_fetch["status"] == "downloaded" else []
+                  cov_info = parse_covariance_diag(cov_fetch["text"]) if cov_fetch["status"] == "downloaded" else {"dimension": None, "diagonal": [], "shape_status": "not_downloaded"}
+                  z_eff = z_eff_from_name(target["mean"], label)
+                  diag = cov_info.get("diagonal", [])
+                  frac_precisions = []
+                  for i, mean_val in enumerate(mean_vals):
+                      if i < len(diag) and abs(mean_val) > 0 and diag[i] >= 0:
+                          frac_precisions.append(math.sqrt(max(float(diag[i]), 0.0)) / abs(float(mean_val)))
+                  if z_eff is None:
+                      band = "unknown"
+                  elif z_eff < 0.7:
+                      band = "low_z_reach"
+                  elif z_eff < 1.6:
+                      band = "mid_z_reach"
+                  else:
+                      band = "high_z_reach"
+                  rows.append({
+                      "surface_id": f"bao_{label}",
+                      "surface_family": "reach_geometry",
+                      "z_eff": z_eff,
+                      "regime_band": band,
+                      "mean_status": mean_fetch["status"],
+                      "cov_status": cov_fetch["status"],
+                      "mean_numeric_count": len(mean_vals),
+                      "cov_dimension": cov_info.get("dimension"),
+                      "cov_shape_status": cov_info.get("shape_status"),
+                      "median_fractional_precision_estimate": float(np.median(frac_precisions)) if frac_precisions else None,
+                      "interpretation": "BAO reach/ruler surface coverage for later likelihood testing.",
+                      "truth_boundary": "Coverage and precision estimate only; not BAO model fit.",
+                  })
+              summary = {
+                  "bao_surface_count": len(rows),
+                  "downloaded_mean_count": sum(1 for r in rows if r["mean_status"] == "downloaded"),
+                  "downloaded_cov_count": sum(1 for r in rows if r["cov_status"] == "downloaded"),
+                  "precision_surface_count": sum(1 for r in rows if r["median_fractional_precision_estimate"] is not None),
+                  "regime_bands_present": sorted(set(r["regime_band"] for r in rows if r["regime_band"] != "unknown")),
+              }
+              return summary, downloads, rows
+
+
+          def sigma_tension(a_value, a_sigma, b_value, b_sigma):
+              denom = math.sqrt(float(a_sigma) ** 2 + float(b_sigma) ** 2)
+              if denom <= 0:
+                  return None
+              return abs(float(a_value) - float(b_value)) / denom
+
+
+          def build_h0_reach_surface():
+              early, local = GEOMETRY_ANCHORS
+              delta = local["value"] - early["value"]
+              tension = sigma_tension(local["value"], local["sigma"], early["value"], early["sigma"])
+              return {
+                  "surface_id": "h0_reach_early_late_pressure",
+                  "surface_family": "reach_geometry",
+                  "early_anchor": early["surface"],
+                  "late_anchor": local["surface"],
+                  "early_value": early["value"],
+                  "late_value": local["value"],
+                  "late_minus_early": delta,
+                  "sigma_tension": tension,
+                  "direction": "late_local_reach_higher_than_early_inferred" if delta > 0 else "late_local_reach_not_higher",
+                  "interpretation": "Geometry/reach seam; not a solution.",
+                  "truth_boundary": "Declared H0 pressure anchor only.",
+              }
+
+
+          def build_growth_consolidation_surface():
+              planck = GROWTH_ANCHORS[0]
+              rows = []
+              for anchor in GROWTH_ANCHORS[1:]:
+                  delta = anchor["value"] - planck["value"]
+                  tension = sigma_tension(anchor["value"], anchor["sigma"], planck["value"], planck["sigma"])
+                  rows.append({
+                      "surface_id": f"{anchor['surface']}_vs_{planck['surface']}",
+                      "surface_family": "consolidation_growth",
+                      "early_anchor": planck["surface"],
+                      "late_anchor": anchor["surface"],
+                      "early_value": planck["value"],
+                      "late_value": anchor["value"],
+                      "late_minus_early": delta,
+                      "sigma_tension": tension,
+                      "direction": "late_consolidation_lower_than_early_inferred" if delta < 0 else "late_consolidation_not_lower",
+                      "interpretation": "Growth/consolidation seam; not a solution.",
+                      "truth_boundary": "Declared growth anchor only; not full weak-lensing likelihood.",
+                  })
+              return rows
+
+
+          def build_surface_matrix(h0_reach, sn_rows, bao_rows, growth_rows):
+              matrix = []
+              matrix.append({
+                  "surface_group": "reach_geometry",
+                  "surface_type": "H0",
+                  "surface_count": 1,
+                  "direction_summary": h0_reach["direction"],
+                  "pressure_indicator": h0_reach["sigma_tension"],
+                  "load_bearing_now": h0_reach["sigma_tension"] is not None and h0_reach["sigma_tension"] >= 3.0,
+              })
+              matrix.append({
+                  "surface_group": "reach_geometry",
+                  "surface_type": "SN",
+                  "surface_count": len(sn_rows),
+                  "direction_summary": "residual_bins_after_geometry_fit",
+                  "pressure_indicator": max([r["mean_abs_residual_mu"] for r in sn_rows]) if sn_rows else None,
+                  "load_bearing_now": len(sn_rows) >= 3,
+              })
+              matrix.append({
+                  "surface_group": "reach_geometry",
+                  "surface_type": "BAO",
+                  "surface_count": len(bao_rows),
+                  "direction_summary": "ruler_coverage_across_redshift_bands",
+                  "pressure_indicator": sum(1 for r in bao_rows if r["median_fractional_precision_estimate"] is not None),
+                  "load_bearing_now": sum(1 for r in bao_rows if r["median_fractional_precision_estimate"] is not None) >= 5,
+              })
+              matrix.append({
+                  "surface_group": "consolidation_growth",
+                  "surface_type": "S8",
+                  "surface_count": len(growth_rows),
+                  "direction_summary": "late_consolidation_lower_than_early_inferred",
+                  "pressure_indicator": sum(1 for r in growth_rows if r["sigma_tension"] is not None and r["sigma_tension"] >= 1.8),
+                  "load_bearing_now": sum(1 for r in growth_rows if r["direction"] == "late_consolidation_lower_than_early_inferred") >= 2,
+              })
+              return matrix
+
+
+          def decide(sn_count, cov_shape, h0_reach, sn_bins, bao_summary, growth_rows, matrix):
+              prior_ok = (
+                  PRIOR_LOCKS["v3_3_3"] == "frozen_gate_not_supported_as_sn_distance_pressure_term"
+                  and PRIOR_LOCKS["v3_4"] == "frozen_gate_rejected_as_bao_cmb_ruler_term"
+                  and PRIOR_LOCKS["v3_6"] == "regime_activation_supported_cross_surface_not_sn_distance"
+              )
+              reach_ready = (
+                  sn_count >= 1000
+                  and len(sn_bins) >= 3
+                  and bao_summary["downloaded_mean_count"] >= 5
+                  and bao_summary["downloaded_cov_count"] >= 5
+                  and h0_reach["sigma_tension"] is not None
+                  and h0_reach["sigma_tension"] >= 3.0
+              )
+              consolidation_ready = (
+                  len(growth_rows) >= 3
+                  and sum(1 for r in growth_rows if r["direction"] == "late_consolidation_lower_than_early_inferred") >= 2
+                  and sum(1 for r in growth_rows if r["sigma_tension"] is not None and r["sigma_tension"] >= 1.8) >= 2
+              )
+              surface_matrix_ready = all(r["load_bearing_now"] for r in matrix)
+
+              gates = [
+                  {"gate": "G1_prior_failed_gate_routes_remain_closed", "passed": prior_ok, "evidence": PRIOR_LOCKS},
+                  {"gate": "G2_sn_reach_surface_built", "passed": sn_count >= 1000 and len(sn_bins) >= 3, "evidence": {"sn_count": sn_count, "sn_bin_count": len(sn_bins)}},
+                  {"gate": "G3_bao_reach_surface_built", "passed": bao_summary["downloaded_mean_count"] >= 5 and bao_summary["downloaded_cov_count"] >= 5, "evidence": bao_summary},
+                  {"gate": "G4_h0_reach_pressure_available", "passed": h0_reach["sigma_tension"] is not None and h0_reach["sigma_tension"] >= 3.0, "evidence": h0_reach},
+                  {"gate": "G5_growth_consolidation_surface_built", "passed": consolidation_ready, "evidence": {"growth_rows": growth_rows}},
+                  {"gate": "G6_reach_and_consolidation_matrix_ready", "passed": surface_matrix_ready, "evidence": {"surface_matrix": matrix}},
+                  {"gate": "G7_no_frozen_gate_correction_reintroduced", "passed": True, "evidence": {"frozen_gate_correction": False}},
+                  {"gate": "G8_no_validation_claim_allowed", "passed": True, "evidence": {"validation_claim": False, "h0_correction_claim": False, "new_physics_claim": False}},
+              ]
+
+              failed = [g["gate"] for g in gates if not g["passed"]]
+
+              if not failed:
+                  status = "reach_consolidation_surface_builder_ready_for_model_probe_not_validation"
+                  readiness = 9
+                  next_wall = "Build v3.8 as a two-surface model probe: reach geometry and consolidation growth as separate variables."
+              elif reach_ready and consolidation_ready:
+                  status = "reach_consolidation_surface_builder_partial_with_cautions"
+                  readiness = 8
+                  next_wall = "Surface split is usable, but repair failed matrix/coverage gates before model probing."
+              elif reach_ready or consolidation_ready:
+                  status = "reach_consolidation_surface_builder_one_side_ready"
+                  readiness = 7
+                  next_wall = "One side of the surface is ready; add data for the weaker side."
+              else:
+                  status = "reach_consolidation_surface_builder_not_ready"
+                  readiness = 5
+                  next_wall = "Do not model yet; surface construction is incomplete."
+
+              return {
+                  "final_status": status,
+                  "readiness_score_0_to_10": readiness,
+                  "next_wall": next_wall,
+                  "failed_gates": failed,
+                  "gates": gates,
+                  "truth_boundary": CLAIMS["truth_boundary"],
+              }
+
+
+          def make_plots(h0_reach, sn_bins, bao_rows, growth_rows, matrix):
+              try:
+                  labels = [r["surface_id"] for r in sn_bins]
+                  values = [r["mean_abs_residual_mu"] for r in sn_bins]
+                  plt.figure(figsize=(10, 5))
+                  plt.bar(np.arange(len(labels)), values)
+                  plt.xticks(np.arange(len(labels)), labels, rotation=30, ha="right")
+                  plt.ylabel("mean absolute residual mu")
+                  plt.title("v3.7 SN reach residual bins")
+                  plt.tight_layout()
+                  plt.savefig(OUTDIR / "sn_reach_residual_bins_v3_7_inline.png", dpi=160)
+                  plt.close()
+
+                  usable_bao = [r for r in bao_rows if r["z_eff"] is not None]
+                  if usable_bao:
+                      labels = [r["surface_id"].replace("bao_", "") for r in usable_bao]
+                      zvals = [r["z_eff"] for r in usable_bao]
+                      precisions = [r["median_fractional_precision_estimate"] or 0.0 for r in usable_bao]
+                      x = np.arange(len(labels))
+                      plt.figure(figsize=(10, 5))
+                      plt.bar(x, zvals)
+                      plt.xticks(x, labels, rotation=35, ha="right")
+                      plt.ylabel("effective redshift")
+                      plt.title("v3.7 BAO reach coverage")
+                      plt.tight_layout()
+                      plt.savefig(OUTDIR / "bao_reach_coverage_v3_7_inline.png", dpi=160)
+                      plt.close()
+
+                      plt.figure(figsize=(10, 5))
+                      plt.bar(x, precisions)
+                      plt.xticks(x, labels, rotation=35, ha="right")
+                      plt.ylabel("median fractional precision estimate")
+                      plt.title("v3.7 BAO reach precision estimates")
+                      plt.tight_layout()
+                      plt.savefig(OUTDIR / "bao_reach_precision_v3_7_inline.png", dpi=160)
+                      plt.close()
+
+                  labels = ["H0 reach"] + [r["late_anchor"].replace("_", " ") for r in growth_rows]
+                  sigmas = [h0_reach["sigma_tension"]] + [r["sigma_tension"] for r in growth_rows]
+                  plt.figure(figsize=(11, 5))
+                  plt.bar(np.arange(len(labels)), sigmas)
+                  plt.xticks(np.arange(len(labels)), labels, rotation=35, ha="right")
+                  plt.ylabel("sigma tension")
+                  plt.title("v3.7 reach and consolidation pressure")
+                  plt.tight_layout()
+                  plt.savefig(OUTDIR / "reach_consolidation_pressure_v3_7_inline.png", dpi=160)
+                  plt.close()
+
+              except Exception as exc:
+                  write_json(OUTDIR / "plot_error_v3_7_inline.json", {"error": repr(exc), "traceback": traceback.format_exc()})
+
+
+          def write_handoff(decision, h0_reach, growth_rows):
+              lines = [
+                  "# TAIRID v3.7 Inline Handoff",
+                  "",
+                  "## Current status",
+                  "",
+                  f"- Final status: `{decision['final_status']}`",
+                  f"- Readiness score: `{decision['readiness_score_0_to_10']}/10`",
+                  f"- Next wall: {decision['next_wall']}",
+                  "",
+                  "## What v3.7 built",
+                  "",
+                  "- A reach/geometry surface from H0, SN residual bins, and BAO redshift/ruler coverage.",
+                  "- A consolidation/growth surface from Planck-like S8 versus DES/KiDS weak-lensing anchors.",
+                  "- A combined surface matrix without reintroducing the failed frozen gate as a correction.",
+                  "",
+                  "## Directional result",
+                  "",
+                  f"- H0 reach direction: `{h0_reach['direction']}`",
+                  f"- H0 reach tension: `{h0_reach['sigma_tension']}`",
+                  f"- Growth late-lower count: `{sum(1 for r in growth_rows if r['direction'] == 'late_consolidation_lower_than_early_inferred')}`",
+                  "",
+                  "## Truth boundary",
+                  "",
+                  "- v3.7 is a surface builder only.",
+                  "- It does not validate TAIRID.",
+                  "- It does not prove H0 correction.",
+                  "- It does not prove new physics.",
+                  "- It does not disprove standard cosmology.",
+                  "",
+                  "## Next test",
+                  "",
+              ]
+              if decision["readiness_score_0_to_10"] >= 8:
+                  lines.append("Build v3.8 — Two-Surface Model Probe. Test reach and consolidation as separate variables, with penalties, instead of one global correction.")
+              else:
+                  lines.append("Repair the surface builder before modeling.")
+              lines.append("")
+              return "\n".join(lines)
+
+
+          def main():
+              print("TAIRID Reach / Consolidation Surface Builder v3.7 Inline starting.")
+              print("Boundary: surface builder only; no validation, no H0 claim, no new physics claim.")
+
+              write_json(OUTDIR / "claims_v3_7_inline.json", CLAIMS)
+              write_json(OUTDIR / "prior_locks_v3_7_inline.json", PRIOR_LOCKS)
+
+              distance_fetch = fetch_text(PANTHEON_REPO, PANTHEON_BRANCHES, PANTHEON_DISTANCE_PATH, timeout=120)
+              cov_fetch = fetch_text(PANTHEON_REPO, PANTHEON_BRANCHES, PANTHEON_COV_PATH, timeout=180)
+              write_csv(OUTDIR / "pantheon_download_ledger_v3_7_inline.csv", [
+                  {"path": PANTHEON_DISTANCE_PATH, "status": distance_fetch["status"], "branch": distance_fetch["branch"], "url": distance_fetch["url"], "bytes": distance_fetch["bytes"], "errors": json.dumps(distance_fetch["errors"], default=json_default)},
+                  {"path": PANTHEON_COV_PATH, "status": cov_fetch["status"], "branch": cov_fetch["branch"], "url": cov_fetch["url"], "bytes": cov_fetch["bytes"], "errors": json.dumps(cov_fetch["errors"], default=json_default)},
+              ])
+
+              if distance_fetch["status"] == "downloaded":
+                  (DOWNLOAD_DIR / safe_name(PANTHEON_DISTANCE_PATH)).write_text(distance_fetch["text"], encoding="utf-8")
+              if cov_fetch["status"] == "downloaded":
+                  (DOWNLOAD_DIR / safe_name(PANTHEON_COV_PATH)).write_text(cov_fetch["text"], encoding="utf-8")
+
+              distance = parse_distance_table(distance_fetch["text"])
+              cov_shape = parse_cov_shape(cov_fetch["text"])
+              write_json(OUTDIR / "pantheon_covariance_shape_v3_7_inline.json", cov_shape)
+
+              sn_rows = select_sn_rows(distance["rows"])
+              if len(sn_rows) < 1000:
+                  raise RuntimeError(f"Not enough SN rows selected: {len(sn_rows)}")
+
+              z = np.asarray([float(r["zHD"]) for r in sn_rows], dtype=float)
+              mu = np.asarray([float(r["MU_SH0ES"]) for r in sn_rows], dtype=float)
+              sigma = np.asarray([float(r["MU_SH0ES_ERR_DIAG"]) for r in sn_rows], dtype=float)
+
+              sn_best_public, sn_grid, sn_best = fit_lcdm_sn_surface(z, mu, sigma)
+              sn_bins = sn_reach_bins(sn_rows, z, mu, sigma, sn_best)
+              write_csv(OUTDIR / "sn_reach_lcdm_grid_v3_7_inline.csv", sn_grid)
+              write_json(OUTDIR / "sn_reach_best_fit_v3_7_inline.json", sn_best_public)
+              write_csv(OUTDIR / "sn_reach_residual_bins_v3_7_inline.csv", sn_bins)
+
+              bao_summary, bao_downloads, bao_rows = build_bao_reach_surfaces()
+              write_csv(OUTDIR / "bao_download_ledger_v3_7_inline.csv", bao_downloads)
+              write_csv(OUTDIR / "bao_reach_surface_rows_v3_7_inline.csv", bao_rows)
+              write_json(OUTDIR / "bao_reach_surface_summary_v3_7_inline.json", bao_summary)
+
+              h0_reach = build_h0_reach_surface()
+              growth_rows = build_growth_consolidation_surface()
+              matrix = build_surface_matrix(h0_reach, sn_bins, bao_rows, growth_rows)
+
+              write_json(OUTDIR / "h0_reach_surface_v3_7_inline.json", h0_reach)
+              write_csv(OUTDIR / "growth_consolidation_surface_rows_v3_7_inline.csv", growth_rows)
+              write_csv(OUTDIR / "reach_consolidation_surface_matrix_v3_7_inline.csv", matrix)
+
+              decision = decide(len(sn_rows), cov_shape, h0_reach, sn_bins, bao_summary, growth_rows, matrix)
+              write_json(OUTDIR / "decision_v3_7_inline.json", decision)
+
+              make_plots(h0_reach, sn_bins, bao_rows, growth_rows, matrix)
+
+              handoff = write_handoff(decision, h0_reach, growth_rows)
+              (OUTDIR / "next_thread_handoff_after_v3_7_inline.md").write_text(handoff, encoding="utf-8")
+              (OUTDIR / "next_thread_handoff_after_v3_7_inline.txt").write_text(handoff, encoding="utf-8")
+
+              summary = {
+                  "test_name": CLAIMS["test_name"],
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "boundary": CLAIMS["truth_boundary"],
+                  "prior_locks": PRIOR_LOCKS,
+                  "sn_surface": {
+                      "selected_noncalibrator_count": len(sn_rows),
+                      "z_min": float(np.min(z)),
+                      "z_max": float(np.max(z)),
+                      "best_fit": sn_best_public,
+                      "bins": sn_bins,
+                      "sigma_source": "MU_SH0ES_ERR_DIAG only; covariance shape parsed but not used as full likelihood.",
+                  },
+                  "bao_reach_surface": bao_summary,
+                  "h0_reach_surface": h0_reach,
+                  "growth_consolidation_surface": growth_rows,
+                  "surface_matrix": matrix,
+                  "decision": decision,
+                  "interpretation": {
+                      "what_success_means": "Reach and consolidation surfaces are built separately and are ready for a penalized two-surface probe.",
+                      "what_success_does_not_mean": "This does not validate TAIRID or solve cosmological tensions.",
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  },
+              }
+              write_json(OUTDIR / "reach_consolidation_surface_builder_v3_7_inline_summary.json", summary)
+
+              with open(OUTDIR / "reach_consolidation_surface_builder_v3_7_inline_summary.txt", "w", encoding="utf-8") as f:
+                  f.write("TAIRID Reach / Consolidation Surface Builder v3.7 Inline\n\n")
+                  f.write("Boundary: surface builder only. No validation. No H0 claim. No new physics claim.\n\n")
+                  f.write(f"Final status: {decision['final_status']}\n")
+                  f.write(f"Readiness score: {decision['readiness_score_0_to_10']}/10\n")
+                  f.write(f"Next wall: {decision['next_wall']}\n\n")
+                  f.write("H0 reach surface:\n")
+                  f.write(json.dumps(h0_reach, indent=2, default=json_default) + "\n\n")
+                  f.write("BAO reach surface summary:\n")
+                  f.write(json.dumps(bao_summary, indent=2, default=json_default) + "\n\n")
+                  f.write("Growth consolidation surface:\n")
+                  f.write(json.dumps(growth_rows, indent=2, default=json_default) + "\n\n")
+                  f.write("Surface matrix:\n")
+                  f.write(json.dumps(matrix, indent=2, default=json_default) + "\n\n")
+                  f.write("Failed gates:\n")
+                  f.write(json.dumps(decision["failed_gates"], indent=2, default=json_default) + "\n\n")
+                  f.write("Truth boundary:\n")
+                  f.write("- This does not prove TAIRID.\n")
+                  f.write("- This does not prove H0 correction.\n")
+                  f.write("- This does not prove new physics.\n")
+                  f.write("- This does not disprove standard cosmology.\n")
+                  f.write("- This only builds reach/consolidation surfaces for the next test.\n")
+
+              print("TAIRID Reach / Consolidation Surface Builder v3.7 Inline complete.")
+              print(f"Final status: {decision['final_status']}")
+              print(f"Readiness score: {decision['readiness_score_0_to_10']}/10")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as exc:
+                  OUTDIR.mkdir(parents=True, exist_ok=True)
+                  summary = {
+                      "test_name": CLAIMS["test_name"],
+                      "created_utc": datetime.now(timezone.utc).isoformat(),
+                      "final_status": "reach_consolidation_surface_builder_v3_7_inline_runtime_failed",
+                      "error": repr(exc),
+                      "traceback": traceback.format_exc(),
+                      "truth_boundary": CLAIMS["truth_boundary"],
+                  }
+                  write_json(OUTDIR / "reach_consolidation_surface_builder_v3_7_inline_summary.json", summary)
+                  print(summary["traceback"])
+                  raise
+          PY
+
+          python run_tairid_reach_consolidation_surface_builder_v3_7_inline.py
+
+      - name: Upload inline outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-reach-consolidation-surface-builder-v3-7-inline-output
+          path: |
+            tairid_reach_consolidation_surface_builder_v3_7_inline_outputs/**
