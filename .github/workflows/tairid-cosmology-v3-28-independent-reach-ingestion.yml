@@ -1,0 +1,655 @@
+name: TAIRID Cosmology v3.28 Independent Reach Ingestion
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-ingestion:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.28 independent reach ingestion
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_28
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_28")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_28_independent_reach_ingestion"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This ingests independent non-DESI reach/geometry products selected by v3.27.",
+              "DESI remains excluded because v3.25 showed the mapped DESI reach rows are scaled counterparts.",
+              "SDSS/eBOSS DR16 BAO rows are ingested as independent reach/ruler diagnostics.",
+              "BOSS DR12/DR11 BAO rows and covariance products are ingested as older independent BAO diagnostics.",
+              "TDCOSMO time-delay rows are ingested as strong-lens reach diagnostics.",
+              "Ingestion does not make any row a model anchor.",
+              "A pass only means independent reach products are available for a later standardization and eligibility audit."
+          ]
+
+          EBOSS_PRODUCTS = [
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_QSO",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR12_LRG",
+                  "role": "pre_DESI_BAO_DMDH",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              }
+          ]
+
+          BOSS_PRODUCTS = {
+              "archive_url": "https://data.sdss.org/sas/dr10/boss/papers/clustering/Anderson_2013_CMASSDR11_LOWZDR11_cosmomc.tar.gz",
+              "cmass_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/CMASSDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat",
+              "lowz_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/LOWZDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+          }
+
+          TDCOSMO_PRODUCTS = {
+              "posterior_table_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv",
+              "processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_processed.pkl",
+              "om_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed.pkl",
+              "om_kappa_processed_pkl_url": "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_om_processed_with_kappa.pkl"
+          }
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.28-independent-reach-ingestion/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def load_numeric_matrix(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lines = [
+                  line for line in text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+              if not lines:
+                  raise RuntimeError(f"No numeric lines found in {path}")
+              return np.loadtxt(io.StringIO("\n".join(lines)))
+
+          def parse_bao_data_table(path):
+              rows = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+
+                  try:
+                      z = float(parts[0])
+                      value = float(parts[1])
+                  except Exception:
+                      continue
+
+                  observable = parts[2]
+                  rows.append({
+                      "z": z,
+                      "value": value,
+                      "observable": observable
+                  })
+
+              return rows
+
+          def ingest_eboss():
+              eboss_dir = DOWNLOADS / "SDSS_eBOSS_DR16"
+              eboss_dir.mkdir(parents=True, exist_ok=True)
+
+              ledger_rows = []
+              source_rows = []
+              downloads = []
+
+              for product in EBOSS_PRODUCTS:
+                  data_path = eboss_dir / safe_name(product["data_url"])
+                  cov_path = eboss_dir / safe_name(product["cov_url"])
+
+                  downloads.append(download(product["data_url"], data_path))
+                  downloads.append(download(product["cov_url"], cov_path))
+
+                  data_rows = parse_bao_data_table(data_path)
+                  cov = load_numeric_matrix(cov_path)
+
+                  if cov.ndim == 0:
+                      cov = cov.reshape((1, 1))
+                  elif cov.ndim == 1:
+                      cov = cov.reshape((1, -1))
+
+                  cov_rows = int(cov.shape[0])
+                  cov_cols = int(cov.shape[1])
+                  covariance_match = cov_rows == cov_cols == len(data_rows)
+
+                  for i, row in enumerate(data_rows):
+                      sigma = None
+                      if covariance_match:
+                          diag = float(cov[i, i])
+                          sigma = math.sqrt(diag) if diag >= 0 else None
+
+                      ledger_rows.append({
+                          "source": product["source"],
+                          "surface": "reach_geometry",
+                          "family": product["family"],
+                          "entry_role": "independent_bao_reach_ruler_diagnostic",
+                          "parameter": row["observable"],
+                          "z": row["z"],
+                          "value": row["value"],
+                          "sigma": sigma if sigma is not None else "",
+                          "covariance_available": covariance_match,
+                          "covariance_dimension": f"{cov_rows}x{cov_cols}",
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "boundary_note": "Independent pre-DESI BAO D_M/r_s or D_H/r_s diagnostic; ingested only, not promoted."
+                      })
+
+                  source_rows.append({
+                      "source": product["source"],
+                      "family": product["family"],
+                      "role": product["role"],
+                      "data_row_count": len(data_rows),
+                      "cov_rows": cov_rows,
+                      "cov_cols": cov_cols,
+                      "covariance_match": covariance_match,
+                      "ingestion_pass": len(data_rows) > 0 and covariance_match
+                  })
+
+              pass_flag = all(row["ingestion_pass"] for row in source_rows)
+
+              return {
+                  "source": "SDSS_eBOSS_DR16",
+                  "surface": "reach_geometry",
+                  "ingestion_pass": pass_flag,
+                  "ledger_rows": ledger_rows,
+                  "source_rows": source_rows,
+                  "download_count": len(downloads),
+                  "downloads": downloads,
+                  "boundary": "SDSS/eBOSS DR16 BAO products ingested as independent reach/ruler diagnostics, not model anchors."
+              }
+
+          def parse_archive_bao_member(tf, member_name):
+              member = next((m for m in tf.getmembers() if m.name.endswith(member_name)), None)
+              if member is None:
+                  raise RuntimeError(f"Archive member not found: {member_name}")
+
+              f = tf.extractfile(member)
+              if f is None:
+                  raise RuntimeError(f"Could not extract member: {member_name}")
+
+              text = f.read().decode("utf-8", errors="replace")
+              rows = []
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  parts = stripped.split()
+                  nums = []
+                  for p in parts:
+                      try:
+                          nums.append(float(p))
+                      except Exception:
+                          pass
+
+                  if len(nums) >= 3:
+                      rows.append({
+                          "z": nums[0],
+                          "value": nums[1],
+                          "sigma": nums[2],
+                          "raw_line": stripped
+                      })
+
+              return rows
+
+          def ingest_boss():
+              boss_dir = DOWNLOADS / "BOSS_DR12_BAO"
+              boss_dir.mkdir(parents=True, exist_ok=True)
+
+              archive_path = boss_dir / safe_name(BOSS_PRODUCTS["archive_url"])
+              cmass_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["cmass_cov_url"])
+              lowz_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["lowz_cov_url"])
+
+              downloads = [
+                  download(BOSS_PRODUCTS["archive_url"], archive_path),
+                  download(BOSS_PRODUCTS["cmass_cov_url"], cmass_cov_path),
+                  download(BOSS_PRODUCTS["lowz_cov_url"], lowz_cov_path)
+              ]
+
+              ledger_rows = []
+              source_rows = []
+
+              with tarfile.open(archive_path, "r:*") as tf:
+                  cmass_rows = parse_archive_bao_member(tf, "data/sdss_DR11CMASS_bao.txt")
+                  lowz_rows = parse_archive_bao_member(tf, "data/sdss_DR11LOWZ_bao.txt")
+
+              cmass_cov = load_numeric_matrix(cmass_cov_path)
+              lowz_cov = load_numeric_matrix(lowz_cov_path)
+
+              for family, rows, cov in [
+                  ("BOSS_DR11_CMASS_archive_BAO", cmass_rows, cmass_cov),
+                  ("BOSS_DR11_LOWZ_archive_BAO", lowz_rows, lowz_cov)
+              ]:
+                  cov_shape = f"{int(cov.shape[0])}x{int(cov.shape[1])}" if cov.ndim == 2 else str(cov.shape)
+
+                  for row in rows:
+                      ledger_rows.append({
+                          "source": "BOSS_DR12_BAO",
+                          "surface": "reach_geometry",
+                          "family": family,
+                          "entry_role": "independent_boss_bao_archive_diagnostic",
+                          "parameter": "BAO_archive_observable",
+                          "z": row["z"],
+                          "value": row["value"],
+                          "sigma": row["sigma"],
+                          "covariance_available": cov.ndim == 2 and cov.shape[0] == cov.shape[1],
+                          "covariance_dimension": cov_shape,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "boundary_note": "Older BOSS BAO archive row; ingested as independent reach/ruler diagnostic only."
+                      })
+
+                  source_rows.append({
+                      "source": "BOSS_DR12_BAO",
+                      "family": family,
+                      "role": "pre_DESI_BOSS_archive_BAO",
+                      "data_row_count": len(rows),
+                      "cov_rows": int(cov.shape[0]) if cov.ndim == 2 else "",
+                      "cov_cols": int(cov.shape[1]) if cov.ndim == 2 else "",
+                      "covariance_match": cov.ndim == 2 and cov.shape[0] == cov.shape[1],
+                      "ingestion_pass": len(rows) > 0 and cov.ndim == 2 and cov.shape[0] == cov.shape[1]
+                  })
+
+              pass_flag = all(row["ingestion_pass"] for row in source_rows)
+
+              return {
+                  "source": "BOSS_DR12_BAO",
+                  "surface": "reach_geometry",
+                  "ingestion_pass": pass_flag,
+                  "ledger_rows": ledger_rows,
+                  "source_rows": source_rows,
+                  "download_count": len(downloads),
+                  "downloads": downloads,
+                  "boundary": "BOSS BAO archive and covariance products ingested as independent older BAO diagnostics, not model anchors."
+              }
+
+          def ingest_tdcosmo():
+              td_dir = DOWNLOADS / "TDCOSMO_2020"
+              td_dir.mkdir(parents=True, exist_ok=True)
+
+              table_path = td_dir / safe_name(TDCOSMO_PRODUCTS["posterior_table_url"])
+              downloads = [download(TDCOSMO_PRODUCTS["posterior_table_url"], table_path)]
+
+              # Keep binary products as shape-only companion downloads.
+              binary_records = []
+              for key in ["processed_pkl_url", "om_processed_pkl_url", "om_kappa_processed_pkl_url"]:
+                  url = TDCOSMO_PRODUCTS[key]
+                  path = td_dir / safe_name(url)
+                  record = download(url, path)
+                  record["shape_only"] = True
+                  binary_records.append({
+                      "product": key,
+                      "path": str(path),
+                      "size_bytes": record["size_bytes"],
+                      "shape_only": True,
+                      "boundary": "Binary posterior product downloaded for later source-specific parser; not parsed in v3.28."
+                  })
+                  downloads.append(record)
+
+              ledger_rows = []
+              source_rows = []
+
+              with table_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                  reader = csv.DictReader(f)
+                  rows = list(reader)
+
+              required = ["name", "z_lens", "z_source", "Ddt_mean", "Ddt_sigma", "Dd_mean", "Dd_sigma"]
+              missing = [c for c in required if c not in (reader.fieldnames or [])]
+              if missing:
+                  raise RuntimeError(f"TDCOSMO posterior table missing columns: {missing}")
+
+              for row in rows:
+                  name = row["name"]
+                  z_lens = float(row["z_lens"])
+                  z_source = float(row["z_source"])
+
+                  for param, mean_col, sigma_col in [
+                      ("Ddt_time_delay_distance", "Ddt_mean", "Ddt_sigma"),
+                      ("Dd_angular_diameter_distance", "Dd_mean", "Dd_sigma")
+                  ]:
+                      ledger_rows.append({
+                          "source": "TDCOSMO_2020",
+                          "surface": "reach_geometry",
+                          "family": "TDCOSMO_time_delay",
+                          "entry_role": "independent_time_delay_reach_diagnostic",
+                          "parameter": param,
+                          "lens_name": name,
+                          "z_lens": z_lens,
+                          "z_source": z_source,
+                          "value": float(row[mean_col]),
+                          "sigma": float(row[sigma_col]),
+                          "covariance_available": False,
+                          "posterior_table_available": True,
+                          "included_in_model": False,
+                          "model_anchor_allowed_now": False,
+                          "boundary_note": "Time-delay / angular-diameter distance diagnostic; ingested only, not promoted."
+                      })
+
+              source_rows.append({
+                  "source": "TDCOSMO_2020",
+                  "family": "TDCOSMO_time_delay",
+                  "role": "hierarchical_time_delay_posterior_table",
+                  "lens_row_count": len(rows),
+                  "ledger_row_count": len(ledger_rows),
+                  "binary_shape_product_count": len(binary_records),
+                  "ingestion_pass": len(rows) > 0 and len(ledger_rows) >= 2
+              })
+
+              pass_flag = all(row["ingestion_pass"] for row in source_rows)
+
+              return {
+                  "source": "TDCOSMO_2020",
+                  "surface": "reach_geometry",
+                  "ingestion_pass": pass_flag,
+                  "ledger_rows": ledger_rows,
+                  "source_rows": source_rows,
+                  "binary_records": binary_records,
+                  "download_count": len(downloads),
+                  "downloads": downloads,
+                  "boundary": "TDCOSMO time-delay posterior table ingested as independent reach diagnostic, not a model anchor."
+              }
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_27_status": "independent_reach_shape_probe_passed_multiple_ingestion_lanes_ready",
+                  "v3_27_next_allowed_step": "Build v3.28 targeted independent reach ingestion for SDSS_eBOSS_DR16, BOSS_DR12_BAO, TDCOSMO_2020."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.28 independent reach ingestion")
+          print("Truth boundary: ingestion only; no refit; no validation claim.")
+          print()
+
+          all_ledger_rows = []
+          all_source_rows = []
+          binary_rows = []
+          source_errors = {}
+
+          for name, fn in [
+              ("SDSS_eBOSS_DR16", ingest_eboss),
+              ("BOSS_DR12_BAO", ingest_boss),
+              ("TDCOSMO_2020", ingest_tdcosmo)
+          ]:
+              print(f"Ingesting {name}")
+              try:
+                  result = fn()
+                  inventory["source_results"][name] = {
+                      k: v for k, v in result.items()
+                      if k not in ["ledger_rows", "source_rows", "downloads", "binary_records"]
+                  }
+                  all_ledger_rows.extend(result["ledger_rows"])
+                  all_source_rows.extend(result["source_rows"])
+                  binary_rows.extend(result.get("binary_records", []))
+                  print(f"  pass: {result['ingestion_pass']}")
+                  print(f"  ledger rows: {len(result['ledger_rows'])}")
+                  print()
+              except Exception as e:
+                  source_errors[name] = f"{type(e).__name__}: {e}"
+                  inventory["source_results"][name] = {
+                      "source": name,
+                      "surface": "reach_geometry",
+                      "ingestion_pass": False,
+                      "error": source_errors[name],
+                      "boundary": "Source ingestion failed; no model claim allowed."
+                  }
+                  print(f"  failed: {source_errors[name]}")
+                  print()
+
+          ledger_csv = OUTDIR / "independent_reach_ingestion_ledger_v3_28.csv"
+          ledger_fields = sorted({
+              key for row in all_ledger_rows for key in row.keys()
+          })
+
+          with ledger_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=ledger_fields)
+              writer.writeheader()
+              for row in all_ledger_rows:
+                  writer.writerow({k: row.get(k, "") for k in ledger_fields})
+
+          source_csv = OUTDIR / "independent_reach_ingestion_source_summary_v3_28.csv"
+          source_fields = sorted({
+              key for row in all_source_rows for key in row.keys()
+          } | {"error"})
+
+          with source_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=source_fields)
+              writer.writeheader()
+              for row in all_source_rows:
+                  writer.writerow({k: row.get(k, "") for k in source_fields})
+
+              for name, error in source_errors.items():
+                  writer.writerow({
+                      "source": name,
+                      "ingestion_pass": False,
+                      "error": error
+                  })
+
+          binary_csv = OUTDIR / "tdcosmo_binary_shape_products_v3_28.csv"
+          with binary_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = ["product", "path", "size_bytes", "shape_only", "boundary"]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in binary_rows:
+                  writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+          pass_sources = [
+              name for name, result in inventory["source_results"].items()
+              if result.get("ingestion_pass") is True
+          ]
+
+          failed_gates = []
+
+          if len(pass_sources) < 2:
+              failed_gates.append("fewer_than_two_independent_reach_lanes_ingested")
+
+          if len(all_ledger_rows) < 10:
+              failed_gates.append("independent_reach_ledger_too_small")
+
+          if not failed_gates and len(pass_sources) == 3:
+              readiness_label = "independent_reach_ingestion_passed_three_lanes_ready_for_v3_29_standardization"
+          elif not failed_gates:
+              readiness_label = "independent_reach_ingestion_partial_pass_ready_for_v3_29_standardization"
+          else:
+              readiness_label = "independent_reach_ingestion_needs_source_followup"
+
+          next_step = (
+              "Build v3.29 independent reach standardization audit: normalize eBOSS/BOSS BAO and TDCOSMO time-delay rows into comparable reach-family roles without promoting any row to model anchor."
+              if not failed_gates
+              else "Fix failed independent reach ingestion lanes before standardization."
+          )
+
+          inventory["ledger_row_count"] = len(all_ledger_rows)
+          inventory["source_summary_row_count"] = len(all_source_rows)
+          inventory["binary_shape_product_count"] = len(binary_rows)
+          inventory["pass_sources"] = pass_sources
+          inventory["source_errors"] = source_errors
+          inventory["output_files"] = {
+              "ledger": str(ledger_csv),
+              "source_summary": str(source_csv),
+              "tdcosmo_binary_shape_products": str(binary_csv)
+          }
+
+          inventory["gate_result"] = {
+              "failed_gates": failed_gates,
+              "readiness_label": readiness_label,
+              "pass_sources": pass_sources,
+              "source_error_count": len(source_errors),
+              "ledger_row_count": len(all_ledger_rows),
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_28_independent_reach_ingestion.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.28 — Independent Reach Ingestion")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.28 ingests the first independent non-DESI reach products selected by v3.27.")
+          md.append("")
+          md.append("- SDSS/eBOSS DR16 BAO D_M/r_s and D_H/r_s rows plus covariance products.")
+          md.append("- BOSS DR11/DR12 BAO archive rows plus covariance products.")
+          md.append("- TDCOSMO 2020 time-delay and angular-diameter distance posterior table rows.")
+          md.append("")
+          md.append("It does not refit the two-surface model and does not promote any row to model-anchor status.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Passing sources: `{', '.join(pass_sources) if pass_sources else 'none'}`")
+          md.append(f"- Source errors: `{len(source_errors)}`")
+          md.append(f"- Ledger rows: `{len(all_ledger_rows)}`")
+          md.append(f"- Binary shape products recorded: `{len(binary_rows)}`")
+          md.append("")
+          md.append("## Source results")
+          md.append("")
+          md.append("| Source | Pass | Ledger rows / note |")
+          md.append("|---|---:|---|")
+          for name, result in inventory["source_results"].items():
+              if result.get("ingestion_pass"):
+                  note = result.get("boundary", "")
+              else:
+                  note = result.get("error", "")
+              md.append(f"| {name} | {result.get('ingestion_pass')} | {note} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_ingestion_ledger_v3_28.csv`")
+          md.append("- `independent_reach_ingestion_source_summary_v3_28.csv`")
+          md.append("- `tdcosmo_binary_shape_products_v3_28.csv`")
+          md.append("- `tairid_cosmology_v3_28_independent_reach_ingestion.json`")
+          md.append("- `tairid_cosmology_v3_28_independent_reach_ingestion.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_28_independent_reach_ingestion.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.28 independent reach ingestion artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-28-independent-reach-ingestion
+          path: artifacts/tairid_cosmology_v3_28/
