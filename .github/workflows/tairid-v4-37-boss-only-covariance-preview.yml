@@ -1,0 +1,826 @@
+name: TAIRID v4.37 BOSS Only Covariance Preview
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-37-boss-only-covariance-preview.yml"
+
+jobs:
+  tairid-v4-37-boss-only-covariance-preview:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.37 BOSS only covariance preview
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_37_boss_only_covariance_preview
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_37_boss_only_covariance_preview")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_37_boss_only_covariance_preview"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run the BOSS likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not make the full RSD lane covariance-aware.",
+              "This computes only a BOSS-only covariance residual preview using the extracted BOSS f_sigma8 submatrix.",
+              "Reference-model uncertainty is not included.",
+              "WiggleZ and eBOSS covariance remain unresolved.",
+              "A pass means BOSS-only covariance preview is bounded, not that TAIRID cosmology is validated."
+          ]
+
+          PACKAGE = {
+              "package_id": "boss_dr12_consensus_gaussian_constraints",
+              "survey_family": "BOSS_DR12",
+              "package_url": "https://data.sdss.org/sas/dr12/boss/papers/clustering/ALAM_ET_AL_2016_consensus_and_individual_Gaussian_constraints.tar.gz",
+              "selected_from": "v4.36 BOSS f_sigma8 covariance extraction"
+          }
+
+          SELECTED_PAIR = {
+              "pair_id": "final_consensus_dV_FAP_fsig",
+              "role": "BAO_plus_FS_final_consensus_dV_FAP_fsigma8",
+              "results_member": "COMBINEDDR12_final_consensus_dV_FAP/final_consensus_results_dV_FAP_fsig.txt",
+              "covariance_member": "COMBINEDDR12_final_consensus_dV_FAP/final_consensus_covtot_dV_FAP_fsig.txt",
+              "v4_36_status": "BOSS_fsigma8_covariance_extracted"
+          }
+
+          REFERENCE_MODEL = {
+              "model_id": "planck_like_flat_lcdm_growth_reference_v0",
+              "model_role": "declared_reference_curve_only",
+              "Omega_m0": 0.315,
+              "Omega_lambda0": 0.685,
+              "sigma8_0": 0.811,
+              "growth_index_gamma": 0.55,
+              "method": "flat_LCDM_growth_factor_integral_normalized_to_D_z0_equals_1_plus_growth_index_f_approximation",
+              "limitations": [
+                  "This is a declared Planck-like LCDM reference curve, not a Planck chain posterior.",
+                  "Reference-model uncertainty is not included.",
+                  "This does not run a likelihood, BIC, refit, or model comparison.",
+                  "This does not compare f_sigma8 to one scalar S8 value.",
+                  "This result is BOSS-only and non-final."
+              ]
+          }
+
+          PREVIEW_RULES = [
+              {
+                  "rule_id": "BOSS_only_scope",
+                  "description": "Only the three mapped BOSS DR12 f_sigma8 rows may enter this covariance preview.",
+                  "failure_mode": "WiggleZ or eBOSS enters without covariance resolution."
+              },
+              {
+                  "rule_id": "fsigma8_submatrix_used",
+                  "description": "The preview must use the 3x3 BOSS f_sigma8 covariance submatrix.",
+                  "failure_mode": "Diagonal-only preview is mislabeled as covariance-aware."
+              },
+              {
+                  "rule_id": "reference_uncertainty_missing_labeled",
+                  "description": "Reference-model uncertainty is absent and must stay labeled.",
+                  "failure_mode": "BOSS-only preview becomes final pressure."
+              },
+              {
+                  "rule_id": "full_RSD_claim_blocked",
+                  "description": "BOSS-only covariance does not resolve WiggleZ or eBOSS covariance.",
+                  "failure_mode": "BOSS-only result is promoted to full RSD result."
+              },
+              {
+                  "rule_id": "no_likelihood_or_final_pressure",
+                  "description": "This may compute a BOSS-only covariance preview statistic but not a final pressure score or likelihood.",
+                  "failure_mode": "Preview becomes model testing."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "The full RSD lane is covariance-aware.",
+              "WiggleZ covariance is resolved.",
+              "eBOSS covariance is resolved.",
+              "Reference-model uncertainty is included.",
+              "A BOSS likelihood was run.",
+              "A likelihood, BIC, refit, or model comparison was run.",
+              "BOSS-only covariance preview proves growth suppression."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_38_SDSS_DR16_child_product_selection",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Inspect SDSS DR16 final cosmology directory children and identify candidate eBOSS covariance/likelihood products.",
+                  "must_include": "child product paths, tracer labels, row mapping status, published-summary boundary.",
+                  "must_not_include": "final pressure score or direct chain claim without parsing."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_39_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before any stronger RSD comparison.",
+                  "must_include": "reference parameter uncertainty, Planck-chain boundary, growth curve uncertainty.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_40_WiggleZ_covariance_locator_retry",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Try to locate a WiggleZ covariance/product path or formally keep WiggleZ non-final.",
+                  "must_include": "source path, product status, row mapping, unresolved boundary if not found.",
+                  "must_not_include": "treating WiggleZ as covariance-ready without product."
+              }
+          ]
+
+          def E_of_a(a, omega_m0, omega_lambda0):
+              return math.sqrt(omega_m0 / (a ** 3) + omega_lambda0)
+
+          def omega_m_of_a(a, omega_m0, omega_lambda0):
+              e2 = omega_m0 / (a ** 3) + omega_lambda0
+              return (omega_m0 / (a ** 3)) / e2
+
+          def growth_integral(a, omega_m0, omega_lambda0, n=5000):
+              a_min = 1.0e-4
+              if a <= a_min:
+                  return 0.0
+              step = (a - a_min) / n
+              total = 0.0
+              for i in range(n + 1):
+                  x = a_min + i * step
+                  weight = 0.5 if i == 0 or i == n else 1.0
+                  e = E_of_a(x, omega_m0, omega_lambda0)
+                  total += weight * (1.0 / ((x ** 3) * (e ** 3)))
+              return total * step
+
+          def unnormalized_growth_D(a, omega_m0, omega_lambda0):
+              e = E_of_a(a, omega_m0, omega_lambda0)
+              integral = growth_integral(a, omega_m0, omega_lambda0)
+              return (5.0 * omega_m0 * e / 2.0) * integral
+
+          def normalized_growth_D(z, omega_m0, omega_lambda0):
+              a = 1.0 / (1.0 + z)
+              d_a = unnormalized_growth_D(a, omega_m0, omega_lambda0)
+              d_1 = unnormalized_growth_D(1.0, omega_m0, omega_lambda0)
+              return d_a / d_1
+
+          def f_growth_approx(z, omega_m0, omega_lambda0, gamma):
+              a = 1.0 / (1.0 + z)
+              omega_m_z = omega_m_of_a(a, omega_m0, omega_lambda0)
+              return omega_m_z ** gamma
+
+          def f_sigma8_ref(z, model):
+              d_z = normalized_growth_D(z, model["Omega_m0"], model["Omega_lambda0"])
+              f_z = f_growth_approx(z, model["Omega_m0"], model["Omega_lambda0"], model["growth_index_gamma"])
+              sigma8_z = model["sigma8_0"] * d_z
+              return {
+                  "D_z": d_z,
+                  "f_z": f_z,
+                  "sigma8_z": sigma8_z,
+                  "f_sigma8_ref": f_z * sigma8_z
+              }
+
+          def fetch_package(url, max_bytes=150_000_000, timeout=120):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.37-BOSS-only-covariance-preview",
+                      "Accept": "application/gzip,application/x-tar,application/octet-stream,*/*"
+                  }
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  data = response.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      raise RuntimeError("package_exceeded_size_cap")
+                  return {
+                      "ok": True,
+                      "http_status": getattr(response, "status", 200),
+                      "content_type": response.headers.get("Content-Type", ""),
+                      "bytes_read": len(data),
+                      "data": data
+                  }
+
+          def read_member_text(tar, member_name):
+              member = tar.getmember(member_name)
+              f = tar.extractfile(member)
+              if f is None:
+                  return ""
+              return f.read().decode("utf-8", errors="replace")
+
+          def parse_results_text(text):
+              rows = []
+              pattern = re.compile(r"(?P<z>\d+\.\d+)\s+(?P<obs>[A-Za-z0-9_/\.\-]+)\s+(?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+              for idx, match in enumerate(pattern.finditer(text or "")):
+                  z = float(match.group("z"))
+                  obs = match.group("obs").strip()
+                  value = float(match.group("value"))
+                  obs_norm = obs.lower().replace("σ", "sigma")
+                  if obs_norm in ["fsig8", "f_sigma8", "fsigma8"]:
+                      axis = "f_sigma8"
+                  elif "dv" in obs_norm or "dm" in obs_norm or "hz" in obs_norm or "f_ap" in obs_norm or "fap" in obs_norm:
+                      axis = "distance_or_BAO_boundary"
+                  else:
+                      axis = "other"
+                  rows.append({
+                      "result_index": idx,
+                      "z_eff": z,
+                      "observable": obs,
+                      "observable_axis": axis,
+                      "value": value
+                  })
+              return rows
+
+          def parse_covariance_text(text):
+              values = []
+              for token in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text or ""):
+                  values.append(float(token))
+              n = int(math.sqrt(len(values))) if values else 0
+              is_square = n * n == len(values) and n > 0
+              matrix = []
+              if is_square:
+                  for i in range(n):
+                      matrix.append(values[i*n:(i+1)*n])
+              return {
+                  "value_count": len(values),
+                  "dimension": n if is_square else "",
+                  "is_square": is_square,
+                  "matrix": matrix
+              }
+
+          def det3(m):
+              return (
+                  m[0][0]*(m[1][1]*m[2][2] - m[1][2]*m[2][1])
+                  - m[0][1]*(m[1][0]*m[2][2] - m[1][2]*m[2][0])
+                  + m[0][2]*(m[1][0]*m[2][1] - m[1][1]*m[2][0])
+              )
+
+          def inv3(m):
+              d = det3(m)
+              if abs(d) < 1e-30:
+                  raise RuntimeError("singular_3x3_matrix")
+              return [
+                  [
+                      (m[1][1]*m[2][2] - m[1][2]*m[2][1]) / d,
+                      (m[0][2]*m[2][1] - m[0][1]*m[2][2]) / d,
+                      (m[0][1]*m[1][2] - m[0][2]*m[1][1]) / d
+                  ],
+                  [
+                      (m[1][2]*m[2][0] - m[1][0]*m[2][2]) / d,
+                      (m[0][0]*m[2][2] - m[0][2]*m[2][0]) / d,
+                      (m[0][2]*m[1][0] - m[0][0]*m[1][2]) / d
+                  ],
+                  [
+                      (m[1][0]*m[2][1] - m[1][1]*m[2][0]) / d,
+                      (m[0][1]*m[2][0] - m[0][0]*m[2][1]) / d,
+                      (m[0][0]*m[1][1] - m[0][1]*m[1][0]) / d
+                  ]
+              ]
+
+          def matvec(m, v):
+              return [sum(m[i][j] * v[j] for j in range(len(v))) for i in range(len(m))]
+
+          def dot(a, b):
+              return sum(x*y for x, y in zip(a, b))
+
+          failed_gates = []
+          warnings = []
+
+          download_info = {
+              "download_ok": False,
+              "http_status": "",
+              "content_type": "",
+              "bytes_read": 0,
+              "error": ""
+          }
+
+          parsed_result_rows = []
+          boss_residual_rows = []
+          covariance_entries = []
+          correlation_entries = []
+          inverse_covariance_entries = []
+          covariance_matrix = []
+          inverse_covariance_matrix = []
+
+          preview_summary = {
+              "boss_only_row_count": 0,
+              "negative_residual_count": 0,
+              "positive_residual_count": 0,
+              "zero_residual_count": 0,
+              "mean_residual_observed_minus_reference": "",
+              "mean_diagonal_z_preview": "",
+              "boss_only_covariance_chi2_preview": "",
+              "boss_only_covariance_preview_dof": 3,
+              "boss_only_covariance_sqrt_chi2_preview": "",
+              "covariance_used_for_BOSS_only_preview": False,
+              "reference_uncertainty_included": False,
+              "full_RSD_covariance_complete": False,
+              "final_pressure_score_built": False
+          }
+
+          try:
+              fetched = fetch_package(PACKAGE["package_url"])
+              download_info.update({
+                  "download_ok": fetched["ok"],
+                  "http_status": fetched["http_status"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": ""
+              })
+
+              with tarfile.open(fileobj=io.BytesIO(fetched["data"]), mode="r:gz") as tar:
+                  results_text = read_member_text(tar, SELECTED_PAIR["results_member"])
+                  covariance_text = read_member_text(tar, SELECTED_PAIR["covariance_member"])
+
+                  parsed_result_rows = parse_results_text(results_text)
+                  cov = parse_covariance_text(covariance_text)
+
+                  fsigma_rows = [row for row in parsed_result_rows if row["observable_axis"] == "f_sigma8"]
+                  fsigma_rows = sorted(fsigma_rows, key=lambda r: r["z_eff"])
+
+                  if cov["is_square"] and cov["dimension"] == len(parsed_result_rows):
+                      indices = [row["result_index"] for row in fsigma_rows]
+                      covariance_matrix = [
+                          [cov["matrix"][i][j] for j in indices]
+                          for i in indices
+                      ]
+                      inverse_covariance_matrix = inv3(covariance_matrix)
+
+                      residual_vector = []
+                      diagonal_z_values = []
+
+                      for sub_i, row in enumerate(fsigma_rows):
+                          ref = f_sigma8_ref(row["z_eff"], REFERENCE_MODEL)
+                          observed = row["value"]
+                          residual = observed - ref["f_sigma8_ref"]
+                          diag_sigma = math.sqrt(covariance_matrix[sub_i][sub_i])
+                          diagonal_z = residual / diag_sigma if diag_sigma > 0 else ""
+
+                          residual_vector.append(residual)
+                          diagonal_z_values.append(diagonal_z)
+
+                          if residual < 0:
+                              direction = "negative_observed_minus_reference"
+                          elif residual > 0:
+                              direction = "positive_observed_minus_reference"
+                          else:
+                              direction = "zero"
+
+                          boss_residual_rows.append({
+                              "sub_index": sub_i,
+                              "result_index": row["result_index"],
+                              "z_eff": row["z_eff"],
+                              "observable_axis": row["observable_axis"],
+                              "observed_f_sigma8": observed,
+                              "reference_f_sigma8": ref["f_sigma8_ref"],
+                              "D_z": ref["D_z"],
+                              "f_z": ref["f_z"],
+                              "sigma8_z": ref["sigma8_z"],
+                              "residual_observed_minus_reference": residual,
+                              "covariance_diagonal": covariance_matrix[sub_i][sub_i],
+                              "implied_sigma_from_covariance": diag_sigma,
+                              "diagonal_z_preview": diagonal_z,
+                              "direction": direction,
+                              "preview_status": "BOSS_only_covariance_preview",
+                              "covariance_used_for_BOSS_only_preview": True,
+                              "reference_uncertainty_included": False,
+                              "full_RSD_covariance_complete": False,
+                              "final_pressure_score": False
+                          })
+
+                      weighted = matvec(inverse_covariance_matrix, residual_vector)
+                      chi2 = dot(residual_vector, weighted)
+
+                      for i in range(3):
+                          for j in range(3):
+                              cov_value = covariance_matrix[i][j]
+                              diag_i = covariance_matrix[i][i]
+                              diag_j = covariance_matrix[j][j]
+                              corr_value = cov_value / math.sqrt(diag_i * diag_j) if diag_i > 0 and diag_j > 0 else ""
+
+                              covariance_entries.append({
+                                  "sub_i": i,
+                                  "sub_j": j,
+                                  "covariance_value": cov_value,
+                                  "covariance_applied_to_BOSS_only_preview": True,
+                                  "pressure_score_allowed_now": False
+                              })
+
+                              correlation_entries.append({
+                                  "sub_i": i,
+                                  "sub_j": j,
+                                  "correlation_value": corr_value,
+                                  "covariance_applied_to_BOSS_only_preview": True,
+                                  "pressure_score_allowed_now": False
+                              })
+
+                              inverse_covariance_entries.append({
+                                  "sub_i": i,
+                                  "sub_j": j,
+                                  "inverse_covariance_value": inverse_covariance_matrix[i][j],
+                                  "pressure_score_allowed_now": False
+                              })
+
+                      negative_count = sum(1 for row in boss_residual_rows if row["direction"] == "negative_observed_minus_reference")
+                      positive_count = sum(1 for row in boss_residual_rows if row["direction"] == "positive_observed_minus_reference")
+                      zero_count = sum(1 for row in boss_residual_rows if row["direction"] == "zero")
+
+                      preview_summary.update({
+                          "boss_only_row_count": len(boss_residual_rows),
+                          "negative_residual_count": negative_count,
+                          "positive_residual_count": positive_count,
+                          "zero_residual_count": zero_count,
+                          "mean_residual_observed_minus_reference": sum(row["residual_observed_minus_reference"] for row in boss_residual_rows) / len(boss_residual_rows),
+                          "mean_diagonal_z_preview": sum(diagonal_z_values) / len(diagonal_z_values),
+                          "boss_only_covariance_chi2_preview": chi2,
+                          "boss_only_covariance_preview_dof": 3,
+                          "boss_only_covariance_sqrt_chi2_preview": math.sqrt(chi2) if chi2 >= 0 else "",
+                          "covariance_used_for_BOSS_only_preview": True,
+                          "reference_uncertainty_included": False,
+                          "full_RSD_covariance_complete": False,
+                          "final_pressure_score_built": False
+                      })
+
+          except Exception as exc:
+              download_info["error"] = repr(exc)
+
+          if not download_info["download_ok"]:
+              failed_gates.append("package_download_failed")
+
+          if len(boss_residual_rows) != 3:
+              failed_gates.append("BOSS_only_preview_did_not_build_three_rows")
+
+          expected_z = [0.38, 0.51, 0.61]
+          parsed_z = sorted(round(row["z_eff"], 2) for row in boss_residual_rows)
+          if parsed_z != expected_z:
+              failed_gates.append("BOSS_only_preview_z_values_wrong")
+
+          if len(covariance_entries) != 9:
+              failed_gates.append("BOSS_3x3_covariance_entries_missing")
+
+          if len(inverse_covariance_entries) != 9:
+              failed_gates.append("BOSS_3x3_inverse_covariance_entries_missing")
+
+          if preview_summary["covariance_used_for_BOSS_only_preview"] is not True:
+              failed_gates.append("BOSS_covariance_not_used_for_BOSS_only_preview")
+
+          if preview_summary["reference_uncertainty_included"] is not False:
+              failed_gates.append("reference_uncertainty_included_violation")
+
+          if preview_summary["full_RSD_covariance_complete"] is not False:
+              failed_gates.append("full_RSD_covariance_complete_violation")
+
+          if preview_summary["final_pressure_score_built"] is not False:
+              failed_gates.append("final_pressure_score_built_violation")
+
+          for row in boss_residual_rows:
+              if row["covariance_used_for_BOSS_only_preview"] is not True:
+                  failed_gates.append("row_missing_BOSS_only_covariance_flag")
+              if row["reference_uncertainty_included"] is not False:
+                  failed_gates.append("row_reference_uncertainty_violation")
+              if row["full_RSD_covariance_complete"] is not False:
+                  failed_gates.append("row_full_RSD_covariance_violation")
+              if row["final_pressure_score"] is not False:
+                  failed_gates.append("row_final_pressure_violation")
+
+          rule_results = [
+              {
+                  "rule_id": "BOSS_only_scope",
+                  "pass": len(boss_residual_rows) == 3 and parsed_z == expected_z,
+                  "result": "only_three_BOSS_rows_entered_preview",
+                  "boundary": "WiggleZ and eBOSS do not enter this covariance preview."
+              },
+              {
+                  "rule_id": "fsigma8_submatrix_used",
+                  "pass": len(covariance_entries) == 9 and preview_summary["covariance_used_for_BOSS_only_preview"] is True,
+                  "result": "BOSS_3x3_fsigma8_covariance_used_for_BOSS_only_preview",
+                  "boundary": "This is BOSS-only, not full RSD."
+              },
+              {
+                  "rule_id": "reference_uncertainty_missing_labeled",
+                  "pass": preview_summary["reference_uncertainty_included"] is False,
+                  "result": "reference_uncertainty_absent_and_labeled",
+                  "boundary": "No final pressure claim."
+              },
+              {
+                  "rule_id": "full_RSD_claim_blocked",
+                  "pass": preview_summary["full_RSD_covariance_complete"] is False,
+                  "result": "full_RSD_covariance_not_complete",
+                  "boundary": "WiggleZ and eBOSS covariance remain unresolved."
+              },
+              {
+                  "rule_id": "no_likelihood_or_final_pressure",
+                  "pass": preview_summary["final_pressure_score_built"] is False,
+                  "result": "BOSS_only_preview_statistic_built_without_likelihood_or_final_pressure",
+                  "boundary": "Preview only, not validation."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_BOSS_only_preview_rules_passed")
+
+          warnings.append("BOSS_only_covariance_preview_does_not_complete_full_RSD_lane")
+          warnings.append("WiggleZ_and_eBOSS_covariance_still_unresolved")
+          warnings.append("reference_model_uncertainty_still_missing")
+          warnings.append("BOSS_likelihood_not_run")
+          warnings.append("not_a_final_pressure_score")
+          warnings.append("not_validation")
+
+          if failed_gates:
+              readiness_label = "BOSS_only_covariance_preview_failed"
+              next_step = "Repair BOSS-only covariance preview before moving to eBOSS or reference uncertainty work."
+          else:
+              readiness_label = "BOSS_only_covariance_preview_passed_ready_for_SDSS_DR16_child_product_selection"
+              next_step = (
+                  "Proceed to v4.38 SDSS DR16 child product selection for eBOSS covariance/likelihood candidates. "
+                  "Keep BOSS-only preview separate from full RSD covariance claims."
+              )
+
+          system_health = {
+              "download_ok": download_info["download_ok"],
+              "boss_only_preview_row_count": preview_summary["boss_only_row_count"],
+              "negative_residual_count": preview_summary["negative_residual_count"],
+              "positive_residual_count": preview_summary["positive_residual_count"],
+              "zero_residual_count": preview_summary["zero_residual_count"],
+              "mean_residual_observed_minus_reference": preview_summary["mean_residual_observed_minus_reference"],
+              "mean_diagonal_z_preview": preview_summary["mean_diagonal_z_preview"],
+              "boss_only_covariance_chi2_preview": preview_summary["boss_only_covariance_chi2_preview"],
+              "boss_only_covariance_preview_dof": preview_summary["boss_only_covariance_preview_dof"],
+              "boss_only_covariance_sqrt_chi2_preview": preview_summary["boss_only_covariance_sqrt_chi2_preview"],
+              "covariance_used_for_BOSS_only_preview": preview_summary["covariance_used_for_BOSS_only_preview"],
+              "reference_uncertainty_included": False,
+              "full_RSD_covariance_complete": False,
+              "final_pressure_score_built": False,
+              "likelihood_run": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results)
+          }
+
+          interpretation = (
+              "v4.37 computes a BOSS-only covariance residual preview using the extracted BOSS DR12 f_sigma8 3x3 covariance submatrix. "
+              "This is the first covariance-aware preview, but only for BOSS. "
+              "It is not a full RSD result because WiggleZ and eBOSS covariance remain unresolved. "
+              "It is not final because reference-model uncertainty is not included and no likelihood is run."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "package": PACKAGE,
+              "selected_pair": SELECTED_PAIR,
+              "reference_model": REFERENCE_MODEL,
+              "download_info": download_info,
+              "parsed_result_rows": parsed_result_rows,
+              "boss_residual_rows": boss_residual_rows,
+              "boss_fsigma8_covariance_entries": covariance_entries,
+              "boss_fsigma8_correlation_entries": correlation_entries,
+              "boss_fsigma8_inverse_covariance_entries": inverse_covariance_entries,
+              "preview_summary": preview_summary,
+              "preview_rules": PREVIEW_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "BOSS_only_covariance_preview_built": True,
+                  "full_RSD_covariance_complete": False,
+                  "reference_uncertainty_included": False,
+                  "likelihood_run": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "boss_only_covariance_residual_rows_v4_37.csv",
+              boss_residual_rows,
+              [
+                  "sub_index",
+                  "result_index",
+                  "z_eff",
+                  "observable_axis",
+                  "observed_f_sigma8",
+                  "reference_f_sigma8",
+                  "D_z",
+                  "f_z",
+                  "sigma8_z",
+                  "residual_observed_minus_reference",
+                  "covariance_diagonal",
+                  "implied_sigma_from_covariance",
+                  "diagonal_z_preview",
+                  "direction",
+                  "preview_status",
+                  "covariance_used_for_BOSS_only_preview",
+                  "reference_uncertainty_included",
+                  "full_RSD_covariance_complete",
+                  "final_pressure_score"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_only_covariance_entries_v4_37.csv",
+              covariance_entries,
+              ["sub_i", "sub_j", "covariance_value", "covariance_applied_to_BOSS_only_preview", "pressure_score_allowed_now"]
+          )
+
+          write_csv(
+              OUTDIR / "boss_only_correlation_entries_v4_37.csv",
+              correlation_entries,
+              ["sub_i", "sub_j", "correlation_value", "covariance_applied_to_BOSS_only_preview", "pressure_score_allowed_now"]
+          )
+
+          write_csv(
+              OUTDIR / "boss_only_inverse_covariance_entries_v4_37.csv",
+              inverse_covariance_entries,
+              ["sub_i", "sub_j", "inverse_covariance_value", "pressure_score_allowed_now"]
+          )
+
+          write_csv(
+              OUTDIR / "boss_only_preview_summary_v4_37.csv",
+              [preview_summary],
+              [
+                  "boss_only_row_count",
+                  "negative_residual_count",
+                  "positive_residual_count",
+                  "zero_residual_count",
+                  "mean_residual_observed_minus_reference",
+                  "mean_diagonal_z_preview",
+                  "boss_only_covariance_chi2_preview",
+                  "boss_only_covariance_preview_dof",
+                  "boss_only_covariance_sqrt_chi2_preview",
+                  "covariance_used_for_BOSS_only_preview",
+                  "reference_uncertainty_included",
+                  "full_RSD_covariance_complete",
+                  "final_pressure_score_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_only_preview_rule_results_v4_37.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_37.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_37.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_37.csv",
+              [system_health],
+              [
+                  "download_ok",
+                  "boss_only_preview_row_count",
+                  "negative_residual_count",
+                  "positive_residual_count",
+                  "zero_residual_count",
+                  "mean_residual_observed_minus_reference",
+                  "mean_diagonal_z_preview",
+                  "boss_only_covariance_chi2_preview",
+                  "boss_only_covariance_preview_dof",
+                  "boss_only_covariance_sqrt_chi2_preview",
+                  "covariance_used_for_BOSS_only_preview",
+                  "reference_uncertainty_included",
+                  "full_RSD_covariance_complete",
+                  "final_pressure_score_built",
+                  "likelihood_run",
+                  "validation_claim_allowed",
+                  "rule_pass_count",
+                  "rule_total_count"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_37_boss_only_covariance_preview.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.37 — BOSS-only Covariance Residual Preview Guard")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("A BOSS-only covariance residual preview was computed using the extracted BOSS f_sigma8 covariance submatrix.")
+          md.append("")
+          md.append("This is not a full RSD pressure score. WiggleZ and eBOSS covariance are still unresolved, and reference uncertainty is still missing.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## BOSS-only residual rows")
+          md.append("")
+          md.append("| z | Observed | Reference | Residual | Diagonal z | Direction |")
+          md.append("|---:|---:|---:|---:|---:|---|")
+          for row in boss_residual_rows:
+              md.append(
+                  f"| `{row['z_eff']}` | `{row['observed_f_sigma8']:.6f}` | `{row['reference_f_sigma8']:.6f}` | "
+                  f"`{row['residual_observed_minus_reference']:.6f}` | `{row['diagonal_z_preview']:.6f}` | `{row['direction']}` |"
+              )
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `boss_only_covariance_residual_rows_v4_37.csv`")
+          md.append("- `boss_only_covariance_entries_v4_37.csv`")
+          md.append("- `boss_only_correlation_entries_v4_37.csv`")
+          md.append("- `boss_only_inverse_covariance_entries_v4_37.csv`")
+          md.append("- `boss_only_preview_summary_v4_37.csv`")
+          md.append("- `boss_only_preview_rule_results_v4_37.csv`")
+          md.append("- `blocked_claims_v4_37.csv`")
+          md.append("- `next_test_ladder_v4_37.csv`")
+          md.append("- `system_health_v4_37.csv`")
+          md.append("- `tairid_v4_37_boss_only_covariance_preview.json`")
+          md.append("- `tairid_v4_37_boss_only_covariance_preview.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_37_boss_only_covariance_preview.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.37 BOSS only covariance preview artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-37-boss-only-covariance-preview
+          path: artifacts/tairid_v4_37_boss_only_covariance_preview/
