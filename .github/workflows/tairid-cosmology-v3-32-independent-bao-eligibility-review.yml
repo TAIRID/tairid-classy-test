@@ -1,0 +1,1018 @@
+name: TAIRID Cosmology v3.32 Independent BAO Eligibility Review
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-bao-eligibility-review:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.32 independent BAO eligibility review
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_32
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_32")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_32_independent_bao_eligibility_review"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This reviews independent BAO pressure rows for reach-anchor eligibility only.",
+              "DESI remains excluded because v3.25 showed the mapped DESI reach rows are scaled counterparts.",
+              "TDCOSMO remains parked because v3.30 flagged TDLMC seed-row provenance review.",
+              "BOSS archive rows remain provisional and cannot become reach anchors in this workflow.",
+              "eBOSS rows may be reviewed as clean independent BAO diagnostics, but mixed signs block source-level reach-anchor promotion.",
+              "A positive subfamily may be recorded as a subfamily candidate only, not as a global BAO reach anchor.",
+              "No row may be promoted to model-anchor status.",
+              "No refit is allowed from eligibility review alone."
+          ]
+
+          C_LIGHT = 299792.458
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          EBOSS_PRODUCTS = [
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_LRG",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_QSO",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR12_LRG",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              }
+          ]
+
+          BOSS_PRODUCTS = {
+              "archive_url": "https://data.sdss.org/sas/dr10/boss/papers/clustering/Anderson_2013_CMASSDR11_LOWZDR11_cosmomc.tar.gz",
+              "cmass_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/CMASSDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat",
+              "lowz_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/LOWZDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+          }
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.32-independent-bao-eligibility-review/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+
+                  try:
+                      rows.append({
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "lower1": float(parts[3]),
+                          "upper1": float(parts[4]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              dl = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+                  text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+              rows = parse_planck_margestats(text)
+              marg = {r["parameter"]: r for r in rows}
+
+              required = ["H0", "omegam", "rdrag"]
+              missing = [p for p in required if p not in marg]
+              if missing:
+                  raise RuntimeError(f"Missing Planck reference parameters: {missing}")
+
+              return {
+                  "download": dl,
+                  "H0": float(marg["H0"]["mean"]),
+                  "H0_sigma": float(marg["H0"]["sddev"]),
+                  "omegam": float(marg["omegam"]["mean"]),
+                  "omegam_sigma": float(marg["omegam"]["sddev"]),
+                  "rdrag": float(marg["rdrag"]["mean"]),
+                  "rdrag_sigma": float(marg["rdrag"]["sddev"]),
+                  "boundary": "Planck margestats are used only as a baseline reference, not a full likelihood."
+              }
+
+          def E_z(z, om):
+              return math.sqrt(om * (1.0 + z) ** 3 + (1.0 - om))
+
+          def integrate_simpson(func, a, b, n=1200):
+              if b <= a:
+                  return 0.0
+              if n % 2 == 1:
+                  n += 1
+
+              h = (b - a) / n
+              s = func(a) + func(b)
+
+              for i in range(1, n):
+                  x = a + i * h
+                  s += (4 if i % 2 == 1 else 2) * func(x)
+
+              return s * h / 3.0
+
+          def comoving_distance(z, H0, om):
+              integral = integrate_simpson(lambda x: 1.0 / E_z(x, om), 0.0, z)
+              return (C_LIGHT / H0) * integral
+
+          def dm_distance(z, H0, om):
+              return comoving_distance(z, H0, om)
+
+          def dh_distance(z, H0, om):
+              return C_LIGHT / (H0 * E_z(z, om))
+
+          def dv_distance(z, H0, om):
+              dm = dm_distance(z, H0, om)
+              dh = dh_distance(z, H0, om)
+              return (z * dm * dm * dh) ** (1.0 / 3.0)
+
+          def baseline_value(z, kind, planck):
+              if kind == "DM_over_rd":
+                  return dm_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              if kind == "DH_over_rd":
+                  return dh_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              if kind == "DV_over_rd":
+                  return dv_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              raise RuntimeError(f"Unknown BAO baseline kind: {kind}")
+
+          def baseline_sigma_finite_difference(z, kind, planck):
+              base = baseline_value(z, kind, planck)
+              params = [
+                  ("H0", planck["H0"], planck["H0_sigma"]),
+                  ("omegam", planck["omegam"], planck["omegam_sigma"]),
+                  ("rdrag", planck["rdrag"], planck["rdrag_sigma"])
+              ]
+
+              variance = 0.0
+
+              for name, mean, sigma in params:
+                  if sigma <= 0:
+                      continue
+
+                  plus = dict(planck)
+                  minus = dict(planck)
+                  plus[name] = mean + sigma
+                  minus[name] = mean - sigma
+
+                  if name == "omegam":
+                      plus[name] = min(max(plus[name], 0.01), 0.99)
+                      minus[name] = min(max(minus[name], 0.01), 0.99)
+
+                  f_plus = baseline_value(z, kind, plus)
+                  f_minus = baseline_value(z, kind, minus)
+                  derivative_component = (f_plus - f_minus) / 2.0
+                  variance += derivative_component ** 2
+
+              return math.sqrt(max(variance, 0.0)), base
+
+          def load_numeric_matrix(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lines = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+              arr = np.loadtxt(io.StringIO("\n".join(lines)))
+
+              if arr.ndim == 0:
+                  arr = arr.reshape((1, 1))
+              elif arr.ndim == 1:
+                  arr = arr.reshape((1, -1))
+
+              return arr
+
+          def parse_bao_data_table(path):
+              rows = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+
+                  try:
+                      z = float(parts[0])
+                      value = float(parts[1])
+                  except Exception:
+                      continue
+
+                  rows.append({
+                      "z_eff": z,
+                      "value": value,
+                      "parameter": parts[2],
+                      "raw_line": stripped
+                  })
+
+              return rows
+
+          def classify_bao_parameter(parameter):
+              lower = str(parameter).lower()
+
+              if "dm" in lower:
+                  return {
+                      "kind": "DM_over_rd",
+                      "standard_role": "bao_transverse_reach",
+                      "observable_family": "BAO_D_M_over_r_d",
+                      "baseline_formula": "D_M(z)/r_d"
+                  }
+
+              if "dh" in lower:
+                  return {
+                      "kind": "DH_over_rd",
+                      "standard_role": "bao_radial_reach",
+                      "observable_family": "BAO_D_H_over_r_d",
+                      "baseline_formula": "D_H(z)/r_d"
+                  }
+
+              if "dv" in lower:
+                  return {
+                      "kind": "DV_over_rd",
+                      "standard_role": "bao_isotropic_reach",
+                      "observable_family": "BAO_D_V_over_r_d",
+                      "baseline_formula": "D_V(z)/r_d"
+                  }
+
+              return {
+                  "kind": "unknown",
+                  "standard_role": "bao_unknown",
+                  "observable_family": "BAO_unknown",
+                  "baseline_formula": "unknown"
+              }
+
+          def pressure_row(source, family, role, parameter, z_eff, observed, sigma_obs, kind, planck, boundary_note, provisional=False):
+              sigma_base, baseline = baseline_sigma_finite_difference(z_eff, kind, planck)
+              combined_sigma = math.sqrt(float(sigma_obs) ** 2 + sigma_base ** 2)
+              residual = float(observed) - baseline
+              pressure = residual / combined_sigma if combined_sigma > 0 else None
+
+              sign = "positive" if pressure is not None and pressure > 0 else "negative" if pressure is not None and pressure < 0 else "zero"
+
+              return {
+                  "source": source,
+                  "surface": "reach_geometry",
+                  "standard_surface": "reach_geometry_bao",
+                  "family": family,
+                  "standard_role": role,
+                  "parameter": parameter,
+                  "z_eff": z_eff,
+                  "observed_value": observed,
+                  "observed_sigma": sigma_obs,
+                  "baseline_family": "Planck_2018_flat_LCDM_reference",
+                  "baseline_kind": kind,
+                  "baseline_value": baseline,
+                  "baseline_sigma_finite_difference": sigma_base,
+                  "combined_sigma": combined_sigma,
+                  "residual_observed_minus_baseline": residual,
+                  "pressure_z": pressure if pressure is not None else "",
+                  "pressure_sign": sign,
+                  "absolute_pressure_z": abs(pressure) if pressure is not None else "",
+                  "provisional": provisional,
+                  "diagnostic_only": True,
+                  "included_in_model": False,
+                  "model_anchor_allowed_now": False,
+                  "pressure_score_built": True,
+                  "boundary_note": boundary_note
+              }
+
+          def ingest_eboss_pressure(planck):
+              eboss_dir = DOWNLOADS / "SDSS_eBOSS_DR16"
+              rows = []
+              source_rows = []
+              downloads = []
+
+              for product in EBOSS_PRODUCTS:
+                  data_path = eboss_dir / safe_name(product["data_url"])
+                  cov_path = eboss_dir / safe_name(product["cov_url"])
+
+                  downloads.append(download(product["data_url"], data_path))
+                  downloads.append(download(product["cov_url"], cov_path))
+
+                  data_rows = parse_bao_data_table(data_path)
+                  cov = load_numeric_matrix(cov_path)
+                  covariance_match = cov.ndim == 2 and cov.shape[0] == cov.shape[1] == len(data_rows)
+
+                  if not covariance_match:
+                      raise RuntimeError(f"Covariance mismatch for {product['family']}")
+
+                  for i, row in enumerate(data_rows):
+                      cls = classify_bao_parameter(row["parameter"])
+
+                      if cls["kind"] == "unknown":
+                          continue
+
+                      diag = float(cov[i, i])
+                      if diag < 0:
+                          raise RuntimeError(f"Negative covariance diagonal for {product['family']} row {i}")
+
+                      sigma_obs = math.sqrt(diag)
+
+                      rows.append(pressure_row(
+                          source=product["source"],
+                          family=product["family"],
+                          role=cls["standard_role"],
+                          parameter=row["parameter"],
+                          z_eff=row["z_eff"],
+                          observed=row["value"],
+                          sigma_obs=sigma_obs,
+                          kind=cls["kind"],
+                          planck=planck,
+                          boundary_note="eBOSS BAO pressure diagnostic against Planck flat-LCDM baseline; eligibility reviewed but not promoted.",
+                          provisional=False
+                      ))
+
+                  source_rows.append({
+                      "source": product["source"],
+                      "family": product["family"],
+                      "data_rows": len(data_rows),
+                      "pressure_rows": sum(1 for r in rows if r["family"] == product["family"]),
+                      "covariance_match": covariance_match,
+                      "ingestion_pass": len(data_rows) > 0 and covariance_match
+                  })
+
+              return rows, source_rows, downloads
+
+          def archive_member_by_suffix(tf, suffix):
+              matches = [m for m in tf.getmembers() if m.isfile() and m.name.endswith(suffix)]
+              return matches[0] if matches else None
+
+          def archive_member_contains(tf, tokens):
+              tokens = [t.lower() for t in tokens]
+              for m in tf.getmembers():
+                  if not m.isfile():
+                      continue
+                  lower = m.name.lower()
+                  if all(t in lower for t in tokens):
+                      return m
+              return None
+
+          def parse_archive_bao_rows(tf, member):
+              f = tf.extractfile(member)
+              if f is None:
+                  raise RuntimeError(f"Could not extract archive member: {member.name}")
+
+              text = f.read().decode("utf-8", errors="replace")
+              rows = []
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  nums = []
+                  for part in stripped.split():
+                      try:
+                          nums.append(float(part))
+                      except Exception:
+                          pass
+
+                  if len(nums) >= 3:
+                      rows.append({
+                          "z_eff": nums[0],
+                          "value": nums[1],
+                          "sigma": nums[2],
+                          "raw_line": stripped
+                      })
+
+              return rows
+
+          def ingest_boss_pressure(planck):
+              boss_dir = DOWNLOADS / "BOSS_DR12_BAO"
+              archive_path = boss_dir / safe_name(BOSS_PRODUCTS["archive_url"])
+              cmass_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["cmass_cov_url"])
+              lowz_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["lowz_cov_url"])
+
+              downloads = [
+                  download(BOSS_PRODUCTS["archive_url"], archive_path),
+                  download(BOSS_PRODUCTS["cmass_cov_url"], cmass_cov_path),
+                  download(BOSS_PRODUCTS["lowz_cov_url"], lowz_cov_path)
+              ]
+
+              rows = []
+              source_rows = []
+
+              with tarfile.open(archive_path, "r:*") as tf:
+                  cmass_member = archive_member_by_suffix(tf, "data/sdss_DR11CMASS_bao.txt") or archive_member_contains(tf, ["cmass", "bao"])
+                  lowz_member = archive_member_by_suffix(tf, "data/sdss_DR11LOWZ_bao.txt") or archive_member_contains(tf, ["lowz", "bao"])
+
+                  if cmass_member is None:
+                      raise RuntimeError("Could not find CMASS BAO archive member.")
+                  if lowz_member is None:
+                      raise RuntimeError("Could not find LOWZ BAO archive member.")
+
+                  cmass_rows = parse_archive_bao_rows(tf, cmass_member)
+                  lowz_rows = parse_archive_bao_rows(tf, lowz_member)
+
+              cmass_cov = load_numeric_matrix(cmass_cov_path)
+              lowz_cov = load_numeric_matrix(lowz_cov_path)
+
+              for family, source_rows_raw, cov, member_name in [
+                  ("BOSS_DR11_CMASS_archive_BAO", cmass_rows, cmass_cov, cmass_member.name),
+                  ("BOSS_DR11_LOWZ_archive_BAO", lowz_rows, lowz_cov, lowz_member.name)
+              ]:
+                  cov_ok = cov.ndim == 2 and cov.shape[0] == cov.shape[1]
+
+                  for row in source_rows_raw:
+                      rows.append(pressure_row(
+                          source="BOSS_DR12_BAO",
+                          family=family,
+                          role="bao_isotropic_reach_candidate",
+                          parameter="BAO_archive_observable_inferred_DV_over_rd",
+                          z_eff=row["z_eff"],
+                          observed=row["value"],
+                          sigma_obs=row["sigma"],
+                          kind="DV_over_rd",
+                          planck=planck,
+                          boundary_note=f"Provisional BOSS archive pressure diagnostic from {member_name}; ineligible for anchor promotion in v3.32.",
+                          provisional=True
+                      ))
+
+                  source_rows.append({
+                      "source": "BOSS_DR12_BAO",
+                      "family": family,
+                      "archive_member": member_name,
+                      "data_rows": len(source_rows_raw),
+                      "pressure_rows": len(source_rows_raw),
+                      "covariance_square": cov_ok,
+                      "provisional": True,
+                      "ingestion_pass": len(source_rows_raw) > 0 and cov_ok
+                  })
+
+              return rows, source_rows, downloads
+
+          def family_summary(rows):
+              out = []
+
+              for family in sorted(set(r["family"] for r in rows)):
+                  subset = [r for r in rows if r["family"] == family]
+                  pressures = [float(r["pressure_z"]) for r in subset if r["pressure_z"] != ""]
+
+                  positive_count = sum(1 for p in pressures if p > 0)
+                  negative_count = sum(1 for p in pressures if p < 0)
+                  zero_count = sum(1 for p in pressures if p == 0)
+
+                  row_count = len(subset)
+                  provisional = any(r["provisional"] is True for r in subset)
+                  clean_nonprovisional = not provisional
+
+                  mean_pressure = float(np.mean(pressures)) if pressures else ""
+                  median_pressure = float(np.median(pressures)) if pressures else ""
+                  min_pressure = float(np.min(pressures)) if pressures else ""
+                  max_pressure = float(np.max(pressures)) if pressures else ""
+
+                  family_all_positive = row_count > 0 and positive_count == row_count
+                  family_all_negative = row_count > 0 and negative_count == row_count
+                  family_mixed = row_count > 0 and not family_all_positive and not family_all_negative
+
+                  dominant_sign = (
+                      "positive" if positive_count > negative_count
+                      else "negative" if negative_count > positive_count
+                      else "mixed_or_tied"
+                  )
+
+                  dominant_fraction = max(positive_count, negative_count, zero_count) / row_count if row_count else 0.0
+
+                  positive_subfamily_candidate = (
+                      clean_nonprovisional
+                      and row_count >= 2
+                      and family_all_positive
+                  )
+
+                  negative_or_mixed_subfamily = (
+                      clean_nonprovisional
+                      and row_count >= 2
+                      and not family_all_positive
+                  )
+
+                  out.append({
+                      "family": family,
+                      "source": ";".join(sorted(set(r["source"] for r in subset))),
+                      "row_count": row_count,
+                      "standard_roles": ";".join(sorted(set(r["standard_role"] for r in subset))),
+                      "provisional": provisional,
+                      "clean_nonprovisional": clean_nonprovisional,
+                      "mean_pressure_z": mean_pressure,
+                      "median_pressure_z": median_pressure,
+                      "min_pressure_z": min_pressure,
+                      "max_pressure_z": max_pressure,
+                      "positive_count": positive_count,
+                      "negative_count": negative_count,
+                      "zero_count": zero_count,
+                      "dominant_sign": dominant_sign,
+                      "dominant_fraction": dominant_fraction,
+                      "family_all_positive": family_all_positive,
+                      "family_all_negative": family_all_negative,
+                      "family_mixed": family_mixed,
+                      "positive_subfamily_candidate": positive_subfamily_candidate,
+                      "negative_or_mixed_subfamily": negative_or_mixed_subfamily,
+                      "global_bao_reach_anchor_eligible": False,
+                      "model_anchor_allowed_now": False,
+                      "diagnostic_only": True,
+                      "eligibility_note": (
+                          "Positive clean eBOSS subfamily candidate only; not global BAO anchor."
+                          if positive_subfamily_candidate
+                          else "BOSS provisional; blocked from anchor promotion."
+                          if provisional
+                          else "Clean eBOSS family is negative, mixed, or tied; not positive reach anchor."
+                      )
+                  })
+
+              return out
+
+          def row_eligibility(rows, family_rows):
+              fam_index = {r["family"]: r for r in family_rows}
+              out = []
+
+              for row in rows:
+                  fam = fam_index[row["family"]]
+                  candidate_status = "diagnostic_only"
+
+                  if row["provisional"] is True:
+                      candidate_status = "blocked_provisional_boss"
+                  elif fam["positive_subfamily_candidate"] is True:
+                      candidate_status = "positive_subfamily_candidate_only"
+                  elif fam["negative_or_mixed_subfamily"] is True:
+                      candidate_status = "clean_bao_negative_or_mixed_diagnostic"
+                  else:
+                      candidate_status = "diagnostic_only"
+
+                  out.append({
+                      "source": row["source"],
+                      "family": row["family"],
+                      "standard_role": row["standard_role"],
+                      "parameter": row["parameter"],
+                      "z_eff": row["z_eff"],
+                      "pressure_z": row["pressure_z"],
+                      "pressure_sign": row["pressure_sign"],
+                      "absolute_pressure_z": row["absolute_pressure_z"],
+                      "provisional": row["provisional"],
+                      "diagnostic_only": True,
+                      "candidate_status": candidate_status,
+                      "eligible_for_global_bao_reach_anchor": False,
+                      "eligible_for_subfamily_candidate_record": candidate_status == "positive_subfamily_candidate_only",
+                      "included_in_model": False,
+                      "model_anchor_allowed_now": False,
+                      "boundary_note": "Eligibility review only; row remains diagnostic and cannot enter a refit."
+                  })
+
+              return out
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_31_status": "independent_bao_pressure_construction_passed_ready_for_v3_32_eligibility_review",
+                  "v3_31_note": "Independent BAO pressure rows exist, but eBOSS signs were mixed and BOSS rows were provisional."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.32 independent BAO eligibility review")
+          print("Truth boundary: eligibility review only; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+          source_errors = {}
+          pressure_rows = []
+          source_rows = []
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_results"]["Planck_2018"] = {
+                  "loaded": True,
+                  "H0": planck["H0"],
+                  "omegam": planck["omegam"],
+                  "rdrag": planck["rdrag"],
+                  "boundary": planck["boundary"]
+              }
+              print("Planck baseline reference loaded.")
+          except Exception as e:
+              planck = None
+              failed_gates.append("planck_reference_load_failed")
+              source_errors["Planck_2018"] = f"{type(e).__name__}: {e}"
+              inventory["source_results"]["Planck_2018"] = {"loaded": False, "error": source_errors["Planck_2018"]}
+              print(f"Planck failed: {source_errors['Planck_2018']}")
+
+          if planck is not None:
+              for name, fn in [
+                  ("SDSS_eBOSS_DR16", ingest_eboss_pressure),
+                  ("BOSS_DR12_BAO", ingest_boss_pressure)
+              ]:
+                  try:
+                      rows, summaries, downloads = fn(planck)
+                      pressure_rows.extend(rows)
+                      source_rows.extend(summaries)
+                      inventory["source_results"][name] = {
+                          "loaded": True,
+                          "pressure_row_count": len(rows),
+                          "source_summary_count": len(summaries),
+                          "provisional_row_count": sum(1 for r in rows if r["provisional"] is True)
+                      }
+                      print(f"{name} rows loaded: {len(rows)}")
+                  except Exception as e:
+                      failed_gates.append(f"{name}_eligibility_source_failed")
+                      source_errors[name] = f"{type(e).__name__}: {e}"
+                      inventory["source_results"][name] = {"loaded": False, "error": source_errors[name]}
+                      print(f"{name} failed: {source_errors[name]}")
+
+          fam_rows = family_summary(pressure_rows)
+          row_review = row_eligibility(pressure_rows, fam_rows)
+
+          row_csv = OUTDIR / "independent_bao_eligibility_row_review_v3_32.csv"
+          row_fields = [
+              "source", "family", "standard_role", "parameter", "z_eff",
+              "pressure_z", "pressure_sign", "absolute_pressure_z",
+              "provisional", "diagnostic_only", "candidate_status",
+              "eligible_for_global_bao_reach_anchor",
+              "eligible_for_subfamily_candidate_record",
+              "included_in_model", "model_anchor_allowed_now",
+              "boundary_note"
+          ]
+
+          with row_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=row_fields)
+              writer.writeheader()
+              for row in row_review:
+                  writer.writerow({k: row.get(k, "") for k in row_fields})
+
+          family_csv = OUTDIR / "independent_bao_eligibility_family_review_v3_32.csv"
+          family_fields = [
+              "family", "source", "row_count", "standard_roles",
+              "provisional", "clean_nonprovisional",
+              "mean_pressure_z", "median_pressure_z",
+              "min_pressure_z", "max_pressure_z",
+              "positive_count", "negative_count", "zero_count",
+              "dominant_sign", "dominant_fraction",
+              "family_all_positive", "family_all_negative", "family_mixed",
+              "positive_subfamily_candidate",
+              "negative_or_mixed_subfamily",
+              "global_bao_reach_anchor_eligible",
+              "model_anchor_allowed_now",
+              "diagnostic_only", "eligibility_note"
+          ]
+
+          with family_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=family_fields)
+              writer.writeheader()
+              for row in fam_rows:
+                  writer.writerow({k: row.get(k, "") for k in family_fields})
+
+          source_csv = OUTDIR / "independent_bao_eligibility_source_summary_v3_32.csv"
+          source_fields = sorted({key for row in source_rows for key in row.keys()} | {"error"}) if source_rows else ["source", "family", "error"]
+
+          with source_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=source_fields)
+              writer.writeheader()
+              for row in source_rows:
+                  writer.writerow({k: row.get(k, "") for k in source_fields})
+              for name, err in source_errors.items():
+                  writer.writerow({"source": name, "error": err})
+
+          eboss_rows = [r for r in row_review if r["source"] == "SDSS_eBOSS_DR16"]
+          boss_rows = [r for r in row_review if r["source"] == "BOSS_DR12_BAO"]
+
+          eboss_families = [r for r in fam_rows if r["source"] == "SDSS_eBOSS_DR16"]
+          boss_families = [r for r in fam_rows if r["source"] == "BOSS_DR12_BAO"]
+
+          positive_subfamilies = [r for r in eboss_families if r["positive_subfamily_candidate"] is True]
+          negative_or_mixed_subfamilies = [r for r in eboss_families if r["negative_or_mixed_subfamily"] is True]
+
+          source_level_global_bao_anchor_allowed = (
+              len(eboss_families) > 0
+              and all(r["positive_subfamily_candidate"] is True for r in eboss_families)
+              and len(boss_rows) == 0
+          )
+
+          # Because BOSS exists but is provisional and negative, and eBOSS is mixed,
+          # the global BAO reach anchor must remain blocked.
+          global_bao_anchor_blocked = not source_level_global_bao_anchor_allowed
+
+          diagnostic_only_count = sum(1 for r in row_review if r["diagnostic_only"] is True)
+          model_anchor_count = sum(1 for r in row_review if r["model_anchor_allowed_now"] is True)
+          desi_count = sum(1 for r in row_review if "DESI" in r["source"])
+          tdcosmo_count = sum(1 for r in row_review if "TDCOSMO" in r["source"])
+
+          eboss_pressures = [float(r["pressure_z"]) for r in row_review if r["source"] == "SDSS_eBOSS_DR16"]
+          boss_pressures = [float(r["pressure_z"]) for r in row_review if r["source"] == "BOSS_DR12_BAO"]
+
+          eboss_mean = float(np.mean(eboss_pressures)) if eboss_pressures else None
+          boss_mean = float(np.mean(boss_pressures)) if boss_pressures else None
+
+          audit_rows = [
+              {
+                  "audit_gate": "source_review_loads_completed",
+                  "pass": len(source_errors) == 0,
+                  "value": json.dumps(source_errors, sort_keys=True),
+                  "boundary": "Planck, eBOSS, and BOSS must load for eligibility review."
+              },
+              {
+                  "audit_gate": "desi_excluded",
+                  "pass": desi_count == 0,
+                  "value": desi_count,
+                  "boundary": "DESI remains excluded."
+              },
+              {
+                  "audit_gate": "tdcosmo_parked",
+                  "pass": tdcosmo_count == 0,
+                  "value": tdcosmo_count,
+                  "boundary": "TDCOSMO remains parked for provenance review."
+              },
+              {
+                  "audit_gate": "boss_rows_provisional_and_blocked",
+                  "pass": len(boss_rows) >= 2 and all(r["provisional"] is True for r in boss_rows),
+                  "value": f"boss_rows={len(boss_rows)}",
+                  "boundary": "BOSS rows must remain provisional and ineligible."
+              },
+              {
+                  "audit_gate": "eboss_clean_rows_reviewed",
+                  "pass": len(eboss_rows) >= 8 and all(r["provisional"] is False for r in eboss_rows),
+                  "value": len(eboss_rows),
+                  "boundary": "eBOSS is the clean independent BAO lane for eligibility review."
+              },
+              {
+                  "audit_gate": "positive_subfamily_recorded_but_not_global_anchor",
+                  "pass": len(positive_subfamilies) >= 1,
+                  "value": ";".join([r["family"] for r in positive_subfamilies]),
+                  "boundary": "A positive subfamily may be recorded but cannot represent global BAO reach."
+              },
+              {
+                  "audit_gate": "negative_or_mixed_subfamilies_block_global_anchor",
+                  "pass": len(negative_or_mixed_subfamilies) >= 1,
+                  "value": ";".join([r["family"] for r in negative_or_mixed_subfamilies]),
+                  "boundary": "Mixed or negative clean eBOSS families block source-level reach-anchor promotion."
+              },
+              {
+                  "audit_gate": "global_bao_reach_anchor_blocked",
+                  "pass": global_bao_anchor_blocked,
+                  "value": global_bao_anchor_blocked,
+                  "boundary": "Independent BAO is not currently a clean global reach-positive anchor."
+              },
+              {
+                  "audit_gate": "all_rows_diagnostic_only",
+                  "pass": diagnostic_only_count == len(row_review) and model_anchor_count == 0,
+                  "value": f"diagnostic={diagnostic_only_count}; model_anchor={model_anchor_count}",
+                  "boundary": "Eligibility review cannot promote rows to model anchors."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed from v3.32."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          audit_csv = OUTDIR / "independent_bao_eligibility_audit_v3_32.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failed = []
+          if source_errors:
+              hard_failed.append("source_review_errors_present")
+          if desi_count != 0:
+              hard_failed.append("desi_rows_leaked_into_bao_eligibility")
+          if tdcosmo_count != 0:
+              hard_failed.append("tdcosmo_rows_leaked_into_bao_eligibility")
+          if len(eboss_rows) < 8:
+              hard_failed.append("eboss_clean_rows_missing")
+          if len(boss_rows) < 2:
+              hard_failed.append("boss_provisional_rows_missing")
+          if model_anchor_count != 0:
+              hard_failed.append("model_anchor_promotion_violation")
+
+          if hard_failed:
+              readiness_label = "independent_bao_eligibility_review_needs_followup"
+          elif global_bao_anchor_blocked and len(positive_subfamilies) >= 1:
+              readiness_label = "independent_bao_eligibility_passed_subfamily_only_global_anchor_blocked"
+          elif global_bao_anchor_blocked:
+              readiness_label = "independent_bao_eligibility_passed_no_global_reach_anchor"
+          else:
+              readiness_label = "independent_bao_eligibility_passed_global_anchor_candidate_ready_for_review"
+
+          if global_bao_anchor_blocked:
+              next_step = (
+                  "Build v3.33 independent reach-lane contrast audit: keep BAO as mixed/subfamily diagnostic, compare against non-BAO reach lanes such as SH0ES/H0LiCOW, and do not refit."
+              )
+          else:
+              next_step = (
+                  "Build v3.33 guarded reach-anchor candidate review before any two-surface refit."
+              )
+
+          inventory["row_review_count"] = len(row_review)
+          inventory["family_review_count"] = len(fam_rows)
+          inventory["eboss_row_count"] = len(eboss_rows)
+          inventory["boss_row_count"] = len(boss_rows)
+          inventory["positive_subfamily_count"] = len(positive_subfamilies)
+          inventory["negative_or_mixed_subfamily_count"] = len(negative_or_mixed_subfamilies)
+          inventory["global_bao_anchor_blocked"] = global_bao_anchor_blocked
+          inventory["source_level_global_bao_anchor_allowed"] = source_level_global_bao_anchor_allowed
+          inventory["eboss_mean_pressure_z"] = eboss_mean
+          inventory["boss_mean_pressure_z"] = boss_mean
+          inventory["diagnostic_only_count"] = diagnostic_only_count
+          inventory["model_anchor_count"] = model_anchor_count
+          inventory["source_errors"] = source_errors
+
+          inventory["gate_result"] = {
+              "failed_gates": hard_failed,
+              "readiness_label": readiness_label,
+              "row_review_count": len(row_review),
+              "family_review_count": len(fam_rows),
+              "eboss_row_count": len(eboss_rows),
+              "boss_row_count": len(boss_rows),
+              "positive_subfamilies": [r["family"] for r in positive_subfamilies],
+              "negative_or_mixed_subfamilies": [r["family"] for r in negative_or_mixed_subfamilies],
+              "global_bao_anchor_blocked": global_bao_anchor_blocked,
+              "source_level_global_bao_anchor_allowed": source_level_global_bao_anchor_allowed,
+              "eboss_mean_pressure_z": eboss_mean,
+              "boss_mean_pressure_z": boss_mean,
+              "model_anchor_count": model_anchor_count,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_32_independent_bao_eligibility_review.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.32 — Independent BAO Eligibility Review")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.32 reviews the independent BAO pressure rows built in v3.31 and decides whether they can become reach-anchor candidates.")
+          md.append("")
+          md.append("It does not run a refit and does not promote any row to model-anchor status.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Reviewed rows: `{len(row_review)}`")
+          md.append(f"- Reviewed families: `{len(fam_rows)}`")
+          md.append(f"- eBOSS clean rows: `{len(eboss_rows)}`")
+          md.append(f"- BOSS provisional rows: `{len(boss_rows)}`")
+          md.append(f"- Positive subfamilies: `{', '.join([r['family'] for r in positive_subfamilies]) if positive_subfamilies else 'none'}`")
+          md.append(f"- Negative or mixed clean subfamilies: `{', '.join([r['family'] for r in negative_or_mixed_subfamilies]) if negative_or_mixed_subfamilies else 'none'}`")
+          md.append(f"- Global BAO reach anchor blocked: `{global_bao_anchor_blocked}`")
+          md.append(f"- eBOSS mean pressure: `{eboss_mean}`")
+          md.append(f"- BOSS mean pressure: `{boss_mean}`")
+          md.append(f"- Model anchors: `{model_anchor_count}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if global_bao_anchor_blocked and positive_subfamilies:
+              md.append("Independent BAO has at least one positive clean subfamily, but it is not coherent at the source level. BAO remains useful as a mixed/subfamily diagnostic, not as a global reach-positive anchor.")
+          elif global_bao_anchor_blocked:
+              md.append("Independent BAO does not currently provide a clean reach-positive anchor. It should stay diagnostic.")
+          else:
+              md.append("A global independent BAO reach-anchor candidate was found, but it still requires a separate guarded review before any refit.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_bao_eligibility_row_review_v3_32.csv`")
+          md.append("- `independent_bao_eligibility_family_review_v3_32.csv`")
+          md.append("- `independent_bao_eligibility_source_summary_v3_32.csv`")
+          md.append("- `independent_bao_eligibility_audit_v3_32.csv`")
+          md.append("- `tairid_cosmology_v3_32_independent_bao_eligibility_review.json`")
+          md.append("- `tairid_cosmology_v3_32_independent_bao_eligibility_review.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_32_independent_bao_eligibility_review.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.32 independent BAO eligibility review artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-32-independent-bao-eligibility-review
+          path: artifacts/tairid_cosmology_v3_32/
