@@ -1,0 +1,940 @@
+name: TAIRID v4.44 eBOSS LRG QSO Partial Preview
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-44-eboss-lrg-qso-partial-preview.yml"
+
+jobs:
+  tairid-v4-44-eboss-lrg-qso-partial-preview:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.44 eBOSS LRG QSO partial preview
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_44_eboss_lrg_qso_partial_preview
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_44_eboss_lrg_qso_partial_preview")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_44_eboss_lrg_qso_partial_preview"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run an eBOSS or SDSS likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not make the full eBOSS lane covariance-aware.",
+              "This does not make the full RSD lane covariance-aware.",
+              "This computes only an eBOSS LRG/QSO partial covariance residual preview.",
+              "ELG is explicitly excluded as parser-needed or parked.",
+              "WiggleZ covariance remains unresolved.",
+              "Reference-model uncertainty is not included.",
+              "A pass means a bounded LRG/QSO partial preview was built, not that TAIRID cosmology is validated."
+          ]
+
+          PRODUCT_PAIRS = [
+              {
+                  "pair_id": "eboss_dr16_lrg_baoplus_dmdhfs8",
+                  "tracer": "LRG",
+                  "current_row_id": "eboss_dr16_lrg_z070_fsigma8",
+                  "z_eff": 0.70,
+                  "observed_fsigma8": 0.473,
+                  "published_sigma": 0.041,
+                  "result_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+                  "covtot_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+                  "observable_order": ["DM", "DH", "f_sigma8"],
+                  "fsigma8_index": 2,
+                  "v4_42_status": "fsigma8_covariance_metadata_extracted"
+              },
+              {
+                  "pair_id": "eboss_dr16_qso_baoplus_dmdhfs8",
+                  "tracer": "QSO",
+                  "current_row_id": "eboss_dr16_qso_z148_fsigma8",
+                  "z_eff": 1.48,
+                  "observed_fsigma8": 0.462,
+                  "published_sigma": 0.045,
+                  "result_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+                  "covtot_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+                  "observable_order": ["DM", "DH", "f_sigma8"],
+                  "fsigma8_index": 2,
+                  "v4_42_status": "fsigma8_covariance_metadata_extracted"
+              }
+          ]
+
+          ELG_STATUS = {
+              "row_id": "eboss_dr16_elg_z085_fsigma8",
+              "tracer": "ELG",
+              "z_eff": 0.85,
+              "observed_fsigma8": 0.315,
+              "published_sigma": 0.095,
+              "v4_43_status": "ELG_grid_visible_parser_required_formally_parked_from_simple_covariance_preview",
+              "enters_partial_preview_now": False,
+              "simple_covariance_ready": False,
+              "likelihood_run_now": False,
+              "covariance_applied_now": False,
+              "pressure_score_allowed_now": False
+          }
+
+          REFERENCE_MODEL = {
+              "model_id": "planck_like_flat_lcdm_growth_reference_v0",
+              "model_role": "declared_reference_curve_only",
+              "Omega_m0": 0.315,
+              "Omega_lambda0": 0.685,
+              "sigma8_0": 0.811,
+              "growth_index_gamma": 0.55,
+              "method": "flat_LCDM_growth_factor_integral_normalized_to_D_z0_equals_1_plus_growth_index_f_approximation",
+              "limitations": [
+                  "This is a declared Planck-like LCDM reference curve, not a Planck chain posterior.",
+                  "Reference-model uncertainty is not included.",
+                  "This does not run a likelihood, BIC, refit, or model comparison.",
+                  "This does not compare f_sigma8 to one scalar S8 value.",
+                  "This result is eBOSS LRG/QSO partial only and non-final."
+              ]
+          }
+
+          PREVIEW_RULES = [
+              {
+                  "rule_id": "LRG_QSO_only_scope",
+                  "description": "Only LRG and QSO mapped f_sigma8 rows may enter this partial preview.",
+                  "failure_mode": "ELG or another unresolved row enters the preview."
+              },
+              {
+                  "rule_id": "ELG_excluded_and_labeled",
+                  "description": "ELG must be explicitly excluded as parser-needed or parked.",
+                  "failure_mode": "ELG is silently ignored or treated as simple covariance-ready."
+              },
+              {
+                  "rule_id": "mapped_covtot_metadata_used",
+                  "description": "LRG/QSO f_sigma8 covariance diagonals must come from mapped DMDHfs8 covtot files.",
+                  "failure_mode": "The preview becomes diagonal-only without saying so."
+              },
+              {
+                  "rule_id": "reference_uncertainty_missing_labeled",
+                  "description": "Reference-model uncertainty is absent and must stay labeled.",
+                  "failure_mode": "Partial preview becomes final pressure."
+              },
+              {
+                  "rule_id": "full_eBOSS_and_full_RSD_claims_blocked",
+                  "description": "LRG/QSO partial preview must not become full eBOSS or full RSD covariance.",
+                  "failure_mode": "Partial preview is promoted to full lane result."
+              },
+              {
+                  "rule_id": "no_likelihood_or_final_pressure",
+                  "description": "This may compute a bounded partial preview statistic but not a likelihood or final pressure score.",
+                  "failure_mode": "Preview becomes model testing."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "The full eBOSS lane is covariance-aware.",
+              "The full RSD lane is covariance-aware.",
+              "ELG covariance is resolved.",
+              "ELG grid likelihood was run.",
+              "WiggleZ covariance is resolved.",
+              "Reference-model uncertainty is included.",
+              "An eBOSS likelihood was run.",
+              "A likelihood, BIC, refit, or model comparison was run.",
+              "The LRG/QSO partial preview proves growth suppression."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_45_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before any stronger RSD comparison.",
+                  "must_include": "Planck-chain boundary, growth curve uncertainty, no final pressure claim, BOSS/eBOSS partial status.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_46_WiggleZ_covariance_locator_retry",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Try to locate a WiggleZ covariance/product path or formally keep WiggleZ non-final.",
+                  "must_include": "source path, product status, row mapping, unresolved boundary if not found.",
+                  "must_not_include": "treating WiggleZ as covariance-ready without product."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_47_ELG_grid_parser_design_optional",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Optional later design for a true ELG grid-likelihood parser.",
+                  "must_include": "column meanings, likelihood interpretation, marginalization policy, no pressure score.",
+                  "must_not_include": "ELG covariance-ready claim without parser."
+              },
+              {
+                  "priority": 4,
+                  "next_test": "v4_48_growth_lane_status_handoff",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Write a compact milestone handoff for BOSS covariance preview, eBOSS partial preview, unresolved ELG/WiggleZ, and reference uncertainty.",
+                  "must_include": "truth boundary, partial status, unresolved lanes, next robustness path.",
+                  "must_not_include": "validation claim."
+              }
+          ]
+
+          def E_of_a(a, omega_m0, omega_lambda0):
+              return math.sqrt(omega_m0 / (a ** 3) + omega_lambda0)
+
+          def omega_m_of_a(a, omega_m0, omega_lambda0):
+              e2 = omega_m0 / (a ** 3) + omega_lambda0
+              return (omega_m0 / (a ** 3)) / e2
+
+          def growth_integral(a, omega_m0, omega_lambda0, n=5000):
+              a_min = 1.0e-4
+              if a <= a_min:
+                  return 0.0
+              step = (a - a_min) / n
+              total = 0.0
+              for i in range(n + 1):
+                  x = a_min + i * step
+                  weight = 0.5 if i == 0 or i == n else 1.0
+                  e = E_of_a(x, omega_m0, omega_lambda0)
+                  total += weight * (1.0 / ((x ** 3) * (e ** 3)))
+              return total * step
+
+          def unnormalized_growth_D(a, omega_m0, omega_lambda0):
+              e = E_of_a(a, omega_m0, omega_lambda0)
+              integral = growth_integral(a, omega_m0, omega_lambda0)
+              return (5.0 * omega_m0 * e / 2.0) * integral
+
+          def normalized_growth_D(z, omega_m0, omega_lambda0):
+              a = 1.0 / (1.0 + z)
+              d_a = unnormalized_growth_D(a, omega_m0, omega_lambda0)
+              d_1 = unnormalized_growth_D(1.0, omega_m0, omega_lambda0)
+              return d_a / d_1
+
+          def f_growth_approx(z, omega_m0, omega_lambda0, gamma):
+              a = 1.0 / (1.0 + z)
+              omega_m_z = omega_m_of_a(a, omega_m0, omega_lambda0)
+              return omega_m_z ** gamma
+
+          def f_sigma8_ref(z, model):
+              d_z = normalized_growth_D(z, model["Omega_m0"], model["Omega_lambda0"])
+              f_z = f_growth_approx(z, model["Omega_m0"], model["Omega_lambda0"], model["growth_index_gamma"])
+              sigma8_z = model["sigma8_0"] * d_z
+              return {
+                  "D_z": d_z,
+                  "f_z": f_z,
+                  "sigma8_z": sigma8_z,
+                  "f_sigma8_ref": f_z * sigma8_z
+              }
+
+          def fetch_text(url, timeout=90, byte_limit=2_000_000):
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 TAIRID-v4.44-eBOSS-LRG-QSO-partial-preview",
+                          "Accept": "text/plain,text/html,application/xml,*/*"
+                      }
+                  )
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(byte_limit)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "fetch_ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "fetch_ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def numeric_values(text):
+              vals = []
+              for token in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text or ""):
+                  try:
+                      vals.append(float(token))
+                  except Exception:
+                      pass
+              return vals
+
+          def square_matrix(values):
+              n = int(math.sqrt(len(values))) if values else 0
+              if n * n != len(values) or n == 0:
+                  return "", False, []
+              matrix = []
+              for i in range(n):
+                  matrix.append(values[i*n:(i+1)*n])
+              return n, True, matrix
+
+          def value_seen(values, target, tolerance=0.006):
+              return any(abs(v - target) <= tolerance for v in values)
+
+          def z_seen(values, target, tolerance=0.03):
+              return any(abs(v - target) <= tolerance for v in values)
+
+          def has_fsigma8_signal(text, url):
+              combo = ((text or "")[:5000] + " " + (url or "")).lower()
+              return any(token in combo for token in ["fs8", "fsig", "fsigma8", "f_sigma8", "fσ8"])
+
+          failed_gates = []
+          warnings = []
+
+          fetch_rows = []
+          residual_rows = []
+          covariance_metadata_rows = []
+          correlation_metadata_rows = []
+
+          partial_summary = {
+              "partial_scope": "eBOSS_LRG_QSO_only",
+              "partial_row_count": 0,
+              "negative_residual_count": 0,
+              "positive_residual_count": 0,
+              "zero_residual_count": 0,
+              "mean_residual_observed_minus_reference": "",
+              "mean_diagonal_z_preview": "",
+              "partial_independent_covariance_chi2_preview": "",
+              "partial_preview_dof": 2,
+              "partial_independent_covariance_sqrt_chi2_preview": "",
+              "LRG_QSO_covariance_used_for_partial_preview": False,
+              "ELG_excluded_parser_needed": True,
+              "reference_uncertainty_included": False,
+              "complete_eBOSS_covariance_mapping_now": False,
+              "full_RSD_covariance_complete": False,
+              "final_pressure_score_built": False
+          }
+
+          for pair in PRODUCT_PAIRS:
+              result_fetch = fetch_text(pair["result_url"])
+              cov_fetch = fetch_text(pair["covtot_url"])
+
+              fetch_rows.append({
+                  "pair_id": pair["pair_id"],
+                  "tracer": pair["tracer"],
+                  "url_role": "result_url",
+                  "url": pair["result_url"],
+                  "fetch_ok": result_fetch["fetch_ok"],
+                  "http_status": result_fetch["http_status"],
+                  "content_type": result_fetch["content_type"],
+                  "bytes_read": result_fetch["bytes_read"],
+                  "error": result_fetch["error"]
+              })
+
+              fetch_rows.append({
+                  "pair_id": pair["pair_id"],
+                  "tracer": pair["tracer"],
+                  "url_role": "covtot_url",
+                  "url": pair["covtot_url"],
+                  "fetch_ok": cov_fetch["fetch_ok"],
+                  "http_status": cov_fetch["http_status"],
+                  "content_type": cov_fetch["content_type"],
+                  "bytes_read": cov_fetch["bytes_read"],
+                  "error": cov_fetch["error"]
+              })
+
+              result_values = numeric_values(result_fetch["text"])
+              cov_values = numeric_values(cov_fetch["text"])
+              cov_dim, cov_square, cov_matrix = square_matrix(cov_values)
+
+              result_has_fsigma8 = has_fsigma8_signal(result_fetch["text"], pair["result_url"])
+              expected_value_seen = value_seen(result_values, pair["observed_fsigma8"])
+              expected_z_seen = z_seen(result_values, pair["z_eff"])
+
+              if not result_fetch["fetch_ok"]:
+                  failed_gates.append(pair["pair_id"] + "_result_fetch_failed")
+              if not cov_fetch["fetch_ok"]:
+                  failed_gates.append(pair["pair_id"] + "_covtot_fetch_failed")
+              if not result_has_fsigma8:
+                  failed_gates.append(pair["pair_id"] + "_fsigma8_signal_missing")
+              if not expected_value_seen:
+                  failed_gates.append(pair["pair_id"] + "_expected_value_not_seen")
+              if not expected_z_seen:
+                  failed_gates.append(pair["pair_id"] + "_expected_z_not_seen")
+              if not cov_square or cov_dim != 3:
+                  failed_gates.append(pair["pair_id"] + "_covtot_not_3x3")
+
+              if cov_square and cov_dim == 3:
+                  idx = pair["fsigma8_index"]
+                  fsigma8_cov_diag = cov_matrix[idx][idx]
+                  implied_sigma = math.sqrt(fsigma8_cov_diag) if fsigma8_cov_diag > 0 else ""
+                  sigma_abs_delta = abs(implied_sigma - pair["published_sigma"]) if implied_sigma != "" else ""
+
+                  ref = f_sigma8_ref(pair["z_eff"], REFERENCE_MODEL)
+                  residual = pair["observed_fsigma8"] - ref["f_sigma8_ref"]
+
+                  if implied_sigma != "" and implied_sigma > 0:
+                      diagonal_z = residual / implied_sigma
+                      chi2_piece = (residual * residual) / fsigma8_cov_diag
+                  else:
+                      diagonal_z = ""
+                      chi2_piece = ""
+
+                  if residual < 0:
+                      direction = "negative_observed_minus_reference"
+                  elif residual > 0:
+                      direction = "positive_observed_minus_reference"
+                  else:
+                      direction = "zero"
+
+                  residual_rows.append({
+                      "pair_id": pair["pair_id"],
+                      "tracer": pair["tracer"],
+                      "current_row_id": pair["current_row_id"],
+                      "z_eff": pair["z_eff"],
+                      "observed_fsigma8": pair["observed_fsigma8"],
+                      "reference_fsigma8": ref["f_sigma8_ref"],
+                      "D_z": ref["D_z"],
+                      "f_z": ref["f_z"],
+                      "sigma8_z": ref["sigma8_z"],
+                      "residual_observed_minus_reference": residual,
+                      "fsigma8_covariance_diagonal": fsigma8_cov_diag,
+                      "implied_sigma_from_covariance": implied_sigma,
+                      "published_sigma": pair["published_sigma"],
+                      "sigma_abs_delta_from_published": sigma_abs_delta,
+                      "diagonal_z_preview": diagonal_z,
+                      "chi2_piece_independent_preview": chi2_piece,
+                      "direction": direction,
+                      "preview_status": "eBOSS_LRG_QSO_partial_covariance_preview",
+                      "ELG_excluded_parser_needed": True,
+                      "reference_uncertainty_included": False,
+                      "complete_eBOSS_covariance_mapping_now": False,
+                      "full_RSD_covariance_complete": False,
+                      "final_pressure_score": False
+                  })
+
+                  for i in range(3):
+                      for j in range(3):
+                          obs_i = pair["observable_order"][i]
+                          obs_j = pair["observable_order"][j]
+                          cov_value = cov_matrix[i][j]
+                          diag_i = cov_matrix[i][i]
+                          diag_j = cov_matrix[j][j]
+
+                          if diag_i > 0 and diag_j > 0:
+                              corr_value = cov_value / math.sqrt(diag_i * diag_j)
+                          else:
+                              corr_value = ""
+
+                          covariance_metadata_rows.append({
+                              "pair_id": pair["pair_id"],
+                              "tracer": pair["tracer"],
+                              "obs_i": obs_i,
+                              "obs_j": obs_j,
+                              "i": i,
+                              "j": j,
+                              "covariance_value": cov_value,
+                              "is_fsigma8_cell": obs_i == "f_sigma8" or obs_j == "f_sigma8",
+                              "covariance_used_for_LRG_QSO_partial_preview": obs_i == "f_sigma8" and obs_j == "f_sigma8",
+                              "pressure_score_allowed_now": False
+                          })
+
+                          correlation_metadata_rows.append({
+                              "pair_id": pair["pair_id"],
+                              "tracer": pair["tracer"],
+                              "obs_i": obs_i,
+                              "obs_j": obs_j,
+                              "i": i,
+                              "j": j,
+                              "correlation_value": corr_value,
+                              "is_fsigma8_cell": obs_i == "f_sigma8" or obs_j == "f_sigma8",
+                              "pressure_score_allowed_now": False
+                          })
+
+                  if implied_sigma != "" and sigma_abs_delta != "" and sigma_abs_delta > 0.03:
+                      warnings.append(pair["tracer"] + "_implied_sigma_differs_from_published_summary_review_product_choice")
+
+          if len(residual_rows) == 2:
+              negative_count = sum(1 for row in residual_rows if row["direction"] == "negative_observed_minus_reference")
+              positive_count = sum(1 for row in residual_rows if row["direction"] == "positive_observed_minus_reference")
+              zero_count = sum(1 for row in residual_rows if row["direction"] == "zero")
+
+              diag_z_values = [row["diagonal_z_preview"] for row in residual_rows if row["diagonal_z_preview"] != ""]
+              chi2_pieces = [row["chi2_piece_independent_preview"] for row in residual_rows if row["chi2_piece_independent_preview"] != ""]
+
+              chi2_preview = sum(chi2_pieces) if len(chi2_pieces) == 2 else ""
+              sqrt_chi2 = math.sqrt(chi2_preview) if chi2_preview != "" and chi2_preview >= 0 else ""
+
+              partial_summary.update({
+                  "partial_row_count": len(residual_rows),
+                  "negative_residual_count": negative_count,
+                  "positive_residual_count": positive_count,
+                  "zero_residual_count": zero_count,
+                  "mean_residual_observed_minus_reference": sum(row["residual_observed_minus_reference"] for row in residual_rows) / len(residual_rows),
+                  "mean_diagonal_z_preview": sum(diag_z_values) / len(diag_z_values) if diag_z_values else "",
+                  "partial_independent_covariance_chi2_preview": chi2_preview,
+                  "partial_preview_dof": 2,
+                  "partial_independent_covariance_sqrt_chi2_preview": sqrt_chi2,
+                  "LRG_QSO_covariance_used_for_partial_preview": True,
+                  "ELG_excluded_parser_needed": True,
+                  "reference_uncertainty_included": False,
+                  "complete_eBOSS_covariance_mapping_now": False,
+                  "full_RSD_covariance_complete": False,
+                  "final_pressure_score_built": False
+              })
+
+          if len(residual_rows) != 2:
+              failed_gates.append("LRG_QSO_partial_preview_did_not_build_two_rows")
+
+          if any(row["tracer"] not in ["LRG", "QSO"] for row in residual_rows):
+              failed_gates.append("non_LRG_QSO_row_entered_partial_preview")
+
+          if ELG_STATUS["enters_partial_preview_now"] is not False:
+              failed_gates.append("ELG_entered_partial_preview_violation")
+
+          if ELG_STATUS["simple_covariance_ready"] is not False:
+              failed_gates.append("ELG_simple_covariance_ready_violation")
+
+          if ELG_STATUS["likelihood_run_now"] is not False:
+              failed_gates.append("ELG_likelihood_run_violation")
+
+          if ELG_STATUS["covariance_applied_now"] is not False:
+              failed_gates.append("ELG_covariance_application_violation")
+
+          if partial_summary["LRG_QSO_covariance_used_for_partial_preview"] is not True:
+              failed_gates.append("LRG_QSO_covariance_not_used_for_partial_preview")
+
+          if partial_summary["reference_uncertainty_included"] is not False:
+              failed_gates.append("reference_uncertainty_included_violation")
+
+          if partial_summary["complete_eBOSS_covariance_mapping_now"] is not False:
+              failed_gates.append("complete_eBOSS_covariance_violation")
+
+          if partial_summary["full_RSD_covariance_complete"] is not False:
+              failed_gates.append("full_RSD_covariance_complete_violation")
+
+          if partial_summary["final_pressure_score_built"] is not False:
+              failed_gates.append("final_pressure_score_built_violation")
+
+          for row in residual_rows:
+              if row["ELG_excluded_parser_needed"] is not True:
+                  failed_gates.append(row["pair_id"] + "_missing_ELG_exclusion_label")
+              if row["reference_uncertainty_included"] is not False:
+                  failed_gates.append(row["pair_id"] + "_reference_uncertainty_violation")
+              if row["complete_eBOSS_covariance_mapping_now"] is not False:
+                  failed_gates.append(row["pair_id"] + "_complete_eBOSS_violation")
+              if row["full_RSD_covariance_complete"] is not False:
+                  failed_gates.append(row["pair_id"] + "_full_RSD_violation")
+              if row["final_pressure_score"] is not False:
+                  failed_gates.append(row["pair_id"] + "_final_pressure_violation")
+
+          blocked_text = " | ".join(BLOCKED_CLAIMS).lower()
+          for phrase in [
+              "final rsd pressure score",
+              "full eboss lane",
+              "full rsd lane",
+              "elg covariance",
+              "wigglez covariance",
+              "reference-model uncertainty",
+              "likelihood was run",
+              "bic",
+              "proves growth suppression"
+          ]:
+              if phrase not in blocked_text:
+                  failed_gates.append("blocked_claim_missing_" + phrase.replace(" ", "_"))
+
+          warnings.append("eBOSS_LRG_QSO_partial_preview_does_not_complete_full_eBOSS_lane")
+          warnings.append("ELG_excluded_as_parser_needed_or_parked")
+          warnings.append("WiggleZ_covariance_still_unresolved")
+          warnings.append("reference_model_uncertainty_still_missing")
+          warnings.append("no_eBOSS_likelihood_run")
+          warnings.append("not_a_final_RSD_pressure_score")
+          warnings.append("not_validation")
+
+          rule_results = [
+              {
+                  "rule_id": "LRG_QSO_only_scope",
+                  "pass": len(residual_rows) == 2 and all(row["tracer"] in ["LRG", "QSO"] for row in residual_rows),
+                  "result": "only_LRG_QSO_rows_entered_partial_preview",
+                  "boundary": "ELG and WiggleZ do not enter this preview."
+              },
+              {
+                  "rule_id": "ELG_excluded_and_labeled",
+                  "pass": ELG_STATUS["enters_partial_preview_now"] is False and ELG_STATUS["simple_covariance_ready"] is False,
+                  "result": "ELG_excluded_as_parser_needed_or_parked",
+                  "boundary": "No full eBOSS covariance claim."
+              },
+              {
+                  "rule_id": "mapped_covtot_metadata_used",
+                  "pass": partial_summary["LRG_QSO_covariance_used_for_partial_preview"] is True and len(covariance_metadata_rows) == 18,
+                  "result": "LRG_QSO_mapped_covtot_metadata_used_for_partial_preview",
+                  "boundary": "Partial preview only."
+              },
+              {
+                  "rule_id": "reference_uncertainty_missing_labeled",
+                  "pass": partial_summary["reference_uncertainty_included"] is False,
+                  "result": "reference_uncertainty_absent_and_labeled",
+                  "boundary": "No final pressure claim."
+              },
+              {
+                  "rule_id": "full_eBOSS_and_full_RSD_claims_blocked",
+                  "pass": partial_summary["complete_eBOSS_covariance_mapping_now"] is False and partial_summary["full_RSD_covariance_complete"] is False,
+                  "result": "full_eBOSS_and_full_RSD_covariance_not_complete",
+                  "boundary": "LRG/QSO partial cannot become full lane."
+              },
+              {
+                  "rule_id": "no_likelihood_or_final_pressure",
+                  "pass": partial_summary["final_pressure_score_built"] is False,
+                  "result": "partial_preview_built_without_likelihood_or_final_pressure",
+                  "boundary": "Preview only, not validation."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_eBOSS_partial_preview_rules_passed")
+
+          if failed_gates:
+              readiness_label = "eBOSS_LRG_QSO_partial_covariance_preview_failed"
+              next_step = "Repair eBOSS LRG/QSO partial preview before moving to reference uncertainty or WiggleZ."
+          else:
+              readiness_label = "eBOSS_LRG_QSO_partial_covariance_preview_passed_ready_for_RSD_reference_uncertainty_boundary_audit"
+              next_step = (
+                  "Proceed to v4.45 RSD reference uncertainty boundary audit. "
+                  "Do not claim full eBOSS or full RSD covariance awareness."
+              )
+
+          system_health = {
+              "partial_scope": partial_summary["partial_scope"],
+              "partial_row_count": partial_summary["partial_row_count"],
+              "negative_residual_count": partial_summary["negative_residual_count"],
+              "positive_residual_count": partial_summary["positive_residual_count"],
+              "zero_residual_count": partial_summary["zero_residual_count"],
+              "mean_residual_observed_minus_reference": partial_summary["mean_residual_observed_minus_reference"],
+              "mean_diagonal_z_preview": partial_summary["mean_diagonal_z_preview"],
+              "partial_independent_covariance_chi2_preview": partial_summary["partial_independent_covariance_chi2_preview"],
+              "partial_preview_dof": partial_summary["partial_preview_dof"],
+              "partial_independent_covariance_sqrt_chi2_preview": partial_summary["partial_independent_covariance_sqrt_chi2_preview"],
+              "LRG_QSO_covariance_used_for_partial_preview": partial_summary["LRG_QSO_covariance_used_for_partial_preview"],
+              "ELG_excluded_parser_needed": partial_summary["ELG_excluded_parser_needed"],
+              "ELG_simple_covariance_ready_now": ELG_STATUS["simple_covariance_ready"],
+              "reference_uncertainty_included": False,
+              "complete_eBOSS_covariance_mapping_now": False,
+              "full_RSD_covariance_complete": False,
+              "final_pressure_score_built": False,
+              "likelihood_run": False,
+              "validation_claim_allowed": False,
+              "WiggleZ_covariance_resolved": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results)
+          }
+
+          interpretation = (
+              "v4.44 computes a bounded eBOSS LRG/QSO partial covariance residual preview using mapped DMDHfs8 covtot metadata. "
+              "ELG is explicitly excluded as parser-needed or parked. "
+              "This is not a full eBOSS result and not a full RSD result. "
+              "Reference-model uncertainty is still missing, no likelihood is run, and no final pressure score is computed."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "product_pairs": PRODUCT_PAIRS,
+              "elg_status": ELG_STATUS,
+              "reference_model": REFERENCE_MODEL,
+              "fetch_rows": fetch_rows,
+              "residual_rows": residual_rows,
+              "covariance_metadata_rows": covariance_metadata_rows,
+              "correlation_metadata_rows": correlation_metadata_rows,
+              "partial_summary": partial_summary,
+              "preview_rules": PREVIEW_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "eBOSS_LRG_QSO_partial_preview_built": len(failed_gates) == 0,
+                  "complete_eBOSS_covariance_mapping_now": False,
+                  "full_RSD_covariance_complete": False,
+                  "reference_uncertainty_included": False,
+                  "likelihood_run": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "eboss_lrg_qso_partial_residual_rows_v4_44.csv",
+              residual_rows,
+              [
+                  "pair_id",
+                  "tracer",
+                  "current_row_id",
+                  "z_eff",
+                  "observed_fsigma8",
+                  "reference_fsigma8",
+                  "D_z",
+                  "f_z",
+                  "sigma8_z",
+                  "residual_observed_minus_reference",
+                  "fsigma8_covariance_diagonal",
+                  "implied_sigma_from_covariance",
+                  "published_sigma",
+                  "sigma_abs_delta_from_published",
+                  "diagonal_z_preview",
+                  "chi2_piece_independent_preview",
+                  "direction",
+                  "preview_status",
+                  "ELG_excluded_parser_needed",
+                  "reference_uncertainty_included",
+                  "complete_eBOSS_covariance_mapping_now",
+                  "full_RSD_covariance_complete",
+                  "final_pressure_score"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_lrg_qso_partial_covariance_metadata_v4_44.csv",
+              covariance_metadata_rows,
+              [
+                  "pair_id",
+                  "tracer",
+                  "obs_i",
+                  "obs_j",
+                  "i",
+                  "j",
+                  "covariance_value",
+                  "is_fsigma8_cell",
+                  "covariance_used_for_LRG_QSO_partial_preview",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_lrg_qso_partial_correlation_metadata_v4_44.csv",
+              correlation_metadata_rows,
+              [
+                  "pair_id",
+                  "tracer",
+                  "obs_i",
+                  "obs_j",
+                  "i",
+                  "j",
+                  "correlation_value",
+                  "is_fsigma8_cell",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_elg_excluded_status_v4_44.csv",
+              [ELG_STATUS],
+              [
+                  "row_id",
+                  "tracer",
+                  "z_eff",
+                  "observed_fsigma8",
+                  "published_sigma",
+                  "v4_43_status",
+                  "enters_partial_preview_now",
+                  "simple_covariance_ready",
+                  "likelihood_run_now",
+                  "covariance_applied_now",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_partial_preview_summary_v4_44.csv",
+              [partial_summary],
+              [
+                  "partial_scope",
+                  "partial_row_count",
+                  "negative_residual_count",
+                  "positive_residual_count",
+                  "zero_residual_count",
+                  "mean_residual_observed_minus_reference",
+                  "mean_diagonal_z_preview",
+                  "partial_independent_covariance_chi2_preview",
+                  "partial_preview_dof",
+                  "partial_independent_covariance_sqrt_chi2_preview",
+                  "LRG_QSO_covariance_used_for_partial_preview",
+                  "ELG_excluded_parser_needed",
+                  "reference_uncertainty_included",
+                  "complete_eBOSS_covariance_mapping_now",
+                  "full_RSD_covariance_complete",
+                  "final_pressure_score_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_partial_preview_rule_results_v4_44.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_44.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_44.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_44.csv",
+              [system_health],
+              [
+                  "partial_scope",
+                  "partial_row_count",
+                  "negative_residual_count",
+                  "positive_residual_count",
+                  "zero_residual_count",
+                  "mean_residual_observed_minus_reference",
+                  "mean_diagonal_z_preview",
+                  "partial_independent_covariance_chi2_preview",
+                  "partial_preview_dof",
+                  "partial_independent_covariance_sqrt_chi2_preview",
+                  "LRG_QSO_covariance_used_for_partial_preview",
+                  "ELG_excluded_parser_needed",
+                  "ELG_simple_covariance_ready_now",
+                  "reference_uncertainty_included",
+                  "complete_eBOSS_covariance_mapping_now",
+                  "full_RSD_covariance_complete",
+                  "final_pressure_score_built",
+                  "likelihood_run",
+                  "validation_claim_allowed",
+                  "WiggleZ_covariance_resolved",
+                  "rule_pass_count",
+                  "rule_total_count"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_44_eboss_lrg_qso_partial_preview.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.44 — eBOSS LRG/QSO Partial Covariance Preview Guard")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("A bounded eBOSS LRG/QSO partial covariance preview was computed.")
+          md.append("")
+          md.append("ELG was excluded as parser-needed. WiggleZ covariance remains unresolved. Reference uncertainty is still missing. This is not a final RSD pressure score.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Partial residual rows")
+          md.append("")
+          md.append("| Tracer | z | Observed | Reference | Residual | Diagonal z | Direction |")
+          md.append("|---|---:|---:|---:|---:|---:|---|")
+          for row in residual_rows:
+              md.append(
+                  f"| `{row['tracer']}` | `{row['z_eff']}` | `{row['observed_fsigma8']:.6f}` | "
+                  f"`{row['reference_fsigma8']:.6f}` | `{row['residual_observed_minus_reference']:.6f}` | "
+                  f"`{row['diagonal_z_preview']:.6f}` | `{row['direction']}` |"
+              )
+          md.append("")
+          md.append("## ELG status")
+          md.append("")
+          md.append(f"`{ELG_STATUS['v4_43_status']}`")
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `eboss_lrg_qso_partial_residual_rows_v4_44.csv`")
+          md.append("- `eboss_lrg_qso_partial_covariance_metadata_v4_44.csv`")
+          md.append("- `eboss_lrg_qso_partial_correlation_metadata_v4_44.csv`")
+          md.append("- `eboss_elg_excluded_status_v4_44.csv`")
+          md.append("- `eboss_partial_preview_summary_v4_44.csv`")
+          md.append("- `eboss_partial_preview_rule_results_v4_44.csv`")
+          md.append("- `blocked_claims_v4_44.csv`")
+          md.append("- `next_test_ladder_v4_44.csv`")
+          md.append("- `system_health_v4_44.csv`")
+          md.append("- `tairid_v4_44_eboss_lrg_qso_partial_preview.json`")
+          md.append("- `tairid_v4_44_eboss_lrg_qso_partial_preview.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_44_eboss_lrg_qso_partial_preview.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.44 eBOSS LRG QSO partial preview artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-44-eboss-lrg-qso-partial-preview
+          path: artifacts/tairid_v4_44_eboss_lrg_qso_partial_preview/
