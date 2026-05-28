@@ -1,0 +1,815 @@
+name: TAIRID v4.43 ELG Grid Parser or Park
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-43-elg-grid-parser-or-park.yml"
+
+jobs:
+  tairid-v4-43-elg-grid-parser-or-park:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.43 ELG grid parser or formal park
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_43_elg_grid_parser_or_park
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import urllib.request
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_43_elg_grid_parser_or_park")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_43_elg_grid_parser_or_park"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run the ELG grid likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not import or apply ELG covariance to residuals.",
+              "This inspects the ELG grid-likelihood product enough to decide parser-needed versus formal park.",
+              "ELG is not simple covariance-ready in this test.",
+              "A pass means ELG is explicitly handled as parser-needed or parked, not that eBOSS covariance-aware testing is complete."
+          ]
+
+          ELG_GRID = {
+              "row_id": "eboss_dr16_elg_z085_fsigma8",
+              "tracer": "ELG",
+              "z_eff": 0.85,
+              "observable_axis": "f_sigma8",
+              "published_value": 0.315,
+              "published_sigma": 0.095,
+              "grid_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_ELG_FSBAO_DMDHfs8gridlikelihood.txt",
+              "prior_status": "grid_likelihood_visible_parser_needed_not_simple_covariance_ready",
+              "selected_from": "v4.42 eBOSS LRG/QSO covariance extraction"
+          }
+
+          LRG_QSO_CARRIED_STATUS = [
+              {
+                  "tracer": "LRG",
+                  "row_id": "eboss_dr16_lrg_z070_fsigma8",
+                  "v4_42_status": "fsigma8_covariance_metadata_extracted",
+                  "may_enter_partial_preview_later": True
+              },
+              {
+                  "tracer": "QSO",
+                  "row_id": "eboss_dr16_qso_z148_fsigma8",
+                  "v4_42_status": "fsigma8_covariance_metadata_extracted",
+                  "may_enter_partial_preview_later": True
+              }
+          ]
+
+          PARSER_REQUIREMENTS = [
+              {
+                  "requirement_id": "grid_column_meanings_required",
+                  "required_before_ELG_covariance_use": True,
+                  "description": "The ELG grid file must have confirmed column meanings, likely including DM, DH, f_sigma8, and likelihood or chi-square surface values.",
+                  "failure_mode": "Treating a grid file as if it were a simple covariance matrix."
+              },
+              {
+                  "requirement_id": "grid_likelihood_normalization_policy_required",
+                  "required_before_ELG_covariance_use": True,
+                  "description": "A parser must define whether the grid values are likelihood, log-likelihood, chi-square, delta-chi-square, or another surface.",
+                  "failure_mode": "Misreading grid values as direct Gaussian covariance."
+              },
+              {
+                  "requirement_id": "marginalization_or_peak_policy_required",
+                  "required_before_ELG_covariance_use": True,
+                  "description": "A parser must define how f_sigma8 is extracted or marginalized from the multi-dimensional grid.",
+                  "failure_mode": "Using one grid point as the ELG f_sigma8 constraint."
+              },
+              {
+                  "requirement_id": "covariance_derivation_policy_required",
+                  "required_before_ELG_covariance_use": True,
+                  "description": "If covariance is derived from the grid, the method must be explicit and separate from simple covtot extraction.",
+                  "failure_mode": "Calling the grid covariance-ready without a derivation."
+              },
+              {
+                  "requirement_id": "ELG_partial_or_park_status_required",
+                  "required_before_LRG_QSO_partial_preview": True,
+                  "description": "ELG must be explicitly handled before LRG/QSO partial eBOSS preview proceeds.",
+                  "failure_mode": "Ignoring ELG without recording the boundary."
+              },
+              {
+                  "requirement_id": "no_likelihood_or_pressure_now",
+                  "required_before_ELG_covariance_use": True,
+                  "description": "v4.43 must not run the ELG likelihood or compute pressure.",
+                  "failure_mode": "Parser decision becomes model testing."
+              }
+          ]
+
+          DECISION_RULES = [
+              {
+                  "rule_id": "ELG_grid_url_declared",
+                  "description": "The ELG grid-likelihood URL must be declared.",
+                  "failure_mode": "No ELG parser/park decision can be made."
+              },
+              {
+                  "rule_id": "ELG_fetch_attempt_recorded",
+                  "description": "The ELG grid fetch attempt must be recorded, whether it succeeds or fails.",
+                  "failure_mode": "Source visibility is hidden."
+              },
+              {
+                  "rule_id": "grid_profile_or_unresolved_status_recorded",
+                  "description": "If grid content is visible, profile it; if not, record unresolved/parked status.",
+                  "failure_mode": "No parser/park state is produced."
+              },
+              {
+                  "rule_id": "ELG_not_simple_covariance_ready",
+                  "description": "ELG must not be marked simple covariance-ready.",
+                  "failure_mode": "Grid likelihood is treated like result-plus-covtot."
+              },
+              {
+                  "rule_id": "ELG_explicitly_handled_before_partial_preview",
+                  "description": "ELG must be explicitly parser-needed or parked before LRG/QSO partial preview.",
+                  "failure_mode": "LRG/QSO preview proceeds while ELG status is ambiguous."
+              },
+              {
+                  "rule_id": "no_likelihood_covariance_or_pressure_now",
+                  "description": "This test must not run likelihood, apply covariance, or compute pressure.",
+                  "failure_mode": "Parser/park decision becomes model testing."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "The ELG grid likelihood was run.",
+              "ELG covariance was applied to residuals.",
+              "ELG is simple covariance-ready.",
+              "ELG grid likelihood is equivalent to a covtot matrix without a parser.",
+              "LRG/QSO plus ELG now completes the full eBOSS covariance lane.",
+              "The full RSD lane is covariance-aware.",
+              "WiggleZ covariance is resolved.",
+              "Reference-model uncertainty is included.",
+              "A likelihood, BIC, refit, or model comparison was run."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_44_eBOSS_LRG_QSO_covariance_residual_preview_guard",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Use LRG/QSO extracted covariance in a bounded eBOSS partial preview with ELG explicitly parked/parser-needed.",
+                  "must_include": "LRG/QSO-only status, ELG parked/parser-needed status, no full eBOSS claim, no final RSD score.",
+                  "must_not_include": "full eBOSS covariance claim, final RSD pressure score, validation claim."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_45_ELG_grid_parser_design_optional",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Optional later design for a true ELG grid-likelihood parser.",
+                  "must_include": "column meanings, likelihood interpretation, marginalization policy, no pressure score.",
+                  "must_not_include": "ELG covariance-ready claim without parser."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_46_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before stronger RSD comparison.",
+                  "must_include": "reference parameter uncertainty, Planck-chain boundary, growth curve uncertainty.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              },
+              {
+                  "priority": 4,
+                  "next_test": "v4_47_WiggleZ_covariance_locator_retry",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Try to locate a WiggleZ covariance/product path or formally keep WiggleZ non-final.",
+                  "must_include": "source path, product status, row mapping, unresolved boundary if not found.",
+                  "must_not_include": "treating WiggleZ as covariance-ready without product."
+              }
+          ]
+
+          def fetch_text(url, timeout=90, byte_limit=25_000_000):
+              if not url:
+                  return {
+                      "fetch_ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": "missing_url"
+                  }
+
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 TAIRID-v4.43-ELG-grid-parser-or-park",
+                          "Accept": "text/plain,text/html,application/xml,*/*"
+                      }
+                  )
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(byte_limit)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "fetch_ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "fetch_ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def numeric_tokens(line):
+              vals = []
+              for token in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", line or ""):
+                  try:
+                      vals.append(float(token))
+                  except Exception:
+                      pass
+              return vals
+
+          def has_fsigma8_signal(text, url):
+              sample = ((text or "")[:20000] + " " + (url or "")).lower()
+              return any(token in sample for token in ["fs8", "fsig", "fsigma8", "f_sigma8", "fσ8", "dmdhfs8"])
+
+          def has_dm_dh_signal(text, url):
+              sample = ((text or "")[:20000] + " " + (url or "")).lower()
+              return any(token in sample for token in ["dmdh", "dm_dh", "dm", "dh"])
+
+          def profile_grid(text):
+              comment_lines = 0
+              blank_lines = 0
+              numeric_lines = []
+              headerish_lines = []
+
+              for line_number, raw in enumerate((text or "").splitlines(), start=1):
+                  stripped = raw.strip()
+
+                  if not stripped:
+                      blank_lines += 1
+                      continue
+
+                  if stripped.startswith("#") or stripped.startswith("//"):
+                      comment_lines += 1
+                      if len(headerish_lines) < 40:
+                          headerish_lines.append({
+                              "line_number": line_number,
+                              "line_preview": stripped[:300]
+                          })
+                      continue
+
+                  vals = numeric_tokens(stripped)
+
+                  if len(vals) >= 2:
+                      numeric_lines.append({
+                          "line_number": line_number,
+                          "numeric_count": len(vals),
+                          "first_values_preview": ";".join(str(v) for v in vals[:8]),
+                          "contains_expected_value_0315": any(abs(v - 0.315) <= 0.01 for v in vals),
+                          "contains_expected_z_085": any(abs(v - 0.85) <= 0.03 for v in vals)
+                      })
+                  else:
+                      if len(headerish_lines) < 40:
+                          headerish_lines.append({
+                              "line_number": line_number,
+                              "line_preview": stripped[:300]
+                          })
+
+              column_counts = Counter(row["numeric_count"] for row in numeric_lines)
+              distribution = ";".join(f"{k}:{v}" for k, v in sorted(column_counts.items()))
+
+              return {
+                  "line_count": len((text or "").splitlines()),
+                  "blank_line_count": blank_lines,
+                  "comment_line_count": comment_lines,
+                  "numeric_data_line_count": len(numeric_lines),
+                  "column_count_distribution": distribution,
+                  "dominant_numeric_column_count": column_counts.most_common(1)[0][0] if column_counts else "",
+                  "numeric_lines": numeric_lines,
+                  "headerish_lines": headerish_lines
+              }
+
+          failed_gates = []
+          warnings = []
+
+          fetch = fetch_text(ELG_GRID["grid_url"])
+          profile = profile_grid(fetch["text"]) if fetch["fetch_ok"] else {
+              "line_count": 0,
+              "blank_line_count": 0,
+              "comment_line_count": 0,
+              "numeric_data_line_count": 0,
+              "column_count_distribution": "",
+              "dominant_numeric_column_count": "",
+              "numeric_lines": [],
+              "headerish_lines": []
+          }
+
+          fsigma8_signal = has_fsigma8_signal(fetch["text"], ELG_GRID["grid_url"]) if fetch["fetch_ok"] else False
+          dm_dh_signal = has_dm_dh_signal(fetch["text"], ELG_GRID["grid_url"]) if fetch["fetch_ok"] else False
+
+          expected_value_visible = any(row["contains_expected_value_0315"] for row in profile["numeric_lines"])
+          expected_z_visible = any(row["contains_expected_z_085"] for row in profile["numeric_lines"])
+
+          grid_visible = fetch["fetch_ok"] is True and profile["numeric_data_line_count"] > 0
+          parser_feasible_candidate = grid_visible and fsigma8_signal is True and profile["dominant_numeric_column_count"] not in ["", 0]
+
+          if parser_feasible_candidate:
+              elg_decision = "ELG_grid_visible_parser_required_formally_parked_from_simple_covariance_preview"
+              parser_status = "parser_feasible_but_not_built"
+              next_action = "optional_ELG_grid_parser_design_later"
+          elif fetch["fetch_ok"]:
+              elg_decision = "ELG_grid_visible_but_structure_unclear_formally_parked_pending_parser_design"
+              parser_status = "parser_needed_structure_unclear"
+              next_action = "manual_grid_format_review_or_parser_design"
+          else:
+              elg_decision = "ELG_grid_unavailable_formally_parked_pending_path_repair"
+              parser_status = "fetch_unavailable_or_blocked"
+              next_action = "repair_ELG_grid_path_or_keep_parked"
+
+          elg_decision_row = {
+              "row_id": ELG_GRID["row_id"],
+              "tracer": ELG_GRID["tracer"],
+              "z_eff": ELG_GRID["z_eff"],
+              "published_value": ELG_GRID["published_value"],
+              "published_sigma": ELG_GRID["published_sigma"],
+              "grid_url": ELG_GRID["grid_url"],
+              "fetch_ok": fetch["fetch_ok"],
+              "numeric_data_line_count": profile["numeric_data_line_count"],
+              "dominant_numeric_column_count": profile["dominant_numeric_column_count"],
+              "column_count_distribution": profile["column_count_distribution"],
+              "fsigma8_signal_detected": fsigma8_signal,
+              "dm_dh_signal_detected": dm_dh_signal,
+              "expected_value_visible_in_grid": expected_value_visible,
+              "expected_z_visible_in_grid": expected_z_visible,
+              "parser_status": parser_status,
+              "elg_decision": elg_decision,
+              "next_action": next_action,
+              "ELG_simple_covariance_ready_now": False,
+              "ELG_enters_LRG_QSO_partial_preview_now": False,
+              "ELG_likelihood_run_now": False,
+              "ELG_covariance_applied_now": False,
+              "ELG_pressure_score_allowed_now": False,
+              "ELG_formally_handled_for_next_partial_preview": True
+          }
+
+          fetch_row = {
+              "row_id": ELG_GRID["row_id"],
+              "tracer": ELG_GRID["tracer"],
+              "url_role": "ELG_grid_likelihood",
+              "url": ELG_GRID["grid_url"],
+              "fetch_ok": fetch["fetch_ok"],
+              "http_status": fetch["http_status"],
+              "content_type": fetch["content_type"],
+              "bytes_read": fetch["bytes_read"],
+              "error": fetch["error"]
+          }
+
+          grid_profile_row = {
+              "row_id": ELG_GRID["row_id"],
+              "line_count": profile["line_count"],
+              "blank_line_count": profile["blank_line_count"],
+              "comment_line_count": profile["comment_line_count"],
+              "numeric_data_line_count": profile["numeric_data_line_count"],
+              "dominant_numeric_column_count": profile["dominant_numeric_column_count"],
+              "column_count_distribution": profile["column_count_distribution"],
+              "fsigma8_signal_detected": fsigma8_signal,
+              "dm_dh_signal_detected": dm_dh_signal,
+              "expected_value_visible_in_grid": expected_value_visible,
+              "expected_z_visible_in_grid": expected_z_visible,
+              "parser_feasible_candidate": parser_feasible_candidate
+          }
+
+          sample_numeric_rows = profile["numeric_lines"][:60]
+          sample_header_rows = profile["headerish_lines"][:40]
+
+          if not ELG_GRID["grid_url"]:
+              failed_gates.append("ELG_grid_url_missing")
+
+          if fetch_row["url"] != ELG_GRID["grid_url"]:
+              failed_gates.append("ELG_fetch_attempt_not_recorded_correctly")
+
+          if elg_decision_row["ELG_simple_covariance_ready_now"] is not False:
+              failed_gates.append("ELG_marked_simple_covariance_ready_violation")
+
+          if elg_decision_row["ELG_likelihood_run_now"] is not False:
+              failed_gates.append("ELG_likelihood_run_violation")
+
+          if elg_decision_row["ELG_covariance_applied_now"] is not False:
+              failed_gates.append("ELG_covariance_application_violation")
+
+          if elg_decision_row["ELG_pressure_score_allowed_now"] is not False:
+              failed_gates.append("ELG_pressure_allowed_violation")
+
+          if elg_decision_row["ELG_formally_handled_for_next_partial_preview"] is not True:
+              failed_gates.append("ELG_not_formally_handled")
+
+          for row in LRG_QSO_CARRIED_STATUS:
+              if row["v4_42_status"] != "fsigma8_covariance_metadata_extracted":
+                  failed_gates.append(row["tracer"] + "_v4_42_status_not_carried_forward")
+
+          if fetch["fetch_ok"] is not True:
+              warnings.append("ELG_grid_fetch_failed_or_blocked_formal_park_used")
+          if grid_visible is not True:
+              warnings.append("ELG_grid_not_numerically_profiled_formal_park_used")
+          if parser_feasible_candidate is True:
+              warnings.append("ELG_grid_parser_feasible_but_not_built_in_v4_43")
+          if expected_value_visible is not True:
+              warnings.append("ELG_expected_value_not_confirmed_in_grid_profile")
+          if expected_z_visible is not True:
+              warnings.append("ELG_expected_z_not_confirmed_in_grid_profile")
+
+          warnings.append("ELG_grid_decision_does_not_run_likelihood")
+          warnings.append("ELG_grid_decision_does_not_apply_covariance")
+          warnings.append("ELG_grid_decision_does_not_compute_pressure")
+          warnings.append("ELG_remains_out_of_LRG_QSO_partial_preview")
+          warnings.append("full_eBOSS_covariance_not_complete")
+          warnings.append("full_RSD_covariance_not_complete")
+          warnings.append("reference_model_uncertainty_still_missing")
+          warnings.append("WiggleZ_covariance_still_unresolved")
+
+          blocked_text = " | ".join(BLOCKED_CLAIMS).lower()
+          for phrase in [
+              "final rsd pressure score",
+              "elg grid likelihood was run",
+              "covariance was applied",
+              "simple covariance-ready",
+              "full eboss covariance",
+              "full rsd lane",
+              "wigglez",
+              "reference-model uncertainty",
+              "bic"
+          ]:
+              if phrase not in blocked_text:
+                  failed_gates.append("blocked_claim_missing_" + phrase.replace(" ", "_"))
+
+          rule_results = [
+              {
+                  "rule_id": "ELG_grid_url_declared",
+                  "pass": bool(ELG_GRID["grid_url"]),
+                  "result": "ELG_grid_url_declared",
+                  "boundary": "URL declaration is not likelihood use."
+              },
+              {
+                  "rule_id": "ELG_fetch_attempt_recorded",
+                  "pass": fetch_row["url"] == ELG_GRID["grid_url"],
+                  "result": "ELG_fetch_attempt_recorded",
+                  "boundary": "Fetch result may be visible or unresolved."
+              },
+              {
+                  "rule_id": "grid_profile_or_unresolved_status_recorded",
+                  "pass": bool(elg_decision),
+                  "result": elg_decision,
+                  "boundary": "Profile/park decision is not covariance extraction."
+              },
+              {
+                  "rule_id": "ELG_not_simple_covariance_ready",
+                  "pass": elg_decision_row["ELG_simple_covariance_ready_now"] is False,
+                  "result": "ELG_not_simple_covariance_ready",
+                  "boundary": "Grid likelihood requires parser or park."
+              },
+              {
+                  "rule_id": "ELG_explicitly_handled_before_partial_preview",
+                  "pass": elg_decision_row["ELG_formally_handled_for_next_partial_preview"] is True,
+                  "result": "ELG_formally_handled_as_parser_needed_or_parked",
+                  "boundary": "LRG/QSO partial preview may proceed only as partial."
+              },
+              {
+                  "rule_id": "no_likelihood_covariance_or_pressure_now",
+                  "pass": (
+                      elg_decision_row["ELG_likelihood_run_now"] is False
+                      and elg_decision_row["ELG_covariance_applied_now"] is False
+                      and elg_decision_row["ELG_pressure_score_allowed_now"] is False
+                  ),
+                  "result": "no_ELG_likelihood_no_covariance_no_pressure",
+                  "boundary": "Decision only."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_ELG_parser_or_park_rules_passed")
+
+          if failed_gates:
+              readiness_label = "ELG_grid_likelihood_parser_or_park_failed"
+              next_step = "Repair ELG parser/park guardrails before partial eBOSS preview."
+          else:
+              readiness_label = "ELG_grid_likelihood_parser_or_park_passed_ready_for_eBOSS_LRG_QSO_partial_covariance_preview_guard"
+              next_step = (
+                  "Proceed to v4.44 eBOSS LRG/QSO covariance residual preview guard. "
+                  "ELG must remain explicitly parked/parser-needed and excluded from the partial preview."
+              )
+
+          system_health = {
+              "ELG_grid_fetch_ok": fetch["fetch_ok"],
+              "ELG_grid_bytes_read": fetch["bytes_read"],
+              "ELG_numeric_data_line_count": profile["numeric_data_line_count"],
+              "ELG_dominant_numeric_column_count": profile["dominant_numeric_column_count"],
+              "ELG_fsigma8_signal_detected": fsigma8_signal,
+              "ELG_expected_value_visible_in_grid": expected_value_visible,
+              "ELG_expected_z_visible_in_grid": expected_z_visible,
+              "ELG_parser_feasible_candidate": parser_feasible_candidate,
+              "ELG_simple_covariance_ready_now": False,
+              "ELG_likelihood_run": False,
+              "ELG_covariance_applied": False,
+              "ELG_pressure_score_allowed_now": False,
+              "ELG_formally_handled_for_next_partial_preview": True,
+              "LRG_QSO_covariance_metadata_carried": all(row["v4_42_status"] == "fsigma8_covariance_metadata_extracted" for row in LRG_QSO_CARRIED_STATUS),
+              "complete_eBOSS_covariance_mapping_now": False,
+              "full_RSD_covariance_complete": False,
+              "reference_model_uncertainty_included": False,
+              "WiggleZ_covariance_resolved": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results),
+              "ELG_decision": elg_decision
+          }
+
+          interpretation = (
+              "v4.43 inspects the ELG grid-likelihood lane and makes a bounded parser-or-park decision. "
+              "ELG is explicitly not simple covariance-ready. "
+              "If the grid is visible, it is treated as parser-feasible but not built here; if not visible, it is formally parked pending repair. "
+              "Either way, ELG is explicitly handled so the next test may run a partial LRG/QSO-only eBOSS covariance preview without claiming full eBOSS or full RSD covariance completion."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "elg_grid": ELG_GRID,
+              "lrg_qso_carried_status": LRG_QSO_CARRIED_STATUS,
+              "fetch_row": fetch_row,
+              "grid_profile_row": grid_profile_row,
+              "sample_numeric_rows": sample_numeric_rows,
+              "sample_header_rows": sample_header_rows,
+              "parser_requirements": PARSER_REQUIREMENTS,
+              "elg_decision_row": elg_decision_row,
+              "decision_rules": DECISION_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "ELG_likelihood_run": False,
+                  "ELG_covariance_applied": False,
+                  "ELG_simple_covariance_ready_now": False,
+                  "ELG_formally_handled_for_next_partial_preview": True,
+                  "complete_eBOSS_covariance_mapping_now": False,
+                  "full_RSD_covariance_complete": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "elg_grid_fetch_v4_43.csv",
+              [fetch_row],
+              ["row_id", "tracer", "url_role", "url", "fetch_ok", "http_status", "content_type", "bytes_read", "error"]
+          )
+
+          write_csv(
+              OUTDIR / "elg_grid_profile_v4_43.csv",
+              [grid_profile_row],
+              [
+                  "row_id",
+                  "line_count",
+                  "blank_line_count",
+                  "comment_line_count",
+                  "numeric_data_line_count",
+                  "dominant_numeric_column_count",
+                  "column_count_distribution",
+                  "fsigma8_signal_detected",
+                  "dm_dh_signal_detected",
+                  "expected_value_visible_in_grid",
+                  "expected_z_visible_in_grid",
+                  "parser_feasible_candidate"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "elg_grid_sample_numeric_rows_v4_43.csv",
+              sample_numeric_rows,
+              [
+                  "line_number",
+                  "numeric_count",
+                  "first_values_preview",
+                  "contains_expected_value_0315",
+                  "contains_expected_z_085"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "elg_grid_sample_header_rows_v4_43.csv",
+              sample_header_rows,
+              ["line_number", "line_preview"]
+          )
+
+          write_csv(
+              OUTDIR / "elg_parser_requirements_v4_43.csv",
+              PARSER_REQUIREMENTS,
+              ["requirement_id", "required_before_ELG_covariance_use", "description", "failure_mode"]
+          )
+
+          write_csv(
+              OUTDIR / "elg_decision_v4_43.csv",
+              [elg_decision_row],
+              [
+                  "row_id",
+                  "tracer",
+                  "z_eff",
+                  "published_value",
+                  "published_sigma",
+                  "grid_url",
+                  "fetch_ok",
+                  "numeric_data_line_count",
+                  "dominant_numeric_column_count",
+                  "column_count_distribution",
+                  "fsigma8_signal_detected",
+                  "dm_dh_signal_detected",
+                  "expected_value_visible_in_grid",
+                  "expected_z_visible_in_grid",
+                  "parser_status",
+                  "elg_decision",
+                  "next_action",
+                  "ELG_simple_covariance_ready_now",
+                  "ELG_enters_LRG_QSO_partial_preview_now",
+                  "ELG_likelihood_run_now",
+                  "ELG_covariance_applied_now",
+                  "ELG_pressure_score_allowed_now",
+                  "ELG_formally_handled_for_next_partial_preview"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "lrg_qso_carried_status_v4_43.csv",
+              LRG_QSO_CARRIED_STATUS,
+              ["tracer", "row_id", "v4_42_status", "may_enter_partial_preview_later"]
+          )
+
+          write_csv(
+              OUTDIR / "elg_parser_or_park_rule_results_v4_43.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_43.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_43.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_43.csv",
+              [system_health],
+              [
+                  "ELG_grid_fetch_ok",
+                  "ELG_grid_bytes_read",
+                  "ELG_numeric_data_line_count",
+                  "ELG_dominant_numeric_column_count",
+                  "ELG_fsigma8_signal_detected",
+                  "ELG_expected_value_visible_in_grid",
+                  "ELG_expected_z_visible_in_grid",
+                  "ELG_parser_feasible_candidate",
+                  "ELG_simple_covariance_ready_now",
+                  "ELG_likelihood_run",
+                  "ELG_covariance_applied",
+                  "ELG_pressure_score_allowed_now",
+                  "ELG_formally_handled_for_next_partial_preview",
+                  "LRG_QSO_covariance_metadata_carried",
+                  "complete_eBOSS_covariance_mapping_now",
+                  "full_RSD_covariance_complete",
+                  "reference_model_uncertainty_included",
+                  "WiggleZ_covariance_resolved",
+                  "validation_claim_allowed",
+                  "rule_pass_count",
+                  "rule_total_count",
+                  "ELG_decision"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_43_elg_grid_parser_or_park.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.43 — ELG Grid Likelihood Parser or Formal Park")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("The ELG grid-likelihood lane was inspected and explicitly handled as parser-needed or parked.")
+          md.append("")
+          md.append("ELG is not simple covariance-ready. No ELG likelihood was run. No ELG covariance was applied. No pressure score was computed.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## ELG decision")
+          md.append("")
+          md.append(f"`{elg_decision}`")
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `elg_grid_fetch_v4_43.csv`")
+          md.append("- `elg_grid_profile_v4_43.csv`")
+          md.append("- `elg_grid_sample_numeric_rows_v4_43.csv`")
+          md.append("- `elg_grid_sample_header_rows_v4_43.csv`")
+          md.append("- `elg_parser_requirements_v4_43.csv`")
+          md.append("- `elg_decision_v4_43.csv`")
+          md.append("- `lrg_qso_carried_status_v4_43.csv`")
+          md.append("- `elg_parser_or_park_rule_results_v4_43.csv`")
+          md.append("- `blocked_claims_v4_43.csv`")
+          md.append("- `next_test_ladder_v4_43.csv`")
+          md.append("- `system_health_v4_43.csv`")
+          md.append("- `tairid_v4_43_elg_grid_parser_or_park.json`")
+          md.append("- `tairid_v4_43_elg_grid_parser_or_park.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_43_elg_grid_parser_or_park.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.43 ELG grid parser or park artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-43-elg-grid-parser-or-park
+          path: artifacts/tairid_v4_43_elg_grid_parser_or_park/
