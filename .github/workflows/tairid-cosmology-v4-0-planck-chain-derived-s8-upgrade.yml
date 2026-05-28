@@ -1,0 +1,600 @@
+name: TAIRID Cosmology v4.0 Planck Chain Derived S8 Upgrade
+
+on:
+  workflow_dispatch:
+
+jobs:
+  planck-chain-derived-s8-upgrade:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.0 Planck chain derived S8 upgrade
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_0_planck_chain_s8
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          import re
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_0_planck_chain_s8")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_0_planck_chain_derived_s8_upgrade"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior, or model comparison.",
+              "This is an uncertainty-handling upgrade for one reviewed KiDS/Planck diagnostic row.",
+              "A pass means the KiDS/Planck consolidation-negative pressure row survives this Planck S8 uncertainty upgrade, not that TAIRID is validated."
+          ]
+
+          # v3.58 carried row
+          KIDS_S8_Q50 = 0.764565
+          PLANCK_PROVISIONAL_S8 = 0.8340746027338657
+          V3_58_PRESSURE_Z = -3.290445079818788
+          CURRENT_DIRECTION = "negative_consolidation_growth_pressure"
+
+          # Guarded portable default.
+          # Replace later with direct KiDS q16/q84 if the old KiDS parser artifact is reintroduced.
+          KIDS_S8_SIGMA_USED = 0.01845
+          KIDS_SIGMA_NOTE = (
+              "Portable default used because the v3.58 handoff preserved KiDS S8 q50 and pressure z, "
+              "but did not preserve a standalone KiDS q16/q84 in this compact workflow. "
+              "This is acceptable for a first Planck-chain uncertainty upgrade, but should be replaced "
+              "by the direct KiDS posterior width in a later repair pass."
+          )
+
+          PLANCK_CHAIN_URL = (
+              "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/"
+              "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          )
+
+          ZIP_PATH = OUTDIR / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+
+          SIGMA8_ALIASES = {"sigma8", "sigma_8", "sig8"}
+          OMEGAM_ALIASES = {"omegam", "omega_m", "omegam0", "omega_m_0", "omega_matter", "om"}
+          DIRECT_S8_ALIASES = {"s8", "s_8", "s8omegamp5", "sigma8omegam05", "sigma8_omegam_0p5"}
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def normalize_param_name(name):
+              token = str(name).strip().split()[0]
+              token = token.rstrip("*")
+              token = token.replace("\\", "")
+              token = token.replace("Omega", "omega")
+              token = token.replace("{", "").replace("}", "")
+              token = token.replace("/", "_")
+              token = token.lower()
+              token = re.sub(r"[^a-z0-9_]+", "", token)
+              return token
+
+          def read_paramnames(path):
+              names = []
+              for raw in Path(path).read_text(errors="ignore").splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  names.append(normalize_param_name(line.split()[0]))
+              return names
+
+          def weighted_quantile(values, quantiles, weights):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              if values.size == 0:
+                  raise ValueError("No finite positive-weight samples remained.")
+
+              sorter = np.argsort(values)
+              values = values[sorter]
+              weights = weights[sorter]
+
+              cumulative = np.cumsum(weights)
+              cumulative = (cumulative - 0.5 * weights) / np.sum(weights)
+
+              return np.interp(np.asarray(quantiles, dtype=float), cumulative, values)
+
+          def weighted_mean_std(values, weights):
+              values = np.asarray(values, dtype=float)
+              weights = np.asarray(weights, dtype=float)
+
+              mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+              values = values[mask]
+              weights = weights[mask]
+
+              mean = np.average(values, weights=weights)
+              var = np.average((values - mean) ** 2, weights=weights)
+              return float(mean), float(np.sqrt(var))
+
+          def find_column(columns, aliases):
+              normalized = {normalize_param_name(col): col for col in columns}
+              for alias in aliases:
+                  alias_norm = normalize_param_name(alias)
+                  if alias_norm in normalized:
+                      return normalized[alias_norm]
+              return None
+
+          def classify_pressure(kids_s8, planck_s8, pressure_z):
+              if not np.isfinite(pressure_z):
+                  return "invalid"
+
+              delta = kids_s8 - planck_s8
+              abs_z = abs(pressure_z)
+
+              if abs(delta) < 1e-6 or abs_z < 0.25:
+                  return "near_zero_pressure_not_robust"
+
+              if delta > 0:
+                  return "flipped_positive_consolidation_negative_pattern_fails"
+
+              if abs_z >= 2.5:
+                  return "strong_diagnostic_survival"
+
+              if abs_z >= 1.5:
+                  return "direction_survives_strength_weakens"
+
+              return "weak_diagnostic_only"
+
+          def score_param_file(path, names):
+              joined = str(path).lower()
+              score = 0
+
+              if "base" in joined:
+                  score += 5
+              if "plik" in joined:
+                  score += 5
+              if "ttteee" in joined:
+                  score += 5
+              if "lowl" in joined:
+                  score += 5
+              if "lowe" in joined or "lowe" in joined.replace("_", ""):
+                  score += 5
+
+              name_set = set(names)
+              if bool(name_set & DIRECT_S8_ALIASES):
+                  score += 20
+              if bool(name_set & SIGMA8_ALIASES) and bool(name_set & OMEGAM_ALIASES):
+                  score += 20
+
+              penalties = ["omegak", "mnu", "w_", "alens", "nnu", "neff", "r_0", "running"]
+              score -= sum(5 for p in penalties if p in joined)
+
+              return score
+
+          def load_best_planck_chain(zip_path):
+              with TemporaryDirectory() as tmp:
+                  tmp = Path(tmp)
+                  with zipfile.ZipFile(zip_path) as zf:
+                      zf.extractall(tmp)
+
+                  products = []
+
+                  for param_path in tmp.rglob("*.paramnames"):
+                      names = read_paramnames(param_path)
+                      if not names:
+                          continue
+
+                      name_set = set(names)
+                      has_direct_s8 = bool(name_set & DIRECT_S8_ALIASES)
+                      has_derived_s8 = bool(name_set & SIGMA8_ALIASES) and bool(name_set & OMEGAM_ALIASES)
+
+                      if not (has_direct_s8 or has_derived_s8):
+                          continue
+
+                      stem = param_path.stem
+                      parent = param_path.parent
+
+                      chain_paths = []
+                      for candidate in parent.glob("*.txt"):
+                          lower = candidate.name.lower()
+                          if any(block in lower for block in ["margestats", "likestats", "minimum", "bestfit"]):
+                              continue
+                          if lower.startswith(stem.lower()) and re.search(r"(_|\.)[0-9]+\.txt$", lower):
+                              chain_paths.append(candidate)
+
+                      if not chain_paths:
+                          for candidate in parent.rglob("*.txt"):
+                              lower = candidate.name.lower()
+                              if any(block in lower for block in ["margestats", "likestats", "minimum", "bestfit"]):
+                                  continue
+                              if stem.lower() in lower and re.search(r"(_|\.)[0-9]+\.txt$", lower):
+                                  chain_paths.append(candidate)
+
+                      if not chain_paths:
+                          continue
+
+                      products.append({
+                          "param_path": param_path,
+                          "names": names,
+                          "chain_paths": sorted(set(chain_paths)),
+                          "score": score_param_file(param_path, names)
+                      })
+
+                  if not products:
+                      raise FileNotFoundError("No compatible Planck CosmoMC chain product with sigma8/Omega_m or S8 was found.")
+
+                  products = sorted(products, key=lambda p: p["score"], reverse=True)
+                  selected = products[0]
+
+                  n_params = len(selected["names"])
+                  columns = ["weight", "neg_loglike"] + selected["names"]
+
+                  frames = []
+                  for chain_path in selected["chain_paths"]:
+                      try:
+                          arr = np.loadtxt(chain_path)
+                      except Exception:
+                          continue
+
+                      if arr.ndim == 1:
+                          arr = arr.reshape(1, -1)
+
+                      if arr.shape[1] < n_params + 2:
+                          continue
+
+                      arr = arr[:, : n_params + 2]
+                      frames.append(arr)
+
+                  if not frames:
+                      raise ValueError("Compatible paramnames were found, but no readable chain rows were loaded.")
+
+                  data = np.vstack(frames)
+                  weights = data[:, 0].astype(float)
+                  params = data[:, 2:].astype(float)
+
+                  col_index = {columns[i + 2]: i for i in range(n_params)}
+
+                  direct_col = find_column(col_index.keys(), DIRECT_S8_ALIASES)
+                  if direct_col is not None:
+                      s8_samples = params[:, col_index[direct_col]]
+                  else:
+                      sigma8_col = find_column(col_index.keys(), SIGMA8_ALIASES)
+                      omegam_col = find_column(col_index.keys(), OMEGAM_ALIASES)
+
+                      if sigma8_col is None or omegam_col is None:
+                          raise KeyError(
+                              "Could not find sigma8 and Omega_m columns. "
+                              f"Available columns: {list(col_index.keys())}"
+                          )
+
+                      sigma8 = params[:, col_index[sigma8_col]]
+                      omegam = params[:, col_index[omegam_col]]
+                      s8_samples = sigma8 * np.sqrt(omegam / 0.3)
+
+                  mask = np.isfinite(s8_samples) & np.isfinite(weights) & (weights > 0)
+                  s8_samples = s8_samples[mask]
+                  weights = weights[mask]
+
+                  if len(s8_samples) == 0:
+                      raise ValueError("No finite positive-weight S8 samples remained.")
+
+                  return {
+                      "s8_samples": s8_samples,
+                      "weights": weights,
+                      "selected_paramnames_path": str(selected["param_path"].relative_to(tmp)),
+                      "selected_chain_count": len(selected["chain_paths"]),
+                      "selected_score": selected["score"],
+                      "available_columns": columns,
+                      "candidate_product_count": len(products)
+                  }
+
+          print("Downloading Planck baseline chain product...")
+          print(PLANCK_CHAIN_URL)
+          urllib.request.urlretrieve(PLANCK_CHAIN_URL, ZIP_PATH)
+          print(f"Downloaded: {ZIP_PATH} ({ZIP_PATH.stat().st_size} bytes)")
+
+          loaded = load_best_planck_chain(ZIP_PATH)
+          s8_samples = loaded["s8_samples"]
+          weights = loaded["weights"]
+
+          q16, q50, q84 = weighted_quantile(s8_samples, [0.16, 0.50, 0.84], weights)
+          mean, weighted_std = weighted_mean_std(s8_samples, weights)
+
+          planck_s8_sigma_68 = float((q84 - q16) / 2.0)
+          combined_sigma = math.sqrt(KIDS_S8_SIGMA_USED ** 2 + planck_s8_sigma_68 ** 2)
+          pressure_z_chain = (KIDS_S8_Q50 - float(q50)) / combined_sigma
+          delta = KIDS_S8_Q50 - float(q50)
+
+          survival_grade = classify_pressure(KIDS_S8_Q50, float(q50), float(pressure_z_chain))
+
+          failed_gates = []
+
+          if not np.isfinite(pressure_z_chain):
+              failed_gates.append("pressure_z_not_finite")
+
+          if combined_sigma <= 0:
+              failed_gates.append("combined_sigma_not_positive")
+
+          if len(s8_samples) < 1000:
+              failed_gates.append("too_few_chain_samples")
+
+          if survival_grade in [
+              "near_zero_pressure_not_robust",
+              "flipped_positive_consolidation_negative_pattern_fails",
+              "invalid"
+          ]:
+              failed_gates.append(f"pressure_survival_grade_{survival_grade}")
+
+          if failed_gates:
+              readiness_label = "planck_chain_s8_upgrade_completed_pressure_row_weakened_or_failed"
+          else:
+              readiness_label = "planck_chain_s8_upgrade_passed_pressure_row_survives"
+
+          if survival_grade == "strong_diagnostic_survival":
+              next_step = (
+                  "Proceed to DES/HSC growth-family repair. The KiDS/Planck row survived the Planck-chain uncertainty upgrade strongly."
+              )
+          elif survival_grade == "direction_survives_strength_weakens":
+              next_step = (
+                  "Proceed cautiously to DES/HSC growth-family repair. Direction survived, but the pressure strength weakened."
+              )
+          elif survival_grade == "weak_diagnostic_only":
+              next_step = (
+                  "Keep the row as weak diagnostic only. DES/HSC repair becomes more important before any integrated checkpoint."
+              )
+          else:
+              next_step = (
+                  "Do not carry the KiDS/Planck consolidation-negative pressure row as robust. Inspect chain selection and KiDS sigma before proceeding."
+              )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "input_reference_from_v3_58": {
+                  "kids_s8_q50": KIDS_S8_Q50,
+                  "kids_s8_sigma_used": KIDS_S8_SIGMA_USED,
+                  "kids_sigma_note": KIDS_SIGMA_NOTE,
+                  "planck_provisional_s8": PLANCK_PROVISIONAL_S8,
+                  "v3_58_pressure_z": V3_58_PRESSURE_Z,
+                  "current_direction": CURRENT_DIRECTION,
+                  "current_limit": "Planck uncertainty was provisional diagonal/marginal propagation before this upgrade."
+              },
+              "planck_chain_product": {
+                  "download_url": PLANCK_CHAIN_URL,
+                  "downloaded_bytes": ZIP_PATH.stat().st_size,
+                  "selected_paramnames_path": loaded["selected_paramnames_path"],
+                  "selected_chain_count": loaded["selected_chain_count"],
+                  "selected_score": loaded["selected_score"],
+                  "candidate_product_count": loaded["candidate_product_count"],
+                  "available_columns": loaded["available_columns"]
+              },
+              "planck_chain_s8_result": {
+                  "q16": float(q16),
+                  "q50_median": float(q50),
+                  "q84": float(q84),
+                  "sigma_68_half_width": float(planck_s8_sigma_68),
+                  "weighted_mean": float(mean),
+                  "weighted_std": float(weighted_std),
+                  "n_samples": int(len(s8_samples))
+              },
+              "recomputed_pressure": {
+                  "delta_kids_minus_planck": float(delta),
+                  "combined_sigma": float(combined_sigma),
+                  "pressure_z_chain_planck": float(pressure_z_chain),
+                  "direction": "negative_consolidation_growth_pressure" if delta < 0 else "non_negative_or_flipped",
+                  "survival_grade": survival_grade
+              },
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "new_cosmological_model_fit": False
+              },
+              "gate_result": {
+                  "failed_gates": failed_gates,
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False
+              }
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v4_0_planck_chain_derived_s8_upgrade.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          csv_path = OUTDIR / "planck_chain_s8_pressure_result_v4_0.csv"
+          with csv_path.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["metric", "value"])
+              writer.writeheader()
+              rows = {
+                  "kids_s8_q50": KIDS_S8_Q50,
+                  "kids_s8_sigma_used": KIDS_S8_SIGMA_USED,
+                  "planck_v3_58_provisional_s8": PLANCK_PROVISIONAL_S8,
+                  "v3_58_pressure_z": V3_58_PRESSURE_Z,
+                  "planck_chain_s8_q16": float(q16),
+                  "planck_chain_s8_q50_median": float(q50),
+                  "planck_chain_s8_q84": float(q84),
+                  "planck_chain_s8_sigma_68_half_width": float(planck_s8_sigma_68),
+                  "planck_chain_s8_weighted_mean": float(mean),
+                  "planck_chain_s8_weighted_std": float(weighted_std),
+                  "chain_sample_count": int(len(s8_samples)),
+                  "delta_kids_minus_planck": float(delta),
+                  "combined_sigma": float(combined_sigma),
+                  "pressure_z_chain_planck": float(pressure_z_chain),
+                  "survival_grade": survival_grade,
+                  "readiness_label": readiness_label
+              }
+              for k, v in rows.items():
+                  writer.writerow({"metric": k, "value": v})
+
+          boundary_path = OUTDIR / "interpretation_boundaries_v4_0.csv"
+          with boundary_path.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["interpretation_id", "status", "wording", "boundary"])
+              writer.writeheader()
+              writer.writerows([
+                  {
+                      "interpretation_id": "allowed_uncertainty_upgrade",
+                      "status": "allowed_with_boundary",
+                      "wording": "The KiDS/Planck pressure row was retested with Planck S8 derived from chain samples.",
+                      "boundary": "Uncertainty upgrade only, not validation."
+                  },
+                  {
+                      "interpretation_id": "allowed_survival_grade",
+                      "status": "allowed_with_boundary",
+                      "wording": f"The survival grade is {survival_grade}.",
+                      "boundary": "This grades one diagnostic row only."
+                  },
+                  {
+                      "interpretation_id": "forbidden_validation_claim",
+                      "status": "forbidden",
+                      "wording": "TAIRID is validated.",
+                      "boundary": "Blocked."
+                  },
+                  {
+                      "interpretation_id": "forbidden_h0_solution_claim",
+                      "status": "forbidden",
+                      "wording": "The H0 tension is solved.",
+                      "boundary": "Blocked."
+                  },
+                  {
+                      "interpretation_id": "forbidden_new_physics_claim",
+                      "status": "forbidden",
+                      "wording": "New physics is proven.",
+                      "boundary": "Blocked."
+                  },
+                  {
+                      "interpretation_id": "forbidden_standard_cosmology_disproof",
+                      "status": "forbidden",
+                      "wording": "Standard cosmology is disproven.",
+                      "boundary": "Blocked."
+                  }
+              ])
+
+          md = []
+          md.append("# TAIRID Cosmology v4.0 — Planck Chain-Derived S8 Upgrade")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("This test upgrades the Planck side of the KiDS/Planck growth-pressure row.")
+          md.append("")
+          md.append("Instead of trusting the earlier provisional diagonal Planck S8 uncertainty, it reads Planck chain samples, computes S8 sample-by-sample, and derives a chain-based Planck S8 median and 68 percent width.")
+          md.append("")
+          md.append("It then recomputes the KiDS-minus-Planck pressure z.")
+          md.append("")
+          md.append("## Input row from v3.58")
+          md.append("")
+          md.append("| Field | Value |")
+          md.append("|---|---:|")
+          md.append(f"| KiDS S8 q50 | `{KIDS_S8_Q50:.12f}` |")
+          md.append(f"| KiDS sigma used | `{KIDS_S8_SIGMA_USED:.12f}` |")
+          md.append(f"| Planck provisional S8 | `{PLANCK_PROVISIONAL_S8:.12f}` |")
+          md.append(f"| v3.58 pressure z | `{V3_58_PRESSURE_Z:.12f}` |")
+          md.append("")
+          md.append("## Planck chain-derived S8")
+          md.append("")
+          md.append("| Statistic | Value |")
+          md.append("|---|---:|")
+          md.append(f"| q16 | `{float(q16):.12f}` |")
+          md.append(f"| q50 median | `{float(q50):.12f}` |")
+          md.append(f"| q84 | `{float(q84):.12f}` |")
+          md.append(f"| sigma 68 half-width | `{float(planck_s8_sigma_68):.12f}` |")
+          md.append(f"| weighted mean | `{float(mean):.12f}` |")
+          md.append(f"| weighted std | `{float(weighted_std):.12f}` |")
+          md.append(f"| sample count | `{int(len(s8_samples))}` |")
+          md.append("")
+          md.append("## Recomputed pressure")
+          md.append("")
+          md.append("| Field | Value |")
+          md.append("|---|---:|")
+          md.append(f"| delta KiDS - Planck | `{float(delta):.12f}` |")
+          md.append(f"| combined sigma | `{float(combined_sigma):.12f}` |")
+          md.append(f"| pressure z using chain Planck | `{float(pressure_z_chain):.12f}` |")
+          md.append("")
+          md.append(f"Direction: `{audit['recomputed_pressure']['direction']}`")
+          md.append("")
+          md.append(f"Survival grade: `{survival_grade}`")
+          md.append("")
+          md.append("## How to read the result")
+          md.append("")
+          md.append("- `strong_diagnostic_survival`: still negative and at least about 2.5 sigma in magnitude.")
+          md.append("- `direction_survives_strength_weakens`: still negative, but weaker, roughly 1.5 to 2.5 sigma.")
+          md.append("- `weak_diagnostic_only`: still negative, but below about 1.5 sigma.")
+          md.append("- `near_zero_pressure_not_robust`: pressure is basically not stable.")
+          md.append("- `flipped_positive_consolidation_negative_pattern_fails`: the consolidation-negative row fails this comparison.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `planck_chain_s8_pressure_result_v4_0.csv`")
+          md.append("- `interpretation_boundaries_v4_0.csv`")
+          md.append("- `tairid_cosmology_v4_0_planck_chain_derived_s8_upgrade.json`")
+          md.append("- `tairid_cosmology_v4_0_planck_chain_derived_s8_upgrade.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_0_planck_chain_derived_s8_upgrade.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Pressure result:")
+          print(json.dumps(audit["recomputed_pressure"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          # This exits nonzero only if the test truly cannot compute or the pressure row fails/weakens enough
+          # to require inspection before moving on.
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.0 Planck chain derived S8 upgrade artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-0-planck-chain-derived-s8-upgrade
+          path: artifacts/tairid_cosmology_v4_0_planck_chain_s8/
