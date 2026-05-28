@@ -1,0 +1,868 @@
+name: TAIRID Cosmology v3.30 Independent Reach Pressure Construction Design
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-pressure-construction-design:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.30 independent reach pressure construction design
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_30
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_30")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_30_independent_reach_pressure_construction_design"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute final pressure scores.",
+              "This designs source-specific pressure construction rules for independent non-DESI reach diagnostics.",
+              "DESI remains excluded because v3.25 showed the mapped DESI reach rows are scaled counterparts.",
+              "BAO rows and time-delay rows are not treated as one universal pressure surface.",
+              "BOSS archive rows are treated as provisional isotropic BAO candidates unless the archive role is confirmed.",
+              "TDCOSMO TDLMC seed rows are flagged for provenance review before observational-anchor use.",
+              "No row is promoted to model-anchor status."
+          ]
+
+          C_LIGHT = 299792.458
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          EBOSS_PRODUCTS = [
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_LRG",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_QSO",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR12_LRG",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              }
+          ]
+
+          BOSS_PRODUCTS = {
+              "archive_url": "https://data.sdss.org/sas/dr10/boss/papers/clustering/Anderson_2013_CMASSDR11_LOWZDR11_cosmomc.tar.gz",
+              "cmass_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/CMASSDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat",
+              "lowz_cov_url": "http://data.sdss3.org/sas/dr10/boss/papers/clustering/LOWZDR10_sanchez_2013_correlation_function_pre_recon_covariance.dat"
+          }
+
+          TDCOSMO_TABLE_URL = "https://raw.githubusercontent.com/TDCOSMO/hierarchy_analysis_2020_public/master/TDLMC/tdlmc_rung3_posterior_table.csv"
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.30-independent-reach-pressure-construction-design/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def parse_float_or_none(value):
+              if value is None:
+                  return None
+              text = str(value).strip()
+              if text in ["", "-", "--", "nan", "NaN", "NAN", "None", "null"]:
+                  return None
+              try:
+                  x = float(text)
+              except Exception:
+                  return None
+              if not math.isfinite(x):
+                  return None
+              return x
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+                  name_raw = parts[0]
+                  name = name_raw.rstrip("*")
+                  try:
+                      rows.append({
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "lower1": float(parts[3]),
+                          "upper1": float(parts[4]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              dl = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+                  text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+              rows = parse_planck_margestats(text)
+              marg = {r["parameter"]: r for r in rows}
+              required = ["H0", "omegam", "rdrag"]
+              missing = [p for p in required if p not in marg]
+              if missing:
+                  raise RuntimeError(f"Missing Planck reference parameters: {missing}")
+
+              return {
+                  "download": dl,
+                  "H0": float(marg["H0"]["mean"]),
+                  "H0_sigma": float(marg["H0"]["sddev"]),
+                  "omegam": float(marg["omegam"]["mean"]),
+                  "omegam_sigma": float(marg["omegam"]["sddev"]),
+                  "rdrag": float(marg["rdrag"]["mean"]),
+                  "rdrag_sigma": float(marg["rdrag"]["sddev"]),
+                  "boundary": "Planck is used only as a baseline-design reference surface, not a full likelihood replacement."
+              }
+
+          def E_z(z, om):
+              return math.sqrt(om * (1.0 + z) ** 3 + (1.0 - om))
+
+          def integrate_simpson(func, a, b, n=1200):
+              if b <= a:
+                  return 0.0
+              if n % 2 == 1:
+                  n += 1
+              h = (b - a) / n
+              s = func(a) + func(b)
+              for i in range(1, n):
+                  x = a + i * h
+                  s += (4 if i % 2 == 1 else 2) * func(x)
+              return s * h / 3.0
+
+          def comoving_distance(z, H0, om):
+              integral = integrate_simpson(lambda x: 1.0 / E_z(x, om), 0.0, z)
+              return (C_LIGHT / H0) * integral
+
+          def dm_distance(z, H0, om):
+              return comoving_distance(z, H0, om)
+
+          def dh_distance(z, H0, om):
+              return C_LIGHT / (H0 * E_z(z, om))
+
+          def dv_distance(z, H0, om):
+              dm = dm_distance(z, H0, om)
+              dh = dh_distance(z, H0, om)
+              return (z * dm * dm * dh) ** (1.0 / 3.0)
+
+          def angular_diameter_distance(z, H0, om):
+              return comoving_distance(z, H0, om) / (1.0 + z)
+
+          def angular_diameter_between(z1, z2, H0, om):
+              if z2 <= z1:
+                  return None
+              dc1 = comoving_distance(z1, H0, om)
+              dc2 = comoving_distance(z2, H0, om)
+              return (dc2 - dc1) / (1.0 + z2)
+
+          def time_delay_distance(z_lens, z_source, H0, om):
+              d_l = angular_diameter_distance(z_lens, H0, om)
+              d_s = angular_diameter_distance(z_source, H0, om)
+              d_ls = angular_diameter_between(z_lens, z_source, H0, om)
+              if d_ls is None or d_ls <= 0:
+                  return None
+              return (1.0 + z_lens) * d_l * d_s / d_ls
+
+          def load_numeric_matrix(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lines = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+              arr = np.loadtxt(io.StringIO("\n".join(lines)))
+              if arr.ndim == 0:
+                  arr = arr.reshape((1, 1))
+              elif arr.ndim == 1:
+                  arr = arr.reshape((1, -1))
+              return arr
+
+          def parse_bao_data_table(path):
+              rows = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      z = float(parts[0])
+                      value = float(parts[1])
+                  except Exception:
+                      continue
+                  rows.append({
+                      "z_eff": z,
+                      "value": value,
+                      "parameter": parts[2],
+                      "raw_line": stripped
+                  })
+              return rows
+
+          def classify_bao_parameter(parameter):
+              lower = str(parameter).lower()
+              if "dm" in lower:
+                  return "BAO_D_M_over_r_d", "bao_transverse_reach", "DM_over_rd", "D_M(z)/r_d"
+              if "dh" in lower:
+                  return "BAO_D_H_over_r_d", "bao_radial_reach", "DH_over_rd", "D_H(z)/r_d"
+              if "dv" in lower:
+                  return "BAO_D_V_over_r_d", "bao_isotropic_reach", "DV_over_rd", "D_V(z)/r_d"
+              return "BAO_source_defined", "bao_source_defined_reach", "source_defined", "source-defined BAO baseline"
+
+          def baseline_for_bao(row, planck, parameter_kind):
+              z = float(row["z_eff"])
+              if parameter_kind == "DM_over_rd":
+                  return dm_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              if parameter_kind == "DH_over_rd":
+                  return dh_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              if parameter_kind == "DV_over_rd":
+                  return dv_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              return None
+
+          def ingest_eboss(planck):
+              eboss_dir = DOWNLOADS / "SDSS_eBOSS_DR16"
+              rows = []
+              source_rows = []
+              downloads = []
+
+              for product in EBOSS_PRODUCTS:
+                  data_path = eboss_dir / safe_name(product["data_url"])
+                  cov_path = eboss_dir / safe_name(product["cov_url"])
+                  downloads.append(download(product["data_url"], data_path))
+                  downloads.append(download(product["cov_url"], cov_path))
+
+                  data_rows = parse_bao_data_table(data_path)
+                  cov = load_numeric_matrix(cov_path)
+                  covariance_match = cov.ndim == 2 and cov.shape[0] == cov.shape[1] == len(data_rows)
+
+                  for i, row in enumerate(data_rows):
+                      observable_family, standard_role, kind, formula = classify_bao_parameter(row["parameter"])
+                      sigma = ""
+                      if covariance_match:
+                          diag = float(cov[i, i])
+                          sigma = math.sqrt(diag) if diag >= 0 else ""
+
+                      baseline = baseline_for_bao(row, planck, kind)
+
+                      rows.append({
+                          "source": product["source"],
+                          "family": product["family"],
+                          "standard_surface": "reach_geometry_bao",
+                          "standard_role": standard_role,
+                          "observable_family": observable_family,
+                          "parameter": row["parameter"],
+                          "z_eff": row["z_eff"],
+                          "value": row["value"],
+                          "sigma": sigma,
+                          "baseline_family": "Planck_2018_flat_LCDM_reference",
+                          "baseline_formula": formula,
+                          "baseline_value_preview": baseline if baseline is not None else "",
+                          "baseline_ready": baseline is not None,
+                          "pressure_formula_design": "(observed - baseline) / sqrt(sigma_observed^2 + sigma_baseline^2)",
+                          "pressure_score_built": False,
+                          "pressure_construction_allowed_next": baseline is not None and covariance_match,
+                          "model_anchor_allowed_now": False,
+                          "diagnostic_only": True,
+                          "block_reason": "",
+                          "boundary_note": "eBOSS BAO row is formula-ready for later source-specific pressure construction; not pressure-scored here."
+                      })
+
+                  source_rows.append({
+                      "source": product["source"],
+                      "family": product["family"],
+                      "data_rows": len(data_rows),
+                      "covariance_match": covariance_match,
+                      "formula_ready_rows": sum(1 for r in rows if r["family"] == product["family"] and r["baseline_ready"] is True)
+                  })
+
+              return rows, source_rows, downloads
+
+          def archive_member_by_suffix(tf, suffix):
+              matches = [m for m in tf.getmembers() if m.isfile() and m.name.endswith(suffix)]
+              return matches[0] if matches else None
+
+          def archive_member_contains(tf, tokens):
+              tokens = [t.lower() for t in tokens]
+              for m in tf.getmembers():
+                  if not m.isfile():
+                      continue
+                  lower = m.name.lower()
+                  if all(t in lower for t in tokens):
+                      return m
+              return None
+
+          def parse_archive_bao_rows(tf, member):
+              f = tf.extractfile(member)
+              if f is None:
+                  raise RuntimeError(f"Could not extract archive member: {member.name}")
+              text = f.read().decode("utf-8", errors="replace")
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  nums = []
+                  for part in stripped.split():
+                      try:
+                          nums.append(float(part))
+                      except Exception:
+                          pass
+                  if len(nums) >= 3:
+                      rows.append({
+                          "z_eff": nums[0],
+                          "value": nums[1],
+                          "sigma": nums[2],
+                          "raw_line": stripped
+                      })
+              return rows
+
+          def ingest_boss(planck):
+              boss_dir = DOWNLOADS / "BOSS_DR12_BAO"
+              archive_path = boss_dir / safe_name(BOSS_PRODUCTS["archive_url"])
+              cmass_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["cmass_cov_url"])
+              lowz_cov_path = boss_dir / safe_name(BOSS_PRODUCTS["lowz_cov_url"])
+
+              downloads = [
+                  download(BOSS_PRODUCTS["archive_url"], archive_path),
+                  download(BOSS_PRODUCTS["cmass_cov_url"], cmass_cov_path),
+                  download(BOSS_PRODUCTS["lowz_cov_url"], lowz_cov_path)
+              ]
+
+              rows = []
+              source_rows = []
+
+              with tarfile.open(archive_path, "r:*") as tf:
+                  cmass_member = archive_member_by_suffix(tf, "data/sdss_DR11CMASS_bao.txt") or archive_member_contains(tf, ["cmass", "bao"])
+                  lowz_member = archive_member_by_suffix(tf, "data/sdss_DR11LOWZ_bao.txt") or archive_member_contains(tf, ["lowz", "bao"])
+
+                  if cmass_member is None:
+                      raise RuntimeError("Could not find CMASS BAO archive member.")
+                  if lowz_member is None:
+                      raise RuntimeError("Could not find LOWZ BAO archive member.")
+
+                  cmass_rows = parse_archive_bao_rows(tf, cmass_member)
+                  lowz_rows = parse_archive_bao_rows(tf, lowz_member)
+
+              cmass_cov = load_numeric_matrix(cmass_cov_path)
+              lowz_cov = load_numeric_matrix(lowz_cov_path)
+
+              for family, source_rows_raw, cov, member_name in [
+                  ("BOSS_DR11_CMASS_archive_BAO", cmass_rows, cmass_cov, cmass_member.name),
+                  ("BOSS_DR11_LOWZ_archive_BAO", lowz_rows, lowz_cov, lowz_member.name)
+              ]:
+                  cov_ok = cov.ndim == 2 and cov.shape[0] == cov.shape[1]
+
+                  for row in source_rows_raw:
+                      baseline = baseline_for_bao(row, planck, "DV_over_rd")
+
+                      rows.append({
+                          "source": "BOSS_DR12_BAO",
+                          "family": family,
+                          "standard_surface": "reach_geometry_bao",
+                          "standard_role": "bao_isotropic_reach_candidate",
+                          "observable_family": "BOSS_archive_inferred_D_V_over_r_d",
+                          "parameter": "BAO_archive_observable_inferred_DV_over_rd",
+                          "z_eff": row["z_eff"],
+                          "value": row["value"],
+                          "sigma": row["sigma"],
+                          "baseline_family": "Planck_2018_flat_LCDM_reference",
+                          "baseline_formula": "D_V(z)/r_d",
+                          "baseline_value_preview": baseline if baseline is not None else "",
+                          "baseline_ready": baseline is not None,
+                          "pressure_formula_design": "(observed - baseline) / sqrt(sigma_observed^2 + sigma_baseline^2)",
+                          "pressure_score_built": False,
+                          "pressure_construction_allowed_next": baseline is not None and cov_ok,
+                          "model_anchor_allowed_now": False,
+                          "diagnostic_only": True,
+                          "block_reason": "provisional_inferred_DV_over_rd_requires_source_role_confirmation",
+                          "boundary_note": f"BOSS archive row from {member_name}; likely isotropic BAO D_V/r_d, but still marked provisional."
+                      })
+
+                  source_rows.append({
+                      "source": "BOSS_DR12_BAO",
+                      "family": family,
+                      "archive_member": member_name,
+                      "data_rows": len(source_rows_raw),
+                      "covariance_square": cov_ok,
+                      "formula_ready_rows": len(source_rows_raw)
+                  })
+
+              return rows, source_rows, downloads
+
+          def ingest_tdcosmo(planck):
+              td_dir = DOWNLOADS / "TDCOSMO_2020"
+              table_path = td_dir / safe_name(TDCOSMO_TABLE_URL)
+              downloads = [download(TDCOSMO_TABLE_URL, table_path)]
+
+              rows = []
+              skipped = []
+
+              with table_path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+                  reader = csv.DictReader(f)
+                  table_rows = list(reader)
+
+              for i, row in enumerate(table_rows):
+                  name = row.get("name", f"row_{i}")
+                  z_lens = parse_float_or_none(row.get("z_lens"))
+                  z_source = parse_float_or_none(row.get("z_source"))
+                  ddt_mean = parse_float_or_none(row.get("Ddt_mean"))
+                  ddt_sigma = parse_float_or_none(row.get("Ddt_sigma"))
+                  flag = parse_float_or_none(row.get("flag"))
+
+                  if z_lens is None or z_source is None or ddt_mean is None or ddt_sigma is None or ddt_sigma <= 0:
+                      skipped.append({"name": name, "reason": "missing_or_invalid_Ddt_or_redshift"})
+                      continue
+
+                  baseline = time_delay_distance(z_lens, z_source, planck["H0"], planck["omegam"])
+                  provenance_blocked = str(name).lower().startswith("seed")
+
+                  rows.append({
+                      "source": "TDCOSMO_2020",
+                      "family": "TDCOSMO_time_delay",
+                      "standard_surface": "reach_geometry_time_delay",
+                      "standard_role": "strong_lens_time_delay_reach",
+                      "observable_family": "TDCOSMO_Ddt_time_delay_distance",
+                      "parameter": "Ddt_time_delay_distance",
+                      "lens_name": name,
+                      "z_lens": z_lens,
+                      "z_source": z_source,
+                      "z_eff": z_lens,
+                      "value": ddt_mean,
+                      "sigma": ddt_sigma,
+                      "flag": flag if flag is not None else "",
+                      "baseline_family": "Planck_2018_flat_LCDM_reference",
+                      "baseline_formula": "(1+z_lens) * D_l * D_s / D_ls",
+                      "baseline_value_preview": baseline if baseline is not None else "",
+                      "baseline_ready": baseline is not None,
+                      "pressure_formula_design": "(observed - baseline) / sqrt(sigma_observed^2 + sigma_baseline^2)",
+                      "pressure_score_built": False,
+                      "pressure_construction_allowed_next": False,
+                      "model_anchor_allowed_now": False,
+                      "diagnostic_only": True,
+                      "block_reason": "provenance_review_required_TDLMC_seed_product" if provenance_blocked else "",
+                      "boundary_note": "TDCOSMO time-delay row has a baseline formula, but seed-style names require provenance review before observational-anchor use."
+                  })
+
+              source_rows = [{
+                  "source": "TDCOSMO_2020",
+                  "family": "TDCOSMO_time_delay",
+                  "table_rows": len(table_rows),
+                  "usable_Ddt_rows": len(rows),
+                  "skipped_rows": len(skipped),
+                  "seed_name_rows": sum(1 for r in rows if str(r["lens_name"]).lower().startswith("seed")),
+                  "pressure_allowed_rows": sum(1 for r in rows if r["pressure_construction_allowed_next"] is True)
+              }]
+
+              return rows, source_rows, downloads, skipped
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_29_status": "independent_reach_standardization_passed_ready_for_v3_30_pressure_construction_design",
+                  "v3_29_next_allowed_step": "Build v3.30 independent reach pressure-construction design."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.30 independent reach pressure-construction design")
+          print("Truth boundary: design only; no pressure scores; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+          design_rows = []
+          source_rows = []
+          skipped_rows = []
+          source_errors = {}
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_results"]["Planck_2018"] = {
+                  "loaded": True,
+                  "H0": planck["H0"],
+                  "omegam": planck["omegam"],
+                  "rdrag": planck["rdrag"],
+                  "boundary": planck["boundary"]
+              }
+              print("Planck baseline reference loaded.")
+          except Exception as e:
+              failed_gates.append("planck_reference_load_failed")
+              planck = None
+              source_errors["Planck_2018"] = f"{type(e).__name__}: {e}"
+              print(f"Planck failed: {source_errors['Planck_2018']}")
+
+          if planck is not None:
+              for name, fn in [
+                  ("SDSS_eBOSS_DR16", ingest_eboss),
+                  ("BOSS_DR12_BAO", ingest_boss)
+              ]:
+                  try:
+                      rows, summaries, downloads = fn(planck)
+                      design_rows.extend(rows)
+                      source_rows.extend(summaries)
+                      inventory["source_results"][name] = {
+                          "loaded": True,
+                          "design_row_count": len(rows),
+                          "source_summary_count": len(summaries),
+                          "pressure_allowed_rows": sum(1 for r in rows if r["pressure_construction_allowed_next"] is True)
+                      }
+                      print(f"{name} design rows: {len(rows)}")
+                  except Exception as e:
+                      failed_gates.append(f"{name}_design_failed")
+                      source_errors[name] = f"{type(e).__name__}: {e}"
+                      inventory["source_results"][name] = {"loaded": False, "error": source_errors[name]}
+                      print(f"{name} failed: {source_errors[name]}")
+
+              try:
+                  rows, summaries, downloads, skipped = ingest_tdcosmo(planck)
+                  design_rows.extend(rows)
+                  source_rows.extend(summaries)
+                  skipped_rows.extend(skipped)
+                  inventory["source_results"]["TDCOSMO_2020"] = {
+                      "loaded": True,
+                      "design_row_count": len(rows),
+                      "source_summary_count": len(summaries),
+                      "pressure_allowed_rows": sum(1 for r in rows if r["pressure_construction_allowed_next"] is True),
+                      "provenance_blocked_rows": sum(1 for r in rows if r["block_reason"] == "provenance_review_required_TDLMC_seed_product")
+                  }
+                  print(f"TDCOSMO design rows: {len(rows)}")
+              except Exception as e:
+                  failed_gates.append("TDCOSMO_2020_design_failed")
+                  source_errors["TDCOSMO_2020"] = f"{type(e).__name__}: {e}"
+                  inventory["source_results"]["TDCOSMO_2020"] = {"loaded": False, "error": source_errors["TDCOSMO_2020"]}
+                  print(f"TDCOSMO failed: {source_errors['TDCOSMO_2020']}")
+
+          design_csv = OUTDIR / "independent_reach_pressure_construction_design_rows_v3_30.csv"
+          design_fields = sorted({key for row in design_rows for key in row.keys()}) if design_rows else [
+              "source", "family", "parameter", "baseline_ready", "pressure_construction_allowed_next"
+          ]
+
+          with design_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=design_fields)
+              writer.writeheader()
+              for row in design_rows:
+                  writer.writerow({k: row.get(k, "") for k in design_fields})
+
+          source_csv = OUTDIR / "independent_reach_pressure_construction_source_summary_v3_30.csv"
+          source_fields = sorted({key for row in source_rows for key in row.keys()} | {"error"}) if source_rows else ["source", "family", "error"]
+
+          with source_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=source_fields)
+              writer.writeheader()
+              for row in source_rows:
+                  writer.writerow({k: row.get(k, "") for k in source_fields})
+              for name, err in source_errors.items():
+                  writer.writerow({"source": name, "error": err})
+
+          skipped_csv = OUTDIR / "independent_reach_pressure_construction_tdcosmo_skipped_v3_30.csv"
+          with skipped_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = ["name", "reason"]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in skipped_rows:
+                  writer.writerow(row)
+
+          pressure_score_count = sum(1 for r in design_rows if r.get("pressure_score_built") is True)
+          model_anchor_count = sum(1 for r in design_rows if r.get("model_anchor_allowed_now") is True)
+          desi_count = sum(1 for r in design_rows if "DESI" in r.get("source", ""))
+
+          eboss_allowed = [
+              r for r in design_rows
+              if r.get("source") == "SDSS_eBOSS_DR16" and r.get("pressure_construction_allowed_next") is True
+          ]
+
+          boss_allowed = [
+              r for r in design_rows
+              if r.get("source") == "BOSS_DR12_BAO" and r.get("pressure_construction_allowed_next") is True
+          ]
+
+          tdcosmo_blocked = [
+              r for r in design_rows
+              if r.get("source") == "TDCOSMO_2020" and r.get("block_reason") == "provenance_review_required_TDLMC_seed_product"
+          ]
+
+          baseline_ready_rows = sum(1 for r in design_rows if r.get("baseline_ready") is True)
+          allowed_next_rows = sum(1 for r in design_rows if r.get("pressure_construction_allowed_next") is True)
+
+          audit_rows = [
+              {
+                  "audit_gate": "source_design_loads_completed",
+                  "pass": len(source_errors) == 0 and "planck_reference_load_failed" not in failed_gates,
+                  "value": json.dumps(source_errors, sort_keys=True),
+                  "boundary": "All source products must load before pressure construction."
+              },
+              {
+                  "audit_gate": "desi_excluded",
+                  "pass": desi_count == 0,
+                  "value": desi_count,
+                  "boundary": "DESI remains excluded from independent reach construction."
+              },
+              {
+                  "audit_gate": "baseline_designs_available",
+                  "pass": baseline_ready_rows >= 10,
+                  "value": baseline_ready_rows,
+                  "boundary": "Rows may have baseline previews, but pressure scores are not built in v3.30."
+              },
+              {
+                  "audit_gate": "eboss_bao_ready_for_next_pressure_construction",
+                  "pass": len(eboss_allowed) >= 6,
+                  "value": len(eboss_allowed),
+                  "boundary": "eBOSS BAO is the cleanest next independent BAO pressure-construction lane."
+              },
+              {
+                  "audit_gate": "boss_bao_provisional_ready",
+                  "pass": len(boss_allowed) >= 2,
+                  "value": len(boss_allowed),
+                  "boundary": "BOSS archive rows are provisionally inferred as D_V/r_d and require source-role note preservation."
+              },
+              {
+                  "audit_gate": "tdcosmo_provenance_blocked_not_promoted",
+                  "pass": len(tdcosmo_blocked) >= 10,
+                  "value": len(tdcosmo_blocked),
+                  "boundary": "TDCOSMO TDLMC seed rows must not be promoted as observational anchors without provenance review."
+              },
+              {
+                  "audit_gate": "pressure_scores_not_built",
+                  "pass": pressure_score_count == 0,
+                  "value": pressure_score_count,
+                  "boundary": "v3.30 designs pressure construction only."
+              },
+              {
+                  "audit_gate": "model_anchors_not_promoted",
+                  "pass": model_anchor_count == 0,
+                  "value": model_anchor_count,
+                  "boundary": "No row may become a model anchor in v3.30."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed from pressure-construction design alone."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          audit_csv = OUTDIR / "independent_reach_pressure_construction_design_audit_v3_30.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failed = []
+          if source_errors:
+              hard_failed.append("source_design_errors_present")
+          if desi_count != 0:
+              hard_failed.append("desi_rows_leaked_into_independent_design")
+          if pressure_score_count != 0:
+              hard_failed.append("pressure_scores_built_too_early")
+          if model_anchor_count != 0:
+              hard_failed.append("model_anchor_promotion_violation")
+          if len(eboss_allowed) < 6:
+              hard_failed.append("eboss_bao_not_ready_for_next_pressure_construction")
+          if len(tdcosmo_blocked) < 10:
+              hard_failed.append("tdcosmo_provenance_guard_not_triggered")
+
+          if not hard_failed:
+              readiness_label = "independent_reach_pressure_design_passed_bao_ready_tdcosmo_provenance_blocked"
+          else:
+              readiness_label = "independent_reach_pressure_design_needs_followup"
+
+          next_step = (
+              "Build v3.31 independent BAO pressure-construction audit using eBOSS plus provisional BOSS D_V/r_d rows only; keep TDCOSMO parked for provenance review."
+              if not hard_failed
+              else "Fix v3.30 pressure-construction design failures before building pressure scores."
+          )
+
+          inventory["design_row_count"] = len(design_rows)
+          inventory["baseline_ready_rows"] = baseline_ready_rows
+          inventory["pressure_allowed_next_rows"] = allowed_next_rows
+          inventory["eboss_pressure_allowed_next_rows"] = len(eboss_allowed)
+          inventory["boss_pressure_allowed_next_rows"] = len(boss_allowed)
+          inventory["tdcosmo_provenance_blocked_rows"] = len(tdcosmo_blocked)
+          inventory["pressure_score_count"] = pressure_score_count
+          inventory["model_anchor_count"] = model_anchor_count
+          inventory["source_errors"] = source_errors
+
+          inventory["gate_result"] = {
+              "failed_gates": hard_failed,
+              "readiness_label": readiness_label,
+              "design_row_count": len(design_rows),
+              "baseline_ready_rows": baseline_ready_rows,
+              "pressure_allowed_next_rows": allowed_next_rows,
+              "eboss_pressure_allowed_next_rows": len(eboss_allowed),
+              "boss_pressure_allowed_next_rows": len(boss_allowed),
+              "tdcosmo_provenance_blocked_rows": len(tdcosmo_blocked),
+              "pressure_score_count": pressure_score_count,
+              "model_anchor_count": model_anchor_count,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_30_independent_reach_pressure_construction_design.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.30 — Independent Reach Pressure Construction Design")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.30 designs source-specific pressure construction rules for independent non-DESI reach diagnostics.")
+          md.append("")
+          md.append("It creates baseline formulas for eBOSS BAO, provisional BOSS BAO, and TDCOSMO time-delay rows, but it does not compute final pressure scores.")
+          md.append("")
+          md.append("TDCOSMO rows are parked because the usable rows are seed-style TDLMC entries and require provenance review before observational-anchor use.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Design rows: `{len(design_rows)}`")
+          md.append(f"- Baseline-ready rows: `{baseline_ready_rows}`")
+          md.append(f"- Pressure-allowed-next rows: `{allowed_next_rows}`")
+          md.append(f"- eBOSS rows allowed next: `{len(eboss_allowed)}`")
+          md.append(f"- BOSS provisional rows allowed next: `{len(boss_allowed)}`")
+          md.append(f"- TDCOSMO provenance-blocked rows: `{len(tdcosmo_blocked)}`")
+          md.append(f"- Pressure scores built: `{pressure_score_count}`")
+          md.append(f"- Model anchors: `{model_anchor_count}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not hard_failed:
+              md.append("The independent reach lane is now ready for a narrow BAO pressure-construction audit. The cleaner path is eBOSS first, with BOSS included only as provisional D_V/r_d, while TDCOSMO stays parked until provenance is settled.")
+          else:
+              md.append("The design audit found blockers. No pressure scoring or refit is allowed.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_pressure_construction_design_rows_v3_30.csv`")
+          md.append("- `independent_reach_pressure_construction_source_summary_v3_30.csv`")
+          md.append("- `independent_reach_pressure_construction_tdcosmo_skipped_v3_30.csv`")
+          md.append("- `independent_reach_pressure_construction_design_audit_v3_30.csv`")
+          md.append("- `tairid_cosmology_v3_30_independent_reach_pressure_construction_design.json`")
+          md.append("- `tairid_cosmology_v3_30_independent_reach_pressure_construction_design.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_30_independent_reach_pressure_construction_design.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.30 independent reach pressure construction design artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-30-independent-reach-pressure-construction-design
+          path: artifacts/tairid_cosmology_v3_30/
