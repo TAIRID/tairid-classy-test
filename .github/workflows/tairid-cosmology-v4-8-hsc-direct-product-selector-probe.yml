@@ -1,0 +1,826 @@
+name: TAIRID Cosmology v4.8 HSC Direct Product Selector Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  hsc-direct-product-selector-probe:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.8 HSC direct product selector probe
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_8_hsc_direct_product_selector_probe
+
+          python - <<'PY'
+          import csv
+          import html
+          import json
+          import math
+          import re
+          import shutil
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_8_hsc_direct_product_selector_probe")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_8_hsc_direct_product_selector_probe"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not combine KiDS, DES, and HSC into one posterior.",
+              "This does not claim HSC posterior-chain parsing succeeded unless a product is actually classified as parse-ready.",
+              "This is a direct-product selector/probe for the top HSC candidates found in v4.7.",
+              "A pass means HSC candidate products were downloaded, classified, and assigned a next action, not that TAIRID is validated."
+          ]
+
+          SOURCE_LEDGER = [
+              {
+                  "source_id": "v4_7_hsc_top_candidate",
+                  "family": "HSC",
+                  "source_type": "prior_artifact_candidate",
+                  "source_url": "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_cosmic_shear.txt",
+                  "used_for": "Top v4.7 HSC high-confidence candidate."
+              },
+              {
+                  "source_id": "hsc_y3_official_results_page",
+                  "family": "HSC",
+                  "source_type": "official_results_page",
+                  "source_url": "https://hsc-release.mtk.nao.ac.jp/doc/index.php/wly3/",
+                  "used_for": "Official HSC-Y3 weak-lensing results and product navigation."
+              },
+              {
+                  "source_id": "hsc_y3_data_vector_candidate",
+                  "family": "HSC",
+                  "source_type": "official_product_candidate",
+                  "source_url": "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/li23/data/data_vector.fits",
+                  "used_for": "HSC-Y3 data-vector candidate found in v4.7 context."
+              },
+              {
+                  "source_id": "hsc_y3_cosmosis_config_candidate",
+                  "family": "HSC",
+                  "source_type": "repository_config_candidate",
+                  "source_url": "https://raw.githubusercontent.com/joezuntz/cosmosis-standard-library/main/examples/hsc-y3-shear-real.ini",
+                  "used_for": "CosmoSIS HSC-Y3 configuration candidate for product path discovery."
+              }
+          ]
+
+          CANDIDATE_PRODUCTS = [
+              {
+                  "candidate_id": "hsc_y3_fourier_cosmic_shear_txt",
+                  "family": "HSC",
+                  "url": "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/dalal23/hsc_y3_fourier_cosmic_shear.txt",
+                  "candidate_role_from_v4_7": "top_high_confidence_hsc_candidate",
+                  "expected_kind": "unknown_txt_product_or_pointer",
+                  "priority": 1
+              },
+              {
+                  "candidate_id": "hsc_y3_data_vector_fits",
+                  "family": "HSC",
+                  "url": "https://hsc-release.mtk.nao.ac.jp/archive/filetree/shape_catalog_y3/li23/data/data_vector.fits",
+                  "candidate_role_from_v4_7": "official_data_vector_candidate",
+                  "expected_kind": "fits_data_vector_not_chain",
+                  "priority": 2
+              },
+              {
+                  "candidate_id": "hsc_y3_cosmosis_config_raw",
+                  "family": "HSC",
+                  "url": "https://raw.githubusercontent.com/joezuntz/cosmosis-standard-library/main/examples/hsc-y3-shear-real.ini",
+                  "candidate_role_from_v4_7": "cosmosis_config_candidate",
+                  "expected_kind": "configuration_or_path_map",
+                  "priority": 3
+              },
+              {
+                  "candidate_id": "hsc_y3_likelihood_repo",
+                  "family": "HSC",
+                  "url": "https://github.com/HSC-S19A-cosmology-analysis/hscs19a3x2pt-likelihood",
+                  "candidate_role_from_v4_7": "repository_candidate",
+                  "expected_kind": "repository_manual_selection_candidate",
+                  "priority": 4
+              }
+          ]
+
+          HIGH_VALUE_WORDS = [
+              "chain", "chains", "posterior", "posteriors", "mcmc", "multinest",
+              "sample", "samples", "cosmosis", "cosmomc", "cobaya", "firecrown",
+              "likelihood", "parameter", "params"
+          ]
+
+          AXIS_WORDS = [
+              "s8", "s_8", "sigma8", "sigma_8", "omega_m", "omegam", "omega matter"
+          ]
+
+          DATA_PRODUCT_WORDS = [
+              "data_vector", "datavector", "covariance", "cov", "fits", "hdf5", "h5",
+              "npz", "npy", "catalog", "catalogue", "shear", "correlation", "power",
+              "fourier", "real", "xi", "cl"
+          ]
+
+          FILE_EXTENSIONS = [
+              ".zip", ".tar", ".tar.gz", ".tgz", ".gz", ".txt", ".dat", ".csv",
+              ".fits", ".fit", ".h5", ".hdf5", ".npz", ".npy", ".ini", ".yaml",
+              ".yml", ".json", ".pkl", ".pickle"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(value):
+              return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:120]
+
+          def canonical_url(url):
+              url = html.unescape(url or "").strip()
+              url = urllib.parse.urldefrag(url)[0]
+              return url.rstrip("/")
+
+          def fetch_url(url, out_path, timeout=90, byte_limit=8_000_000):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.8-HSC-selector-probe",
+                      "Accept": "*/*"
+                  }
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      with out_path.open("wb") as f:
+                          remaining = byte_limit
+                          while remaining > 0:
+                              chunk = response.read(min(65536, remaining))
+                              if not chunk:
+                                  break
+                              f.write(chunk)
+                              remaining -= len(chunk)
+
+                      return {
+                          "ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "content_length_header": response.headers.get("Content-Length", ""),
+                          "bytes_saved": out_path.stat().st_size,
+                          "truncated_at_byte_limit": remaining == 0,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "content_length_header": "",
+                      "bytes_saved": 0,
+                      "truncated_at_byte_limit": False,
+                      "error": repr(exc)
+                  }
+
+          def decode_preview(path, max_bytes=500000):
+              try:
+                  raw = Path(path).read_bytes()[:max_bytes]
+              except Exception:
+                  return ""
+
+              for encoding in ["utf-8", "latin-1"]:
+                  try:
+                      return raw.decode(encoding, errors="replace")
+                  except Exception:
+                      pass
+
+              return ""
+
+          def clean_text(value):
+              value = html.unescape(value or "")
+              value = re.sub(r"<[^>]+>", " ", value)
+              value = re.sub(r"\s+", " ", value)
+              return value.strip()
+
+          def extract_links(base_url, text):
+              links = []
+
+              anchor_pattern = re.compile(
+                  r"<a\\b[^>]*?href\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"][^>]*>(.*?)</a>",
+                  re.IGNORECASE | re.DOTALL
+              )
+
+              for match in anchor_pattern.finditer(text or ""):
+                  href = html.unescape(match.group(1)).strip()
+                  anchor_text = clean_text(match.group(2))
+                  if not href or href.startswith("#") or href.lower().startswith("mailto:"):
+                      continue
+                  links.append({
+                      "url": canonical_url(urllib.parse.urljoin(base_url, href)),
+                      "anchor_text": anchor_text,
+                      "discovery": "anchor"
+                  })
+
+              raw_url_pattern = re.compile(r"https?://[^\\s\\\"'<>]+", re.IGNORECASE)
+              for match in raw_url_pattern.finditer(text or ""):
+                  links.append({
+                      "url": canonical_url(match.group(0).rstrip(").,;]")),
+                      "anchor_text": "",
+                      "discovery": "raw_url"
+                  })
+
+              deduped = {}
+              for link in links:
+                  if not link["url"]:
+                      continue
+                  if link["url"] not in deduped:
+                      deduped[link["url"]] = link
+                  else:
+                      if link["anchor_text"] and not deduped[link["url"]]["anchor_text"]:
+                          deduped[link["url"]]["anchor_text"] = link["anchor_text"]
+                      deduped[link["url"]]["discovery"] += f"+{link['discovery']}"
+
+              return list(deduped.values())
+
+          def numeric_profile(text, max_lines=5000):
+              numeric_line_count = 0
+              text_line_count = 0
+              ncols_counts = {}
+              first_numeric_preview = ""
+              first_text_preview = ""
+
+              for raw in (text or "").splitlines()[:max_lines]:
+                  line = raw.strip()
+                  if not line:
+                      continue
+
+                  parts = line.replace(",", " ").split()
+                  numeric = True
+                  floats = []
+
+                  for part in parts:
+                      try:
+                          floats.append(float(part))
+                      except Exception:
+                          numeric = False
+                          break
+
+                  if numeric and len(floats) >= 3:
+                      numeric_line_count += 1
+                      ncols_counts[len(floats)] = ncols_counts.get(len(floats), 0) + 1
+                      if not first_numeric_preview:
+                          first_numeric_preview = line[:300]
+                  else:
+                      text_line_count += 1
+                      if not first_text_preview:
+                          first_text_preview = line[:300]
+
+              best_ncols = ""
+              best_ncols_count = 0
+
+              if ncols_counts:
+                  best_ncols, best_ncols_count = sorted(ncols_counts.items(), key=lambda kv: kv[1], reverse=True)[0]
+
+              return {
+                  "numeric_line_count": numeric_line_count,
+                  "text_line_count": text_line_count,
+                  "best_ncols": best_ncols,
+                  "best_ncols_count": best_ncols_count,
+                  "first_numeric_preview": first_numeric_preview,
+                  "first_text_preview": first_text_preview
+              }
+
+          def score_text_product(url, content_type, text, numeric):
+              lower = f"{url} {content_type} {text[:200000]}".lower()
+              score = 0
+              reasons = []
+
+              for word in HIGH_VALUE_WORDS:
+                  if word in lower:
+                      score += 8
+                      reasons.append(f"high_value:{word}")
+
+              for word in AXIS_WORDS:
+                  if word in lower:
+                      score += 5
+                      reasons.append(f"axis_word:{word}")
+
+              for word in DATA_PRODUCT_WORDS:
+                  if word in lower:
+                      score += 4
+                      reasons.append(f"data_word:{word}")
+
+              for ext in FILE_EXTENSIONS:
+                  if ext in url.lower():
+                      score += 5
+                      reasons.append(f"extension:{ext}")
+
+              if numeric["numeric_line_count"] >= 100:
+                  score += 12
+                  reasons.append("many_numeric_lines")
+              elif numeric["numeric_line_count"] >= 10:
+                  score += 6
+                  reasons.append("some_numeric_lines")
+
+              if "github.com" in url.lower():
+                  score += 6
+                  reasons.append("github_signal")
+
+              if "raw.githubusercontent.com" in url.lower():
+                  score += 8
+                  reasons.append("raw_config_signal")
+
+              if ".fits" in url.lower():
+                  score += 4
+                  reasons.append("fits_product_signal")
+
+              if "posterior" in lower or "chain" in lower or "mcmc" in lower or "multinest" in lower:
+                  score += 10
+                  reasons.append("posterior_language")
+
+              return score, ";".join(reasons)
+
+          def classify_product(url, content_type, text, numeric, score, reasons):
+              lower = f"{url} {content_type} {text[:200000]}".lower()
+              reasons_lower = reasons.lower()
+
+              if (
+                  ("posterior_language" in reasons_lower or "multinest" in lower or "mcmc" in lower)
+                  and numeric["numeric_line_count"] >= 100
+                  and any(axis in lower for axis in AXIS_WORDS)
+              ):
+                  return "posterior_chain_parse_candidate"
+
+              if ".ini" in url.lower() or "cosmosis" in lower or "raw_config_signal" in reasons_lower:
+                  return "configuration_path_map_candidate"
+
+              if ".fits" in url.lower() or "fits" in content_type.lower():
+                  return "data_vector_or_covariance_candidate_not_chain"
+
+              if numeric["numeric_line_count"] >= 100:
+                  return "numeric_product_needs_column_map"
+
+              if "github.com" in url.lower():
+                  return "repository_candidate_manual_selection_needed"
+
+              if any(word in lower for word in ["data_vector", "covariance", "catalog", "shear"]):
+                  return "supporting_data_product_candidate_not_chain"
+
+              return "context_or_unknown_product"
+
+          def score_extracted_link(url, anchor_text):
+              lower = f"{url} {anchor_text}".lower()
+              score = 0
+              reasons = []
+
+              for word in HIGH_VALUE_WORDS:
+                  if word in lower:
+                      score += 10
+                      reasons.append(f"high_value:{word}")
+
+              for word in AXIS_WORDS:
+                  if word in lower:
+                      score += 4
+                      reasons.append(f"axis:{word}")
+
+              for word in DATA_PRODUCT_WORDS:
+                  if word in lower:
+                      score += 5
+                      reasons.append(f"product:{word}")
+
+              for ext in FILE_EXTENSIONS:
+                  if ext in lower:
+                      score += 6
+                      reasons.append(f"extension:{ext}")
+
+              if "github.com" in lower or "zenodo" in lower or "dataverse" in lower:
+                  score += 8
+                  reasons.append("repository_signal")
+
+              return score, ";".join(reasons)
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          created_at = now_iso()
+
+          product_rows = []
+          text_profile_rows = []
+          extracted_link_rows = []
+
+          for candidate in CANDIDATE_PRODUCTS:
+              local_path = OUTDIR / f"download_{candidate['priority']}_{safe_name(candidate['candidate_id'])}"
+              fetch = fetch_url(candidate["url"], local_path)
+
+              text = decode_preview(local_path) if fetch["ok"] else ""
+              links = extract_links(candidate["url"], text) if text else []
+              numeric = numeric_profile(text)
+
+              score, reasons = score_text_product(candidate["url"], fetch["content_type"], text, numeric)
+              classification = classify_product(candidate["url"], fetch["content_type"], text, numeric, score, reasons)
+
+              product_rows.append({
+                  "candidate_id": candidate["candidate_id"],
+                  "family": candidate["family"],
+                  "url": candidate["url"],
+                  "priority": candidate["priority"],
+                  "candidate_role_from_v4_7": candidate["candidate_role_from_v4_7"],
+                  "expected_kind": candidate["expected_kind"],
+                  "fetch_ok": fetch["ok"],
+                  "http_status": fetch["http_status"],
+                  "content_type": fetch["content_type"],
+                  "content_length_header": fetch["content_length_header"],
+                  "bytes_saved": fetch["bytes_saved"],
+                  "truncated_at_byte_limit": fetch["truncated_at_byte_limit"],
+                  "error": fetch["error"],
+                  "product_score": score,
+                  "score_reasons": reasons,
+                  "classification": classification,
+                  "extracted_link_count": len(links),
+                  "local_probe_file": str(local_path.name)
+              })
+
+              text_profile_rows.append({
+                  "candidate_id": candidate["candidate_id"],
+                  "url": candidate["url"],
+                  "classification": classification,
+                  "numeric_line_count": numeric["numeric_line_count"],
+                  "text_line_count": numeric["text_line_count"],
+                  "best_ncols": numeric["best_ncols"],
+                  "best_ncols_count": numeric["best_ncols_count"],
+                  "first_numeric_preview": numeric["first_numeric_preview"],
+                  "first_text_preview": numeric["first_text_preview"],
+                  "text_preview_first_1000": text[:1000].replace("\n", " ") if text else ""
+              })
+
+              for link in links:
+                  link_score, link_reasons = score_extracted_link(link["url"], link["anchor_text"])
+                  if link_score <= 0:
+                      continue
+
+                  extracted_link_rows.append({
+                      "source_candidate_id": candidate["candidate_id"],
+                      "source_url": candidate["url"],
+                      "candidate_url": link["url"],
+                      "anchor_text": link["anchor_text"],
+                      "discovery": link["discovery"],
+                      "link_score": link_score,
+                      "score_reasons": link_reasons
+                  })
+
+          extracted_link_rows.sort(key=lambda row: row["link_score"], reverse=True)
+
+          parse_candidates = [
+              row for row in product_rows
+              if row["classification"] == "posterior_chain_parse_candidate"
+          ]
+
+          config_candidates = [
+              row for row in product_rows
+              if row["classification"] == "configuration_path_map_candidate"
+          ]
+
+          numeric_candidates = [
+              row for row in product_rows
+              if row["classification"] == "numeric_product_needs_column_map"
+          ]
+
+          supporting_products = [
+              row for row in product_rows
+              if row["classification"] in [
+                  "data_vector_or_covariance_candidate_not_chain",
+                  "supporting_data_product_candidate_not_chain"
+              ]
+          ]
+
+          failed_gates = []
+          warnings = []
+
+          if not any(row["fetch_ok"] for row in product_rows):
+              failed_gates.append("no_hsc_candidate_products_reachable")
+
+          if not parse_candidates:
+              warnings.append("no_confirmed_hsc_posterior_chain_parse_candidate")
+
+          if supporting_products and not parse_candidates:
+              warnings.append("hsc_products_found_but_appear_to_be_data_or_config_not_posterior_chain")
+
+          if config_candidates:
+              warnings.append("hsc_config_candidate_found_may_need_path_followup")
+
+          if failed_gates:
+              readiness_label = "hsc_direct_product_selector_probe_failed"
+              next_step = "Repair HSC candidate URLs before parser work."
+          elif parse_candidates:
+              readiness_label = "hsc_direct_product_selector_probe_completed_parse_candidate_found"
+              next_step = (
+                  "Proceed to v4.9 HSC posterior-chain parser for the selected parse candidate. "
+                  "Do not parse DES at the same time."
+              )
+          elif config_candidates or extracted_link_rows:
+              readiness_label = "hsc_direct_product_selector_probe_completed_config_or_links_found"
+              next_step = (
+                  "Proceed to v4.9 HSC product path expansion from config/link candidates. "
+                  "Do not claim HSC posterior parsing yet."
+              )
+          elif numeric_candidates:
+              readiness_label = "hsc_direct_product_selector_probe_completed_numeric_column_map_needed"
+              next_step = (
+                  "Proceed to v4.9 HSC numeric column-map repair if the numeric product is confirmed relevant."
+              )
+          else:
+              readiness_label = "hsc_direct_product_selector_probe_completed_manual_selection_needed"
+              next_step = (
+                  "Do not write a chain parser yet. Manually inspect HSC product pages or add a direct HSC posterior-chain URL."
+              )
+
+          if parse_candidates:
+              selected = parse_candidates[0]
+              selected_reason = "confirmed_parse_candidate"
+          elif config_candidates:
+              selected = config_candidates[0]
+              selected_reason = "configuration_path_map_candidate"
+          elif numeric_candidates:
+              selected = numeric_candidates[0]
+              selected_reason = "numeric_product_needs_column_map"
+          elif supporting_products:
+              selected = supporting_products[0]
+              selected_reason = "supporting_product_not_chain"
+          else:
+              selected = product_rows[0] if product_rows else {}
+              selected_reason = "fallback_first_candidate"
+
+          selector_decision = {
+              "selected_candidate_id": selected.get("candidate_id", ""),
+              "selected_url": selected.get("url", ""),
+              "selected_classification": selected.get("classification", ""),
+              "selected_reason": selected_reason,
+              "next_action": next_step,
+              "posterior_chain_parse_ready": bool(parse_candidates),
+              "config_or_link_expansion_ready": bool(config_candidates or extracted_link_rows),
+              "manual_selection_needed": not bool(parse_candidates or config_candidates or extracted_link_rows or numeric_candidates)
+          }
+
+          interpretation = (
+              "v4.8 checks whether the top HSC crawler result is really a posterior-chain product. "
+              "If it is not, the correct result is still useful: it tells us whether HSC has a data vector, configuration file, repository pointer, or manual-selection problem before we write a parser."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_ledger": SOURCE_LEDGER,
+              "candidate_products": CANDIDATE_PRODUCTS,
+              "product_rows": product_rows,
+              "text_profile_rows": text_profile_rows,
+              "extracted_link_rows_top_100": extracted_link_rows[:100],
+              "selector_decision": selector_decision,
+              "interpretation": interpretation,
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "combined_growth_posterior_built": False,
+                  "new_cosmological_model_fit": False,
+                  "posterior_chain_parsed": False
+              },
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "selected_candidate_id": selector_decision["selected_candidate_id"],
+                  "selected_classification": selector_decision["selected_classification"],
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False,
+                  "posterior_chain_parsed": False
+              }
+          }
+
+          write_csv(
+              OUTDIR / "hsc_product_fetch_inventory_v4_8.csv",
+              product_rows,
+              [
+                  "candidate_id",
+                  "family",
+                  "url",
+                  "priority",
+                  "candidate_role_from_v4_7",
+                  "expected_kind",
+                  "fetch_ok",
+                  "http_status",
+                  "content_type",
+                  "content_length_header",
+                  "bytes_saved",
+                  "truncated_at_byte_limit",
+                  "error",
+                  "product_score",
+                  "score_reasons",
+                  "classification",
+                  "extracted_link_count",
+                  "local_probe_file"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "hsc_text_product_profile_v4_8.csv",
+              text_profile_rows,
+              [
+                  "candidate_id",
+                  "url",
+                  "classification",
+                  "numeric_line_count",
+                  "text_line_count",
+                  "best_ncols",
+                  "best_ncols_count",
+                  "first_numeric_preview",
+                  "first_text_preview",
+                  "text_preview_first_1000"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "hsc_extracted_candidate_links_v4_8.csv",
+              extracted_link_rows[:300],
+              [
+                  "source_candidate_id",
+                  "source_url",
+                  "candidate_url",
+                  "anchor_text",
+                  "discovery",
+                  "link_score",
+                  "score_reasons"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "hsc_selector_decision_v4_8.csv",
+              [selector_decision],
+              [
+                  "selected_candidate_id",
+                  "selected_url",
+                  "selected_classification",
+                  "selected_reason",
+                  "next_action",
+                  "posterior_chain_parse_ready",
+                  "config_or_link_expansion_ready",
+                  "manual_selection_needed"
+              ]
+          )
+
+          interpretation_rows = [
+              {
+                  "interpretation_id": "allowed_selector_probe_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "HSC candidate products were downloaded, profiled, and classified.",
+                  "boundary": "Selector/probe only, not validation."
+              },
+              {
+                  "interpretation_id": "allowed_not_chain_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "If a product is a data vector or configuration file, it may guide a later parser but is not itself a posterior-chain parse.",
+                  "boundary": "Blocks false parser claims."
+              },
+              {
+                  "interpretation_id": "forbidden_parser_claim",
+                  "status": "forbidden",
+                  "wording": "HSC posterior chains were parsed.",
+                  "boundary": "Blocked. v4.8 classifies products only."
+              },
+              {
+                  "interpretation_id": "forbidden_validation_claim",
+                  "status": "forbidden",
+                  "wording": "TAIRID is validated.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_model_comparison_claim",
+                  "status": "forbidden",
+                  "wording": "A likelihood, BIC, or model comparison was run.",
+                  "boundary": "Blocked."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "interpretation_boundaries_v4_8.csv",
+              interpretation_rows,
+              ["interpretation_id", "status", "wording", "boundary"]
+          )
+
+          json_path = OUTDIR / "tairid_cosmology_v4_8_hsc_direct_product_selector_probe.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v4.8 — HSC Direct Product Selector Probe")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v4.7 found HSC as the best next direct-product target. v4.8 downloads and classifies the top HSC candidates before any parser is written.")
+          md.append("")
+          md.append("This prevents us from mistaking a data vector, config file, or repository page for a posterior chain.")
+          md.append("")
+          md.append("## Product classifications")
+          md.append("")
+          md.append("| Candidate | OK | Bytes | Classification | Score | Links |")
+          md.append("|---|---:|---:|---|---:|---:|")
+          for row in product_rows:
+              md.append(
+                  f"| `{row['candidate_id']}` | `{row['fetch_ok']}` | `{row['bytes_saved']}` | "
+                  f"`{row['classification']}` | `{row['product_score']}` | `{row['extracted_link_count']}` |"
+              )
+          md.append("")
+          md.append("## Selector decision")
+          md.append("")
+          md.append("| Field | Value |")
+          md.append("|---|---|")
+          for key, value in selector_decision.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Top extracted links")
+          md.append("")
+          md.append("| Source | Score | URL | Anchor text |")
+          md.append("|---|---:|---|---|")
+          for row in extracted_link_rows[:25]:
+              anchor = (row["anchor_text"] or "").replace("|", "/")[:120]
+              md.append(
+                  f"| `{row['source_candidate_id']}` | `{row['link_score']}` | {row['candidate_url']} | `{anchor}` |"
+              )
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append(interpretation)
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `hsc_product_fetch_inventory_v4_8.csv`")
+          md.append("- `hsc_text_product_profile_v4_8.csv`")
+          md.append("- `hsc_extracted_candidate_links_v4_8.csv`")
+          md.append("- `hsc_selector_decision_v4_8.csv`")
+          md.append("- `interpretation_boundaries_v4_8.csv`")
+          md.append("- `tairid_cosmology_v4_8_hsc_direct_product_selector_probe.json`")
+          md.append("- `tairid_cosmology_v4_8_hsc_direct_product_selector_probe.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_8_hsc_direct_product_selector_probe.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Selector decision:")
+          print(json.dumps(selector_decision, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.8 HSC direct product selector probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-8-hsc-direct-product-selector-probe
+          path: artifacts/tairid_cosmology_v4_8_hsc_direct_product_selector_probe/
