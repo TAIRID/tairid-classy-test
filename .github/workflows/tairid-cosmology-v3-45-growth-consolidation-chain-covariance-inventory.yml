@@ -1,0 +1,797 @@
+name: TAIRID Cosmology v3.45 Growth Consolidation Chain Covariance Inventory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  growth-consolidation-chain-covariance-inventory:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.45 growth consolidation chain covariance inventory
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_45
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_45")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_45_growth_consolidation_chain_covariance_inventory"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute new pressure scores.",
+              "This inventories DES/KiDS/HSC growth/consolidation chain, posterior, covariance, data-vector, and configuration products.",
+              "This does not parse final growth constraints.",
+              "This does not compare growth products against H0LiCOW.",
+              "This upgrades data-access readiness only.",
+              "No survey product may be promoted to model-anchor status in this workflow."
+          ]
+
+          PREVIOUS_MILESTONE = {
+              "v3_44_status": "guarded_two_surface_comparison_design_passed_growth_chain_covariance_upgrade_required",
+              "v3_44_next_rule": "Find DES/KiDS/HSC chain or covariance products so the consolidation side can be upgraded beyond summary anchors before any guarded two-surface implementation.",
+              "h0licow_status": "source_specific_chain_parsed_diagnostic_reach_candidate",
+              "growth_status": "summary_anchor_prototype_only_chain_covariance_upgrade_required",
+              "bao_status": "auxiliary_mixed_ruler_reference_not_global_reach_anchor"
+          }
+
+          SURVEY_SEEDS = [
+              {
+                  "survey": "DES_Y3",
+                  "family": "growth_consolidation",
+                  "seed_role": "official_des_y3_data_release_context",
+                  "urls": [
+                      "https://www.darkenergysurvey.org/des-year-3-cosmology-results-papers/",
+                      "https://des.ncsa.illinois.edu/releases/y3a2"
+                  ]
+              },
+              {
+                  "survey": "KiDS_1000",
+                  "family": "growth_consolidation",
+                  "seed_role": "official_kids_1000_lensing_data_products",
+                  "urls": [
+                      "https://kids.strw.leidenuniv.nl/sciencedata.php",
+                      "https://kids.strw.leidenuniv.nl/DR4/lensing.php"
+                  ]
+              },
+              {
+                  "survey": "HSC_Y3",
+                  "family": "growth_consolidation",
+                  "seed_role": "official_hsc_y3_weak_lensing_results_context",
+                  "urls": [
+                      "https://hsc-release.mtk.nao.ac.jp/doc/index.php/wly3/"
+                  ]
+              }
+          ]
+
+          PRODUCT_TERMS = {
+              "chain_or_posterior": [
+                  "chain", "chains", "posterior", "posteriors", "sampled", "samples",
+                  "polychord", "multinest", "mcmc", "nested"
+              ],
+              "covariance": [
+                  "covariance", "covariances", "covmat", "cov_matrix", "cov"
+              ],
+              "data_vector": [
+                  "data vector", "data-vector", "datavector", "2pt", "3x2pt",
+                  "cosmic shear", "cosebis", "bandpower", "xi", "xipm"
+              ],
+              "cosmosis_config": [
+                  "cosmosis", "kcap", "config", "ini", "pipeline", "likelihood"
+              ],
+              "growth_parameter": [
+                  "s8", "s_8", "sigma8", "sigma_8", "omegam", "omega_m",
+                  "omega", "clustering", "weak lensing", "growth"
+              ],
+              "downloadable_archive": [
+                  ".tar.gz", ".tgz", ".zip", ".tar", ".gz", ".fits", ".h5",
+                  ".hdf5", ".txt", ".dat", ".csv", ".npy", ".npz"
+              ]
+          }
+
+          BAD_LINK_TERMS = [
+              "mailto:", "javascript:", "#", ".png", ".jpg", ".jpeg", ".gif",
+              ".css", ".svg", ".ico", "youtube", "twitter", "facebook"
+          ]
+
+          REQUIRED_CONTRACT_FIELDS = [
+              "source",
+              "observable_role",
+              "pressure_surface",
+              "baseline",
+              "parser_status",
+              "provenance_status",
+              "block_condition",
+              "claim_boundary"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def request_url(url, method="GET", timeout=60, max_bytes=2_000_000):
+              req = urllib.request.Request(
+                  url,
+                  method=method,
+                  headers={
+                      "User-Agent": "TAIRID-v3.45-growth-consolidation-inventory/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  body = b""
+                  if method != "HEAD":
+                      body = resp.read(max_bytes)
+                  return {
+                      "url": url,
+                      "status": getattr(resp, "status", None),
+                      "final_url": resp.geturl(),
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length": resp.headers.get("Content-Length"),
+                      "body": body
+                  }
+
+          def fetch_text(url):
+              result = request_url(url, method="GET", max_bytes=2_000_000)
+              result["text"] = result["body"].decode("utf-8", errors="replace")
+              return result
+
+          def safe_head(url):
+              try:
+                  return request_url(url, method="HEAD", max_bytes=0)
+              except Exception:
+                  try:
+                      return request_url(url, method="GET", max_bytes=200_000)
+                  except Exception as e:
+                      return {
+                          "url": url,
+                          "status": "",
+                          "final_url": url,
+                          "content_type": "",
+                          "content_length": "",
+                          "body": b"",
+                          "error": f"{type(e).__name__}: {e}"
+                      }
+
+          def extract_links(base_url, text):
+              links = []
+              for raw in re.findall(r'''href\s*=\s*["']([^"']+)["']''', text, flags=re.IGNORECASE):
+                  raw = raw.strip()
+                  if not raw:
+                      continue
+                  low = raw.lower()
+                  if any(term in low for term in BAD_LINK_TERMS):
+                      continue
+                  links.append(urllib.parse.urljoin(base_url, raw))
+
+              seen = set()
+              out = []
+              for link in links:
+                  if link not in seen:
+                      seen.add(link)
+                      out.append(link)
+              return out
+
+          def score_link(url, context_text=""):
+              low = (url + " " + context_text).lower()
+              score = 0
+              matched = {}
+
+              for category, terms in PRODUCT_TERMS.items():
+                  hits = sorted(set([term for term in terms if term.lower() in low]))
+                  if hits:
+                      matched[category] = hits
+                      if category in ["chain_or_posterior", "covariance"]:
+                          score += 5 * len(hits)
+                      elif category in ["data_vector", "cosmosis_config", "growth_parameter"]:
+                          score += 3 * len(hits)
+                      elif category == "downloadable_archive":
+                          score += 4 * len(hits)
+
+              if any(x in low for x in ["readme", "data", "download", "release"]):
+                  score += 2
+
+              if any(x in low for x in ["paper", "arxiv", "doi", "talk", "slides"]):
+                  score -= 1
+
+              return score, matched
+
+          def classify_candidate(url, matched, content_type=""):
+              low = (url + " " + content_type).lower()
+              cats = set(matched.keys())
+
+              if "chain_or_posterior" in cats:
+                  return "chain_or_posterior_candidate"
+              if "covariance" in cats:
+                  return "covariance_candidate"
+              if "data_vector" in cats:
+                  return "data_vector_candidate"
+              if "cosmosis_config" in cats:
+                  return "cosmosis_config_candidate"
+              if "downloadable_archive" in cats and ("data" in low or "download" in low or "tar" in low or "zip" in low):
+                  return "downloadable_growth_product_candidate"
+              if "growth_parameter" in cats:
+                  return "growth_parameter_context"
+              return "context_or_followup"
+
+          def infer_parser_status(role):
+              if role in [
+                  "chain_or_posterior_candidate",
+                  "covariance_candidate",
+                  "data_vector_candidate",
+                  "cosmosis_config_candidate",
+                  "downloadable_growth_product_candidate"
+              ]:
+                  return "inventory_candidate_parser_not_built"
+              return "context_only"
+
+          def infer_block_condition(role, survey):
+              if role == "chain_or_posterior_candidate":
+                  return "blocked_until_chain_columns_parameter_names_and_sample_format_are_parsed"
+              if role == "covariance_candidate":
+                  return "blocked_until_covariance_shape_data_vector_mapping_and_parameter_role_are_parsed"
+              if role == "data_vector_candidate":
+                  return "blocked_until_data_vector_observable_mapping_and_covariance_pairing_are_confirmed"
+              if role == "cosmosis_config_candidate":
+                  return "support_only_until_linked_to_chain_or_covariance_products"
+              if role == "downloadable_growth_product_candidate":
+                  return "blocked_until_archive_inventory_identifies_chain_covariance_or_data_vector_members"
+              if survey == "HSC_Y3":
+                  return "blocked_until_public_chain_covariance_or_data_product_link_is_confirmed"
+              return "context_only_not_growth_input"
+
+          def write_csv(path, rows, fields):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({k: row.get(k, "") for k in fields})
+
+          created_at = now_iso()
+
+          page_rows = []
+          link_rows = []
+          candidate_rows = []
+          source_errors = {}
+
+          print("TAIRID Cosmology v3.45 growth/consolidation chain-covariance inventory")
+          print("Truth boundary: inventory only; no scoring; no refit.")
+          print()
+
+          # First pass: fetch seed pages and extract links.
+          for survey in SURVEY_SEEDS:
+              survey_name = survey["survey"]
+
+              for seed_url in survey["urls"]:
+                  print(f"Fetching {survey_name}: {seed_url}")
+
+                  try:
+                      result = fetch_text(seed_url)
+                      text = result.get("text", "")
+                      links = extract_links(result.get("final_url") or seed_url, text)
+
+                      page_score, page_matches = score_link(seed_url, text[:5000])
+
+                      page_rows.append({
+                          "survey": survey_name,
+                          "family": survey["family"],
+                          "seed_role": survey["seed_role"],
+                          "url": seed_url,
+                          "final_url": result.get("final_url", ""),
+                          "status": result.get("status", ""),
+                          "content_type": result.get("content_type", ""),
+                          "content_length": result.get("content_length", ""),
+                          "link_count": len(links),
+                          "page_score": page_score,
+                          "matched_categories": ";".join(sorted(page_matches.keys())),
+                          "page_reachable": True,
+                          "error": ""
+                      })
+
+                      for link in links:
+                          score, matched = score_link(link, text[:2000])
+                          data_like = score > 0
+                          link_rows.append({
+                              "survey": survey_name,
+                              "seed_url": seed_url,
+                              "url": link,
+                              "score": score,
+                              "matched_categories": ";".join(sorted(matched.keys())),
+                              "matched_terms": json.dumps(matched, sort_keys=True),
+                              "data_like": data_like
+                          })
+
+                  except Exception as e:
+                      err = f"{type(e).__name__}: {e}"
+                      source_errors[f"{survey_name}:{seed_url}"] = err
+                      page_rows.append({
+                          "survey": survey_name,
+                          "family": survey["family"],
+                          "seed_role": survey["seed_role"],
+                          "url": seed_url,
+                          "final_url": "",
+                          "status": "",
+                          "content_type": "",
+                          "content_length": "",
+                          "link_count": 0,
+                          "page_score": 0,
+                          "matched_categories": "",
+                          "page_reachable": False,
+                          "error": err
+                      })
+                      print(f"  failed: {err}")
+
+          # Candidate product inventory.
+          candidate_pool = sorted(
+              [row for row in link_rows if row["score"] > 0],
+              key=lambda r: (r["survey"], -int(r["score"]), r["url"])
+          )
+
+          # Limit per survey so the inventory stays readable.
+          selected = []
+          counts = {}
+          for row in candidate_pool:
+              counts.setdefault(row["survey"], 0)
+              if counts[row["survey"]] >= 40:
+                  continue
+              counts[row["survey"]] += 1
+              selected.append(row)
+
+          for row in selected:
+              head = safe_head(row["url"])
+              matched = json.loads(row["matched_terms"]) if row["matched_terms"] else {}
+              role = classify_candidate(row["url"], matched, head.get("content_type", ""))
+
+              candidate_rows.append({
+                  "source": row["survey"],
+                  "observable_role": "weak_lensing_clustering_growth",
+                  "pressure_surface": "consolidation_growth",
+                  "baseline": "not_selected_inventory_only",
+                  "parser_status": infer_parser_status(role),
+                  "provenance_status": "official_or_officially_linked_public_product_candidate",
+                  "candidate_role": role,
+                  "url": row["url"],
+                  "http_status": head.get("status", ""),
+                  "content_type": head.get("content_type", ""),
+                  "content_length": head.get("content_length", ""),
+                  "score": row["score"],
+                  "matched_categories": row["matched_categories"],
+                  "matched_terms": row["matched_terms"],
+                  "block_condition": infer_block_condition(role, row["survey"]),
+                  "claim_boundary": "inventory_candidate_only_not_model_anchor",
+                  "model_anchor_allowed_now": False,
+                  "refit_allowed_now": False,
+                  "new_pressure_score_allowed_now": False,
+                  "error": head.get("error", "")
+              })
+
+          # Survey readiness summary.
+          summary_rows = []
+          for survey in [s["survey"] for s in SURVEY_SEEDS]:
+              survey_pages = [r for r in page_rows if r["survey"] == survey]
+              survey_candidates = [r for r in candidate_rows if r["source"] == survey]
+
+              chain_count = sum(1 for r in survey_candidates if r["candidate_role"] == "chain_or_posterior_candidate")
+              covariance_count = sum(1 for r in survey_candidates if r["candidate_role"] == "covariance_candidate")
+              data_vector_count = sum(1 for r in survey_candidates if r["candidate_role"] == "data_vector_candidate")
+              config_count = sum(1 for r in survey_candidates if r["candidate_role"] == "cosmosis_config_candidate")
+              archive_count = sum(1 for r in survey_candidates if r["candidate_role"] == "downloadable_growth_product_candidate")
+              reachable_pages = sum(1 for r in survey_pages if r["page_reachable"] is True)
+
+              if chain_count > 0 and (covariance_count > 0 or data_vector_count > 0 or archive_count > 0):
+                  readiness = "ready_for_growth_parser_design_candidate"
+              elif chain_count > 0 or covariance_count > 0 or data_vector_count > 0 or archive_count > 0:
+                  readiness = "partial_growth_product_inventory_candidate"
+              elif reachable_pages > 0:
+                  readiness = "context_reachable_product_followup_needed"
+              else:
+                  readiness = "source_reachability_failed_or_blocked"
+
+              summary_rows.append({
+                  "survey": survey,
+                  "reachable_seed_pages": reachable_pages,
+                  "candidate_count": len(survey_candidates),
+                  "chain_or_posterior_candidate_count": chain_count,
+                  "covariance_candidate_count": covariance_count,
+                  "data_vector_candidate_count": data_vector_count,
+                  "cosmosis_config_candidate_count": config_count,
+                  "downloadable_archive_candidate_count": archive_count,
+                  "readiness_status": readiness,
+                  "claim_boundary": "inventory_only_not_model_anchor",
+                  "next_use": "Use only to choose source-specific parser design targets."
+              })
+
+          # Recommended parser-design targets.
+          target_rows = []
+          for row in candidate_rows:
+              if row["candidate_role"] in [
+                  "chain_or_posterior_candidate",
+                  "covariance_candidate",
+                  "data_vector_candidate",
+                  "downloadable_growth_product_candidate",
+                  "cosmosis_config_candidate"
+              ]:
+                  target_rows.append({
+                      "priority": 1 if row["candidate_role"] == "chain_or_posterior_candidate" else 2,
+                      "source": row["source"],
+                      "candidate_role": row["candidate_role"],
+                      "url": row["url"],
+                      "recommended_next_parser_step": {
+                          "chain_or_posterior_candidate": "Open product/archive and identify parameter names, S8/sigma8/omegam columns, sample weights, and chain format.",
+                          "covariance_candidate": "Open product/archive and identify covariance matrix shape, paired data vector, and observable mapping.",
+                          "data_vector_candidate": "Open product/archive and pair data vector with covariance and theory/config files.",
+                          "downloadable_growth_product_candidate": "Inventory archive members before selecting parser path.",
+                          "cosmosis_config_candidate": "Use as support context for likelihood and parameter mapping."
+                      }.get(row["candidate_role"], "manual review"),
+                      "block_condition": row["block_condition"],
+                      "claim_boundary": row["claim_boundary"]
+                  })
+
+          target_rows = sorted(target_rows, key=lambda r: (int(r["priority"]), r["source"], r["candidate_role"], r["url"]))[:40]
+
+          # Write outputs.
+          write_csv(
+              OUTDIR / "growth_inventory_seed_pages_v3_45.csv",
+              page_rows,
+              [
+                  "survey", "family", "seed_role", "url", "final_url", "status",
+                  "content_type", "content_length", "link_count", "page_score",
+                  "matched_categories", "page_reachable", "error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "growth_inventory_extracted_links_v3_45.csv",
+              link_rows,
+              [
+                  "survey", "seed_url", "url", "score", "matched_categories",
+                  "matched_terms", "data_like"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "growth_chain_covariance_candidate_inventory_v3_45.csv",
+              candidate_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "parser_status", "provenance_status", "candidate_role",
+                  "url", "http_status", "content_type", "content_length",
+                  "score", "matched_categories", "matched_terms",
+                  "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_allowed_now", "error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "growth_source_readiness_summary_v3_45.csv",
+              summary_rows,
+              [
+                  "survey", "reachable_seed_pages", "candidate_count",
+                  "chain_or_posterior_candidate_count", "covariance_candidate_count",
+                  "data_vector_candidate_count", "cosmosis_config_candidate_count",
+                  "downloadable_archive_candidate_count", "readiness_status",
+                  "claim_boundary", "next_use"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "growth_parser_design_target_queue_v3_45.csv",
+              target_rows,
+              [
+                  "priority", "source", "candidate_role", "url",
+                  "recommended_next_parser_step", "block_condition", "claim_boundary"
+              ]
+          )
+
+          # Audit.
+          reachable_survey_count = sum(1 for r in summary_rows if int(r["reachable_seed_pages"]) > 0)
+          ready_or_partial_count = sum(
+              1 for r in summary_rows
+              if r["readiness_status"] in [
+                  "ready_for_growth_parser_design_candidate",
+                  "partial_growth_product_inventory_candidate"
+              ]
+          )
+
+          total_chain = sum(int(r["chain_or_posterior_candidate_count"]) for r in summary_rows)
+          total_cov = sum(int(r["covariance_candidate_count"]) for r in summary_rows)
+          total_data_vector = sum(int(r["data_vector_candidate_count"]) for r in summary_rows)
+          total_archive = sum(int(r["downloadable_archive_candidate_count"]) for r in summary_rows)
+
+          kids_ready = any(
+              r["survey"] == "KiDS_1000"
+              and r["readiness_status"] in [
+                  "ready_for_growth_parser_design_candidate",
+                  "partial_growth_product_inventory_candidate"
+              ]
+              for r in summary_rows
+          )
+
+          des_available = any(
+              r["survey"] == "DES_Y3"
+              and int(r["reachable_seed_pages"]) > 0
+              for r in summary_rows
+          )
+
+          hsc_context_recorded = any(
+              r["survey"] == "HSC_Y3"
+              and int(r["reachable_seed_pages"]) > 0
+              for r in summary_rows
+          )
+
+          no_model_anchors = all(r["model_anchor_allowed_now"] is False for r in candidate_rows)
+          no_refits = all(r["refit_allowed_now"] is False for r in candidate_rows)
+          no_scores = all(r["new_pressure_score_allowed_now"] is False for r in candidate_rows)
+
+          required_contract_present = True
+          for row in candidate_rows:
+              for field in REQUIRED_CONTRACT_FIELDS:
+                  if field not in row or row[field] in ["", None]:
+                      required_contract_present = False
+
+          target_queue_ready = len(target_rows) > 0
+
+          audit_rows = [
+              {
+                  "audit_gate": "survey_seed_pages_reachable",
+                  "pass": reachable_survey_count >= 2,
+                  "value": reachable_survey_count,
+                  "boundary": "At least two growth survey families should have reachable official/context pages."
+              },
+              {
+                  "audit_gate": "growth_candidates_found",
+                  "pass": len(candidate_rows) > 0,
+                  "value": len(candidate_rows),
+                  "boundary": "Need candidate chain/covariance/data-vector/config links before parser design."
+              },
+              {
+                  "audit_gate": "chain_or_covariance_or_archive_candidate_found",
+                  "pass": (total_chain + total_cov + total_data_vector + total_archive) > 0,
+                  "value": f"chains={total_chain}; covariance={total_cov}; data_vectors={total_data_vector}; archives={total_archive}",
+                  "boundary": "Need at least one machine-readable growth product candidate."
+              },
+              {
+                  "audit_gate": "kids_growth_products_identified",
+                  "pass": kids_ready,
+                  "value": kids_ready,
+                  "boundary": "KiDS is expected to provide usable chains/covariance/data-vector products."
+              },
+              {
+                  "audit_gate": "des_context_or_products_recorded",
+                  "pass": des_available,
+                  "value": des_available,
+                  "boundary": "DES Y3 release context should be recorded, even if parser target selection needs follow-up."
+              },
+              {
+                  "audit_gate": "hsc_context_recorded",
+                  "pass": hsc_context_recorded,
+                  "value": hsc_context_recorded,
+                  "boundary": "HSC Y3 context should be recorded; lack of public product candidates is not automatically a failed cosmology result."
+              },
+              {
+                  "audit_gate": "parser_design_targets_queued",
+                  "pass": target_queue_ready,
+                  "value": len(target_rows),
+                  "boundary": "Inventory should produce next parser-design targets."
+              },
+              {
+                  "audit_gate": "required_contract_fields_present",
+                  "pass": required_contract_present,
+                  "value": required_contract_present,
+                  "boundary": "source/role/surface/baseline/parser/provenance/block/claim contract must persist."
+              },
+              {
+                  "audit_gate": "no_new_pressure_scores",
+                  "pass": no_scores,
+                  "value": no_scores,
+                  "boundary": "No pressure scores in v3.45."
+              },
+              {
+                  "audit_gate": "no_model_anchors_promoted",
+                  "pass": no_model_anchors,
+                  "value": no_model_anchors,
+                  "boundary": "No model anchors in v3.45."
+              },
+              {
+                  "audit_gate": "no_refit_allowed",
+                  "pass": no_refits,
+                  "value": no_refits,
+                  "boundary": "No refit in v3.45."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "growth_chain_covariance_inventory_audit_v3_45.csv",
+              audit_rows,
+              ["audit_gate", "pass", "value", "boundary"]
+          )
+
+          hard_failed = []
+
+          if reachable_survey_count < 2:
+              hard_failed.append("too_few_growth_survey_pages_reachable")
+          if len(candidate_rows) == 0:
+              hard_failed.append("no_growth_candidates_found")
+          if (total_chain + total_cov + total_data_vector + total_archive) <= 0:
+              hard_failed.append("no_machine_readable_growth_product_candidates")
+          if not kids_ready:
+              hard_failed.append("kids_growth_products_not_identified")
+          if not des_available:
+              hard_failed.append("des_context_not_recorded")
+          if not hsc_context_recorded:
+              hard_failed.append("hsc_context_not_recorded")
+          if not target_queue_ready:
+              hard_failed.append("parser_design_target_queue_empty")
+          if not required_contract_present:
+              hard_failed.append("required_contract_fields_missing")
+          if not no_scores:
+              hard_failed.append("new_pressure_score_guard_violation")
+          if not no_model_anchors:
+              hard_failed.append("model_anchor_promotion_violation")
+          if not no_refits:
+              hard_failed.append("refit_guard_violation")
+
+          if hard_failed:
+              readiness_label = "growth_consolidation_chain_covariance_inventory_needs_followup"
+          elif ready_or_partial_count >= 2:
+              readiness_label = "growth_consolidation_chain_covariance_inventory_passed_ready_for_parser_design"
+          else:
+              readiness_label = "growth_consolidation_chain_covariance_inventory_partial_kids_ready_followup_needed"
+
+          next_step = (
+              "Build v3.46 growth/consolidation parser-design target review: choose the safest DES/KiDS/HSC product family for source-specific parser implementation, still with no pressure scoring or refit."
+              if not hard_failed
+              else "Inspect v3.45 inventory outputs and add explicit product URLs or source pages before parser design."
+          )
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "previous_milestone": PREVIOUS_MILESTONE,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_errors": source_errors,
+              "seed_page_count": len(page_rows),
+              "candidate_count": len(candidate_rows),
+              "target_queue_count": len(target_rows),
+              "reachable_survey_count": reachable_survey_count,
+              "ready_or_partial_survey_count": ready_or_partial_count,
+              "total_chain_candidates": total_chain,
+              "total_covariance_candidates": total_cov,
+              "total_data_vector_candidates": total_data_vector,
+              "total_archive_candidates": total_archive,
+              "gate_result": {
+                  "failed_gates": hard_failed,
+                  "readiness_label": readiness_label,
+                  "seed_page_count": len(page_rows),
+                  "candidate_count": len(candidate_rows),
+                  "target_queue_count": len(target_rows),
+                  "reachable_survey_count": reachable_survey_count,
+                  "ready_or_partial_survey_count": ready_or_partial_count,
+                  "total_chain_candidates": total_chain,
+                  "total_covariance_candidates": total_cov,
+                  "total_data_vector_candidates": total_data_vector,
+                  "total_archive_candidates": total_archive,
+                  "kids_ready": kids_ready,
+                  "des_context_recorded": des_available,
+                  "hsc_context_recorded": hsc_context_recorded,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "new_pressure_scores_built": False,
+                  "next_allowed_step": next_step
+              }
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_45_growth_consolidation_chain_covariance_inventory.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.45 — Growth / Consolidation Chain-Covariance Inventory")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this inventory does")
+          md.append("")
+          md.append("v3.45 searches official or officially linked DES/KiDS/HSC growth-consolidation sources for chains, posteriors, covariance products, data vectors, and configuration files.")
+          md.append("")
+          md.append("It does not parse final growth constraints, does not compare against H0LiCOW, does not compute pressure scores, and does not run a refit.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Seed pages checked: `{len(page_rows)}`")
+          md.append(f"- Candidate products/links: `{len(candidate_rows)}`")
+          md.append(f"- Parser-design targets queued: `{len(target_rows)}`")
+          md.append(f"- Reachable survey families: `{reachable_survey_count}`")
+          md.append(f"- Chain/posterior candidates: `{total_chain}`")
+          md.append(f"- Covariance candidates: `{total_cov}`")
+          md.append(f"- Data-vector candidates: `{total_data_vector}`")
+          md.append(f"- Archive/download candidates: `{total_archive}`")
+          md.append("")
+          md.append("## Survey summary")
+          md.append("")
+          md.append("| Survey | Readiness | Candidates | Chains | Covariance | Data vectors | Archives |")
+          md.append("|---|---|---:|---:|---:|---:|---:|")
+          for row in summary_rows:
+              md.append(f"| `{row['survey']}` | `{row['readiness_status']}` | {row['candidate_count']} | {row['chain_or_posterior_candidate_count']} | {row['covariance_candidate_count']} | {row['data_vector_candidate_count']} | {row['downloadable_archive_candidate_count']} |")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not hard_failed:
+              md.append("The inventory found enough growth/consolidation source material to move toward parser design. This is still data-access readiness, not a growth-pressure result.")
+          else:
+              md.append("The inventory found blockers. Parser design should wait until missing source pages or explicit product URLs are repaired.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `growth_inventory_seed_pages_v3_45.csv`")
+          md.append("- `growth_inventory_extracted_links_v3_45.csv`")
+          md.append("- `growth_chain_covariance_candidate_inventory_v3_45.csv`")
+          md.append("- `growth_source_readiness_summary_v3_45.csv`")
+          md.append("- `growth_parser_design_target_queue_v3_45.csv`")
+          md.append("- `growth_chain_covariance_inventory_audit_v3_45.csv`")
+          md.append("- `tairid_cosmology_v3_45_growth_consolidation_chain_covariance_inventory.json`")
+          md.append("- `tairid_cosmology_v3_45_growth_consolidation_chain_covariance_inventory.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_45_growth_consolidation_chain_covariance_inventory.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.45 growth consolidation chain covariance inventory artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-45-growth-consolidation-chain-covariance-inventory
+          path: artifacts/tairid_cosmology_v3_45/
