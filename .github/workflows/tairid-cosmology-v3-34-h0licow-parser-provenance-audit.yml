@@ -1,0 +1,1046 @@
+name: TAIRID Cosmology v3.34 H0LiCOW Parser Provenance Audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  h0licow-parser-provenance-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.34 H0LiCOW parser provenance audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_34
+
+          python - <<'PY'
+          import csv
+          import gzip
+          import io
+          import json
+          import math
+          import os
+          import re
+          import shutil
+          import tarfile
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_34")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_34_h0licow_parser_provenance_audit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This audits H0LiCOW time-delay source products after v3.33 found H0LiCOW shape-ready.",
+              "This is parser and provenance work only.",
+              "No H0LiCOW row may be promoted to model-anchor status.",
+              "No H0LiCOW pressure score is built in this workflow.",
+              "BAO remains mixed/subfamily diagnostic from v3.32 and v3.33.",
+              "SH0ES remains parked because v3.33 could not safely parse a source H0 pressure row.",
+              "DESI remains excluded because v3.25 showed the mapped DESI reach rows are scaled counterparts.",
+              "TDCOSMO remains parked because v3.30 flagged TDLMC seed-row provenance review."
+          ]
+
+          H0LICOW_PAGE_URL = "https://shsuyu.github.io/H0LiCOW/site/h0licow_data.html"
+          H0LICOW_REPO = "shsuyu/H0LiCOW-public"
+          TREE_URLS = [
+              "https://api.github.com/repos/shsuyu/H0LiCOW-public/git/trees/master?recursive=1",
+              "https://api.github.com/repos/shsuyu/H0LiCOW-public/git/trees/main?recursive=1"
+          ]
+
+          DIRECT_SITE_PRODUCTS = [
+              "https://shsuyu.github.io/H0LiCOW/site/data/J1206_final.csv",
+              "https://shsuyu.github.io/H0LiCOW/site/data/HE0435_lcs.dat",
+              "https://shsuyu.github.io/H0LiCOW/site/data/PaperIII_complete_catalogue.txt",
+              "https://shsuyu.github.io/H0LiCOW/site/data/HE0435_data_PaperII.tar.gz"
+          ]
+
+          MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
+
+          CANDIDATE_PATH_TERMS = [
+              "h0licow_distance_chains",
+              "cosmo_parameter_chains",
+              "h0_inference_code",
+              "montepython_cosmo_sampling",
+              "h0_tension",
+              "distance",
+              "chain",
+              "chains",
+              "posterior",
+              "samples",
+              "h0",
+              "ddt",
+              "dd",
+              "timedelay",
+              "time_delay",
+              "cosmo"
+          ]
+
+          DATA_EXTENSIONS = [
+              ".txt", ".dat", ".csv", ".tsv", ".chain", ".paramnames",
+              ".npy", ".npz", ".pkl", ".pickle",
+              ".zip", ".tar.gz", ".tgz", ".tar", ".gz"
+          ]
+
+          TEXT_EXTENSIONS = [".txt", ".dat", ".csv", ".tsv", ".chain", ".paramnames", ".py", ".md"]
+          ARCHIVE_EXTENSIONS = [".zip", ".tar.gz", ".tgz", ".tar", ".gz"]
+          BINARY_EXTENSIONS = [".npy", ".npz", ".pkl", ".pickle"]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url_or_path):
+              name = url_or_path.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def is_data_path(path):
+              lower = path.lower()
+              return any(lower.endswith(ext) for ext in DATA_EXTENSIONS)
+
+          def is_text_path(path):
+              lower = path.lower()
+              return any(lower.endswith(ext) for ext in TEXT_EXTENSIONS)
+
+          def is_archive_path(path):
+              lower = path.lower()
+              return any(lower.endswith(ext) for ext in ARCHIVE_EXTENSIONS)
+
+          def is_binary_path(path):
+              lower = path.lower()
+              return any(lower.endswith(ext) for ext in BINARY_EXTENSIONS)
+
+          def request_url(url, timeout=120, max_bytes=None):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.34-h0licow-parser-provenance-audit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  if max_bytes is None:
+                      body = resp.read()
+                  else:
+                      body = resp.read(max_bytes)
+                  return {
+                      "url": url,
+                      "status": getattr(resp, "status", None),
+                      "final_url": resp.geturl(),
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length": resp.headers.get("Content-Length"),
+                      "body": body
+                  }
+
+          def fetch_text(url, timeout=120):
+              result = request_url(url, timeout=timeout, max_bytes=2_000_000)
+              result["text"] = result["body"].decode("utf-8", errors="replace")
+              return result
+
+          def download_capped(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+
+              result = {
+                  "url": url,
+                  "path": str(path),
+                  "downloaded": False,
+                  "skipped": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "size_bytes": 0,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v3.34-h0licow-parser-provenance-audit/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", None)
+                      result["status"] = status
+                      result["content_type"] = resp.headers.get("Content-Type")
+                      result["content_length"] = resp.headers.get("Content-Length")
+
+                      if status is None or not (200 <= status < 400):
+                          raise RuntimeError(f"HTTP status {status}")
+
+                      clen = resp.headers.get("Content-Length")
+                      if clen is not None:
+                          try:
+                              if int(clen) > MAX_DOWNLOAD_BYTES:
+                                  result["skipped"] = True
+                                  result["error"] = f"content_length_exceeds_cap:{clen}>{MAX_DOWNLOAD_BYTES}"
+                                  return result
+                          except Exception:
+                              pass
+
+                      total = 0
+                      with path.open("wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > MAX_DOWNLOAD_BYTES:
+                                  f.close()
+                                  try:
+                                      path.unlink()
+                                  except Exception:
+                                      pass
+                                  result["skipped"] = True
+                                  result["error"] = f"download_exceeds_cap:{total}>{MAX_DOWNLOAD_BYTES}"
+                                  return result
+                              f.write(chunk)
+
+                      result["downloaded"] = True
+                      result["size_bytes"] = path.stat().st_size
+                      return result
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+                  return result
+
+          def extract_html_links(base_url, text):
+              links = []
+              for raw in re.findall(r'''href\s*=\s*["']([^"']+)["']''', text, flags=re.IGNORECASE):
+                  raw = raw.strip()
+                  if not raw or raw.startswith("#") or raw.startswith("mailto:") or raw.startswith("javascript:"):
+                      continue
+                  links.append(urllib.parse.urljoin(base_url, raw))
+
+              deduped = []
+              seen = set()
+              for link in links:
+                  if link not in seen:
+                      seen.add(link)
+                      deduped.append(link)
+
+              return deduped
+
+          def fetch_github_tree():
+              errors = {}
+              for url in TREE_URLS:
+                  try:
+                      result = fetch_text(url, timeout=120)
+                      parsed = json.loads(result["text"])
+                      tree = parsed.get("tree", [])
+                      if tree:
+                          branch = "master" if "master" in url else "main"
+                          return branch, tree, result
+                      errors[url] = "tree_empty"
+                  except Exception as e:
+                      errors[url] = f"{type(e).__name__}: {e}"
+
+              raise RuntimeError(f"Could not fetch GitHub tree: {errors}")
+
+          def raw_github_url(branch, path):
+              quoted = "/".join(urllib.parse.quote(part) for part in path.split("/"))
+              return f"https://raw.githubusercontent.com/{H0LICOW_REPO}/{branch}/{quoted}"
+
+          def score_repo_path(path):
+              lower = path.lower()
+              score = 0
+
+              for term in CANDIDATE_PATH_TERMS:
+                  if term in lower:
+                      score += 2
+
+              if is_data_path(lower):
+                  score += 3
+
+              if any(x in lower for x in ["readme", "license", ".png", ".jpg", ".pdf", ".html", ".css", ".js"]):
+                  score -= 3
+
+              if "h0licow_distance_chains" in lower:
+                  score += 8
+
+              if "cosmo_parameter_chains" in lower:
+                  score += 7
+
+              if "h0_inference_code" in lower:
+                  score += 4
+
+              if "montepython_cosmo_sampling" in lower:
+                  score += 3
+
+              return score
+
+          def summarize_text_bytes(data, label):
+              text = data.decode("utf-8", errors="replace")
+              lines = [line.rstrip("\n") for line in text.splitlines()]
+              nonempty = [line.strip() for line in lines if line.strip()]
+
+              numeric_rows = 0
+              max_numeric_cols = 0
+              header_like = ""
+              first_lines = []
+
+              for line in nonempty[:10]:
+                  first_lines.append(line[:240])
+
+              for line in nonempty[:500]:
+                  clean = line.lstrip("#").strip()
+                  if not clean:
+                      continue
+
+                  parts = re.split(r"[\s,]+", clean)
+                  numeric = 0
+
+                  for p in parts:
+                      try:
+                          float(p)
+                          numeric += 1
+                      except Exception:
+                          pass
+
+                  if numeric >= 2:
+                      numeric_rows += 1
+                      max_numeric_cols = max(max_numeric_cols, numeric)
+                  elif not header_like and any(term in clean.lower() for term in ["h0", "ddt", "distance", "omega", "cosmo", "posterior", "chain"]):
+                      header_like = clean[:300]
+
+              text_hits = []
+              low = text.lower()
+              for term in ["h0", "ddt", "dd", "distance", "time-delay", "time delay", "timedelay", "omega", "chain", "posterior", "sample", "cosmo"]:
+                  if term in low or term in label.lower():
+                      text_hits.append(term)
+
+              return {
+                  "text_line_count_sample": len(nonempty),
+                  "numeric_rows_in_sample": numeric_rows,
+                  "max_numeric_columns_in_sample": max_numeric_cols,
+                  "header_like": header_like,
+                  "first_lines": " | ".join(first_lines),
+                  "content_hits": ";".join(sorted(set(text_hits)))
+              }
+
+          def inspect_text_file(path, label):
+              with path.open("rb") as f:
+                  data = f.read(512 * 1024)
+              return summarize_text_bytes(data, label)
+
+          def inspect_archive(path, source_label):
+              archive_records = []
+              sample_records = []
+              summary = {
+                  "archive_valid": False,
+                  "archive_member_count": 0,
+                  "archive_text_member_count": 0,
+                  "archive_chain_like_member_count": 0,
+                  "archive_distance_like_member_count": 0,
+                  "archive_h0_like_member_count": 0,
+                  "archive_error": ""
+              }
+
+              try:
+                  lower = str(path).lower()
+                  if lower.endswith(".zip"):
+                      with zipfile.ZipFile(path, "r") as zf:
+                          members = [i for i in zf.infolist() if not i.is_dir()]
+                          summary["archive_valid"] = True
+                          summary["archive_member_count"] = len(members)
+
+                          for info in members[:400]:
+                              name = info.filename
+                              lname = name.lower()
+                              archive_records.append({
+                                  "archive_path": str(path),
+                                  "member_name": name,
+                                  "member_size_bytes": int(info.file_size),
+                                  "chain_like": "chain" in lname or "sample" in lname or "mcmc" in lname,
+                                  "distance_like": "distance" in lname or "ddt" in lname or "dd" in lname,
+                                  "h0_like": "h0" in lname
+                              })
+
+                          text_members = [i for i in members if is_text_path(i.filename)]
+                          summary["archive_text_member_count"] = len(text_members)
+                          summary["archive_chain_like_member_count"] = sum(1 for i in members if "chain" in i.filename.lower() or "sample" in i.filename.lower() or "mcmc" in i.filename.lower())
+                          summary["archive_distance_like_member_count"] = sum(1 for i in members if "distance" in i.filename.lower() or "ddt" in i.filename.lower() or "dd" in i.filename.lower())
+                          summary["archive_h0_like_member_count"] = sum(1 for i in members if "h0" in i.filename.lower())
+
+                          sampled = 0
+                          for info in text_members:
+                              if sampled >= 20:
+                                  break
+                              if info.file_size > 3 * 1024 * 1024:
+                                  continue
+                              data = zf.read(info.filename)[:512 * 1024]
+                              ss = summarize_text_bytes(data, info.filename)
+                              ss.update({
+                                  "archive_path": str(path),
+                                  "member_name": info.filename
+                              })
+                              sample_records.append(ss)
+                              sampled += 1
+                  else:
+                      with tarfile.open(path, "r:*") as tf:
+                          members = [i for i in tf.getmembers() if i.isfile()]
+                          summary["archive_valid"] = True
+                          summary["archive_member_count"] = len(members)
+
+                          for info in members[:400]:
+                              name = info.name
+                              lname = name.lower()
+                              archive_records.append({
+                                  "archive_path": str(path),
+                                  "member_name": name,
+                                  "member_size_bytes": int(info.size),
+                                  "chain_like": "chain" in lname or "sample" in lname or "mcmc" in lname,
+                                  "distance_like": "distance" in lname or "ddt" in lname or "dd" in lname,
+                                  "h0_like": "h0" in lname
+                              })
+
+                          text_members = [i for i in members if is_text_path(i.name)]
+                          summary["archive_text_member_count"] = len(text_members)
+                          summary["archive_chain_like_member_count"] = sum(1 for i in members if "chain" in i.name.lower() or "sample" in i.name.lower() or "mcmc" in i.name.lower())
+                          summary["archive_distance_like_member_count"] = sum(1 for i in members if "distance" in i.name.lower() or "ddt" in i.name.lower() or "dd" in i.name.lower())
+                          summary["archive_h0_like_member_count"] = sum(1 for i in members if "h0" in i.name.lower())
+
+                          sampled = 0
+                          for info in text_members:
+                              if sampled >= 20:
+                                  break
+                              if info.size > 3 * 1024 * 1024:
+                                  continue
+                              f = tf.extractfile(info)
+                              if f is None:
+                                  continue
+                              data = f.read(512 * 1024)
+                              ss = summarize_text_bytes(data, info.name)
+                              ss.update({
+                                  "archive_path": str(path),
+                                  "member_name": info.name
+                              })
+                              sample_records.append(ss)
+                              sampled += 1
+
+              except Exception as e:
+                  summary["archive_error"] = f"{type(e).__name__}: {e}"
+
+              return summary, archive_records, sample_records
+
+          def inspect_downloaded_file(path, label):
+              result = {
+                  "text_shape_ok": False,
+                  "binary_shape_ok": False,
+                  "archive_shape_ok": False,
+                  "numeric_rows_in_sample": 0,
+                  "max_numeric_columns_in_sample": 0,
+                  "header_like": "",
+                  "content_hits": "",
+                  "archive_valid": False,
+                  "archive_member_count": 0,
+                  "archive_chain_like_member_count": 0,
+                  "archive_distance_like_member_count": 0,
+                  "archive_h0_like_member_count": 0,
+                  "inspection_note": ""
+              }
+
+              archive_records = []
+              sample_records = []
+
+              try:
+                  if is_archive_path(label):
+                      summary, archive_records, sample_records = inspect_archive(path, label)
+                      result["archive_shape_ok"] = summary["archive_valid"]
+                      result["archive_valid"] = summary["archive_valid"]
+                      result["archive_member_count"] = summary["archive_member_count"]
+                      result["archive_chain_like_member_count"] = summary["archive_chain_like_member_count"]
+                      result["archive_distance_like_member_count"] = summary["archive_distance_like_member_count"]
+                      result["archive_h0_like_member_count"] = summary["archive_h0_like_member_count"]
+                      result["inspection_note"] = summary["archive_error"]
+
+                  elif is_binary_path(label):
+                      result["binary_shape_ok"] = path.stat().st_size > 0
+                      result["inspection_note"] = "binary_shape_only_not_parsed"
+
+                  else:
+                      ss = inspect_text_file(path, label)
+                      result["text_shape_ok"] = ss["text_line_count_sample"] > 0
+                      result["numeric_rows_in_sample"] = ss["numeric_rows_in_sample"]
+                      result["max_numeric_columns_in_sample"] = ss["max_numeric_columns_in_sample"]
+                      result["header_like"] = ss["header_like"]
+                      result["content_hits"] = ss["content_hits"]
+                      sample_records.append({
+                          "archive_path": "",
+                          "member_name": label,
+                          **ss
+                      })
+
+              except Exception as e:
+                  result["inspection_note"] = f"{type(e).__name__}: {e}"
+
+              return result, archive_records, sample_records
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_33_status": "independent_reach_lane_contrast_passed_h0licow_shape_ready_shoes_parser_followup_needed",
+                  "v3_33_next_allowed_step": "Build v3.34 H0LiCOW time-delay parser/provenance audit; keep BAO mixed and do not refit."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_summaries": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.34 H0LiCOW parser/provenance audit")
+          print("Truth boundary: parser/provenance only; no pressure score; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+          source_errors = {}
+          page_links = []
+          repo_candidates = []
+          product_records = []
+          archive_records_all = []
+          sample_records_all = []
+
+          # 1. Inspect H0LiCOW data page.
+          try:
+              page = fetch_text(H0LICOW_PAGE_URL)
+              page_links = extract_html_links(H0LICOW_PAGE_URL, page["text"])
+              data_like_links = [
+                  link for link in page_links
+                  if any(term in link.lower() for term in ["h0", "time", "delay", "data", ".dat", ".csv", ".tar", ".zip", "chain", "distance"])
+              ]
+              inventory["source_summaries"]["H0LiCOW_page"] = {
+                  "page_reachable": True,
+                  "status": page["status"],
+                  "content_type": page["content_type"],
+                  "link_count": len(page_links),
+                  "data_like_link_count": len(data_like_links)
+              }
+              print(f"H0LiCOW page links: {len(page_links)}")
+          except Exception as e:
+              source_errors["H0LiCOW_page"] = f"{type(e).__name__}: {e}"
+              failed_gates.append("h0licow_page_fetch_failed")
+              data_like_links = []
+              inventory["source_summaries"]["H0LiCOW_page"] = {
+                  "page_reachable": False,
+                  "error": source_errors["H0LiCOW_page"]
+              }
+              print(f"H0LiCOW page failed: {source_errors['H0LiCOW_page']}")
+
+          # 2. Inspect public GitHub tree.
+          branch = None
+          tree = []
+          try:
+              branch, tree, tree_result = fetch_github_tree()
+              files = [item for item in tree if item.get("type") == "blob"]
+              for item in files:
+                  path = item.get("path", "")
+                  score = score_repo_path(path)
+                  if score <= 0:
+                      continue
+
+                  repo_candidates.append({
+                      "source": "H0LiCOW",
+                      "origin": "github_tree",
+                      "branch": branch,
+                      "path": path,
+                      "raw_url": raw_github_url(branch, path),
+                      "size": item.get("size"),
+                      "score": score,
+                      "path_lower": path.lower()
+                  })
+
+              repo_candidates = sorted(repo_candidates, key=lambda x: (-x["score"], x["path"]))
+
+              inventory["source_summaries"]["H0LiCOW_repo"] = {
+                  "repo_tree_reachable": True,
+                  "branch": branch,
+                  "tree_file_count": len(files),
+                  "candidate_count": len(repo_candidates)
+              }
+              print(f"H0LiCOW repo candidates: {len(repo_candidates)}")
+          except Exception as e:
+              source_errors["H0LiCOW_repo"] = f"{type(e).__name__}: {e}"
+              failed_gates.append("h0licow_repo_tree_fetch_failed")
+              inventory["source_summaries"]["H0LiCOW_repo"] = {
+                  "repo_tree_reachable": False,
+                  "error": source_errors["H0LiCOW_repo"]
+              }
+              print(f"H0LiCOW repo failed: {source_errors['H0LiCOW_repo']}")
+
+          # 3. Download and inspect selected products.
+          selected_repo_candidates = repo_candidates[:35]
+
+          direct_candidates = []
+          for url in DIRECT_SITE_PRODUCTS:
+              direct_candidates.append({
+                  "source": "H0LiCOW",
+                  "origin": "direct_site_product",
+                  "branch": "",
+                  "path": safe_name(url),
+                  "raw_url": url,
+                  "size": "",
+                  "score": 99,
+                  "path_lower": url.lower()
+              })
+
+          selected = direct_candidates + selected_repo_candidates
+
+          for candidate in selected:
+              url = candidate["raw_url"]
+              fname = safe_name(candidate["path"])
+              if candidate["origin"] == "github_tree":
+                  subdir = "repo"
+              else:
+                  subdir = "site"
+
+              local_path = DOWNLOADS / "H0LiCOW" / subdir / fname
+              dl = download_capped(url, local_path)
+
+              record = {
+                  "source": "H0LiCOW",
+                  "origin": candidate["origin"],
+                  "branch": candidate.get("branch", ""),
+                  "path": candidate["path"],
+                  "url": url,
+                  "score": candidate["score"],
+                  "downloaded": dl["downloaded"],
+                  "skipped": dl["skipped"],
+                  "status": dl["status"],
+                  "content_type": dl["content_type"],
+                  "content_length": dl["content_length"],
+                  "size_bytes": dl["size_bytes"],
+                  "download_error": dl["error"],
+                  "text_shape_ok": False,
+                  "binary_shape_ok": False,
+                  "archive_shape_ok": False,
+                  "numeric_rows_in_sample": 0,
+                  "max_numeric_columns_in_sample": 0,
+                  "header_like": "",
+                  "content_hits": "",
+                  "archive_valid": False,
+                  "archive_member_count": 0,
+                  "archive_chain_like_member_count": 0,
+                  "archive_distance_like_member_count": 0,
+                  "archive_h0_like_member_count": 0,
+                  "inspection_note": "",
+                  "provenance_role": ""
+              }
+
+              lower_path = candidate["path_lower"]
+
+              if "h0licow_distance_chains" in lower_path:
+                  record["provenance_role"] = "distance_chain_candidate"
+              elif "cosmo_parameter_chains" in lower_path:
+                  record["provenance_role"] = "cosmo_parameter_chain_candidate"
+              elif "h0_inference_code" in lower_path:
+                  record["provenance_role"] = "h0_inference_code"
+              elif "montepython" in lower_path:
+                  record["provenance_role"] = "montepython_sampling_support"
+              elif candidate["origin"] == "direct_site_product":
+                  record["provenance_role"] = "site_data_product"
+              else:
+                  record["provenance_role"] = "supporting_candidate"
+
+              if dl["downloaded"]:
+                  inspection, archive_records, sample_records = inspect_downloaded_file(local_path, candidate["path"])
+                  record.update(inspection)
+
+                  for ar in archive_records:
+                      ar.update({
+                          "source": "H0LiCOW",
+                          "origin_path": candidate["path"],
+                          "origin_url": url
+                      })
+
+                  for sr in sample_records:
+                      sr.update({
+                          "source": "H0LiCOW",
+                          "origin_path": candidate["path"],
+                          "origin_url": url
+                      })
+
+                  archive_records_all.extend(archive_records)
+                  sample_records_all.extend(sample_records)
+
+              product_records.append(record)
+
+          # 4. Candidate summaries.
+          downloaded_records = [r for r in product_records if r["downloaded"] is True]
+          text_numeric_records = [
+              r for r in product_records
+              if r["text_shape_ok"] is True and int(r["numeric_rows_in_sample"]) > 0
+          ]
+          archive_records = [r for r in product_records if r["archive_shape_ok"] is True]
+          binary_records = [r for r in product_records if r["binary_shape_ok"] is True]
+
+          distance_chain_candidates = [
+              r for r in product_records
+              if r["provenance_role"] == "distance_chain_candidate"
+          ]
+
+          cosmo_chain_candidates = [
+              r for r in product_records
+              if r["provenance_role"] == "cosmo_parameter_chain_candidate"
+          ]
+
+          inference_code_candidates = [
+              r for r in product_records
+              if r["provenance_role"] == "h0_inference_code"
+          ]
+
+          parsed_distance_like_records = [
+              r for r in product_records
+              if r["downloaded"] is True
+              and (
+                  r["provenance_role"] == "distance_chain_candidate"
+                  or r["archive_distance_like_member_count"] > 0
+                  or "distance" in str(r["content_hits"]).lower()
+                  or "ddt" in str(r["content_hits"]).lower()
+              )
+          ]
+
+          parsed_h0_like_records = [
+              r for r in product_records
+              if r["downloaded"] is True
+              and (
+                  r["provenance_role"] == "cosmo_parameter_chain_candidate"
+                  or r["archive_h0_like_member_count"] > 0
+                  or "h0" in str(r["content_hits"]).lower()
+              )
+          ]
+
+          # 5. Write outputs.
+          candidate_csv = OUTDIR / "h0licow_repo_candidate_inventory_v3_34.csv"
+          with candidate_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = ["source", "origin", "branch", "path", "raw_url", "size", "score"]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for row in repo_candidates:
+                  writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+          product_csv = OUTDIR / "h0licow_product_probe_summary_v3_34.csv"
+          product_fields = [
+              "source", "origin", "branch", "path", "url", "score",
+              "provenance_role", "downloaded", "skipped", "status",
+              "content_type", "content_length", "size_bytes",
+              "download_error", "text_shape_ok", "binary_shape_ok",
+              "archive_shape_ok", "numeric_rows_in_sample",
+              "max_numeric_columns_in_sample", "header_like",
+              "content_hits", "archive_valid", "archive_member_count",
+              "archive_chain_like_member_count",
+              "archive_distance_like_member_count",
+              "archive_h0_like_member_count", "inspection_note"
+          ]
+          with product_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=product_fields)
+              writer.writeheader()
+              for row in product_records:
+                  writer.writerow({k: row.get(k, "") for k in product_fields})
+
+          archive_csv = OUTDIR / "h0licow_archive_member_inventory_v3_34.csv"
+          archive_fields = [
+              "source", "origin_path", "origin_url", "archive_path",
+              "member_name", "member_size_bytes", "chain_like",
+              "distance_like", "h0_like"
+          ]
+          with archive_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=archive_fields)
+              writer.writeheader()
+              for row in archive_records_all:
+                  writer.writerow({k: row.get(k, "") for k in archive_fields})
+
+          samples_csv = OUTDIR / "h0licow_text_sample_shapes_v3_34.csv"
+          sample_fields = [
+              "source", "origin_path", "origin_url", "archive_path",
+              "member_name", "text_line_count_sample",
+              "numeric_rows_in_sample", "max_numeric_columns_in_sample",
+              "header_like", "content_hits", "first_lines"
+          ]
+          with samples_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=sample_fields)
+              writer.writeheader()
+              for row in sample_records_all:
+                  writer.writerow({k: row.get(k, "") for k in sample_fields})
+
+          page_links_csv = OUTDIR / "h0licow_page_links_v3_34.csv"
+          with page_links_csv.open("w", newline="", encoding="utf-8") as f:
+              fieldnames = ["source", "url", "data_like"]
+              writer = csv.DictWriter(f, fieldnames=fieldnames)
+              writer.writeheader()
+              for link in page_links:
+                  writer.writerow({
+                      "source": "H0LiCOW",
+                      "url": link,
+                      "data_like": any(term in link.lower() for term in ["h0", "time", "delay", "data", ".dat", ".csv", ".tar", ".zip", "chain", "distance"])
+                  })
+
+          # 6. Audit gates.
+          repo_reachable = bool(inventory["source_summaries"].get("H0LiCOW_repo", {}).get("repo_tree_reachable"))
+          page_reachable = bool(inventory["source_summaries"].get("H0LiCOW_page", {}).get("page_reachable"))
+
+          distance_chain_found = len(distance_chain_candidates) > 0
+          cosmo_chain_found = len(cosmo_chain_candidates) > 0
+          inference_code_found = len(inference_code_candidates) > 0
+
+          usable_numeric_shape_found = len(text_numeric_records) > 0 or len(archive_records) > 0 or len(binary_records) > 0
+          distance_like_shape_found = len(parsed_distance_like_records) > 0
+          h0_like_shape_found = len(parsed_h0_like_records) > 0
+
+          provenance_audit_pass = (
+              repo_reachable
+              and page_reachable
+              and (distance_chain_found or cosmo_chain_found)
+              and inference_code_found
+              and usable_numeric_shape_found
+          )
+
+          ready_for_chain_ingestion_design = (
+              provenance_audit_pass
+              and (distance_like_shape_found or h0_like_shape_found)
+          )
+
+          audit_rows = [
+              {
+                  "audit_gate": "h0licow_page_reachable",
+                  "pass": page_reachable,
+                  "value": inventory["source_summaries"].get("H0LiCOW_page", {}).get("link_count", ""),
+                  "boundary": "The H0LiCOW public data page should be reachable."
+              },
+              {
+                  "audit_gate": "h0licow_repo_tree_reachable",
+                  "pass": repo_reachable,
+                  "value": inventory["source_summaries"].get("H0LiCOW_repo", {}).get("candidate_count", ""),
+                  "boundary": "The public H0LiCOW GitHub tree should be reachable."
+              },
+              {
+                  "audit_gate": "distance_or_cosmo_chain_candidates_found",
+                  "pass": distance_chain_found or cosmo_chain_found,
+                  "value": f"distance={len(distance_chain_candidates)}; cosmo={len(cosmo_chain_candidates)}",
+                  "boundary": "Need candidate chain products before ingestion design."
+              },
+              {
+                  "audit_gate": "h0_inference_code_found",
+                  "pass": inference_code_found,
+                  "value": len(inference_code_candidates),
+                  "boundary": "Inference code presence helps provenance."
+              },
+              {
+                  "audit_gate": "downloaded_products_inspected",
+                  "pass": len(downloaded_records) > 0,
+                  "value": len(downloaded_records),
+                  "boundary": "At least one product should download and inspect."
+              },
+              {
+                  "audit_gate": "usable_shape_found",
+                  "pass": usable_numeric_shape_found,
+                  "value": f"text_numeric={len(text_numeric_records)}; archive={len(archive_records)}; binary={len(binary_records)}",
+                  "boundary": "Parser design needs at least one machine-readable shape."
+              },
+              {
+                  "audit_gate": "distance_or_h0_like_shape_found",
+                  "pass": distance_like_shape_found or h0_like_shape_found,
+                  "value": f"distance_like={len(parsed_distance_like_records)}; h0_like={len(parsed_h0_like_records)}",
+                  "boundary": "Later pressure construction needs a distance-like or H0-like product."
+              },
+              {
+                  "audit_gate": "pressure_scores_not_built",
+                  "pass": True,
+                  "value": 0,
+                  "boundary": "v3.34 must not pressure-score H0LiCOW."
+              },
+              {
+                  "audit_gate": "model_anchor_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No H0LiCOW row may become a model anchor."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          audit_csv = OUTDIR / "h0licow_parser_provenance_audit_v3_34.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failed = []
+          if not page_reachable:
+              hard_failed.append("h0licow_page_not_reachable")
+          if not repo_reachable:
+              hard_failed.append("h0licow_repo_tree_not_reachable")
+          if not (distance_chain_found or cosmo_chain_found):
+              hard_failed.append("h0licow_chain_candidates_missing")
+          if not usable_numeric_shape_found:
+              hard_failed.append("h0licow_machine_readable_shape_missing")
+          if not inference_code_found:
+              hard_failed.append("h0licow_inference_code_missing")
+
+          if hard_failed:
+              readiness_label = "h0licow_parser_provenance_audit_needs_followup"
+          elif ready_for_chain_ingestion_design:
+              readiness_label = "h0licow_parser_provenance_audit_passed_ready_for_v3_35_chain_ingestion_design"
+          else:
+              readiness_label = "h0licow_parser_provenance_audit_partial_provenance_pass_shape_followup_needed"
+
+          if ready_for_chain_ingestion_design:
+              next_step = "Build v3.35 H0LiCOW chain ingestion design: choose distance-chain or H0-chain products for source-specific parsing, still no pressure score and no refit."
+          else:
+              next_step = "Inspect v3.34 H0LiCOW product summaries and add explicit chain file URLs before ingestion design."
+
+          inventory["candidate_count"] = len(repo_candidates)
+          inventory["selected_product_count"] = len(selected)
+          inventory["downloaded_product_count"] = len(downloaded_records)
+          inventory["text_numeric_product_count"] = len(text_numeric_records)
+          inventory["archive_product_count"] = len(archive_records)
+          inventory["binary_product_count"] = len(binary_records)
+          inventory["distance_chain_candidate_count"] = len(distance_chain_candidates)
+          inventory["cosmo_chain_candidate_count"] = len(cosmo_chain_candidates)
+          inventory["inference_code_candidate_count"] = len(inference_code_candidates)
+          inventory["distance_like_shape_count"] = len(parsed_distance_like_records)
+          inventory["h0_like_shape_count"] = len(parsed_h0_like_records)
+          inventory["provenance_audit_pass"] = provenance_audit_pass
+          inventory["ready_for_chain_ingestion_design"] = ready_for_chain_ingestion_design
+          inventory["source_errors"] = source_errors
+
+          inventory["gate_result"] = {
+              "failed_gates": hard_failed,
+              "readiness_label": readiness_label,
+              "page_reachable": page_reachable,
+              "repo_reachable": repo_reachable,
+              "candidate_count": len(repo_candidates),
+              "selected_product_count": len(selected),
+              "downloaded_product_count": len(downloaded_records),
+              "distance_chain_candidate_count": len(distance_chain_candidates),
+              "cosmo_chain_candidate_count": len(cosmo_chain_candidates),
+              "inference_code_candidate_count": len(inference_code_candidates),
+              "distance_like_shape_count": len(parsed_distance_like_records),
+              "h0_like_shape_count": len(parsed_h0_like_records),
+              "pressure_score_built": False,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_34_h0licow_parser_provenance_audit.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.34 — H0LiCOW Parser / Provenance Audit")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.34 audits H0LiCOW as the next non-BAO reach lane after v3.33 showed H0LiCOW shape-ready and SH0ES parser follow-up needed.")
+          md.append("")
+          md.append("It inspects the public H0LiCOW data page, GitHub repository tree, distance-chain candidates, cosmological-parameter chain candidates, inference code, archives, and machine-readable product shapes.")
+          md.append("")
+          md.append("It does not compute pressure scores, does not promote anchors, and does not refit.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Repository candidates: `{len(repo_candidates)}`")
+          md.append(f"- Selected products inspected: `{len(selected)}`")
+          md.append(f"- Downloaded products: `{len(downloaded_records)}`")
+          md.append(f"- Distance-chain candidates: `{len(distance_chain_candidates)}`")
+          md.append(f"- Cosmology-chain candidates: `{len(cosmo_chain_candidates)}`")
+          md.append(f"- Inference-code candidates: `{len(inference_code_candidates)}`")
+          md.append(f"- Distance-like shapes: `{len(parsed_distance_like_records)}`")
+          md.append(f"- H0-like shapes: `{len(parsed_h0_like_records)}`")
+          md.append(f"- Ready for chain ingestion design: `{ready_for_chain_ingestion_design}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if ready_for_chain_ingestion_design:
+              md.append("H0LiCOW has enough provenance and machine-readable shape to design a source-specific chain ingestion step. This is still not a pressure result.")
+          else:
+              md.append("H0LiCOW remains promising, but the next step needs manual source/product follow-up before ingestion design.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `h0licow_repo_candidate_inventory_v3_34.csv`")
+          md.append("- `h0licow_product_probe_summary_v3_34.csv`")
+          md.append("- `h0licow_archive_member_inventory_v3_34.csv`")
+          md.append("- `h0licow_text_sample_shapes_v3_34.csv`")
+          md.append("- `h0licow_page_links_v3_34.csv`")
+          md.append("- `h0licow_parser_provenance_audit_v3_34.csv`")
+          md.append("- `tairid_cosmology_v3_34_h0licow_parser_provenance_audit.json`")
+          md.append("- `tairid_cosmology_v3_34_h0licow_parser_provenance_audit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_34_h0licow_parser_provenance_audit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.34 H0LiCOW parser provenance audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-34-h0licow-parser-provenance-audit
+          path: artifacts/tairid_cosmology_v3_34/
