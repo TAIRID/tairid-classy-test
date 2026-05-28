@@ -1,0 +1,1006 @@
+name: TAIRID Cosmology v3.49 KiDS1000 Chain Parser Implementation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kids1000-chain-parser-implementation:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.49 KiDS1000 chain parser implementation
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_49
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_49")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_49_kids1000_chain_parser_implementation"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute growth pressure scores.",
+              "This does not compare KiDS growth against H0LiCOW.",
+              "This does not compare KiDS against Planck or any other baseline.",
+              "This parses the selected KiDS-1000 fiducial 3x2pt chain into a guarded weighted parameter ledger only.",
+              "S8, sigma8, and Omega_m summaries are parser outputs, not model evidence.",
+              "KiDS-1000 remains one survey family; internal chain files are not independent external anchors.",
+              "No KiDS product may be promoted to model-anchor status in this workflow."
+          ]
+
+          PREVIOUS_MILESTONE = {
+              "v3_48_1_status": "kids1000_chain_parser_design_contract_fix_passed_ready_for_parser_implementation",
+              "v3_48_1_failed_gates": [],
+              "archive_downloaded": True,
+              "readme_downloaded": True,
+              "chain_file_count": 6,
+              "column_mapping_count": 40,
+              "primary_ready": True,
+              "primary_mapping_complete": True,
+              "secondary_ready": True,
+              "selected_primary_defined": True,
+              "required_contract_present": True,
+              "next_rule": "Parse the selected fiducial 3x2pt chain into a guarded weighted growth parameter ledger for S8, sigma8, and Omega_m, still with no growth pressure scoring, no H0LiCOW comparison, and no refit."
+          }
+
+          KIDS_ARCHIVE_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          KIDS_README_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          SELECTED_MEMBER = "KiDS1000_3x2pt_fiducial_chains/cosmology/samples_multinest_blindC_EE_nE_w.txt"
+
+          MAX_DOWNLOAD_BYTES = 750 * 1024 * 1024
+
+          REQUIRED_CONTRACT_FIELDS = [
+              "source",
+              "observable_role",
+              "pressure_surface",
+              "baseline",
+              "parser_status",
+              "provenance_status",
+              "block_condition",
+              "claim_boundary"
+          ]
+
+          PARAMETER_MAP = {
+              "S8": "COSMOLOGICAL_PARAMETERS--S_8",
+              "sigma8": "COSMOLOGICAL_PARAMETERS--SIGMA_8",
+              "omega_m": "COSMOLOGICAL_PARAMETERS--OMEGA_M",
+              "h0": "cosmological_parameters--h0",
+              "prior": "prior",
+              "like": "like",
+              "post": "post",
+              "weight": "weight"
+          }
+
+          PRIMARY_PARAMETERS = ["S8", "sigma8", "omega_m"]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download_capped(url, path, timeout=600):
+              result = {
+                  "url": url,
+                  "path": str(path),
+                  "downloaded": False,
+                  "status": "",
+                  "content_type": "",
+                  "content_length": "",
+                  "size_bytes": 0,
+                  "error": ""
+              }
+
+              try:
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v3.49-kids1000-chain-parser-implementation/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", "")
+                      result["status"] = status
+                      result["content_type"] = resp.headers.get("Content-Type", "")
+                      result["content_length"] = resp.headers.get("Content-Length", "")
+
+                      if status is None or not (200 <= status < 400):
+                          raise RuntimeError(f"HTTP status {status}")
+
+                      total = 0
+                      with path.open("wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > MAX_DOWNLOAD_BYTES:
+                                  raise RuntimeError(f"download_exceeds_cap:{total}>{MAX_DOWNLOAD_BYTES}")
+                              f.write(chunk)
+
+                  result["downloaded"] = True
+                  result["size_bytes"] = path.stat().st_size
+                  return result
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+                  return result
+
+          def parse_float(value):
+              try:
+                  x = float(str(value).strip())
+              except Exception:
+                  return None
+              if not math.isfinite(x):
+                  return None
+              return x
+
+          def split_header(clean):
+              if "\t" in clean:
+                  return clean.split("\t")
+              return re.split(r"\s+", clean.strip())
+
+          def split_numeric_line(line):
+              parts = re.split(r"[,\s]+", line.strip())
+              if not parts or parts == [""]:
+                  return []
+              values = []
+              for p in parts:
+                  x = parse_float(p)
+                  if x is None:
+                      return []
+                  values.append(x)
+              return values
+
+          def weighted_quantile(values, weights, q):
+              pairs = sorted(
+                  [(float(v), float(w)) for v, w in zip(values, weights) if math.isfinite(v) and math.isfinite(w) and w >= 0],
+                  key=lambda x: x[0]
+              )
+
+              if not pairs:
+                  return ""
+
+              total_weight = sum(w for _, w in pairs)
+              if total_weight <= 0:
+                  return ""
+
+              target = q * total_weight
+              running = 0.0
+
+              for value, weight in pairs:
+                  running += weight
+                  if running >= target:
+                      return value
+
+              return pairs[-1][0]
+
+          def weighted_summary(values, weights):
+              clean = [
+                  (float(v), float(w))
+                  for v, w in zip(values, weights)
+                  if math.isfinite(float(v)) and math.isfinite(float(w)) and float(w) >= 0
+              ]
+
+              if not clean:
+                  return {
+                      "finite_count": 0,
+                      "weight_sum": "",
+                      "effective_sample_count": "",
+                      "weighted_mean": "",
+                      "weighted_std": "",
+                      "q16": "",
+                      "q50": "",
+                      "q84": "",
+                      "min": "",
+                      "max": ""
+                  }
+
+              xs = [v for v, _ in clean]
+              ws = [w for _, w in clean]
+              weight_sum = sum(ws)
+
+              if weight_sum <= 0:
+                  return {
+                      "finite_count": len(clean),
+                      "weight_sum": weight_sum,
+                      "effective_sample_count": "",
+                      "weighted_mean": "",
+                      "weighted_std": "",
+                      "q16": "",
+                      "q50": "",
+                      "q84": "",
+                      "min": min(xs),
+                      "max": max(xs)
+                  }
+
+              mean = sum(v * w for v, w in clean) / weight_sum
+              variance = sum(w * (v - mean) ** 2 for v, w in clean) / weight_sum
+              weight_sq_sum = sum(w ** 2 for w in ws)
+              effective_n = (weight_sum ** 2 / weight_sq_sum) if weight_sq_sum > 0 else ""
+
+              return {
+                  "finite_count": len(clean),
+                  "weight_sum": weight_sum,
+                  "effective_sample_count": effective_n,
+                  "weighted_mean": mean,
+                  "weighted_std": math.sqrt(max(variance, 0.0)),
+                  "q16": weighted_quantile(xs, ws, 0.16),
+                  "q50": weighted_quantile(xs, ws, 0.50),
+                  "q84": weighted_quantile(xs, ws, 0.84),
+                  "min": min(xs),
+                  "max": max(xs)
+              }
+
+          def unweighted_summary(values):
+              xs = [float(v) for v in values if math.isfinite(float(v))]
+              if not xs:
+                  return {
+                      "unweighted_mean": "",
+                      "unweighted_min": "",
+                      "unweighted_max": ""
+                  }
+
+              return {
+                  "unweighted_mean": sum(xs) / len(xs),
+                  "unweighted_min": min(xs),
+                  "unweighted_max": max(xs)
+              }
+
+          def find_selected_member(tf):
+              names = tf.getnames()
+              if SELECTED_MEMBER in names:
+                  return tf.getmember(SELECTED_MEMBER)
+
+              lowered_target = SELECTED_MEMBER.lower()
+              for name in names:
+                  if name.lower() == lowered_target:
+                      return tf.getmember(name)
+
+              for name in names:
+                  if "samples_multinest_blindc_ee_ne_w.txt" in name.lower():
+                      return tf.getmember(name)
+
+              return None
+
+          def parse_selected_chain(tf, member):
+              result = {
+                  "selected_member": member.name if member else "",
+                  "member_size_bytes": int(member.size) if member else 0,
+                  "header_found": False,
+                  "header_column_count": 0,
+                  "numeric_row_count": 0,
+                  "skipped_numeric_row_count": 0,
+                  "column_map": {},
+                  "parameter_values": {key: [] for key in PARAMETER_MAP.keys()},
+                  "weight_values": [],
+                  "source_errors": [],
+                  "first_numeric_line": "",
+                  "header_line": ""
+              }
+
+              if member is None:
+                  result["source_errors"].append("selected_member_not_found")
+                  return result
+
+              try:
+                  f = tf.extractfile(member)
+                  if f is None:
+                      result["source_errors"].append("extractfile_unavailable")
+                      return result
+
+                  header_cols = []
+                  column_map = {}
+
+                  for raw in f:
+                      text = raw.decode("utf-8", errors="replace").rstrip("\n")
+                      stripped = text.strip()
+
+                      if not stripped:
+                          continue
+
+                      if stripped.startswith("#"):
+                          clean = stripped.lstrip("#").strip()
+                          if "COSMOLOGICAL_PARAMETERS--" in clean or "cosmological_parameters--" in clean:
+                              header_cols = split_header(clean)
+                              result["header_found"] = True
+                              result["header_column_count"] = len(header_cols)
+                              result["header_line"] = "\t".join(header_cols)
+
+                              for role, column_name in PARAMETER_MAP.items():
+                                  if column_name in header_cols:
+                                      column_map[role] = header_cols.index(column_name)
+
+                              result["column_map"] = column_map
+                          continue
+
+                      values = split_numeric_line(stripped)
+
+                      if not values:
+                          result["skipped_numeric_row_count"] += 1
+                          continue
+
+                      if not result["first_numeric_line"]:
+                          result["first_numeric_line"] = stripped[:1000]
+
+                      if not header_cols:
+                          result["skipped_numeric_row_count"] += 1
+                          continue
+
+                      if len(values) != len(header_cols):
+                          result["skipped_numeric_row_count"] += 1
+                          continue
+
+                      missing_required = [role for role in PRIMARY_PARAMETERS + ["weight"] if role not in column_map]
+                      if missing_required:
+                          result["skipped_numeric_row_count"] += 1
+                          continue
+
+                      weight = values[column_map["weight"]]
+                      if not math.isfinite(weight) or weight < 0:
+                          result["skipped_numeric_row_count"] += 1
+                          continue
+
+                      result["numeric_row_count"] += 1
+                      result["weight_values"].append(weight)
+
+                      for role in PARAMETER_MAP.keys():
+                          if role in column_map:
+                              result["parameter_values"][role].append(values[column_map[role]])
+
+                  return result
+
+              except Exception as e:
+                  result["source_errors"].append(f"{type(e).__name__}: {e}")
+                  return result
+
+          def write_csv(path, rows, fields):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({k: row.get(k, "") for k in fields})
+
+          created_at = now_iso()
+
+          print("TAIRID Cosmology v3.49 KiDS-1000 chain parser implementation")
+          print("Truth boundary: guarded parameter ledger only; no pressure score; no H0LiCOW comparison; no refit.")
+          print()
+
+          archive_path = DOWNLOADS / "KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          readme_path = DOWNLOADS / "KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          archive_dl = download_capped(KIDS_ARCHIVE_URL, archive_path)
+          readme_dl = download_capped(KIDS_README_URL, readme_path)
+
+          failed_gates = []
+          source_errors = {}
+
+          if not archive_dl["downloaded"]:
+              failed_gates.append("kids_archive_download_failed")
+              source_errors["kids_archive"] = archive_dl["error"]
+
+          if not readme_dl["downloaded"]:
+              failed_gates.append("kids_readme_download_failed")
+              source_errors["kids_readme"] = readme_dl["error"]
+
+          parse_result = {
+              "selected_member": SELECTED_MEMBER,
+              "member_size_bytes": 0,
+              "header_found": False,
+              "header_column_count": 0,
+              "numeric_row_count": 0,
+              "skipped_numeric_row_count": 0,
+              "column_map": {},
+              "parameter_values": {key: [] for key in PARAMETER_MAP.keys()},
+              "weight_values": [],
+              "source_errors": ["archive_not_downloaded"],
+              "first_numeric_line": "",
+              "header_line": ""
+          }
+
+          if archive_dl["downloaded"]:
+              try:
+                  with tarfile.open(archive_path, "r:gz") as tf:
+                      member = find_selected_member(tf)
+                      parse_result = parse_selected_chain(tf, member)
+
+              except Exception as e:
+                  failed_gates.append("kids_chain_parse_failed")
+                  source_errors["kids_chain_parse"] = f"{type(e).__name__}: {e}"
+
+          if parse_result["source_errors"]:
+              source_errors["selected_chain_parse"] = ";".join(parse_result["source_errors"])
+
+          weight_values = parse_result["weight_values"]
+          weight_sum = sum(weight_values) if weight_values else 0.0
+
+          column_mapping_rows = []
+          for role, column_name in PARAMETER_MAP.items():
+              column_mapping_rows.append({
+                  "source": "KiDS_1000",
+                  "observable_role": "weak_lensing_clustering_growth",
+                  "pressure_surface": "consolidation_growth",
+                  "baseline": "not_selected_parameter_ledger_only",
+                  "selected_member": parse_result["selected_member"],
+                  "parameter_role": role,
+                  "expected_column_name": column_name,
+                  "column_index_zero_based": parse_result["column_map"].get(role, ""),
+                  "column_present": role in parse_result["column_map"],
+                  "parser_status": "column_mapped_for_guarded_parameter_ledger" if role in parse_result["column_map"] else "column_missing",
+                  "provenance_status": "official_public_kids_archive_member",
+                  "block_condition": "blocked_from_pressure_scoring_until_growth_pressure_design_audit",
+                  "claim_boundary": "parser_output_only_not_model_anchor",
+                  "model_anchor_allowed_now": False,
+                  "refit_allowed_now": False,
+                  "new_pressure_score_built": False
+              })
+
+          parameter_ledger_rows = []
+
+          for role in PRIMARY_PARAMETERS:
+              values = parse_result["parameter_values"].get(role, [])
+              wsum = weighted_summary(values, weight_values)
+              usum = unweighted_summary(values)
+
+              parameter_ledger_rows.append({
+                  "source": "KiDS_1000",
+                  "observable_role": "weak_lensing_clustering_growth",
+                  "pressure_surface": "consolidation_growth",
+                  "baseline": "not_selected_parameter_ledger_only",
+                  "selected_member": parse_result["selected_member"],
+                  "parameter_role": role,
+                  "matched_column_name": PARAMETER_MAP[role],
+                  "column_index_zero_based": parse_result["column_map"].get(role, ""),
+                  "sample_count": parse_result["numeric_row_count"],
+                  "finite_count": wsum["finite_count"],
+                  "weight_sum": wsum["weight_sum"],
+                  "effective_sample_count": wsum["effective_sample_count"],
+                  "weighted_mean": wsum["weighted_mean"],
+                  "weighted_std": wsum["weighted_std"],
+                  "q16": wsum["q16"],
+                  "q50": wsum["q50"],
+                  "q84": wsum["q84"],
+                  "min": wsum["min"],
+                  "max": wsum["max"],
+                  "unweighted_mean": usum["unweighted_mean"],
+                  "unweighted_min": usum["unweighted_min"],
+                  "unweighted_max": usum["unweighted_max"],
+                  "parser_status": "guarded_weighted_parameter_summary_built",
+                  "provenance_status": "official_public_kids_archive_member",
+                  "block_condition": "blocked_from_pressure_scoring_until_growth_pressure_design_audit",
+                  "claim_boundary": "parameter_ledger_only_not_model_anchor",
+                  "model_anchor_allowed_now": False,
+                  "refit_allowed_now": False,
+                  "new_pressure_score_built": False
+              })
+
+          context_ledger_rows = []
+          for role in ["h0", "prior", "like", "post", "weight"]:
+              values = parse_result["parameter_values"].get(role, [])
+              if role == "weight":
+                  usum = unweighted_summary(values)
+                  context_ledger_rows.append({
+                      "source": "KiDS_1000",
+                      "observable_role": "weak_lensing_clustering_growth",
+                      "pressure_surface": "consolidation_growth",
+                      "baseline": "not_selected_parameter_ledger_only",
+                      "selected_member": parse_result["selected_member"],
+                      "context_role": role,
+                      "matched_column_name": PARAMETER_MAP[role],
+                      "column_index_zero_based": parse_result["column_map"].get(role, ""),
+                      "sample_count": parse_result["numeric_row_count"],
+                      "finite_count": len(values),
+                      "mean": usum["unweighted_mean"],
+                      "min": usum["unweighted_min"],
+                      "max": usum["unweighted_max"],
+                      "note": "Weight column used for weighted posterior summaries.",
+                      "parser_status": "context_column_summarized",
+                      "provenance_status": "official_public_kids_archive_member",
+                      "block_condition": "support_context_only_not_pressure_score",
+                      "claim_boundary": "parser_context_only_not_model_anchor",
+                      "model_anchor_allowed_now": False,
+                      "refit_allowed_now": False,
+                      "new_pressure_score_built": False
+                  })
+              elif role in parse_result["column_map"]:
+                  wsum = weighted_summary(values, weight_values)
+                  context_ledger_rows.append({
+                      "source": "KiDS_1000",
+                      "observable_role": "weak_lensing_clustering_growth",
+                      "pressure_surface": "consolidation_growth",
+                      "baseline": "not_selected_parameter_ledger_only",
+                      "selected_member": parse_result["selected_member"],
+                      "context_role": role,
+                      "matched_column_name": PARAMETER_MAP[role],
+                      "column_index_zero_based": parse_result["column_map"].get(role, ""),
+                      "sample_count": parse_result["numeric_row_count"],
+                      "finite_count": wsum["finite_count"],
+                      "mean": wsum["weighted_mean"],
+                      "min": wsum["min"],
+                      "max": wsum["max"],
+                      "note": "Weighted context summary only.",
+                      "parser_status": "context_column_summarized",
+                      "provenance_status": "official_public_kids_archive_member",
+                      "block_condition": "support_context_only_not_pressure_score",
+                      "claim_boundary": "parser_context_only_not_model_anchor",
+                      "model_anchor_allowed_now": False,
+                      "refit_allowed_now": False,
+                      "new_pressure_score_built": False
+                  })
+
+          run_summary_rows = [{
+              "source": "KiDS_1000",
+              "observable_role": "weak_lensing_clustering_growth",
+              "pressure_surface": "consolidation_growth",
+              "baseline": "not_selected_parameter_ledger_only",
+              "selected_member": parse_result["selected_member"],
+              "member_size_bytes": parse_result["member_size_bytes"],
+              "header_found": parse_result["header_found"],
+              "header_column_count": parse_result["header_column_count"],
+              "numeric_row_count": parse_result["numeric_row_count"],
+              "skipped_numeric_row_count": parse_result["skipped_numeric_row_count"],
+              "weight_sum": weight_sum,
+              "mapped_columns": ";".join(sorted(parse_result["column_map"].keys())),
+              "parser_status": "guarded_chain_parser_implemented",
+              "provenance_status": "official_public_kids_archive_member",
+              "block_condition": "blocked_from_pressure_scoring_until_growth_pressure_design_audit",
+              "claim_boundary": "parameter_ledger_only_not_model_anchor",
+              "model_anchor_allowed_now": False,
+              "refit_allowed_now": False,
+              "new_pressure_score_built": False
+          }]
+
+          parser_rules = [
+              {
+                  "rule_id": "weighted_summary_rule",
+                  "rule": "Use the KiDS weight column for posterior summaries.",
+                  "required": True,
+                  "pass": weight_sum > 0,
+                  "block_if_violated": "no_parameter_ledger"
+              },
+              {
+                  "rule_id": "core_parameter_rule",
+                  "rule": "S8, sigma8, and Omega_m must all be parsed before growth ledger review.",
+                  "required": True,
+                  "pass": all(role in parse_result["column_map"] for role in PRIMARY_PARAMETERS),
+                  "block_if_violated": "no_growth_ledger_review"
+              },
+              {
+                  "rule_id": "no_growth_pressure_scoring",
+                  "rule": "v3.49 builds only a parameter ledger, not a growth pressure score.",
+                  "required": True,
+                  "pass": True,
+                  "block_if_violated": "hard_stop"
+              },
+              {
+                  "rule_id": "no_h0licow_comparison",
+                  "rule": "v3.49 must not compare KiDS growth output against H0LiCOW reach output.",
+                  "required": True,
+                  "pass": True,
+                  "block_if_violated": "hard_stop"
+              },
+              {
+                  "rule_id": "kids_family_boundary",
+                  "rule": "KiDS remains one survey family; this parser creates one family ledger, not multiple independent anchors.",
+                  "required": True,
+                  "pass": True,
+                  "block_if_violated": "no_aggregation"
+              }
+          ]
+
+          next_test_queue = [
+              {
+                  "priority": 1,
+                  "next_test": "v3_50_kids1000_growth_parameter_ledger_review",
+                  "purpose": "Review the KiDS weighted growth parameter ledger for parser quality, effective sample size, sane column mapping, and readiness for a later growth pressure-design audit.",
+                  "must_include": "S8, sigma8, Omega_m summaries, weight handling, sample counts, effective sample size, parser/provenance status, family boundary.",
+                  "must_not_include": "growth pressure scoring, H0LiCOW comparison, two-surface refit, model-anchor promotion, validation claim.",
+                  "readiness_if_passes": "Growth/consolidation pressure-design audit may be considered."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "later_kids1000_secondary_chain_sanity_parser",
+                  "purpose": "Parse secondary KiDS shear-only chain as a family-internal sanity lane after primary ledger review.",
+                  "must_include": "same weighted parser rules and family boundary.",
+                  "must_not_include": "treating KiDS internal variants as independent anchors.",
+                  "readiness_if_passes": "KiDS family-internal consistency can be reviewed."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "kids1000_chain_parser_run_summary_v3_49.csv",
+              run_summary_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "selected_member", "member_size_bytes", "header_found",
+                  "header_column_count", "numeric_row_count",
+                  "skipped_numeric_row_count", "weight_sum", "mapped_columns",
+                  "parser_status", "provenance_status", "block_condition",
+                  "claim_boundary", "model_anchor_allowed_now",
+                  "refit_allowed_now", "new_pressure_score_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_column_mapping_v3_49.csv",
+              column_mapping_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "selected_member", "parameter_role", "expected_column_name",
+                  "column_index_zero_based", "column_present", "parser_status",
+                  "provenance_status", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_weighted_growth_parameter_ledger_v3_49.csv",
+              parameter_ledger_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "selected_member", "parameter_role", "matched_column_name",
+                  "column_index_zero_based", "sample_count", "finite_count",
+                  "weight_sum", "effective_sample_count", "weighted_mean",
+                  "weighted_std", "q16", "q50", "q84", "min", "max",
+                  "unweighted_mean", "unweighted_min", "unweighted_max",
+                  "parser_status", "provenance_status", "block_condition",
+                  "claim_boundary", "model_anchor_allowed_now",
+                  "refit_allowed_now", "new_pressure_score_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_context_column_ledger_v3_49.csv",
+              context_ledger_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "selected_member", "context_role", "matched_column_name",
+                  "column_index_zero_based", "sample_count", "finite_count",
+                  "mean", "min", "max", "note", "parser_status",
+                  "provenance_status", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_parser_rules_v3_49.csv",
+              parser_rules,
+              ["rule_id", "rule", "required", "pass", "block_if_violated"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_queue_v3_49.csv",
+              next_test_queue,
+              [
+                  "priority", "next_test", "purpose", "must_include",
+                  "must_not_include", "readiness_if_passes"
+              ]
+          )
+
+          all_output_rows = run_summary_rows + column_mapping_rows + parameter_ledger_rows + context_ledger_rows
+
+          required_contract_present = True
+          missing_contract_rows = []
+          for group_name, rows in [
+              ("run_summary", run_summary_rows),
+              ("column_mapping", column_mapping_rows),
+              ("parameter_ledger", parameter_ledger_rows),
+              ("context_ledger", context_ledger_rows)
+          ]:
+              for idx, row in enumerate(rows):
+                  for field in REQUIRED_CONTRACT_FIELDS:
+                      if field not in row or row.get(field) in ["", None]:
+                          required_contract_present = False
+                          missing_contract_rows.append(f"{group_name}:{idx}:{field}")
+
+          selected_member_found = parse_result["selected_member"] != "" and parse_result["member_size_bytes"] > 0
+          header_ok = parse_result["header_found"] is True and parse_result["header_column_count"] > 0
+          row_count_ok = parse_result["numeric_row_count"] > 1000
+          weight_ok = weight_sum > 0
+          primary_params_ok = len(parameter_ledger_rows) == 3 and all(row["finite_count"] > 1000 for row in parameter_ledger_rows)
+          effective_n_ok = all(
+              row["effective_sample_count"] not in ["", None] and float(row["effective_sample_count"]) > 100
+              for row in parameter_ledger_rows
+          )
+          no_pressure_scores = all(row["new_pressure_score_built"] is False for row in all_output_rows)
+          no_model_anchors = all(row["model_anchor_allowed_now"] is False for row in all_output_rows)
+          no_refits = all(row["refit_allowed_now"] is False for row in all_output_rows)
+
+          next_test_ok = (
+              next_test_queue[0]["next_test"] == "v3_50_kids1000_growth_parameter_ledger_review"
+              and "growth pressure scoring" in next_test_queue[0]["must_not_include"]
+              and "H0LiCOW comparison" in next_test_queue[0]["must_not_include"]
+              and "two-surface refit" in next_test_queue[0]["must_not_include"]
+          )
+
+          audit_rows = [
+              {
+                  "audit_gate": "archive_and_readme_downloaded",
+                  "pass": archive_dl["downloaded"] and readme_dl["downloaded"],
+                  "value": f"archive={archive_dl['downloaded']}; readme={readme_dl['downloaded']}",
+                  "boundary": "Archive and README must be available for parser implementation."
+              },
+              {
+                  "audit_gate": "selected_member_found",
+                  "pass": selected_member_found,
+                  "value": parse_result["selected_member"],
+                  "boundary": "The exact fiducial 3x2pt KiDS chain must be found."
+              },
+              {
+                  "audit_gate": "header_and_columns_parsed",
+                  "pass": header_ok,
+                  "value": f"header_found={parse_result['header_found']}; columns={parse_result['header_column_count']}",
+                  "boundary": "CosmoSIS-style header must map columns."
+              },
+              {
+                  "audit_gate": "required_columns_present",
+                  "pass": all(role in parse_result["column_map"] for role in PRIMARY_PARAMETERS + ["weight", "prior", "like", "post"]),
+                  "value": ";".join(sorted(parse_result["column_map"].keys())),
+                  "boundary": "S8, sigma8, Omega_m, prior, likelihood, posterior, and weight are required."
+              },
+              {
+                  "audit_gate": "numeric_rows_parsed",
+                  "pass": row_count_ok,
+                  "value": parse_result["numeric_row_count"],
+                  "boundary": "Need enough rows to build a guarded weighted parameter ledger."
+              },
+              {
+                  "audit_gate": "weight_column_usable",
+                  "pass": weight_ok,
+                  "value": weight_sum,
+                  "boundary": "Weight column must have positive total weight."
+              },
+              {
+                  "audit_gate": "primary_growth_parameter_ledger_built",
+                  "pass": primary_params_ok,
+                  "value": len(parameter_ledger_rows),
+                  "boundary": "S8, sigma8, and Omega_m summaries must be built."
+              },
+              {
+                  "audit_gate": "effective_sample_size_usable",
+                  "pass": effective_n_ok,
+                  "value": ";".join([str(row["effective_sample_count"]) for row in parameter_ledger_rows]),
+                  "boundary": "Effective sample size should be large enough for ledger review."
+              },
+              {
+                  "audit_gate": "required_contract_fields_present",
+                  "pass": required_contract_present,
+                  "value": ";".join(missing_contract_rows),
+                  "boundary": "source/role/surface/baseline/parser/provenance/block/claim contract must persist."
+              },
+              {
+                  "audit_gate": "no_growth_pressure_scores",
+                  "pass": no_pressure_scores,
+                  "value": no_pressure_scores,
+                  "boundary": "No growth pressure score in v3.49."
+              },
+              {
+                  "audit_gate": "no_model_anchors_promoted",
+                  "pass": no_model_anchors,
+                  "value": no_model_anchors,
+                  "boundary": "No model anchors in v3.49."
+              },
+              {
+                  "audit_gate": "no_refit_allowed",
+                  "pass": no_refits,
+                  "value": no_refits,
+                  "boundary": "No refit in v3.49."
+              },
+              {
+                  "audit_gate": "next_step_is_ledger_review",
+                  "pass": next_test_ok,
+                  "value": next_test_queue[0]["next_test"],
+                  "boundary": "Next step should review the ledger, not score pressure."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "kids1000_chain_parser_implementation_audit_v3_49.csv",
+              audit_rows,
+              ["audit_gate", "pass", "value", "boundary"]
+          )
+
+          hard_failed = list(failed_gates)
+
+          if not (archive_dl["downloaded"] and readme_dl["downloaded"]):
+              hard_failed.append("archive_or_readme_missing")
+          if not selected_member_found:
+              hard_failed.append("selected_member_missing")
+          if not header_ok:
+              hard_failed.append("header_or_column_parse_failed")
+          if not all(role in parse_result["column_map"] for role in PRIMARY_PARAMETERS + ["weight", "prior", "like", "post"]):
+              hard_failed.append("required_columns_missing")
+          if not row_count_ok:
+              hard_failed.append("too_few_numeric_rows_parsed")
+          if not weight_ok:
+              hard_failed.append("weight_column_unusable")
+          if not primary_params_ok:
+              hard_failed.append("primary_growth_parameter_ledger_missing")
+          if not effective_n_ok:
+              hard_failed.append("effective_sample_size_too_low")
+          if not required_contract_present:
+              hard_failed.append("required_contract_fields_missing")
+          if not no_pressure_scores:
+              hard_failed.append("growth_pressure_score_guard_violation")
+          if not no_model_anchors:
+              hard_failed.append("model_anchor_promotion_violation")
+          if not no_refits:
+              hard_failed.append("refit_guard_violation")
+          if not next_test_ok:
+              hard_failed.append("next_test_guard_incomplete")
+
+          if hard_failed:
+              readiness_label = "kids1000_chain_parser_implementation_needs_followup"
+          else:
+              readiness_label = "kids1000_chain_parser_implementation_passed_ready_for_growth_parameter_ledger_review"
+
+          next_step = (
+              "Build v3.50 KiDS-1000 growth parameter ledger review: review weighted S8, sigma8, and Omega_m summaries, weight handling, effective sample size, and parser quality before any growth pressure-design audit."
+              if not hard_failed
+              else "Inspect v3.49 parser outputs and repair selected chain parsing, column mapping, weights, or ledger construction before review."
+          )
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "previous_milestone": PREVIOUS_MILESTONE,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_errors": source_errors,
+              "archive_downloaded": archive_dl["downloaded"],
+              "readme_downloaded": readme_dl["downloaded"],
+              "selected_member": parse_result["selected_member"],
+              "member_size_bytes": parse_result["member_size_bytes"],
+              "header_found": parse_result["header_found"],
+              "header_column_count": parse_result["header_column_count"],
+              "numeric_row_count": parse_result["numeric_row_count"],
+              "skipped_numeric_row_count": parse_result["skipped_numeric_row_count"],
+              "weight_sum": weight_sum,
+              "parameter_ledger_row_count": len(parameter_ledger_rows),
+              "context_ledger_row_count": len(context_ledger_rows),
+              "required_contract_present": required_contract_present,
+              "missing_contract_rows": missing_contract_rows,
+              "gate_result": {
+                  "failed_gates": hard_failed,
+                  "readiness_label": readiness_label,
+                  "archive_downloaded": archive_dl["downloaded"],
+                  "readme_downloaded": readme_dl["downloaded"],
+                  "selected_member_found": selected_member_found,
+                  "header_ok": header_ok,
+                  "numeric_row_count": parse_result["numeric_row_count"],
+                  "weight_sum": weight_sum,
+                  "parameter_ledger_row_count": len(parameter_ledger_rows),
+                  "effective_sample_size_usable": effective_n_ok,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "new_pressure_scores_built": False,
+                  "h0licow_comparison_built": False,
+                  "next_allowed_step": next_step
+              }
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_49_kids1000_chain_parser_implementation.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.49 — KiDS-1000 Chain Parser Implementation")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this parser does")
+          md.append("")
+          md.append("v3.49 parses the selected KiDS-1000 fiducial 3x2pt chain into a guarded weighted growth parameter ledger.")
+          md.append("")
+          md.append("It summarizes S8, sigma8, and Omega_m using the KiDS weight column. It does not compute growth pressure, does not compare against H0LiCOW, and does not run a refit.")
+          md.append("")
+          md.append("## Selected chain")
+          md.append("")
+          md.append(f"`{parse_result['selected_member']}`")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Archive downloaded: `{archive_dl['downloaded']}`")
+          md.append(f"- README downloaded: `{readme_dl['downloaded']}`")
+          md.append(f"- Header found: `{parse_result['header_found']}`")
+          md.append(f"- Header columns: `{parse_result['header_column_count']}`")
+          md.append(f"- Numeric rows parsed: `{parse_result['numeric_row_count']}`")
+          md.append(f"- Skipped numeric rows: `{parse_result['skipped_numeric_row_count']}`")
+          md.append(f"- Weight sum: `{weight_sum}`")
+          md.append(f"- Parameter ledger rows: `{len(parameter_ledger_rows)}`")
+          md.append("")
+          md.append("## Weighted parameter summaries")
+          md.append("")
+          md.append("| Parameter | Weighted mean | q16 | q50 | q84 | Effective N |")
+          md.append("|---|---:|---:|---:|---:|---:|")
+          for row in parameter_ledger_rows:
+              md.append(f"| `{row['parameter_role']}` | `{row['weighted_mean']}` | `{row['q16']}` | `{row['q50']}` | `{row['q84']}` | `{row['effective_sample_count']}` |")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not hard_failed:
+              md.append("The parser implementation passed. KiDS now has a source-specific weighted growth parameter ledger. The next step should review this ledger before any growth pressure design.")
+          else:
+              md.append("The parser implementation found blockers. Ledger review should wait.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `kids1000_chain_parser_run_summary_v3_49.csv`")
+          md.append("- `kids1000_column_mapping_v3_49.csv`")
+          md.append("- `kids1000_weighted_growth_parameter_ledger_v3_49.csv`")
+          md.append("- `kids1000_context_column_ledger_v3_49.csv`")
+          md.append("- `kids1000_parser_rules_v3_49.csv`")
+          md.append("- `next_test_queue_v3_49.csv`")
+          md.append("- `kids1000_chain_parser_implementation_audit_v3_49.csv`")
+          md.append("- `tairid_cosmology_v3_49_kids1000_chain_parser_implementation.json`")
+          md.append("- `tairid_cosmology_v3_49_kids1000_chain_parser_implementation.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_49_kids1000_chain_parser_implementation.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.49 KiDS1000 chain parser implementation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-49-kids1000-chain-parser-implementation
+          path: artifacts/tairid_cosmology_v3_49/
