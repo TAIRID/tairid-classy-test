@@ -1,0 +1,669 @@
+name: TAIRID Cosmology v4.3 Direct Posterior Product Inventory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  direct-posterior-product-inventory:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.3 direct posterior product inventory
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_3_direct_posterior_inventory
+
+          python - <<'PY'
+          import csv
+          import html
+          import json
+          import re
+          import shutil
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_3_direct_posterior_inventory")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_3_direct_posterior_product_inventory"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior, or model comparison.",
+              "This does not parse posterior chains yet.",
+              "This does not combine KiDS, DES, and HSC into one posterior.",
+              "This is a provenance and product-inventory test only.",
+              "A pass means candidate posterior/data products were inventoried for later parser work, not that TAIRID is validated."
+          ]
+
+          SOURCE_PAGES = [
+              {
+                  "source_id": "kids1000_cosmic_shear_public_page",
+                  "family": "KiDS",
+                  "page_url": "https://kids.strw.leidenuniv.nl/DR4/KiDS-1000_cosmicshear.php",
+                  "role": "published_result_page",
+                  "why_included": "KiDS-1000 cosmic shear S8 result and links toward data products."
+              },
+              {
+                  "source_id": "kids1000_lensing_products_page",
+                  "family": "KiDS",
+                  "page_url": "https://kids.strw.leidenuniv.nl/DR4/lensing.php",
+                  "role": "data_product_page",
+                  "why_included": "KiDS-1000 lensing data products and possible chain/posterior links."
+              },
+              {
+                  "source_id": "kids1000_3x2pt_products_page",
+                  "family": "KiDS",
+                  "page_url": "https://kids.strw.leidenuniv.nl/DR4/KiDS-1000_3x2pt_Cosmology.php",
+                  "role": "multiprobe_data_product_page",
+                  "why_included": "KiDS-1000 3x2pt page mentions downloadable products and Multinest chains."
+              },
+              {
+                  "source_id": "des_y3_cosmology_results_papers_page",
+                  "family": "DES",
+                  "page_url": "https://www.darkenergysurvey.org/des-year-3-cosmology-results-papers/",
+                  "role": "official_results_hub",
+                  "why_included": "Official DES Year 3 cosmology papers and product navigation hub."
+              },
+              {
+                  "source_id": "des_data_management_home",
+                  "family": "DES",
+                  "page_url": "https://des.ncsa.illinois.edu/",
+                  "role": "official_data_management_hub",
+                  "why_included": "DES official data management site, possible release/product navigation."
+              },
+              {
+                  "source_id": "des_y3_kids_joint_chains_article",
+                  "family": "DES_KiDS_bridge",
+                  "page_url": "https://astro.theoj.org/article/89164-des-y3-kids-1000-consistent-cosmology-combining-cosmic-shear-surveys",
+                  "role": "joint_survey_chain_bridge",
+                  "why_included": "Joint DES Y3 plus KiDS-1000 analysis page may expose chain links useful for parser design."
+              },
+              {
+                  "source_id": "hsc_y3_weak_lensing_results_page",
+                  "family": "HSC",
+                  "page_url": "https://hsc-release.mtk.nao.ac.jp/doc/index.php/wly3/",
+                  "role": "official_results_and_products_page",
+                  "why_included": "HSC-Y3 weak-lensing results and product navigation page."
+              }
+          ]
+
+          POSTERIOR_KEYWORDS = [
+              "chain",
+              "chains",
+              "posterior",
+              "posteriors",
+              "mcmc",
+              "multinest",
+              "samples",
+              "sample",
+              "cosmomc",
+              "monte",
+              "parameter"
+          ]
+
+          DECOMPOSITION_KEYWORDS = [
+              "s8",
+              "sigma8",
+              "sigma_8",
+              "omegam",
+              "omega_m",
+              "omega",
+              "cosmology",
+              "lcdm",
+              "lambda"
+          ]
+
+          DATA_PRODUCT_KEYWORDS = [
+              "data",
+              "download",
+              "tarball",
+              "covariance",
+              "cov",
+              "vector",
+              "catalog",
+              "catalogue",
+              "fits",
+              "hdf",
+              "h5",
+              "txt",
+              "dat",
+              "zip",
+              "tar",
+              "tgz",
+              "gz"
+          ]
+
+          FILE_EXTENSIONS = [
+              ".zip",
+              ".tar",
+              ".tar.gz",
+              ".tgz",
+              ".gz",
+              ".txt",
+              ".dat",
+              ".csv",
+              ".fits",
+              ".fit",
+              ".h5",
+              ".hdf5",
+              ".npz",
+              ".npy"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def fetch_page(url, timeout=45):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.3-product-inventory",
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                  }
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read()
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      try:
+                          text = body.decode(charset, errors="replace")
+                      except Exception:
+                          text = body.decode("utf-8", errors="replace")
+
+                      return {
+                          "ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def clean_text(value):
+              value = html.unescape(value or "")
+              value = re.sub(r"<[^>]+>", " ", value)
+              value = re.sub(r"\s+", " ", value)
+              return value.strip()
+
+          def extract_links(base_url, text):
+              found = []
+
+              anchor_pattern = re.compile(
+                  r"<a\b[^>]*?href\s*=\s*['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
+                  re.IGNORECASE | re.DOTALL
+              )
+
+              for match in anchor_pattern.finditer(text):
+                  href = html.unescape(match.group(1)).strip()
+                  anchor_text = clean_text(match.group(2))
+                  if not href or href.startswith("#") or href.lower().startswith("mailto:"):
+                      continue
+                  full_url = urllib.parse.urljoin(base_url, href)
+                  found.append({
+                      "url": full_url,
+                      "anchor_text": anchor_text,
+                      "discovery": "anchor_href"
+                  })
+
+              raw_url_pattern = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+              for match in raw_url_pattern.finditer(text):
+                  raw = match.group(0).rstrip(").,;]")
+                  found.append({
+                      "url": raw,
+                      "anchor_text": "",
+                      "discovery": "raw_url"
+                  })
+
+              deduped = {}
+              for item in found:
+                  key = item["url"]
+                  if key not in deduped:
+                      deduped[key] = item
+                  else:
+                      if item["anchor_text"] and not deduped[key]["anchor_text"]:
+                          deduped[key]["anchor_text"] = item["anchor_text"]
+                      deduped[key]["discovery"] += f"+{item['discovery']}"
+
+              return list(deduped.values())
+
+          def score_candidate(url, anchor_text):
+              lower = f"{url} {anchor_text}".lower()
+              score = 0
+              reasons = []
+
+              for ext in FILE_EXTENSIONS:
+                  if ext in lower:
+                      score += 8
+                      reasons.append(f"file_extension:{ext}")
+
+              for token in POSTERIOR_KEYWORDS:
+                  if token in lower:
+                      score += 10
+                      reasons.append(f"posterior_keyword:{token}")
+
+              for token in DECOMPOSITION_KEYWORDS:
+                  if token in lower:
+                      score += 4
+                      reasons.append(f"decomposition_keyword:{token}")
+
+              for token in DATA_PRODUCT_KEYWORDS:
+                  if token in lower:
+                      score += 3
+                      reasons.append(f"data_keyword:{token}")
+
+              if "github" in lower or "zenodo" in lower or "dataverse" in lower or "doi" in lower:
+                  score += 6
+                  reasons.append("repository_or_doi_signal")
+
+              if "pdf" in lower:
+                  score -= 6
+                  reasons.append("pdf_penalty")
+
+              return score, ";".join(reasons)
+
+          def classify_candidate(score, reasons):
+              if "posterior_keyword" in reasons and score >= 12:
+                  return "posterior_chain_candidate"
+              if "multinest" in reasons.lower() or "mcmc" in reasons.lower():
+                  return "posterior_chain_candidate"
+              if "file_extension" in reasons and "data_keyword" in reasons:
+                  return "downloadable_data_product_candidate"
+              if score >= 12:
+                  return "supporting_cosmology_product_candidate"
+              return "low_priority_link"
+
+          created_at = now_iso()
+
+          page_audit_rows = []
+          candidate_rows = []
+
+          for source in SOURCE_PAGES:
+              result = fetch_page(source["page_url"])
+              text = result["text"]
+              links = extract_links(source["page_url"], text) if result["ok"] else []
+
+              scored_links = []
+              for link in links:
+                  score, reasons = score_candidate(link["url"], link["anchor_text"])
+                  candidate_type = classify_candidate(score, reasons)
+                  if score > 0:
+                      scored_links.append({
+                          **source,
+                          "candidate_url": link["url"],
+                          "anchor_text": link["anchor_text"],
+                          "discovery": link["discovery"],
+                          "candidate_score": score,
+                          "candidate_type": candidate_type,
+                          "score_reasons": reasons
+                      })
+
+              scored_links.sort(key=lambda row: row["candidate_score"], reverse=True)
+
+              top_candidates = scored_links[:25]
+              candidate_rows.extend(top_candidates)
+
+              page_audit_rows.append({
+                  "source_id": source["source_id"],
+                  "family": source["family"],
+                  "page_url": source["page_url"],
+                  "role": source["role"],
+                  "page_reachable": result["ok"],
+                  "http_status": result["http_status"],
+                  "content_type": result["content_type"],
+                  "link_count": len(links),
+                  "scored_candidate_count": len(scored_links),
+                  "top_candidate_count_written": len(top_candidates),
+                  "error": result["error"],
+                  "why_included": source["why_included"]
+              })
+
+          families = sorted(set(source["family"] for source in SOURCE_PAGES))
+          family_rows = []
+
+          for family in families:
+              family_pages = [row for row in page_audit_rows if row["family"] == family]
+              family_candidates = [row for row in candidate_rows if row["family"] == family]
+
+              reachable_source_count = sum(1 for row in family_pages if str(row["page_reachable"]) == "True")
+              posterior_candidate_count = sum(
+                  1 for row in family_candidates
+                  if row["candidate_type"] == "posterior_chain_candidate"
+              )
+              data_product_candidate_count = sum(
+                  1 for row in family_candidates
+                  if row["candidate_type"] in [
+                      "posterior_chain_candidate",
+                      "downloadable_data_product_candidate",
+                      "supporting_cosmology_product_candidate"
+                  ]
+              )
+
+              if reachable_source_count == 0:
+                  readiness = "source_pages_not_reachable"
+                  needed_next = "repair URL or add alternate official source page"
+              elif posterior_candidate_count > 0:
+                  readiness = "posterior_candidate_found_ready_for_manual_selection_or_parser_probe"
+                  needed_next = "choose highest-confidence chain/posterior candidate and build parser probe"
+              elif data_product_candidate_count > 0:
+                  readiness = "data_product_candidate_found_but_posterior_not_confirmed"
+                  needed_next = "inspect candidate product manually or add direct posterior URL"
+              else:
+                  readiness = "source_reachable_but_no_candidate_found"
+                  needed_next = "manual source inspection or alternate official source page needed"
+
+              family_rows.append({
+                  "family": family,
+                  "source_page_count": len(family_pages),
+                  "reachable_source_count": reachable_source_count,
+                  "posterior_candidate_count": posterior_candidate_count,
+                  "data_product_candidate_count": data_product_candidate_count,
+                  "readiness": readiness,
+                  "needed_next": needed_next
+              })
+
+          reachable_total = sum(1 for row in page_audit_rows if str(row["page_reachable"]) == "True")
+          posterior_total = sum(1 for row in candidate_rows if row["candidate_type"] == "posterior_chain_candidate")
+          data_product_total = sum(
+              1 for row in candidate_rows
+              if row["candidate_type"] in [
+                  "posterior_chain_candidate",
+                  "downloadable_data_product_candidate",
+                  "supporting_cosmology_product_candidate"
+              ]
+          )
+
+          failed_gates = []
+          warnings = []
+
+          if reachable_total == 0:
+              failed_gates.append("no_source_pages_reachable")
+
+          if posterior_total == 0:
+              warnings.append("no_posterior_chain_candidate_detected_by_automatic_link_scan")
+
+          for family_row in family_rows:
+              if family_row["family"] in ["KiDS", "DES", "HSC"]:
+                  if family_row["reachable_source_count"] == 0:
+                      warnings.append(f"{family_row['family']}_no_reachable_source_page")
+                  elif family_row["posterior_candidate_count"] == 0:
+                      warnings.append(f"{family_row['family']}_no_automatic_posterior_candidate")
+
+          if failed_gates:
+              readiness_label = "direct_posterior_product_inventory_failed_source_reachability"
+              next_step = "Repair source URLs before parser work."
+          elif posterior_total > 0:
+              readiness_label = "direct_posterior_product_inventory_completed_candidates_found"
+              next_step = (
+                  "Proceed to v4.4 direct product selector/parser probe. "
+                  "Use the candidate ledger to choose one KiDS/DES/HSC product at a time, starting with the family that has the clearest posterior-chain candidate."
+              )
+          else:
+              readiness_label = "direct_posterior_product_inventory_completed_manual_selection_needed"
+              next_step = (
+                  "Do not parse yet. Manually inspect the source pages and add direct product URLs for KiDS/DES/HSC posterior chains."
+              )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_pages": SOURCE_PAGES,
+              "page_audit_rows": page_audit_rows,
+              "candidate_rows": candidate_rows,
+              "family_rows": family_rows,
+              "summary_counts": {
+                  "reachable_source_pages": reachable_total,
+                  "posterior_chain_candidates": posterior_total,
+                  "data_or_cosmology_product_candidates": data_product_total
+              },
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "posterior_chain_parsed": False,
+                  "combined_growth_posterior_built": False,
+                  "new_cosmological_model_fit": False
+              },
+              "gate_result": {
+                  "failed_gates": failed_gates,
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "source_page_audit_v4_3.csv",
+              page_audit_rows,
+              [
+                  "source_id",
+                  "family",
+                  "page_url",
+                  "role",
+                  "page_reachable",
+                  "http_status",
+                  "content_type",
+                  "link_count",
+                  "scored_candidate_count",
+                  "top_candidate_count_written",
+                  "error",
+                  "why_included"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "posterior_candidate_links_v4_3.csv",
+              candidate_rows,
+              [
+                  "source_id",
+                  "family",
+                  "page_url",
+                  "role",
+                  "candidate_url",
+                  "anchor_text",
+                  "discovery",
+                  "candidate_score",
+                  "candidate_type",
+                  "score_reasons",
+                  "why_included"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "family_inventory_readiness_v4_3.csv",
+              family_rows,
+              [
+                  "family",
+                  "source_page_count",
+                  "reachable_source_count",
+                  "posterior_candidate_count",
+                  "data_product_candidate_count",
+                  "readiness",
+                  "needed_next"
+              ]
+          )
+
+          interpretation_rows = [
+              {
+                  "interpretation_id": "allowed_inventory_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "Official source pages were scanned for candidate posterior/data products.",
+                  "boundary": "Inventory only, not parser success and not validation."
+              },
+              {
+                  "interpretation_id": "allowed_candidate_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "A candidate link means a later parser may inspect it; it does not mean the product is already verified.",
+                  "boundary": "Candidate status is not evidence status."
+              },
+              {
+                  "interpretation_id": "forbidden_validation_claim",
+                  "status": "forbidden",
+                  "wording": "TAIRID is validated.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_parser_claim",
+                  "status": "forbidden",
+                  "wording": "KiDS/DES/HSC posterior chains have been parsed.",
+                  "boundary": "Blocked. v4.3 inventories candidates only."
+              },
+              {
+                  "interpretation_id": "forbidden_model_comparison_claim",
+                  "status": "forbidden",
+                  "wording": "A model comparison or likelihood was run.",
+                  "boundary": "Blocked."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "interpretation_boundaries_v4_3.csv",
+              interpretation_rows,
+              ["interpretation_id", "status", "wording", "boundary"]
+          )
+
+          json_path = OUTDIR / "tairid_cosmology_v4_3_direct_posterior_product_inventory.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v4.3 — Direct Posterior Product Inventory")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v4.3 scans official KiDS, DES, and HSC source pages for candidate posterior chains, Multinest files, MCMC samples, data products, covariance files, tarballs, zip files, and related cosmology products.")
+          md.append("")
+          md.append("It does not parse any chain yet. It only builds a candidate inventory so the next parser is pointed at real products instead of guessed filenames.")
+          md.append("")
+          md.append("## Summary counts")
+          md.append("")
+          md.append("| Count | Value |")
+          md.append("|---|---:|")
+          md.append(f"| Reachable source pages | `{reachable_total}` |")
+          md.append(f"| Posterior-chain candidates | `{posterior_total}` |")
+          md.append(f"| Data/cosmology product candidates | `{data_product_total}` |")
+          md.append("")
+          md.append("## Family readiness")
+          md.append("")
+          md.append("| Family | Reachable pages | Posterior candidates | Product candidates | Readiness |")
+          md.append("|---|---:|---:|---:|---|")
+          for row in family_rows:
+              md.append(
+                  f"| `{row['family']}` | `{row['reachable_source_count']}` | "
+                  f"`{row['posterior_candidate_count']}` | `{row['data_product_candidate_count']}` | `{row['readiness']}` |"
+              )
+          md.append("")
+          md.append("## Top candidate links")
+          md.append("")
+          md.append("| Family | Type | Score | Candidate URL | Anchor text |")
+          md.append("|---|---|---:|---|---|")
+          for row in sorted(candidate_rows, key=lambda r: r["candidate_score"], reverse=True)[:25]:
+              anchor = row["anchor_text"].replace("|", "/")[:120]
+              md.append(
+                  f"| `{row['family']}` | `{row['candidate_type']}` | `{row['candidate_score']}` | "
+                  f"{row['candidate_url']} | `{anchor}` |"
+              )
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if failed_gates:
+              md.append("The inventory failed because no source pages were reachable. Repair URLs before parser work.")
+          elif posterior_total > 0:
+              md.append("The inventory found posterior-chain candidates. The next step is to choose one candidate product at a time and build a parser probe.")
+          else:
+              md.append("The inventory reached source pages but did not automatically confirm posterior-chain candidates. Manual source inspection or direct product URLs are needed before parsing.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `source_page_audit_v4_3.csv`")
+          md.append("- `posterior_candidate_links_v4_3.csv`")
+          md.append("- `family_inventory_readiness_v4_3.csv`")
+          md.append("- `interpretation_boundaries_v4_3.csv`")
+          md.append("- `tairid_cosmology_v4_3_direct_posterior_product_inventory.json`")
+          md.append("- `tairid_cosmology_v4_3_direct_posterior_product_inventory.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_3_direct_posterior_product_inventory.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Summary counts:")
+          print(json.dumps(audit["summary_counts"], indent=2))
+          print()
+          print("Family readiness:")
+          print(json.dumps(family_rows, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.3 direct posterior product inventory artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-3-direct-posterior-product-inventory
+          path: artifacts/tairid_cosmology_v4_3_direct_posterior_inventory/
