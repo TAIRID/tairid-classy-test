@@ -1,0 +1,781 @@
+name: TAIRID Cosmology v4.7 DES HSC Direct Product Repair Crawler
+
+on:
+  workflow_dispatch:
+
+jobs:
+  des-hsc-direct-product-repair-crawler:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.7 DES HSC direct product repair crawler
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler
+
+          python - <<'PY'
+          import csv
+          import html
+          import json
+          import re
+          import urllib.parse
+          import urllib.request
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not combine KiDS, DES, and HSC into one posterior.",
+              "This does not parse DES or HSC chains yet.",
+              "This is a direct-product repair crawler for DES and HSC source products.",
+              "A pass means candidate DES/HSC direct products were inventoried and ranked, not that TAIRID is validated."
+          ]
+
+          SOURCE_ROOTS = [
+              {
+                  "source_id": "des_y3_cosmology_results_hub",
+                  "family": "DES",
+                  "url": "https://www.darkenergysurvey.org/des-year-3-cosmology-results-papers/",
+                  "role": "official_results_hub",
+                  "crawl_depth": 2,
+                  "why": "Official DES Y3 cosmology results hub."
+              },
+              {
+                  "source_id": "des_data_access",
+                  "family": "DES",
+                  "url": "https://www.darkenergysurvey.org/the-des-project/data-access/",
+                  "role": "official_data_access_hub",
+                  "crawl_depth": 2,
+                  "why": "Official DES data access navigation."
+              },
+              {
+                  "source_id": "des_ncsa_home",
+                  "family": "DES",
+                  "url": "https://des.ncsa.illinois.edu/",
+                  "role": "official_data_management_hub",
+                  "crawl_depth": 2,
+                  "why": "DES data management and releases."
+              },
+              {
+                  "source_id": "des_y3_kids_joint_article",
+                  "family": "DES_KiDS_bridge",
+                  "url": "https://astro.theoj.org/article/89164-des-y3-kids-1000-consistent-cosmology-combining-cosmic-shear-surveys",
+                  "role": "joint_survey_chain_bridge",
+                  "crawl_depth": 2,
+                  "why": "DES Y3 + KiDS-1000 article says chains are available and may expose useful product links."
+              },
+              {
+                  "source_id": "hsc_y3_wl_results_page",
+                  "family": "HSC",
+                  "url": "https://hsc-release.mtk.nao.ac.jp/doc/index.php/wly3/",
+                  "role": "official_results_and_products_page",
+                  "crawl_depth": 3,
+                  "why": "Official HSC-Y3 weak-lensing results and product navigation."
+              },
+              {
+                  "source_id": "hsc_y3_available_data",
+                  "family": "HSC",
+                  "url": "https://hsc-release.mtk.nao.ac.jp/doc/index.php/available-data__pdr3/",
+                  "role": "official_available_data_page",
+                  "crawl_depth": 2,
+                  "why": "HSC PDR3 available data navigation."
+              }
+          ]
+
+          ALLOWED_DOMAINS = [
+              "darkenergysurvey.org",
+              "des.ncsa.illinois.edu",
+              "astro.theoj.org",
+              "hsc-release.mtk.nao.ac.jp",
+              "github.com",
+              "zenodo.org",
+              "figshare.com",
+              "dataverse",
+              "dropbox.com",
+              "google.com",
+              "arxiv.org",
+              "doi.org"
+          ]
+
+          HIGH_VALUE_KEYWORDS = [
+              "chain", "chains", "posterior", "posteriors", "mcmc", "multinest",
+              "samples", "sample", "cosmosis", "cosmomc", "likelihood", "firecrown",
+              "cobaya", "montepython", "parameter", "params", "cosmology"
+          ]
+
+          PRODUCT_KEYWORDS = [
+              "download", "data", "release", "products", "product", "tarball",
+              "covariance", "cov", "datavector", "data_vector", "2pt", "3x2pt",
+              "shear", "catalog", "catalogue", "fits", "hdf", "h5", "npz", "npy",
+              "zip", "tar", "tgz", "gz", "txt", "ini", "yaml"
+          ]
+
+          DES_KEYWORDS = [
+              "des", "y3", "year3", "year_3", "3x2pt", "2pt", "cosmic_shear",
+              "galaxy_galaxy", "clustering"
+          ]
+
+          HSC_KEYWORDS = [
+              "hsc", "y3", "pdr3", "weak_lensing", "wly3", "cosmic_shear",
+              "power_spectra", "correlation", "minimal_bias", "emulator"
+          ]
+
+          FILE_EXTENSIONS = [
+              ".zip", ".tar", ".tar.gz", ".tgz", ".gz", ".txt", ".dat", ".csv",
+              ".fits", ".fit", ".h5", ".hdf5", ".npz", ".npy", ".ini", ".yaml",
+              ".yml", ".json", ".pkl", ".pickle"
+          ]
+
+          BAD_EXTENSIONS = [
+              ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico", ".css", ".js"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def canonical_url(url):
+              url = html.unescape(url or "").strip()
+              url = url.replace("\\", "")
+              url = urllib.parse.urldefrag(url)[0]
+              return url.rstrip("/")
+
+          def domain_allowed(url):
+              try:
+                  host = urllib.parse.urlparse(url).netloc.lower()
+              except Exception:
+                  return False
+              return any(domain in host for domain in ALLOWED_DOMAINS)
+
+          def fetch_page(url, timeout=45):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.7-DES-HSC-product-crawler",
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                  }
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(4_000_000)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "text": text,
+                          "bytes_read": len(body),
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "text": "",
+                      "bytes_read": 0,
+                      "error": repr(exc)
+                  }
+
+          def clean_text(value):
+              value = html.unescape(value or "")
+              value = re.sub(r"<[^>]+>", " ", value)
+              value = re.sub(r"\s+", " ", value)
+              return value.strip()
+
+          def extract_links(base_url, text):
+              links = []
+
+              anchor_pattern = re.compile(
+                  r"<a\b[^>]*?href\s*=\s*['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
+                  re.IGNORECASE | re.DOTALL
+              )
+
+              for match in anchor_pattern.finditer(text or ""):
+                  href = html.unescape(match.group(1)).strip()
+                  anchor_text = clean_text(match.group(2))
+                  if not href or href.startswith("#") or href.lower().startswith("mailto:"):
+                      continue
+
+                  full_url = canonical_url(urllib.parse.urljoin(base_url, href))
+                  links.append({
+                      "url": full_url,
+                      "anchor_text": anchor_text,
+                      "discovery": "anchor"
+                  })
+
+              raw_url_pattern = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+              for match in raw_url_pattern.finditer(text or ""):
+                  raw = canonical_url(match.group(0).rstrip(").,;]"))
+                  links.append({
+                      "url": raw,
+                      "anchor_text": "",
+                      "discovery": "raw_url"
+                  })
+
+              deduped = {}
+              for link in links:
+                  if not link["url"]:
+                      continue
+                  if link["url"] not in deduped:
+                      deduped[link["url"]] = link
+                  else:
+                      if link["anchor_text"] and not deduped[link["url"]]["anchor_text"]:
+                          deduped[link["url"]]["anchor_text"] = link["anchor_text"]
+                      deduped[link["url"]]["discovery"] += f"+{link['discovery']}"
+
+              return list(deduped.values())
+
+          def score_candidate(family, url, anchor_text, source_role):
+              lower = f"{url} {anchor_text} {source_role}".lower()
+              score = 0
+              reasons = []
+
+              if any(lower.endswith(ext) or ext in lower for ext in FILE_EXTENSIONS):
+                  score += 14
+                  reasons.append("download_file_extension")
+
+              if any(ext in lower for ext in BAD_EXTENSIONS):
+                  score -= 25
+                  reasons.append("bad_static_asset_extension")
+
+              for token in HIGH_VALUE_KEYWORDS:
+                  if token in lower:
+                      score += 10
+                      reasons.append(f"high_value:{token}")
+
+              for token in PRODUCT_KEYWORDS:
+                  if token in lower:
+                      score += 5
+                      reasons.append(f"product:{token}")
+
+              if family == "DES":
+                  for token in DES_KEYWORDS:
+                      if token in lower:
+                          score += 3
+                          reasons.append(f"des_context:{token}")
+
+              if family == "HSC":
+                  for token in HSC_KEYWORDS:
+                      if token in lower:
+                          score += 3
+                          reasons.append(f"hsc_context:{token}")
+
+              if "github.com" in lower:
+                  score += 9
+                  reasons.append("github_repository_signal")
+
+              if "zenodo" in lower or "figshare" in lower or "dataverse" in lower:
+                  score += 12
+                  reasons.append("data_repository_signal")
+
+              if "doi.org" in lower:
+                  score += 4
+                  reasons.append("doi_signal")
+
+              if "pdf" in lower:
+                  score -= 8
+                  reasons.append("pdf_penalty")
+
+              if "wp-content/uploads" in lower and any(ext in lower for ext in BAD_EXTENSIONS):
+                  score -= 10
+                  reasons.append("wordpress_image_penalty")
+
+              return score, ";".join(reasons)
+
+          def classify_candidate(score, reasons):
+              lower = reasons.lower()
+
+              if score >= 35 and ("chain" in lower or "posterior" in lower or "mcmc" in lower or "multinest" in lower or "samples" in lower):
+                  return "high_confidence_posterior_or_chain_candidate"
+
+              if score >= 28 and ("data_repository_signal" in lower or "github_repository_signal" in lower):
+                  return "repository_candidate_for_manual_product_selection"
+
+              if score >= 25:
+                  return "high_confidence_data_product_candidate"
+
+              if score >= 15:
+                  return "medium_confidence_product_candidate"
+
+              if score > 0:
+                  return "low_confidence_context_link"
+
+              return "not_candidate"
+
+          visited = set()
+          page_rows = []
+          candidate_rows = []
+
+          crawl_queue = []
+
+          for root in SOURCE_ROOTS:
+              crawl_queue.append({
+                  "root_id": root["source_id"],
+                  "family": root["family"],
+                  "source_role": root["role"],
+                  "root_url": root["url"],
+                  "url": root["url"],
+                  "depth": 0,
+                  "max_depth": root["crawl_depth"],
+                  "why": root["why"]
+              })
+
+          while crawl_queue:
+              item = crawl_queue.pop(0)
+              url = canonical_url(item["url"])
+
+              if not url or url in visited:
+                  continue
+
+              if not domain_allowed(url):
+                  continue
+
+              visited.add(url)
+
+              result = fetch_page(url)
+
+              links = extract_links(url, result["text"]) if result["ok"] else []
+
+              page_rows.append({
+                  "root_id": item["root_id"],
+                  "family": item["family"],
+                  "source_role": item["source_role"],
+                  "root_url": item["root_url"],
+                  "url": url,
+                  "depth": item["depth"],
+                  "reachable": result["ok"],
+                  "http_status": result["http_status"],
+                  "content_type": result["content_type"],
+                  "bytes_read": result["bytes_read"],
+                  "link_count": len(links),
+                  "error": result["error"],
+                  "why": item["why"]
+              })
+
+              for link in links:
+                  link_url = canonical_url(link["url"])
+                  if not link_url or not domain_allowed(link_url):
+                      continue
+
+                  score, reasons = score_candidate(
+                      family=item["family"],
+                      url=link_url,
+                      anchor_text=link["anchor_text"],
+                      source_role=item["source_role"]
+                  )
+                  ctype = classify_candidate(score, reasons)
+
+                  if score > 0:
+                      candidate_rows.append({
+                          "root_id": item["root_id"],
+                          "family": item["family"],
+                          "source_role": item["source_role"],
+                          "source_url": url,
+                          "candidate_url": link_url,
+                          "anchor_text": link["anchor_text"],
+                          "discovery": link["discovery"],
+                          "depth_found": item["depth"],
+                          "candidate_score": score,
+                          "candidate_type": ctype,
+                          "score_reasons": reasons
+                      })
+
+                  # Deeper crawl only follows promising HTML-ish links, not archive files or images.
+                  if item["depth"] < item["max_depth"]:
+                      lower_url = link_url.lower()
+                      is_bad_asset = any(ext in lower_url for ext in BAD_EXTENSIONS)
+                      is_archive = any(ext in lower_url for ext in FILE_EXTENSIONS)
+                      should_follow = (
+                          not is_bad_asset
+                          and not is_archive
+                          and score >= 4
+                          and link_url not in visited
+                      )
+
+                      if should_follow:
+                          crawl_queue.append({
+                              "root_id": item["root_id"],
+                              "family": item["family"],
+                              "source_role": item["source_role"],
+                              "root_url": item["root_url"],
+                              "url": link_url,
+                              "depth": item["depth"] + 1,
+                              "max_depth": item["max_depth"],
+                              "why": item["why"]
+                          })
+
+          # Deduplicate candidate rows by family + candidate_url, keeping best score.
+          best_by_key = {}
+          for row in candidate_rows:
+              key = (row["family"], row["candidate_url"])
+              if key not in best_by_key or row["candidate_score"] > best_by_key[key]["candidate_score"]:
+                  best_by_key[key] = row
+
+          candidate_rows = list(best_by_key.values())
+          candidate_rows.sort(key=lambda row: row["candidate_score"], reverse=True)
+
+          family_summary_rows = []
+
+          for family in sorted(set(row["family"] for row in SOURCE_ROOTS)):
+              family_pages = [row for row in page_rows if row["family"] == family]
+              family_candidates = [row for row in candidate_rows if row["family"] == family]
+
+              reachable_pages = sum(1 for row in family_pages if row["reachable"])
+              high_conf_chain = sum(
+                  1 for row in family_candidates
+                  if row["candidate_type"] == "high_confidence_posterior_or_chain_candidate"
+              )
+              repo_candidates = sum(
+                  1 for row in family_candidates
+                  if row["candidate_type"] == "repository_candidate_for_manual_product_selection"
+              )
+              high_product = sum(
+                  1 for row in family_candidates
+                  if row["candidate_type"] == "high_confidence_data_product_candidate"
+              )
+
+              top = family_candidates[0] if family_candidates else None
+
+              if high_conf_chain > 0:
+                  readiness = "chain_candidate_found_ready_for_parser_probe"
+              elif repo_candidates > 0 or high_product > 0:
+                  readiness = "product_or_repository_candidate_found_manual_selector_needed"
+              elif reachable_pages > 0:
+                  readiness = "pages_reachable_but_no_direct_product_found"
+              else:
+                  readiness = "source_pages_not_reachable"
+
+              family_summary_rows.append({
+                  "family": family,
+                  "reachable_pages": reachable_pages,
+                  "visited_pages": len(family_pages),
+                  "candidate_count": len(family_candidates),
+                  "high_confidence_chain_candidates": high_conf_chain,
+                  "repository_candidates": repo_candidates,
+                  "high_confidence_product_candidates": high_product,
+                  "readiness": readiness,
+                  "top_candidate_url": top["candidate_url"] if top else "",
+                  "top_candidate_score": top["candidate_score"] if top else "",
+                  "top_candidate_type": top["candidate_type"] if top else "",
+                  "needed_next": (
+                      "build parser probe for top candidate"
+                      if high_conf_chain > 0
+                      else "manual product selection or add direct chain URL"
+                  )
+              })
+
+          failed_gates = []
+          warnings = []
+
+          if not page_rows:
+              failed_gates.append("no_pages_visited")
+
+          for family in ["DES", "HSC"]:
+              rows = [row for row in family_summary_rows if row["family"] == family]
+              if not rows:
+                  warnings.append(f"{family}_missing_from_summary")
+                  continue
+
+              row = rows[0]
+              if row["reachable_pages"] == 0:
+                  warnings.append(f"{family}_no_reachable_pages")
+
+              if row["high_confidence_chain_candidates"] == 0:
+                  warnings.append(f"{family}_no_high_confidence_chain_candidate")
+
+          high_conf_total = sum(row["high_confidence_chain_candidates"] for row in family_summary_rows)
+          repo_or_product_total = sum(row["repository_candidates"] + row["high_confidence_product_candidates"] for row in family_summary_rows)
+
+          if failed_gates:
+              readiness_label = "des_hsc_direct_product_repair_crawler_failed"
+              next_step = "Repair source URLs before direct product parser work."
+          elif high_conf_total > 0:
+              readiness_label = "des_hsc_direct_product_repair_crawler_completed_chain_candidates_found"
+              next_step = (
+                  "Proceed to v4.8 direct product selector/parser probe for the highest-confidence DES/HSC chain candidate. "
+                  "Do not parse both families at once."
+              )
+          elif repo_or_product_total > 0:
+              readiness_label = "des_hsc_direct_product_repair_crawler_completed_repository_or_product_candidates_found"
+              next_step = (
+                  "Proceed to v4.8 manual direct product selector. "
+                  "Use the candidate ledger to choose one DES or HSC repository/product candidate before writing a parser."
+              )
+          else:
+              readiness_label = "des_hsc_direct_product_repair_crawler_completed_manual_url_needed"
+              next_step = (
+                  "Do not write a parser yet. Manually add direct DES/HSC chain URLs or repository data-product links."
+              )
+
+          interpretation = (
+              "v4.7 is a provenance repair step. It does not change the v4.6 growth-pressure result. "
+              "It searches for cleaner DES/HSC direct product candidates so later tests can replace summary-only DES/HSC rows with direct posterior products where possible."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_roots": SOURCE_ROOTS,
+              "page_rows": page_rows,
+              "candidate_rows": candidate_rows,
+              "family_summary_rows": family_summary_rows,
+              "summary_counts": {
+                  "visited_pages": len(page_rows),
+                  "candidate_rows": len(candidate_rows),
+                  "high_confidence_chain_candidates": high_conf_total,
+                  "repository_or_high_product_candidates": repo_or_product_total
+              },
+              "interpretation": interpretation,
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "combined_growth_posterior_built": False,
+                  "new_cosmological_model_fit": False,
+                  "posterior_chain_parsed": False
+              },
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False,
+                  "posterior_chain_parsed": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "des_hsc_crawled_pages_v4_7.csv",
+              page_rows,
+              [
+                  "root_id",
+                  "family",
+                  "source_role",
+                  "root_url",
+                  "url",
+                  "depth",
+                  "reachable",
+                  "http_status",
+                  "content_type",
+                  "bytes_read",
+                  "link_count",
+                  "error",
+                  "why"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "des_hsc_candidate_products_v4_7.csv",
+              candidate_rows,
+              [
+                  "root_id",
+                  "family",
+                  "source_role",
+                  "source_url",
+                  "candidate_url",
+                  "anchor_text",
+                  "discovery",
+                  "depth_found",
+                  "candidate_score",
+                  "candidate_type",
+                  "score_reasons"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "des_hsc_family_product_readiness_v4_7.csv",
+              family_summary_rows,
+              [
+                  "family",
+                  "reachable_pages",
+                  "visited_pages",
+                  "candidate_count",
+                  "high_confidence_chain_candidates",
+                  "repository_candidates",
+                  "high_confidence_product_candidates",
+                  "readiness",
+                  "top_candidate_url",
+                  "top_candidate_score",
+                  "top_candidate_type",
+                  "needed_next"
+              ]
+          )
+
+          interpretation_rows = [
+              {
+                  "interpretation_id": "allowed_product_crawler_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "DES/HSC source roots were crawled for candidate direct posterior/data products.",
+                  "boundary": "Crawler inventory only, not parser success and not validation."
+              },
+              {
+                  "interpretation_id": "allowed_candidate_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "A candidate link may be used for a later selector/parser probe.",
+                  "boundary": "Candidate status is not evidence status."
+              },
+              {
+                  "interpretation_id": "forbidden_parser_claim",
+                  "status": "forbidden",
+                  "wording": "DES or HSC posterior chains were parsed.",
+                  "boundary": "Blocked. v4.7 crawls only."
+              },
+              {
+                  "interpretation_id": "forbidden_validation_claim",
+                  "status": "forbidden",
+                  "wording": "TAIRID is validated.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_model_comparison_claim",
+                  "status": "forbidden",
+                  "wording": "A likelihood, BIC, or model comparison was run.",
+                  "boundary": "Blocked."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "interpretation_boundaries_v4_7.csv",
+              interpretation_rows,
+              ["interpretation_id", "status", "wording", "boundary"]
+          )
+
+          json_path = OUTDIR / "tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v4.7 — DES/HSC Direct Product Repair Crawler")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v4.6 preserved the role-explicit growth/consolidation pattern, but DES and HSC still rely mostly on published summary rows.")
+          md.append("")
+          md.append("v4.7 crawls DES and HSC source roots more deeply to look for direct posterior chains, data products, repositories, and parser candidates.")
+          md.append("")
+          md.append("This does not parse chains yet and does not change the v4.6 result.")
+          md.append("")
+          md.append("## Summary counts")
+          md.append("")
+          md.append("| Count | Value |")
+          md.append("|---|---:|")
+          md.append(f"| Visited pages | `{len(page_rows)}` |")
+          md.append(f"| Candidate rows | `{len(candidate_rows)}` |")
+          md.append(f"| High-confidence chain candidates | `{high_conf_total}` |")
+          md.append(f"| Repository/high-product candidates | `{repo_or_product_total}` |")
+          md.append("")
+          md.append("## Family readiness")
+          md.append("")
+          md.append("| Family | Reachable pages | Candidates | Chain candidates | Repository/product candidates | Readiness |")
+          md.append("|---|---:|---:|---:|---:|---|")
+          for row in family_summary_rows:
+              md.append(
+                  f"| `{row['family']}` | `{row['reachable_pages']}` | `{row['candidate_count']}` | "
+                  f"`{row['high_confidence_chain_candidates']}` | "
+                  f"`{row['repository_candidates'] + row['high_confidence_product_candidates']}` | `{row['readiness']}` |"
+              )
+          md.append("")
+          md.append("## Top candidate products")
+          md.append("")
+          md.append("| Family | Type | Score | Candidate URL | Anchor text |")
+          md.append("|---|---|---:|---|---|")
+          for row in candidate_rows[:30]:
+              anchor = (row["anchor_text"] or "").replace("|", "/")[:120]
+              md.append(
+                  f"| `{row['family']}` | `{row['candidate_type']}` | `{row['candidate_score']}` | "
+                  f"{row['candidate_url']} | `{anchor}` |"
+              )
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append(interpretation)
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `des_hsc_crawled_pages_v4_7.csv`")
+          md.append("- `des_hsc_candidate_products_v4_7.csv`")
+          md.append("- `des_hsc_family_product_readiness_v4_7.csv`")
+          md.append("- `interpretation_boundaries_v4_7.csv`")
+          md.append("- `tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler.json`")
+          md.append("- `tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Family readiness:")
+          print(json.dumps(family_summary_rows, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.7 DES HSC direct product repair crawler artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-7-des-hsc-direct-product-repair-crawler
+          path: artifacts/tairid_cosmology_v4_7_des_hsc_direct_product_repair_crawler/
