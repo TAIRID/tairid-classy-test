@@ -1,0 +1,791 @@
+name: TAIRID v4.47 Planck Reference Chain Feasibility
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-47-planck-reference-chain-feasibility.yml"
+
+jobs:
+  tairid-v4-47-planck-reference-chain-feasibility:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.47 Planck reference chain feasibility
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_47_planck_reference_chain_feasibility
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_47_planck_reference_chain_feasibility")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_47_planck_reference_chain_feasibility"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run Planck likelihoods.",
+              "This does not import Planck chains.",
+              "This does not download large Planck MCMC chain files.",
+              "This does not propagate Planck posterior uncertainty into f_sigma8 yet.",
+              "This does not compute a final RSD pressure score.",
+              "This audits whether the Planck reference-chain uncertainty layer can be defined safely for later work.",
+              "A pass means Planck reference-chain requirements are explicit, not that reference uncertainty has been included."
+          ]
+
+          CARRIED_RSD_STATUS = [
+              {
+                  "lane_id": "BOSS_DR12",
+                  "status": "BOSS_only_covariance_preview_nonfinal",
+                  "from_test": "v4_37",
+                  "residual_direction_summary": "mixed_2_negative_1_positive",
+                  "reference_uncertainty_included": False,
+                  "blocks_final_RSD_claim": True
+              },
+              {
+                  "lane_id": "eBOSS_LRG_QSO",
+                  "status": "partial_covariance_preview_nonfinal",
+                  "from_test": "v4_44",
+                  "residual_direction_summary": "positive_2_of_2",
+                  "reference_uncertainty_included": False,
+                  "blocks_final_RSD_claim": True
+              },
+              {
+                  "lane_id": "eBOSS_ELG",
+                  "status": "grid_likelihood_parser_needed_or_parked",
+                  "from_test": "v4_43",
+                  "reference_uncertainty_included": False,
+                  "blocks_final_RSD_claim": True
+              },
+              {
+                  "lane_id": "WiggleZ",
+                  "status": "formally_nonfinal_unresolved_after_locator_retry",
+                  "from_test": "v4_46",
+                  "reference_uncertainty_included": False,
+                  "blocks_final_RSD_claim": True
+              }
+          ]
+
+          PLANCK_SOURCE_ROOTS = [
+              {
+                  "source_id": "planck_legacy_archive_home",
+                  "url": "https://pla.esac.esa.int/",
+                  "source_role": "official_Planck_Legacy_Archive_entry",
+                  "must_fetch_for_feasibility": False
+              },
+              {
+                  "source_id": "esa_planck_pla_info",
+                  "url": "https://www.cosmos.esa.int/web/planck/pla",
+                  "source_role": "ESA_Planck_Legacy_Archive_information_page",
+                  "must_fetch_for_feasibility": False
+              },
+              {
+                  "source_id": "planck_pr3_cosmology_products",
+                  "url": "https://esdcdoi.esac.esa.int/doi/html/data/astronomy/planck/Cosmology.html",
+                  "source_role": "PR3_cosmology_products_listing",
+                  "must_fetch_for_feasibility": False
+              }
+          ]
+
+          PLANCK_CHAIN_TARGETS = [
+              {
+                  "target_id": "planck_2018_base_lcdm_TTTEEE_lowE_lensing_candidate",
+                  "chain_family": "Planck_2018_base_LCDM",
+                  "likelihood_label_needed": "plikHM_TTTEEE_lowl_lowE_lensing_or_equivalent",
+                  "why_this_target": "Closest reference to the Planck-like curve currently used for RSD previews.",
+                  "exact_download_url_known_now": False,
+                  "chain_import_allowed_now": False
+              },
+              {
+                  "target_id": "planck_2018_base_lcdm_TTTEEE_lowE_no_lensing_candidate",
+                  "chain_family": "Planck_2018_base_LCDM",
+                  "likelihood_label_needed": "plikHM_TTTEEE_lowl_lowE_or_equivalent",
+                  "why_this_target": "Useful comparison if lensing-included chain is unavailable or if lensing double-use must be guarded.",
+                  "exact_download_url_known_now": False,
+                  "chain_import_allowed_now": False
+              },
+              {
+                  "target_id": "planck_2018_base_lcdm_lensing_only_candidate",
+                  "chain_family": "Planck_2018_lensing",
+                  "likelihood_label_needed": "lensing_or_equivalent",
+                  "why_this_target": "Potential cross-check for growth/reference tension, not first-line final reference.",
+                  "exact_download_url_known_now": False,
+                  "chain_import_allowed_now": False
+              }
+          ]
+
+          REQUIRED_CHAIN_COLUMNS = [
+              {
+                  "column_or_quantity": "sample_weight",
+                  "required": True,
+                  "acceptable_aliases": "weight; sample_weight; posterior_weight",
+                  "why_needed": "Reference posterior summaries need weighted samples."
+              },
+              {
+                  "column_or_quantity": "Omega_m",
+                  "required": True,
+                  "acceptable_aliases": "omegam; Omega_m; omegaless_matter_density_derived_from_chain",
+                  "why_needed": "f_sigma8(z) depends on the matter-density history."
+              },
+              {
+                  "column_or_quantity": "sigma8",
+                  "required": True,
+                  "acceptable_aliases": "sigma8; sigma_8",
+                  "why_needed": "f_sigma8(z) uses sigma8 scaled by growth."
+              },
+              {
+                  "column_or_quantity": "H0_or_h",
+                  "required": "recommended",
+                  "acceptable_aliases": "H0; H_0; h",
+                  "why_needed": "Useful for provenance and consistency checks; not always needed for approximate f_sigma8 if Omega_m and sigma8 are direct."
+              },
+              {
+                  "column_or_quantity": "chain_parameter_names_file",
+                  "required": True,
+                  "acceptable_aliases": "paramnames; .paramnames; metadata header",
+                  "why_needed": "The parser must not guess column order."
+              }
+          ]
+
+          RSD_REDSHIFT_TARGETS = [
+              {
+                  "source": "BOSS_DR12",
+                  "z_eff": 0.38,
+                  "status": "needs_reference_posterior_fsigma8_samples"
+              },
+              {
+                  "source": "BOSS_DR12",
+                  "z_eff": 0.51,
+                  "status": "needs_reference_posterior_fsigma8_samples"
+              },
+              {
+                  "source": "BOSS_DR12",
+                  "z_eff": 0.61,
+                  "status": "needs_reference_posterior_fsigma8_samples"
+              },
+              {
+                  "source": "eBOSS_LRG",
+                  "z_eff": 0.70,
+                  "status": "needs_reference_posterior_fsigma8_samples"
+              },
+              {
+                  "source": "eBOSS_ELG",
+                  "z_eff": 0.85,
+                  "status": "ELG_parser_needed_but_reference_target_known"
+              },
+              {
+                  "source": "eBOSS_QSO",
+                  "z_eff": 1.48,
+                  "status": "needs_reference_posterior_fsigma8_samples"
+              },
+              {
+                  "source": "WiggleZ",
+                  "z_eff": 0.44,
+                  "status": "WiggleZ_product_unresolved_but_reference_target_known"
+              },
+              {
+                  "source": "WiggleZ",
+                  "z_eff": 0.60,
+                  "status": "WiggleZ_product_unresolved_but_reference_target_known"
+              },
+              {
+                  "source": "WiggleZ",
+                  "z_eff": 0.73,
+                  "status": "WiggleZ_product_unresolved_but_reference_target_known"
+              }
+          ]
+
+          FEASIBILITY_REQUIREMENTS = [
+              {
+                  "requirement_id": "official_source_root_recorded",
+                  "status": "required_now",
+                  "description": "Official Planck source roots must be recorded.",
+                  "why_it_matters": "Later chain work must not rely on guessed or uncited files."
+              },
+              {
+                  "requirement_id": "exact_chain_product_selection_required_later",
+                  "status": "required_before_chain_import",
+                  "description": "A later test must select the exact Planck chain product and record its URL/path before import.",
+                  "why_it_matters": "Different Planck likelihood combinations produce different reference posteriors."
+              },
+              {
+                  "requirement_id": "chain_column_schema_required_later",
+                  "status": "required_before_chain_import",
+                  "description": "The chain parser must confirm parameter names and column order before reading numerical samples.",
+                  "why_it_matters": "Wrong column mapping would produce false reference uncertainty."
+              },
+              {
+                  "requirement_id": "weighted_sample_policy_required_later",
+                  "status": "required_before_reference_uncertainty",
+                  "description": "The later parser must handle sample weights and not treat weighted chains as unweighted unless justified.",
+                  "why_it_matters": "Posterior uncertainty can be distorted by ignoring weights."
+              },
+              {
+                  "requirement_id": "fsigma8_reference_function_required_later",
+                  "status": "required_before_reference_uncertainty",
+                  "description": "A later test must compute f_sigma8(z) for each chain sample at all RSD redshift targets.",
+                  "why_it_matters": "Reference uncertainty must be redshift-specific, not one scalar S8 number."
+              },
+              {
+                  "requirement_id": "reference_covariance_across_redshift_required_later",
+                  "status": "required_before_final_RSD_pressure",
+                  "description": "A later test must build the covariance/correlation of reference f_sigma8 predictions across redshifts.",
+                  "why_it_matters": "One Planck sample shifts many redshifts together."
+              },
+              {
+                  "requirement_id": "data_plus_reference_covariance_policy_required_later",
+                  "status": "required_before_final_RSD_pressure",
+                  "description": "A later statistic must define how data covariance and reference covariance combine.",
+                  "why_it_matters": "Current previews use data-side covariance only."
+              },
+              {
+                  "requirement_id": "no_final_RSD_pressure_now",
+                  "status": "required_now",
+                  "description": "This test must not compute final RSD pressure or claim reference uncertainty is included.",
+                  "why_it_matters": "This is a feasibility audit, not uncertainty propagation."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "Planck chains were imported.",
+              "Planck reference uncertainty is included.",
+              "The exact Planck chain product has been selected.",
+              "BOSS and eBOSS partial previews can be combined into a final score now.",
+              "The full RSD lane is covariance-aware.",
+              "All growth data point negative.",
+              "A likelihood, BIC, refit, or model comparison was run."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_48_Planck_chain_product_locator",
+                  "purpose": "Locate exact Planck 2018 chain product candidates and record direct paths or keep chain import unresolved.",
+                  "must_include": "official source roots, candidate product labels, exact path status, no chain import.",
+                  "must_not_include": "reference uncertainty included claim."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_49_growth_lane_status_handoff",
+                  "purpose": "Write a compact handoff for BOSS, eBOSS, ELG, WiggleZ, and Planck reference uncertainty status.",
+                  "must_include": "partial previews, unresolved lanes, reference-chain requirements, truth boundary.",
+                  "must_not_include": "validation claim."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_50_ELG_grid_parser_design_optional",
+                  "purpose": "Optionally design the real ELG grid-likelihood parser.",
+                  "must_include": "column meanings, likelihood interpretation, marginalization policy.",
+                  "must_not_include": "ELG covariance-ready claim without parser."
+              }
+          ]
+
+          def fetch_text(url, timeout=60, byte_limit=2_000_000):
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 TAIRID-v4.47-Planck-reference-chain-feasibility",
+                          "Accept": "text/html,text/xml,application/xml,text/plain,*/*"
+                      }
+                  )
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(byte_limit)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "fetch_ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "final_url": response.geturl(),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "fetch_ok": False,
+                      "http_status": "",
+                      "final_url": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def text_signal(text, patterns):
+              sample = (text or "")[:200000].lower()
+              hits = []
+              for pattern in patterns:
+                  if pattern.lower() in sample:
+                      hits.append(pattern)
+              return ";".join(hits)
+
+          failed_gates = []
+          warnings = []
+
+          source_fetch_rows = []
+          source_signal_rows = []
+
+          for root in PLANCK_SOURCE_ROOTS:
+              fetched = fetch_text(root["url"])
+
+              source_fetch_rows.append({
+                  "source_id": root["source_id"],
+                  "url": root["url"],
+                  "final_url": fetched["final_url"],
+                  "source_role": root["source_role"],
+                  "must_fetch_for_feasibility": root["must_fetch_for_feasibility"],
+                  "fetch_ok": fetched["fetch_ok"],
+                  "http_status": fetched["http_status"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": fetched["error"]
+              })
+
+              source_signal_rows.append({
+                  "source_id": root["source_id"],
+                  "fetch_ok": fetched["fetch_ok"],
+                  "planck_signal": text_signal(fetched["text"], ["Planck", "Legacy Archive", "PLA", "Cosmology", "PR3", "products"]),
+                  "chain_signal": text_signal(fetched["text"], ["chain", "MCMC", "cosmological parameters", "parameters", "base"]),
+                  "download_signal": text_signal(fetched["text"], ["download", "data", "product", "archive"])
+              })
+
+          fetched_ok_count = sum(1 for row in source_fetch_rows if row["fetch_ok"] is True)
+          official_roots_recorded = len(PLANCK_SOURCE_ROOTS) >= 3
+
+          if not official_roots_recorded:
+              failed_gates.append("official_Planck_source_roots_not_recorded")
+
+          if len(source_fetch_rows) != len(PLANCK_SOURCE_ROOTS):
+              failed_gates.append("source_fetch_attempts_not_recorded")
+
+          missing_required_columns = [
+              row["column_or_quantity"]
+              for row in REQUIRED_CHAIN_COLUMNS
+              if row["required"] is True
+          ]
+
+          if len(missing_required_columns) < 3:
+              failed_gates.append("required_chain_column_set_too_small")
+
+          required_requirement_ids = {
+              "official_source_root_recorded",
+              "exact_chain_product_selection_required_later",
+              "chain_column_schema_required_later",
+              "weighted_sample_policy_required_later",
+              "fsigma8_reference_function_required_later",
+              "reference_covariance_across_redshift_required_later",
+              "data_plus_reference_covariance_policy_required_later",
+              "no_final_RSD_pressure_now"
+          }
+
+          present_requirement_ids = {row["requirement_id"] for row in FEASIBILITY_REQUIREMENTS}
+          missing_requirement_ids = sorted(required_requirement_ids - present_requirement_ids)
+
+          for missing in missing_requirement_ids:
+              failed_gates.append("missing_feasibility_requirement_" + missing)
+
+          if not any(row["lane_id"] == "WiggleZ" and row["status"] == "formally_nonfinal_unresolved_after_locator_retry" for row in CARRIED_RSD_STATUS):
+              failed_gates.append("WiggleZ_formal_nonfinal_status_not_carried")
+
+          if not any(row["lane_id"] == "eBOSS_ELG" and "parser" in row["status"] for row in CARRIED_RSD_STATUS):
+              failed_gates.append("ELG_parser_needed_status_not_carried")
+
+          if not any(row["lane_id"] == "BOSS_DR12" for row in CARRIED_RSD_STATUS):
+              failed_gates.append("BOSS_status_not_carried")
+
+          if not any(row["lane_id"] == "eBOSS_LRG_QSO" for row in CARRIED_RSD_STATUS):
+              failed_gates.append("eBOSS_LRG_QSO_status_not_carried")
+
+          if not all(row["chain_import_allowed_now"] is False for row in PLANCK_CHAIN_TARGETS):
+              failed_gates.append("chain_import_allowed_violation")
+
+          if not all(row["exact_download_url_known_now"] is False for row in PLANCK_CHAIN_TARGETS):
+              failed_gates.append("exact_chain_url_prematurely_claimed")
+
+          blocked_text = " | ".join(BLOCKED_CLAIMS).lower()
+          for phrase in [
+              "final rsd pressure score",
+              "planck chains were imported",
+              "reference uncertainty is included",
+              "exact planck chain product has been selected",
+              "full rsd lane",
+              "all growth data point negative",
+              "likelihood",
+              "bic"
+          ]:
+              if phrase not in blocked_text:
+                  failed_gates.append("blocked_claim_missing_" + phrase.replace(" ", "_"))
+
+          warnings.append("Planck_chain_import_not_run")
+          warnings.append("exact_chain_product_not_selected_yet")
+          warnings.append("reference_uncertainty_not_included_yet")
+          warnings.append("source_pages_may_fetch_or_not_fetch_without_affecting_feasibility_boundary")
+          warnings.append("BOSS_preview_remains_BOSS_only")
+          warnings.append("eBOSS_preview_remains_LRG_QSO_partial")
+          warnings.append("ELG_parser_needed_or_parked")
+          warnings.append("WiggleZ_formally_nonfinal_after_locator_retry")
+          warnings.append("not_a_final_RSD_pressure_score")
+          warnings.append("not_validation")
+
+          if fetched_ok_count == 0:
+              warnings.append("Planck_source_roots_not_fetchable_in_GitHub_environment_but_roots_recorded")
+
+          rule_results = [
+              {
+                  "rule_id": "official_source_roots_recorded",
+                  "pass": official_roots_recorded,
+                  "result": f"{len(PLANCK_SOURCE_ROOTS)} Planck source root(s) recorded",
+                  "boundary": "Recorded roots are source anchors, not chain import."
+              },
+              {
+                  "rule_id": "source_fetch_attempts_recorded",
+                  "pass": len(source_fetch_rows) == len(PLANCK_SOURCE_ROOTS),
+                  "result": f"{len(source_fetch_rows)} fetch attempt row(s) recorded",
+                  "boundary": "Fetch success is useful but not required for feasibility."
+              },
+              {
+                  "rule_id": "candidate_chain_targets_declared_without_import",
+                  "pass": len(PLANCK_CHAIN_TARGETS) >= 2 and all(row["chain_import_allowed_now"] is False for row in PLANCK_CHAIN_TARGETS),
+                  "result": "Planck chain targets declared but not imported",
+                  "boundary": "No reference uncertainty included yet."
+              },
+              {
+                  "rule_id": "required_chain_columns_declared",
+                  "pass": len(REQUIRED_CHAIN_COLUMNS) >= 5,
+                  "result": "required chain columns and aliases declared",
+                  "boundary": "Column schema still must be confirmed later."
+              },
+              {
+                  "rule_id": "rsd_redshift_targets_declared",
+                  "pass": len(RSD_REDSHIFT_TARGETS) >= 6,
+                  "result": f"{len(RSD_REDSHIFT_TARGETS)} RSD redshift targets declared",
+                  "boundary": "Reference samples not computed yet."
+              },
+              {
+                  "rule_id": "feasibility_requirements_complete",
+                  "pass": len(missing_requirement_ids) == 0,
+                  "result": "all feasibility requirements present",
+                  "boundary": "Requirements are not execution."
+              },
+              {
+                  "rule_id": "carried_RSD_boundaries_preserved",
+                  "pass": all(row["blocks_final_RSD_claim"] is True for row in CARRIED_RSD_STATUS),
+                  "result": "BOSS_eBOSS_ELG_WiggleZ_reference_boundaries_preserved",
+                  "boundary": "No final RSD claim."
+              },
+              {
+                  "rule_id": "no_chain_import_no_final_pressure",
+                  "pass": True,
+                  "result": "no_chain_import_no_reference_uncertainty_no_final_pressure",
+                  "boundary": "Feasibility audit only."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_Planck_reference_feasibility_rules_passed")
+
+          if failed_gates:
+              readiness_label = "Planck_reference_chain_feasibility_audit_failed"
+              next_step = "Repair source-root, chain-target, or requirement declarations before product locator."
+          else:
+              readiness_label = "Planck_reference_chain_feasibility_audit_passed_ready_for_Planck_chain_product_locator_or_growth_lane_handoff"
+              next_step = (
+                  "Proceed to v4.48 Planck chain product locator, or write v4.49 growth lane status handoff. "
+                  "Do not import chains or compute final RSD pressure until exact chain products and parser schema are selected."
+              )
+
+          system_health = {
+              "Planck_source_root_count": len(PLANCK_SOURCE_ROOTS),
+              "Planck_source_fetch_attempt_count": len(source_fetch_rows),
+              "Planck_source_fetch_success_count": fetched_ok_count,
+              "candidate_chain_target_count": len(PLANCK_CHAIN_TARGETS),
+              "required_chain_column_count": len(REQUIRED_CHAIN_COLUMNS),
+              "RSD_redshift_target_count": len(RSD_REDSHIFT_TARGETS),
+              "feasibility_requirement_count": len(FEASIBILITY_REQUIREMENTS),
+              "missing_feasibility_requirement_count": len(missing_requirement_ids),
+              "exact_chain_product_selected": False,
+              "Planck_chains_imported": False,
+              "reference_uncertainty_included": False,
+              "reference_fsigma8_samples_computed": False,
+              "reference_covariance_across_redshift_computed": False,
+              "data_plus_reference_covariance_policy_defined": False,
+              "final_RSD_pressure_score_allowed_now": False,
+              "full_RSD_covariance_complete": False,
+              "likelihood_run": False,
+              "BIC_run": False,
+              "refit_run": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results)
+          }
+
+          interpretation = (
+              "v4.47 audits Planck reference-chain feasibility. "
+              "It records official Planck source roots, declares candidate Planck 2018 chain targets, lists the chain columns needed, and declares the RSD redshift targets where f_sigma8 reference samples must later be computed. "
+              "No Planck chains are imported, no reference uncertainty is included, and no final RSD pressure score is allowed."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "carried_rsd_status": CARRIED_RSD_STATUS,
+              "planck_source_roots": PLANCK_SOURCE_ROOTS,
+              "source_fetch_rows": source_fetch_rows,
+              "source_signal_rows": source_signal_rows,
+              "planck_chain_targets": PLANCK_CHAIN_TARGETS,
+              "required_chain_columns": REQUIRED_CHAIN_COLUMNS,
+              "rsd_redshift_targets": RSD_REDSHIFT_TARGETS,
+              "feasibility_requirements": FEASIBILITY_REQUIREMENTS,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "exact_chain_product_selected": False,
+                  "Planck_chains_imported": False,
+                  "reference_uncertainty_included": False,
+                  "reference_fsigma8_samples_computed": False,
+                  "full_RSD_covariance_complete": False,
+                  "likelihood_run": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "carried_rsd_status_v4_47.csv",
+              CARRIED_RSD_STATUS,
+              ["lane_id", "status", "from_test", "residual_direction_summary", "reference_uncertainty_included", "blocks_final_RSD_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "planck_source_fetch_rows_v4_47.csv",
+              source_fetch_rows,
+              [
+                  "source_id",
+                  "url",
+                  "final_url",
+                  "source_role",
+                  "must_fetch_for_feasibility",
+                  "fetch_ok",
+                  "http_status",
+                  "content_type",
+                  "bytes_read",
+                  "error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "planck_source_signal_rows_v4_47.csv",
+              source_signal_rows,
+              ["source_id", "fetch_ok", "planck_signal", "chain_signal", "download_signal"]
+          )
+
+          write_csv(
+              OUTDIR / "planck_chain_targets_v4_47.csv",
+              PLANCK_CHAIN_TARGETS,
+              [
+                  "target_id",
+                  "chain_family",
+                  "likelihood_label_needed",
+                  "why_this_target",
+                  "exact_download_url_known_now",
+                  "chain_import_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "required_chain_columns_v4_47.csv",
+              REQUIRED_CHAIN_COLUMNS,
+              ["column_or_quantity", "required", "acceptable_aliases", "why_needed"]
+          )
+
+          write_csv(
+              OUTDIR / "rsd_redshift_targets_v4_47.csv",
+              RSD_REDSHIFT_TARGETS,
+              ["source", "z_eff", "status"]
+          )
+
+          write_csv(
+              OUTDIR / "planck_feasibility_requirements_v4_47.csv",
+              FEASIBILITY_REQUIREMENTS,
+              ["requirement_id", "status", "description", "why_it_matters"]
+          )
+
+          write_csv(
+              OUTDIR / "planck_reference_feasibility_rule_results_v4_47.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_47.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_47.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_47.csv",
+              [system_health],
+              [
+                  "Planck_source_root_count",
+                  "Planck_source_fetch_attempt_count",
+                  "Planck_source_fetch_success_count",
+                  "candidate_chain_target_count",
+                  "required_chain_column_count",
+                  "RSD_redshift_target_count",
+                  "feasibility_requirement_count",
+                  "missing_feasibility_requirement_count",
+                  "exact_chain_product_selected",
+                  "Planck_chains_imported",
+                  "reference_uncertainty_included",
+                  "reference_fsigma8_samples_computed",
+                  "reference_covariance_across_redshift_computed",
+                  "data_plus_reference_covariance_policy_defined",
+                  "final_RSD_pressure_score_allowed_now",
+                  "full_RSD_covariance_complete",
+                  "likelihood_run",
+                  "BIC_run",
+                  "refit_run",
+                  "validation_claim_allowed",
+                  "rule_pass_count",
+                  "rule_total_count"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_47_planck_reference_chain_feasibility.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.47 — Planck Reference Chain Feasibility Audit")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("Planck reference-chain feasibility was audited. The chain source roots, candidate target families, required columns, and RSD redshift targets are now explicitly bounded.")
+          md.append("")
+          md.append("No Planck chains were imported. No reference uncertainty was included. No final RSD pressure score was computed.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Candidate chain targets")
+          md.append("")
+          md.append("| Target | Family | Likelihood label needed | Import now | Exact URL known now |")
+          md.append("|---|---|---|---:|---:|")
+          for row in PLANCK_CHAIN_TARGETS:
+              md.append(
+                  f"| `{row['target_id']}` | `{row['chain_family']}` | `{row['likelihood_label_needed']}` | "
+                  f"`{row['chain_import_allowed_now']}` | `{row['exact_download_url_known_now']}` |"
+              )
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `carried_rsd_status_v4_47.csv`")
+          md.append("- `planck_source_fetch_rows_v4_47.csv`")
+          md.append("- `planck_source_signal_rows_v4_47.csv`")
+          md.append("- `planck_chain_targets_v4_47.csv`")
+          md.append("- `required_chain_columns_v4_47.csv`")
+          md.append("- `rsd_redshift_targets_v4_47.csv`")
+          md.append("- `planck_feasibility_requirements_v4_47.csv`")
+          md.append("- `planck_reference_feasibility_rule_results_v4_47.csv`")
+          md.append("- `blocked_claims_v4_47.csv`")
+          md.append("- `next_test_ladder_v4_47.csv`")
+          md.append("- `system_health_v4_47.csv`")
+          md.append("- `tairid_v4_47_planck_reference_chain_feasibility.json`")
+          md.append("- `tairid_v4_47_planck_reference_chain_feasibility.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_47_planck_reference_chain_feasibility.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.47 Planck reference chain feasibility artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-47-planck-reference-chain-feasibility
+          path: artifacts/tairid_v4_47_planck_reference_chain_feasibility/
