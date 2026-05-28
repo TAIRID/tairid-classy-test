@@ -1,0 +1,884 @@
+name: TAIRID Cosmology v3.47 KiDS1000 Chain Archive Member Inventory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kids1000-chain-archive-member-inventory:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.47 KiDS1000 chain archive member inventory
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_47
+
+          python - <<'PY'
+          import csv
+          import gzip
+          import io
+          import json
+          import math
+          import os
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_47")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_47_kids1000_chain_archive_member_inventory"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute growth pressure scores.",
+              "This does not compare KiDS growth against H0LiCOW.",
+              "This does not parse final KiDS cosmological constraints.",
+              "This inventories the KiDS-1000 chain archive and README only.",
+              "The purpose is to identify member structure, chain files, metadata, and possible parameter names before parser implementation.",
+              "No KiDS product may be promoted to model-anchor status in this workflow."
+          ]
+
+          PREVIOUS_MILESTONE = {
+              "v3_46_status": "growth_parser_design_target_review_passed_kids1000_primary_ready_for_archive_inventory",
+              "v3_46_failed_gates": [],
+              "primary_target": "kids1000_3x2pt_fiducial_chains",
+              "primary_archive_reachable": True,
+              "primary_readme_reachable": True,
+              "primary_target_ready": True,
+              "next_rule": "Inspect the selected KiDS-1000 3x2pt fiducial chain archive/readme for member structure, candidate chain files, parameter names, and parser rules, still with no pressure scoring or refit."
+          }
+
+          KIDS_ARCHIVE_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          KIDS_README_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          MAX_DOWNLOAD_BYTES = 750 * 1024 * 1024
+          MAX_MEMBER_SAMPLE_BYTES = 256 * 1024
+          MAX_TEXT_SAMPLES = 80
+          MAX_CHAIN_LINE_SCAN = 50
+
+          REQUIRED_CONTRACT_FIELDS = [
+              "source",
+              "observable_role",
+              "pressure_surface",
+              "baseline",
+              "parser_status",
+              "provenance_status",
+              "block_condition",
+              "claim_boundary"
+          ]
+
+          TEXT_EXTENSIONS = [
+              ".txt", ".dat", ".csv", ".tsv", ".chain", ".paramnames",
+              ".names", ".ini", ".yaml", ".yml", ".json", ".log", ".md"
+          ]
+
+          CHAIN_TERMS = [
+              "chain", "chains", "samples", "sample", "posterior", "mcmc",
+              "multinest", "polychord", "lcdm", "wcdm", "fiducial"
+          ]
+
+          PARAMETER_TERMS = [
+              "s8", "s_8", "sigma8", "sigma_8", "omegam", "omega_m",
+              "omega_matter", "omega_c", "omega_b", "h0", "hubble",
+              "a_s", "n_s", "w0", "wa", "omegak", "omega_k"
+          ]
+
+          GROWTH_TERMS = [
+              "weak lensing", "cosmic shear", "3x2pt", "kids", "s8",
+              "sigma8", "omega_m", "omegam", "chains", "posterior"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(text):
+              name = str(text).split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download_capped(url, path, timeout=600):
+              path.parent.mkdir(parents=True, exist_ok=True)
+
+              result = {
+                  "url": url,
+                  "path": str(path),
+                  "downloaded": False,
+                  "status": "",
+                  "content_type": "",
+                  "content_length": "",
+                  "size_bytes": 0,
+                  "error": ""
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v3.47-kids1000-chain-archive-member-inventory/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", "")
+                      result["status"] = status
+                      result["content_type"] = resp.headers.get("Content-Type", "")
+                      result["content_length"] = resp.headers.get("Content-Length", "")
+
+                      if status is None or not (200 <= status < 400):
+                          raise RuntimeError(f"HTTP status {status}")
+
+                      content_length = resp.headers.get("Content-Length")
+                      if content_length:
+                          try:
+                              if int(content_length) > MAX_DOWNLOAD_BYTES:
+                                  raise RuntimeError(f"content_length_exceeds_cap:{content_length}>{MAX_DOWNLOAD_BYTES}")
+                          except ValueError:
+                              pass
+
+                      total = 0
+                      with path.open("wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > MAX_DOWNLOAD_BYTES:
+                                  raise RuntimeError(f"download_exceeds_cap:{total}>{MAX_DOWNLOAD_BYTES}")
+                              f.write(chunk)
+
+                  result["downloaded"] = True
+                  result["size_bytes"] = path.stat().st_size
+                  return result
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+                  return result
+
+          def fetch_text(url, path):
+              dl = download_capped(url, path)
+              text = ""
+              if dl["downloaded"]:
+                  text = path.read_text(encoding="utf-8", errors="replace")
+              return dl, text
+
+          def is_text_member(name):
+              lower = name.lower()
+              return any(lower.endswith(ext) for ext in TEXT_EXTENSIONS)
+
+          def classify_member(name, size):
+              lower = name.lower()
+
+              if any(term in lower for term in ["param", "name", "columns"]):
+                  return "parameter_metadata_candidate"
+
+              if any(term in lower for term in ["readme", "note", "description"]):
+                  return "readme_or_metadata"
+
+              if any(term in lower for term in CHAIN_TERMS):
+                  return "chain_or_sample_candidate"
+
+              if any(term in lower for term in ["cov", "covariance", "covmat"]):
+                  return "covariance_candidate"
+
+              if any(term in lower for term in ["data", "vector", "datavector", "2pt", "3x2pt", "xi"]):
+                  return "data_vector_or_likelihood_context"
+
+              if is_text_member(name) and size > 0:
+                  return "text_support_candidate"
+
+              return "other_archive_member"
+
+          def score_member(name):
+              lower = name.lower()
+              score = 0
+
+              for term in CHAIN_TERMS:
+                  if term in lower:
+                      score += 3
+
+              for term in PARAMETER_TERMS:
+                  if term in lower:
+                      score += 2
+
+              for term in ["fiducial", "3x2pt", "lcdm", "base", "kids1000"]:
+                  if term in lower:
+                      score += 2
+
+              if any(x in lower for x in [".png", ".pdf", ".jpg", ".jpeg"]):
+                  score -= 4
+
+              return score
+
+          def parse_numeric_shape(text, max_lines=MAX_CHAIN_LINE_SCAN):
+              numeric_rows = 0
+              max_numeric_cols = 0
+              first_numeric_line = ""
+              first_non_numeric_lines = []
+              possible_header_lines = []
+
+              for raw in text.splitlines()[:max_lines]:
+                  line = raw.strip()
+                  if not line:
+                      continue
+
+                  clean = line.lstrip("#").strip()
+                  parts = re.split(r"[,\s]+", clean)
+                  values = []
+
+                  for p in parts:
+                      try:
+                          x = float(p)
+                          if math.isfinite(x):
+                              values.append(x)
+                      except Exception:
+                          pass
+
+                  if len(values) > 0 and len(values) == len(parts):
+                      numeric_rows += 1
+                      max_numeric_cols = max(max_numeric_cols, len(values))
+                      if not first_numeric_line:
+                          first_numeric_line = clean[:500]
+                  else:
+                      if len(first_non_numeric_lines) < 8:
+                          first_non_numeric_lines.append(clean[:500])
+                      if any(term in clean.lower() for term in PARAMETER_TERMS + ["weight", "like", "loglike", "post"]):
+                          possible_header_lines.append(clean[:500])
+
+              return {
+                  "numeric_rows_in_sample": numeric_rows,
+                  "max_numeric_columns_in_sample": max_numeric_cols,
+                  "first_numeric_line": first_numeric_line,
+                  "first_non_numeric_lines": " | ".join(first_non_numeric_lines),
+                  "possible_header_lines": " | ".join(possible_header_lines[:8])
+              }
+
+          def parameter_hits_from_text(text, name=""):
+              low = (text + " " + name).lower()
+              hits = sorted(set([term for term in PARAMETER_TERMS if term in low]))
+              growth_hits = sorted(set([term for term in GROWTH_TERMS if term in low]))
+              weight_hits = sorted(set([term for term in ["weight", "weights", "loglike", "likelihood", "post", "posterior"] if term in low]))
+              return hits, growth_hits, weight_hits
+
+          def write_csv(path, rows, fields):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({k: row.get(k, "") for k in fields})
+
+          created_at = now_iso()
+
+          print("TAIRID Cosmology v3.47 KiDS-1000 chain archive member inventory")
+          print("Truth boundary: archive/member inventory only; no scoring; no refit.")
+          print()
+
+          failed_gates = []
+          source_errors = {}
+
+          archive_path = DOWNLOADS / "KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          readme_path = DOWNLOADS / "KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          archive_dl = download_capped(KIDS_ARCHIVE_URL, archive_path)
+          readme_dl, readme_text = fetch_text(KIDS_README_URL, readme_path)
+
+          if not archive_dl["downloaded"]:
+              failed_gates.append("kids_archive_download_failed")
+              source_errors["kids_archive"] = archive_dl["error"]
+
+          if not readme_dl["downloaded"]:
+              failed_gates.append("kids_readme_download_failed")
+              source_errors["kids_readme"] = readme_dl["error"]
+
+          readme_parameter_hits, readme_growth_hits, readme_weight_hits = parameter_hits_from_text(readme_text, KIDS_README_URL)
+          readme_rows = [{
+              "source": "KiDS_1000",
+              "readme_url": KIDS_README_URL,
+              "downloaded": readme_dl["downloaded"],
+              "status": readme_dl["status"],
+              "content_type": readme_dl["content_type"],
+              "content_length": readme_dl["content_length"],
+              "size_bytes": readme_dl["size_bytes"],
+              "parameter_hits": ";".join(readme_parameter_hits),
+              "growth_hits": ";".join(readme_growth_hits),
+              "weight_or_likelihood_hits": ";".join(readme_weight_hits),
+              "readme_text_sample": readme_text[:3000].replace("\n", " | "),
+              "error": readme_dl["error"]
+          }]
+
+          member_rows = []
+          sample_rows = []
+          candidate_rows = []
+
+          if archive_dl["downloaded"]:
+              try:
+                  with tarfile.open(archive_path, "r:gz") as tf:
+                      members = [m for m in tf.getmembers() if m.isfile()]
+
+                      for m in members:
+                          role = classify_member(m.name, m.size)
+                          member_rows.append({
+                              "source": "KiDS_1000",
+                              "archive_url": KIDS_ARCHIVE_URL,
+                              "member_name": m.name,
+                              "member_size_bytes": int(m.size),
+                              "member_role": role,
+                              "member_score": score_member(m.name),
+                              "is_text_like": is_text_member(m.name),
+                              "parser_status": "archive_member_inventory_only",
+                              "provenance_status": "official_public_kids_archive_member",
+                              "observable_role": "weak_lensing_clustering_growth",
+                              "pressure_surface": "consolidation_growth",
+                              "baseline": "not_selected_archive_inventory_only",
+                              "block_condition": "blocked_until_member_format_parameter_mapping_and_sample_columns_are_reviewed",
+                              "claim_boundary": "archive_inventory_only_not_model_anchor",
+                              "model_anchor_allowed_now": False,
+                              "refit_allowed_now": False,
+                              "new_pressure_score_allowed_now": False
+                          })
+
+                      text_sample_count = 0
+
+                      for m in sorted(members, key=lambda x: (-score_member(x.name), x.name)):
+                          if text_sample_count >= MAX_TEXT_SAMPLES:
+                              break
+
+                          if not is_text_member(m.name):
+                              continue
+
+                          if m.size <= 0 or m.size > 25 * 1024 * 1024:
+                              continue
+
+                          f = tf.extractfile(m)
+                          if f is None:
+                              continue
+
+                          data = f.read(MAX_MEMBER_SAMPLE_BYTES)
+                          text = data.decode("utf-8", errors="replace")
+                          numeric_shape = parse_numeric_shape(text)
+                          parameter_hits, growth_hits, weight_hits = parameter_hits_from_text(text, m.name)
+
+                          sample_rows.append({
+                              "source": "KiDS_1000",
+                              "member_name": m.name,
+                              "member_size_bytes": int(m.size),
+                              "member_role": classify_member(m.name, m.size),
+                              "member_score": score_member(m.name),
+                              "sample_bytes_read": len(data),
+                              "numeric_rows_in_sample": numeric_shape["numeric_rows_in_sample"],
+                              "max_numeric_columns_in_sample": numeric_shape["max_numeric_columns_in_sample"],
+                              "first_numeric_line": numeric_shape["first_numeric_line"],
+                              "possible_header_lines": numeric_shape["possible_header_lines"],
+                              "first_non_numeric_lines": numeric_shape["first_non_numeric_lines"],
+                              "parameter_hits": ";".join(parameter_hits),
+                              "growth_hits": ";".join(growth_hits),
+                              "weight_or_likelihood_hits": ";".join(weight_hits),
+                              "text_sample": text[:1000].replace("\n", " | ")
+                          })
+
+                          text_sample_count += 1
+
+                      for row in member_rows:
+                          role = row["member_role"]
+                          score = int(row["member_score"])
+                          if role in [
+                              "chain_or_sample_candidate",
+                              "parameter_metadata_candidate",
+                              "readme_or_metadata",
+                              "text_support_candidate"
+                          ] or score >= 4:
+                              matching_sample = next((s for s in sample_rows if s["member_name"] == row["member_name"]), {})
+                              candidate_rows.append({
+                                  "source": "KiDS_1000",
+                                  "candidate_role": role,
+                                  "member_name": row["member_name"],
+                                  "member_size_bytes": row["member_size_bytes"],
+                                  "member_score": row["member_score"],
+                                  "numeric_rows_in_sample": matching_sample.get("numeric_rows_in_sample", ""),
+                                  "max_numeric_columns_in_sample": matching_sample.get("max_numeric_columns_in_sample", ""),
+                                  "parameter_hits": matching_sample.get("parameter_hits", ""),
+                                  "growth_hits": matching_sample.get("growth_hits", ""),
+                                  "weight_or_likelihood_hits": matching_sample.get("weight_or_likelihood_hits", ""),
+                                  "recommended_parser_step": (
+                                      "inspect_column_names_and_numeric_chain_shape"
+                                      if role == "chain_or_sample_candidate"
+                                      else "use_as_parameter_metadata_or_support_context"
+                                      if role in ["parameter_metadata_candidate", "readme_or_metadata"]
+                                      else "manual_review_before_parser"
+                                  ),
+                                  "parser_status": "candidate_selected_for_parser_design_not_parsed",
+                                  "provenance_status": "official_public_kids_archive_member",
+                                  "observable_role": "weak_lensing_clustering_growth",
+                                  "pressure_surface": "consolidation_growth",
+                                  "baseline": "not_selected_archive_inventory_only",
+                                  "block_condition": "blocked_until_chain_parameter_mapping_and_weight_semantics_are_confirmed",
+                                  "claim_boundary": "parser_candidate_only_not_model_anchor",
+                                  "model_anchor_allowed_now": False,
+                                  "refit_allowed_now": False,
+                                  "new_pressure_score_allowed_now": False
+                              })
+
+              except Exception as e:
+                  failed_gates.append("kids_archive_member_inventory_failed")
+                  source_errors["kids_archive_member_inventory"] = f"{type(e).__name__}: {e}"
+
+          # Prioritize candidates for next parser design.
+          candidate_rows = sorted(
+              candidate_rows,
+              key=lambda r: (
+                  0 if r["candidate_role"] == "chain_or_sample_candidate" else
+                  1 if r["candidate_role"] == "parameter_metadata_candidate" else
+                  2,
+                  -int(r["member_score"] or 0),
+                  r["member_name"]
+              )
+          )
+
+          parser_rule_rows = [
+              {
+                  "rule_id": "do_not_score_growth_yet",
+                  "rule": "No KiDS growth pressure score may be built from archive inventory.",
+                  "required": True,
+                  "block_if_violated": "hard_stop"
+              },
+              {
+                  "rule_id": "identify_chain_files_first",
+                  "rule": "Select chain/sample files only after archive member role and numeric shape are reviewed.",
+                  "required": True,
+                  "block_if_violated": "no_parser_implementation"
+              },
+              {
+                  "rule_id": "map_parameters_before_summary",
+                  "rule": "S8, sigma8, Omega_m, and any weights/log-likelihood columns must be mapped before constructing parameter summaries.",
+                  "required": True,
+                  "block_if_violated": "no_growth_parameter_ledger"
+              },
+              {
+                  "rule_id": "family_boundary",
+                  "rule": "KiDS remains one survey family; member files may not be treated as independent external anchors.",
+                  "required": True,
+                  "block_if_violated": "no_aggregation"
+              },
+              {
+                  "rule_id": "no_two_surface_refit",
+                  "rule": "KiDS archive inventory cannot trigger a two-surface comparison or refit.",
+                  "required": True,
+                  "block_if_violated": "hard_stop"
+              }
+          ]
+
+          next_test_queue = [
+              {
+                  "priority": 1,
+                  "next_test": "v3_48_kids1000_chain_parser_design",
+                  "purpose": "Choose exact KiDS-1000 chain/member files and define column/parameter mapping rules for parser implementation.",
+                  "must_include": "selected member names, numeric shape, parameter-name candidates, S8/sigma8/Omega_m mapping, weight/likelihood handling, family boundary.",
+                  "must_not_include": "growth pressure scoring, two-surface refit, model-anchor promotion, validation claim.",
+                  "readiness_if_passes": "KiDS-1000 chain parser implementation may proceed."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "later_kids1000_chain_parser_implementation",
+                  "purpose": "Parse selected KiDS chain files into a guarded growth parameter ledger.",
+                  "must_include": "sample counts, parameter columns, weight handling, parser/provenance status.",
+                  "must_not_include": "comparison against H0LiCOW or model refit.",
+                  "readiness_if_passes": "Growth/consolidation pressure-design audit may be considered."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "later_des_hsc_explicit_product_followup",
+                  "purpose": "Find explicit DES/HSC chain/covariance products after KiDS parser path is established.",
+                  "must_include": "direct source URL and product role.",
+                  "must_not_include": "context-only promotion.",
+                  "readiness_if_passes": "DES/HSC may enter growth parser queue."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "kids1000_archive_download_probe_v3_47.csv",
+              [{
+                  "source": "KiDS_1000",
+                  "archive_url": KIDS_ARCHIVE_URL,
+                  "archive_downloaded": archive_dl["downloaded"],
+                  "archive_status": archive_dl["status"],
+                  "archive_content_type": archive_dl["content_type"],
+                  "archive_content_length": archive_dl["content_length"],
+                  "archive_size_bytes": archive_dl["size_bytes"],
+                  "archive_error": archive_dl["error"],
+                  "readme_url": KIDS_README_URL,
+                  "readme_downloaded": readme_dl["downloaded"],
+                  "readme_status": readme_dl["status"],
+                  "readme_content_type": readme_dl["content_type"],
+                  "readme_content_length": readme_dl["content_length"],
+                  "readme_size_bytes": readme_dl["size_bytes"],
+                  "readme_error": readme_dl["error"]
+              }],
+              [
+                  "source", "archive_url", "archive_downloaded", "archive_status",
+                  "archive_content_type", "archive_content_length", "archive_size_bytes",
+                  "archive_error", "readme_url", "readme_downloaded",
+                  "readme_status", "readme_content_type", "readme_content_length",
+                  "readme_size_bytes", "readme_error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_readme_inventory_v3_47.csv",
+              readme_rows,
+              [
+                  "source", "readme_url", "downloaded", "status", "content_type",
+                  "content_length", "size_bytes", "parameter_hits", "growth_hits",
+                  "weight_or_likelihood_hits", "readme_text_sample", "error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_archive_member_inventory_v3_47.csv",
+              member_rows,
+              [
+                  "source", "archive_url", "member_name", "member_size_bytes",
+                  "member_role", "member_score", "is_text_like", "parser_status",
+                  "provenance_status", "observable_role", "pressure_surface",
+                  "baseline", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_member_text_samples_v3_47.csv",
+              sample_rows,
+              [
+                  "source", "member_name", "member_size_bytes", "member_role",
+                  "member_score", "sample_bytes_read", "numeric_rows_in_sample",
+                  "max_numeric_columns_in_sample", "first_numeric_line",
+                  "possible_header_lines", "first_non_numeric_lines",
+                  "parameter_hits", "growth_hits", "weight_or_likelihood_hits",
+                  "text_sample"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_parser_candidate_queue_v3_47.csv",
+              candidate_rows[:60],
+              [
+                  "source", "candidate_role", "member_name", "member_size_bytes",
+                  "member_score", "numeric_rows_in_sample",
+                  "max_numeric_columns_in_sample", "parameter_hits",
+                  "growth_hits", "weight_or_likelihood_hits",
+                  "recommended_parser_step", "parser_status",
+                  "provenance_status", "observable_role", "pressure_surface",
+                  "baseline", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_parser_rules_v3_47.csv",
+              parser_rule_rows,
+              ["rule_id", "rule", "required", "block_if_violated"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_queue_v3_47.csv",
+              next_test_queue,
+              [
+                  "priority", "next_test", "purpose", "must_include",
+                  "must_not_include", "readiness_if_passes"
+              ]
+          )
+
+          member_count = len(member_rows)
+          sample_count = len(sample_rows)
+          candidate_count = len(candidate_rows)
+          chain_candidate_count = sum(1 for r in candidate_rows if r["candidate_role"] == "chain_or_sample_candidate")
+          metadata_candidate_count = sum(1 for r in candidate_rows if r["candidate_role"] in ["parameter_metadata_candidate", "readme_or_metadata"])
+          numeric_sample_candidate_count = sum(1 for r in candidate_rows if str(r.get("numeric_rows_in_sample", "")) not in ["", "0"])
+          parameter_hit_candidate_count = sum(1 for r in candidate_rows if r.get("parameter_hits", ""))
+
+          no_model_anchors = all(r["model_anchor_allowed_now"] is False for r in candidate_rows)
+          no_refits = all(r["refit_allowed_now"] is False for r in candidate_rows)
+          no_scores = all(r["new_pressure_score_allowed_now"] is False for r in candidate_rows)
+
+          required_contract_present = True
+          for row in candidate_rows:
+              for field in REQUIRED_CONTRACT_FIELDS:
+                  if field not in row or row[field] in ["", None]:
+                      required_contract_present = False
+
+          next_test_ok = (
+              next_test_queue[0]["next_test"] == "v3_48_kids1000_chain_parser_design"
+              and "growth pressure scoring" in next_test_queue[0]["must_not_include"]
+              and "two-surface refit" in next_test_queue[0]["must_not_include"]
+          )
+
+          audit_rows = [
+              {
+                  "audit_gate": "kids_archive_downloaded",
+                  "pass": archive_dl["downloaded"],
+                  "value": archive_dl["size_bytes"],
+                  "boundary": "KiDS archive must download before member inventory."
+              },
+              {
+                  "audit_gate": "kids_readme_downloaded",
+                  "pass": readme_dl["downloaded"],
+                  "value": readme_dl["size_bytes"],
+                  "boundary": "KiDS README should download before parser design."
+              },
+              {
+                  "audit_gate": "archive_members_found",
+                  "pass": member_count > 0,
+                  "value": member_count,
+                  "boundary": "Archive must contain members."
+              },
+              {
+                  "audit_gate": "candidate_parser_members_found",
+                  "pass": candidate_count > 0,
+                  "value": candidate_count,
+                  "boundary": "Archive inventory should produce parser candidates."
+              },
+              {
+                  "audit_gate": "chain_or_sample_candidates_found",
+                  "pass": chain_candidate_count > 0,
+                  "value": chain_candidate_count,
+                  "boundary": "Need at least one chain/sample candidate before parser design."
+              },
+              {
+                  "audit_gate": "metadata_or_readme_candidates_found",
+                  "pass": metadata_candidate_count > 0 or readme_dl["downloaded"],
+                  "value": f"metadata_candidates={metadata_candidate_count}; readme_downloaded={readme_dl['downloaded']}",
+                  "boundary": "Need metadata/README context before column mapping."
+              },
+              {
+                  "audit_gate": "numeric_shape_sampled",
+                  "pass": numeric_sample_candidate_count > 0,
+                  "value": numeric_sample_candidate_count,
+                  "boundary": "At least one candidate should expose numeric sample shape."
+              },
+              {
+                  "audit_gate": "parameter_terms_detected",
+                  "pass": parameter_hit_candidate_count > 0 or len(readme_parameter_hits) > 0,
+                  "value": f"candidate_parameter_hits={parameter_hit_candidate_count}; readme_hits={';'.join(readme_parameter_hits)}",
+                  "boundary": "Need possible parameter terms before parser implementation."
+              },
+              {
+                  "audit_gate": "required_contract_fields_present",
+                  "pass": required_contract_present,
+                  "value": required_contract_present,
+                  "boundary": "source/role/surface/baseline/parser/provenance/block/claim contract must persist."
+              },
+              {
+                  "audit_gate": "no_new_pressure_scores",
+                  "pass": no_scores,
+                  "value": no_scores,
+                  "boundary": "No pressure scores in v3.47."
+              },
+              {
+                  "audit_gate": "no_model_anchors_promoted",
+                  "pass": no_model_anchors,
+                  "value": no_model_anchors,
+                  "boundary": "No model anchors in v3.47."
+              },
+              {
+                  "audit_gate": "no_refit_allowed",
+                  "pass": no_refits,
+                  "value": no_refits,
+                  "boundary": "No refit in v3.47."
+              },
+              {
+                  "audit_gate": "next_step_is_parser_design",
+                  "pass": next_test_ok,
+                  "value": next_test_queue[0]["next_test"],
+                  "boundary": "Next step should design parser rules, not score growth."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "kids1000_chain_archive_member_inventory_audit_v3_47.csv",
+              audit_rows,
+              ["audit_gate", "pass", "value", "boundary"]
+          )
+
+          hard_failed = list(failed_gates)
+
+          if not archive_dl["downloaded"]:
+              hard_failed.append("kids_archive_not_downloaded")
+          if not readme_dl["downloaded"]:
+              hard_failed.append("kids_readme_not_downloaded")
+          if member_count <= 0:
+              hard_failed.append("archive_members_not_found")
+          if candidate_count <= 0:
+              hard_failed.append("parser_candidate_queue_empty")
+          if chain_candidate_count <= 0:
+              hard_failed.append("chain_or_sample_candidates_missing")
+          if numeric_sample_candidate_count <= 0:
+              hard_failed.append("numeric_shape_not_sampled")
+          if not (parameter_hit_candidate_count > 0 or len(readme_parameter_hits) > 0):
+              hard_failed.append("parameter_terms_not_detected")
+          if not required_contract_present:
+              hard_failed.append("required_contract_fields_missing")
+          if not no_scores:
+              hard_failed.append("new_pressure_score_guard_violation")
+          if not no_model_anchors:
+              hard_failed.append("model_anchor_promotion_violation")
+          if not no_refits:
+              hard_failed.append("refit_guard_violation")
+          if not next_test_ok:
+              hard_failed.append("next_test_guard_incomplete")
+
+          if hard_failed:
+              readiness_label = "kids1000_chain_archive_member_inventory_needs_followup"
+          else:
+              readiness_label = "kids1000_chain_archive_member_inventory_passed_ready_for_chain_parser_design"
+
+          next_step = (
+              "Build v3.48 KiDS-1000 chain parser design: select exact chain/member files and define S8/sigma8/Omega_m/weight column mapping rules before parser implementation, still with no growth pressure scoring or refit."
+              if not hard_failed
+              else "Inspect v3.47 KiDS archive/member outputs and repair archive, metadata, or candidate selection before parser design."
+          )
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "previous_milestone": PREVIOUS_MILESTONE,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_errors": source_errors,
+              "archive_downloaded": archive_dl["downloaded"],
+              "archive_size_bytes": archive_dl["size_bytes"],
+              "readme_downloaded": readme_dl["downloaded"],
+              "readme_size_bytes": readme_dl["size_bytes"],
+              "member_count": member_count,
+              "text_sample_count": sample_count,
+              "candidate_count": candidate_count,
+              "chain_candidate_count": chain_candidate_count,
+              "metadata_candidate_count": metadata_candidate_count,
+              "numeric_sample_candidate_count": numeric_sample_candidate_count,
+              "parameter_hit_candidate_count": parameter_hit_candidate_count,
+              "readme_parameter_hits": readme_parameter_hits,
+              "readme_growth_hits": readme_growth_hits,
+              "readme_weight_hits": readme_weight_hits,
+              "gate_result": {
+                  "failed_gates": hard_failed,
+                  "readiness_label": readiness_label,
+                  "archive_downloaded": archive_dl["downloaded"],
+                  "readme_downloaded": readme_dl["downloaded"],
+                  "member_count": member_count,
+                  "candidate_count": candidate_count,
+                  "chain_candidate_count": chain_candidate_count,
+                  "metadata_candidate_count": metadata_candidate_count,
+                  "numeric_sample_candidate_count": numeric_sample_candidate_count,
+                  "parameter_hit_candidate_count": parameter_hit_candidate_count,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "new_pressure_scores_built": False,
+                  "next_allowed_step": next_step
+              }
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_47_kids1000_chain_archive_member_inventory.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.47 — KiDS-1000 Chain Archive Member Inventory")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this inventory does")
+          md.append("")
+          md.append("v3.47 downloads the selected KiDS-1000 3x2pt fiducial chain archive and README, inventories archive members, samples small text-like members, and queues candidate chain/metadata files for parser design.")
+          md.append("")
+          md.append("It does not parse final growth constraints, does not compute growth pressure, does not compare against H0LiCOW, and does not run a refit.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Archive downloaded: `{archive_dl['downloaded']}`")
+          md.append(f"- README downloaded: `{readme_dl['downloaded']}`")
+          md.append(f"- Archive members: `{member_count}`")
+          md.append(f"- Text samples: `{sample_count}`")
+          md.append(f"- Parser candidates: `{candidate_count}`")
+          md.append(f"- Chain/sample candidates: `{chain_candidate_count}`")
+          md.append(f"- Metadata candidates: `{metadata_candidate_count}`")
+          md.append(f"- Numeric-shape candidates: `{numeric_sample_candidate_count}`")
+          md.append(f"- Parameter-hit candidates: `{parameter_hit_candidate_count}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not hard_failed:
+              md.append("The archive inventory passed. The next step may design exact KiDS parser rules, but still cannot score growth or compare surfaces.")
+          else:
+              md.append("The archive inventory found blockers. Parser design should wait until archive/member or metadata issues are repaired.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `kids1000_archive_download_probe_v3_47.csv`")
+          md.append("- `kids1000_readme_inventory_v3_47.csv`")
+          md.append("- `kids1000_archive_member_inventory_v3_47.csv`")
+          md.append("- `kids1000_member_text_samples_v3_47.csv`")
+          md.append("- `kids1000_parser_candidate_queue_v3_47.csv`")
+          md.append("- `kids1000_parser_rules_v3_47.csv`")
+          md.append("- `next_test_queue_v3_47.csv`")
+          md.append("- `kids1000_chain_archive_member_inventory_audit_v3_47.csv`")
+          md.append("- `tairid_cosmology_v3_47_kids1000_chain_archive_member_inventory.json`")
+          md.append("- `tairid_cosmology_v3_47_kids1000_chain_archive_member_inventory.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_47_kids1000_chain_archive_member_inventory.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.47 KiDS1000 chain archive member inventory artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-47-kids1000-chain-archive-member-inventory
+          path: artifacts/tairid_cosmology_v3_47/
