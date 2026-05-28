@@ -1,0 +1,700 @@
+name: TAIRID Cosmology v3.52 Planck2018 Growth Reference Inventory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  planck2018-growth-reference-inventory:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.52 Planck2018 growth reference inventory
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_52
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import shutil
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_52")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_52_planck2018_growth_reference_inventory"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute a KiDS growth pressure score.",
+              "This does not compare KiDS growth against H0LiCOW.",
+              "This does not compare reach and consolidation surfaces.",
+              "This inventories and derives a Planck 2018 growth reference only.",
+              "Derived Planck S8 is a baseline reference candidate, not model evidence.",
+              "Any KiDS-vs-Planck pressure score must wait for a later guarded construction workflow.",
+              "No Planck, KiDS, H0LiCOW, or two-surface product may be promoted to model-anchor status in this workflow."
+          ]
+
+          PREVIOUS_MILESTONE = {
+              "v3_51_status": "kids1000_growth_pressure_design_audit_passed_planck_growth_reference_inventory_required",
+              "v3_51_failed_gates": [],
+              "kids_s8_design_input_ready": True,
+              "baseline_requirement_recorded_and_blocked": True,
+              "pressure_formula_designed_not_computed": True,
+              "family_boundary_recorded": True,
+              "new_pressure_scores_built": False,
+              "h0licow_comparison_built": False,
+              "next_rule": "Find or ingest a source-specific Planck S8 / sigma8 / Omega_m reference and uncertainty/covariance before any KiDS growth pressure score is computed."
+          }
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          REQUIRED_CONTRACT_FIELDS = [
+              "source",
+              "observable_role",
+              "pressure_surface",
+              "baseline",
+              "parser_status",
+              "provenance_status",
+              "block_condition",
+              "claim_boundary"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.52-planck2018-growth-reference-inventory/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def parse_planck_margestats(text):
+              rows = []
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  if stripped.startswith("#"):
+                      continue
+                  if stripped.lower().startswith("marginalized"):
+                      continue
+                  if stripped.lower().startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+
+                  name = parts[0].rstrip("*")
+
+                  try:
+                      mean = float(parts[1])
+                      sddev = float(parts[2])
+                  except Exception:
+                      continue
+
+                  rows.append({
+                      "parameter": name,
+                      "parameter_lower": name.lower(),
+                      "mean": mean,
+                      "sddev": sddev,
+                      "raw_line": stripped[:1000]
+                  })
+
+              return rows
+
+          def derive_s8(sigma8, omegam):
+              return sigma8 * math.sqrt(omegam / 0.3)
+
+          def derive_s8_sigma_diag(sigma8, sigma8_sigma, omegam, omegam_sigma):
+              base = derive_s8(sigma8, omegam)
+
+              sig_plus = derive_s8(sigma8 + sigma8_sigma, omegam)
+              sig_minus = derive_s8(sigma8 - sigma8_sigma, omegam)
+
+              om_plus = derive_s8(sigma8, min(max(omegam + omegam_sigma, 0.000001), 1.5))
+              om_minus = derive_s8(sigma8, min(max(omegam - omegam_sigma, 0.000001), 1.5))
+
+              ds_sig = (sig_plus - sig_minus) / 2.0
+              ds_om = (om_plus - om_minus) / 2.0
+
+              sigma = math.sqrt(ds_sig ** 2 + ds_om ** 2)
+
+              return base, sigma, ds_sig, ds_om
+
+          def write_csv(path, rows, fields):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({k: row.get(k, "") for k in fields})
+
+          created_at = now_iso()
+
+          print("TAIRID Cosmology v3.52 Planck 2018 growth reference inventory")
+          print("Truth boundary: Planck baseline inventory only; no KiDS pressure score; no H0LiCOW comparison; no refit.")
+          print()
+
+          failed_gates = []
+          source_errors = {}
+
+          zip_path = DOWNLOADS / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+
+          try:
+              planck_download = download(PLANCK_ZIP_URL, zip_path)
+          except Exception as e:
+              planck_download = {
+                  "url": PLANCK_ZIP_URL,
+                  "path": str(zip_path),
+                  "status": "",
+                  "size_bytes": 0,
+                  "content_type": "",
+                  "content_length_header": "",
+                  "error": f"{type(e).__name__}: {e}"
+              }
+              failed_gates.append("planck_download_failed")
+              source_errors["planck_download"] = planck_download["error"]
+
+          margestats_text = ""
+          margestats_rows_raw = []
+
+          if zip_path.exists() and zip_path.stat().st_size > 0:
+              try:
+                  with zipfile.ZipFile(zip_path, "r") as zf:
+                      if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                          raise RuntimeError(f"Missing Planck margestats path: {PLANCK_MARGESTATS_PATH}")
+                      margestats_text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+                  margestats_rows_raw = parse_planck_margestats(margestats_text)
+
+              except Exception as e:
+                  failed_gates.append("planck_margestats_extract_failed")
+                  source_errors["planck_margestats_extract"] = f"{type(e).__name__}: {e}"
+
+          marg_by_lower = {row["parameter_lower"]: row for row in margestats_rows_raw}
+
+          required_planck_keys = ["sigma8", "omegam"]
+          missing_required = [key for key in required_planck_keys if key not in marg_by_lower]
+
+          if missing_required:
+              failed_gates.append("required_planck_growth_parameters_missing")
+              source_errors["missing_required_planck_parameters"] = ",".join(missing_required)
+
+          sigma8 = marg_by_lower.get("sigma8", {}).get("mean", "")
+          sigma8_sigma = marg_by_lower.get("sigma8", {}).get("sddev", "")
+          omegam = marg_by_lower.get("omegam", {}).get("mean", "")
+          omegam_sigma = marg_by_lower.get("omegam", {}).get("sddev", "")
+
+          derived_s8 = ""
+          derived_s8_sigma = ""
+          derived_s8_sigma_from_sigma8 = ""
+          derived_s8_sigma_from_omegam = ""
+
+          if not missing_required:
+              derived_s8, derived_s8_sigma, derived_s8_sigma_from_sigma8, derived_s8_sigma_from_omegam = derive_s8_sigma_diag(
+                  float(sigma8),
+                  float(sigma8_sigma),
+                  float(omegam),
+                  float(omegam_sigma)
+              )
+
+          planck_download_rows = [{
+              "source": "Planck_2018",
+              "product_url": PLANCK_ZIP_URL,
+              "product_path_inside_zip": PLANCK_MARGESTATS_PATH,
+              "download_status": planck_download.get("status", ""),
+              "download_size_bytes": planck_download.get("size_bytes", ""),
+              "content_type": planck_download.get("content_type", ""),
+              "parser_status": "downloaded_and_margestats_extracted" if margestats_rows_raw else "download_or_extract_failed",
+              "provenance_status": "public_planck_release_3_cosmoparams_product",
+              "claim_boundary": "source_inventory_only_not_model_anchor",
+              "error": ";".join(source_errors.values())
+          }]
+
+          parameter_reference_rows = []
+
+          for key in ["sigma8", "omegam", "H0"]:
+              row = marg_by_lower.get(key.lower())
+              parameter_reference_rows.append({
+                  "source": "Planck_2018",
+                  "observable_role": "growth_reference_baseline",
+                  "pressure_surface": "consolidation_growth",
+                  "baseline": "Planck_2018_base_plikHM_TTTEEE_lowl_lowE_R3_margestats",
+                  "parameter_role": key,
+                  "parameter_source_name": row["parameter"] if row else "",
+                  "value": row["mean"] if row else "",
+                  "sigma": row["sddev"] if row else "",
+                  "derived": False,
+                  "derivation_rule": "",
+                  "parser_status": "source_parameter_ingested" if row else "parameter_missing_or_optional",
+                  "provenance_status": "public_planck_release_3_margestats",
+                  "block_condition": "blocked_from_pressure_scoring_until_guarded_kids_pressure_construction",
+                  "claim_boundary": "baseline_reference_only_not_model_anchor",
+                  "model_anchor_allowed_now": False,
+                  "refit_allowed_now": False,
+                  "new_pressure_score_built": False,
+                  "kids_pressure_score_built": False,
+                  "h0licow_comparison_built": False
+              })
+
+          parameter_reference_rows.append({
+              "source": "Planck_2018",
+              "observable_role": "growth_reference_baseline",
+              "pressure_surface": "consolidation_growth",
+              "baseline": "Planck_2018_base_plikHM_TTTEEE_lowl_lowE_R3_margestats",
+              "parameter_role": "S8_derived",
+              "parameter_source_name": "sigma8 * sqrt(omegam / 0.3)",
+              "value": derived_s8,
+              "sigma": derived_s8_sigma,
+              "derived": True,
+              "derivation_rule": "S8 = sigma8 * sqrt(omegam / 0.3); uncertainty uses diagonal finite-difference propagation from sigma8 and omegam marginal sddevs",
+              "parser_status": "derived_baseline_reference_built" if derived_s8 != "" else "derived_baseline_reference_missing",
+              "provenance_status": "derived_from_public_planck_release_3_margestats",
+              "block_condition": "blocked_from_pressure_scoring_until_guarded_kids_pressure_construction",
+              "claim_boundary": "baseline_reference_only_not_model_anchor",
+              "model_anchor_allowed_now": False,
+              "refit_allowed_now": False,
+              "new_pressure_score_built": False,
+              "kids_pressure_score_built": False,
+              "h0licow_comparison_built": False
+          })
+
+          s8_derivation_rows = [{
+              "source": "Planck_2018",
+              "observable_role": "growth_reference_baseline",
+              "pressure_surface": "consolidation_growth",
+              "baseline": "Planck_2018_base_plikHM_TTTEEE_lowl_lowE_R3_margestats",
+              "sigma8": sigma8,
+              "sigma8_sigma": sigma8_sigma,
+              "omegam": omegam,
+              "omegam_sigma": omegam_sigma,
+              "derived_s8": derived_s8,
+              "derived_s8_sigma_diag": derived_s8_sigma,
+              "sigma_component_from_sigma8": derived_s8_sigma_from_sigma8,
+              "sigma_component_from_omegam": derived_s8_sigma_from_omegam,
+              "derivation_rule": "S8 = sigma8 * sqrt(omegam / 0.3)",
+              "uncertainty_rule": "diagonal finite-difference propagation; covariance not used in v3.52",
+              "parser_status": "planck_growth_reference_derived" if derived_s8 != "" else "planck_growth_reference_not_derived",
+              "provenance_status": "public_planck_release_3_margestats",
+              "block_condition": "blocked_from_pressure_scoring_until_guarded_kids_pressure_construction",
+              "claim_boundary": "derived_reference_only_not_pressure_score",
+              "model_anchor_allowed_now": False,
+              "refit_allowed_now": False,
+              "new_pressure_score_built": False,
+              "kids_pressure_score_built": False,
+              "h0licow_comparison_built": False
+          }]
+
+          future_score_design_rows = [{
+              "source": "KiDS_1000_plus_Planck_2018",
+              "observable_role": "future_growth_pressure_construction",
+              "pressure_surface": "consolidation_growth",
+              "baseline": "Planck_2018_derived_S8_reference",
+              "kids_input_rule": "Use KiDS v3.50 S8 q50 and sigma proxy from source-specific weighted ledger.",
+              "planck_input_rule": "Use Planck v3.52 derived S8 and diagonal propagated sigma.",
+              "future_formula": "pressure_z = (S8_KiDS_q50 - S8_Planck) / sqrt(sigma_KiDS^2 + sigma_Planck^2)",
+              "score_computed_now": False,
+              "why_not_computed_now": "v3.52 inventories baseline only; score construction waits for v3.53.",
+              "parser_status": "future_score_design_ready_baseline_ingested",
+              "provenance_status": "kids_source_specific_ledger_plus_planck_source_specific_reference",
+              "block_condition": "blocked_until_v3_53_guarded_score_construction",
+              "claim_boundary": "future_formula_only_not_pressure_score_not_model_anchor",
+              "model_anchor_allowed_now": False,
+              "refit_allowed_now": False,
+              "new_pressure_score_built": False,
+              "kids_pressure_score_built": False,
+              "h0licow_comparison_built": False
+          }]
+
+          next_test_queue = [
+              {
+                  "priority": 1,
+                  "next_test": "v3_53_kids1000_planck_guarded_growth_pressure_construction",
+                  "purpose": "Compute one guarded KiDS-vs-Planck S8 growth/consolidation pressure row using the source-specific KiDS ledger and Planck derived S8 baseline.",
+                  "must_include": "KiDS S8 q50 and sigma proxy, Planck derived S8 and sigma, combined uncertainty, sign interpretation, family boundary, no H0LiCOW comparison.",
+                  "must_not_include": "H0LiCOW comparison, two-surface refit, model-anchor promotion, validation claim.",
+                  "readiness_if_passes": "A source-specific KiDS consolidation pressure row may be reviewed."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "later_planck_covariance_upgrade",
+                  "purpose": "Upgrade Planck S8 uncertainty beyond diagonal marginal propagation if covariance products are available.",
+                  "must_include": "Planck covariance or chain provenance, sigma8/Omega_m covariance handling, derived S8 uncertainty review.",
+                  "must_not_include": "retroactive overclaiming of v3.52 diagonal sigma.",
+                  "readiness_if_passes": "Planck baseline uncertainty can be improved."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "later_des_hsc_growth_product_repair",
+                  "purpose": "Upgrade DES/HSC into source-specific growth ledgers or explicitly preserve them as blocked.",
+                  "must_include": "direct product URLs, parser/provenance status, family boundary.",
+                  "must_not_include": "summary-anchor substitution.",
+                  "readiness_if_passes": "Growth-family robustness can be revisited."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "planck2018_growth_reference_download_v3_52.csv",
+              planck_download_rows,
+              [
+                  "source", "product_url", "product_path_inside_zip",
+                  "download_status", "download_size_bytes", "content_type",
+                  "parser_status", "provenance_status", "claim_boundary", "error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "planck2018_growth_reference_parameters_v3_52.csv",
+              parameter_reference_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "parameter_role", "parameter_source_name", "value", "sigma",
+                  "derived", "derivation_rule", "parser_status",
+                  "provenance_status", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_built", "kids_pressure_score_built",
+                  "h0licow_comparison_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "planck2018_s8_derivation_v3_52.csv",
+              s8_derivation_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "sigma8", "sigma8_sigma", "omegam", "omegam_sigma",
+                  "derived_s8", "derived_s8_sigma_diag",
+                  "sigma_component_from_sigma8", "sigma_component_from_omegam",
+                  "derivation_rule", "uncertainty_rule", "parser_status",
+                  "provenance_status", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_built", "kids_pressure_score_built",
+                  "h0licow_comparison_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "future_kids_planck_growth_pressure_design_v3_52.csv",
+              future_score_design_rows,
+              [
+                  "source", "observable_role", "pressure_surface", "baseline",
+                  "kids_input_rule", "planck_input_rule", "future_formula",
+                  "score_computed_now", "why_not_computed_now", "parser_status",
+                  "provenance_status", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_built", "kids_pressure_score_built",
+                  "h0licow_comparison_built"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_queue_v3_52.csv",
+              next_test_queue,
+              [
+                  "priority", "next_test", "purpose", "must_include",
+                  "must_not_include", "readiness_if_passes"
+              ]
+          )
+
+          all_contract_rows = parameter_reference_rows + s8_derivation_rows + future_score_design_rows
+
+          required_contract_present = True
+          missing_contract_rows = []
+          for group_name, rows in [
+              ("parameter_reference", parameter_reference_rows),
+              ("s8_derivation", s8_derivation_rows),
+              ("future_score_design", future_score_design_rows)
+          ]:
+              for idx, row in enumerate(rows):
+                  for field in REQUIRED_CONTRACT_FIELDS:
+                      if field not in row or row.get(field) in ["", None]:
+                          required_contract_present = False
+                          missing_contract_rows.append(f"{group_name}:{idx}:{field}")
+
+          planck_downloaded = planck_download.get("status", "") != "" and int(planck_download.get("size_bytes", 0)) > 0
+          margestats_parsed = len(margestats_rows_raw) > 0
+          required_params_found = len(missing_required) == 0
+          s8_derived_ok = derived_s8 != "" and derived_s8_sigma != "" and float(derived_s8) > 0 and float(derived_s8_sigma) > 0
+
+          no_pressure_score = all(row["new_pressure_score_built"] is False and row["kids_pressure_score_built"] is False for row in all_contract_rows)
+          no_h0licow = all(row["h0licow_comparison_built"] is False for row in all_contract_rows)
+          no_model_anchors = all(row["model_anchor_allowed_now"] is False for row in all_contract_rows)
+          no_refits = all(row["refit_allowed_now"] is False for row in all_contract_rows)
+
+          next_test_ok = (
+              next_test_queue[0]["next_test"] == "v3_53_kids1000_planck_guarded_growth_pressure_construction"
+              and "H0LiCOW comparison" in next_test_queue[0]["must_not_include"]
+              and "two-surface refit" in next_test_queue[0]["must_not_include"]
+          )
+
+          audit_rows = [
+              {
+                  "audit_gate": "planck_product_downloaded",
+                  "pass": planck_downloaded,
+                  "value": planck_download.get("size_bytes", ""),
+                  "boundary": "Planck product must download before reference ingestion."
+              },
+              {
+                  "audit_gate": "planck_margestats_parsed",
+                  "pass": margestats_parsed,
+                  "value": len(margestats_rows_raw),
+                  "boundary": "Planck margestats must be parsed."
+              },
+              {
+                  "audit_gate": "required_growth_parameters_found",
+                  "pass": required_params_found,
+                  "value": ",".join(missing_required),
+                  "boundary": "sigma8 and omegam are required to derive Planck S8."
+              },
+              {
+                  "audit_gate": "planck_s8_reference_derived",
+                  "pass": s8_derived_ok,
+                  "value": json.dumps(s8_derivation_rows[0], sort_keys=True),
+                  "boundary": "Planck S8 reference must be derived with positive uncertainty."
+              },
+              {
+                  "audit_gate": "future_score_design_recorded_not_computed",
+                  "pass": future_score_design_rows[0]["score_computed_now"] is False,
+                  "value": future_score_design_rows[0]["future_formula"],
+                  "boundary": "Formula may be recorded, but KiDS pressure score cannot be computed in v3.52."
+              },
+              {
+                  "audit_gate": "required_contract_fields_present",
+                  "pass": required_contract_present,
+                  "value": ";".join(missing_contract_rows),
+                  "boundary": "source/role/surface/baseline/parser/provenance/block/claim contract must persist."
+              },
+              {
+                  "audit_gate": "no_growth_pressure_score",
+                  "pass": no_pressure_score,
+                  "value": no_pressure_score,
+                  "boundary": "No KiDS growth pressure score in v3.52."
+              },
+              {
+                  "audit_gate": "no_h0licow_comparison",
+                  "pass": no_h0licow,
+                  "value": no_h0licow,
+                  "boundary": "No H0LiCOW comparison in v3.52."
+              },
+              {
+                  "audit_gate": "no_model_anchors_promoted",
+                  "pass": no_model_anchors,
+                  "value": no_model_anchors,
+                  "boundary": "No model anchors in v3.52."
+              },
+              {
+                  "audit_gate": "no_refit_allowed",
+                  "pass": no_refits,
+                  "value": no_refits,
+                  "boundary": "No refit in v3.52."
+              },
+              {
+                  "audit_gate": "next_step_is_guarded_growth_pressure_construction",
+                  "pass": next_test_ok,
+                  "value": next_test_queue[0]["next_test"],
+                  "boundary": "Next step may construct one guarded KiDS-Planck growth pressure row, still without H0LiCOW or refit."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "planck2018_growth_reference_inventory_audit_v3_52.csv",
+              audit_rows,
+              ["audit_gate", "pass", "value", "boundary"]
+          )
+
+          hard_failed = list(failed_gates)
+
+          if not planck_downloaded:
+              hard_failed.append("planck_product_not_downloaded")
+          if not margestats_parsed:
+              hard_failed.append("planck_margestats_not_parsed")
+          if not required_params_found:
+              hard_failed.append("required_planck_growth_parameters_missing")
+          if not s8_derived_ok:
+              hard_failed.append("planck_s8_reference_not_derived")
+          if not required_contract_present:
+              hard_failed.append("required_contract_fields_missing")
+          if not no_pressure_score:
+              hard_failed.append("growth_pressure_score_guard_violation")
+          if not no_h0licow:
+              hard_failed.append("h0licow_comparison_guard_violation")
+          if not no_model_anchors:
+              hard_failed.append("model_anchor_promotion_violation")
+          if not no_refits:
+              hard_failed.append("refit_guard_violation")
+          if not next_test_ok:
+              hard_failed.append("next_test_guard_incomplete")
+
+          if hard_failed:
+              readiness_label = "planck2018_growth_reference_inventory_needs_followup"
+          else:
+              readiness_label = "planck2018_growth_reference_inventory_passed_ready_for_guarded_kids_pressure_construction"
+
+          next_step = (
+              "Build v3.53 KiDS-1000 / Planck guarded growth pressure construction: compute one source-specific KiDS S8 pressure row against the Planck derived S8 reference, with no H0LiCOW comparison, no two-surface refit, and no validation claim."
+              if not hard_failed
+              else "Inspect v3.52 outputs and repair Planck download, margestats parsing, derived S8, or contract fields before pressure construction."
+          )
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "previous_milestone": PREVIOUS_MILESTONE,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_errors": source_errors,
+              "planck_downloaded": planck_downloaded,
+              "margestats_row_count": len(margestats_rows_raw),
+              "required_parameters_found": required_params_found,
+              "missing_required_parameters": missing_required,
+              "sigma8": sigma8,
+              "sigma8_sigma": sigma8_sigma,
+              "omegam": omegam,
+              "omegam_sigma": omegam_sigma,
+              "derived_s8": derived_s8,
+              "derived_s8_sigma_diag": derived_s8_sigma,
+              "required_contract_present": required_contract_present,
+              "missing_contract_rows": missing_contract_rows,
+              "gate_result": {
+                  "failed_gates": hard_failed,
+                  "readiness_label": readiness_label,
+                  "planck_downloaded": planck_downloaded,
+                  "margestats_parsed": margestats_parsed,
+                  "required_parameters_found": required_params_found,
+                  "derived_s8": derived_s8,
+                  "derived_s8_sigma_diag": derived_s8_sigma,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "new_pressure_scores_built": False,
+                  "h0licow_comparison_built": False,
+                  "next_allowed_step": next_step
+              }
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_52_planck2018_growth_reference_inventory.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.52 — Planck 2018 Growth Reference Inventory")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this inventory does")
+          md.append("")
+          md.append("v3.52 ingests a source-specific Planck 2018 growth reference and derives S8 from sigma8 and Omega_m.")
+          md.append("")
+          md.append("It does not compute the KiDS pressure score, does not compare against H0LiCOW, and does not run a refit.")
+          md.append("")
+          md.append("## Planck growth reference")
+          md.append("")
+          md.append("| Quantity | Value | Sigma |")
+          md.append("|---|---:|---:|")
+          md.append(f"| `sigma8` | `{sigma8}` | `{sigma8_sigma}` |")
+          md.append(f"| `omegam` | `{omegam}` | `{omegam_sigma}` |")
+          md.append(f"| `S8_derived` | `{derived_s8}` | `{derived_s8_sigma}` |")
+          md.append("")
+          md.append("## Future formula")
+          md.append("")
+          md.append("`pressure_z = (S8_KiDS_q50 - S8_Planck) / sqrt(sigma_KiDS^2 + sigma_Planck^2)`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not hard_failed:
+              md.append("The Planck growth reference inventory passed. The next step may construct one guarded KiDS-vs-Planck S8 pressure row. That still will not compare to H0LiCOW or run a two-surface refit.")
+          else:
+              md.append("The Planck growth reference inventory found blockers. KiDS pressure construction should wait.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `planck2018_growth_reference_download_v3_52.csv`")
+          md.append("- `planck2018_growth_reference_parameters_v3_52.csv`")
+          md.append("- `planck2018_s8_derivation_v3_52.csv`")
+          md.append("- `future_kids_planck_growth_pressure_design_v3_52.csv`")
+          md.append("- `next_test_queue_v3_52.csv`")
+          md.append("- `planck2018_growth_reference_inventory_audit_v3_52.csv`")
+          md.append("- `tairid_cosmology_v3_52_planck2018_growth_reference_inventory.json`")
+          md.append("- `tairid_cosmology_v3_52_planck2018_growth_reference_inventory.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_52_planck2018_growth_reference_inventory.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.52 Planck2018 growth reference inventory artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-52-planck2018-growth-reference-inventory
+          path: artifacts/tairid_cosmology_v3_52/
