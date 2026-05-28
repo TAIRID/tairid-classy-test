@@ -1,0 +1,699 @@
+name: TAIRID v4.35 BOSS File Mapping Audit
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-35-boss-file-mapping-audit.yml"
+
+jobs:
+  tairid-v4-35-boss-file-mapping-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.35 BOSS file mapping audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_35_boss_file_mapping_audit
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_35_boss_file_mapping_audit")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_35_boss_file_mapping_audit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run an RSD likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not apply an RSD covariance matrix to residuals.",
+              "This audits whether BOSS DR12 package files map to the current BOSS f_sigma8 rows.",
+              "A pass means BOSS file mapping is classified, not that covariance-aware RSD testing is complete."
+          ]
+
+          PACKAGE = {
+              "package_id": "boss_dr12_consensus_gaussian_constraints",
+              "survey_family": "BOSS_DR12",
+              "package_url": "https://data.sdss.org/sas/dr12/boss/papers/clustering/ALAM_ET_AL_2016_consensus_and_individual_Gaussian_constraints.tar.gz",
+              "package_role": "candidate compressed Gaussian constraints package for BOSS DR12 consensus and individual constraints",
+              "selected_from": "v4.34 BOSS DR12 consensus package inspection",
+              "inspection_status": "download_parse_target_files_only"
+          }
+
+          CURRENT_BOSS_ROWS = [
+              {
+                  "row_id": "boss_dr12_z038_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.38,
+                  "observable_axis": "f_sigma8",
+                  "current_value": 0.497,
+                  "current_sigma": 0.045,
+                  "current_status": "published_summary_value_ready"
+              },
+              {
+                  "row_id": "boss_dr12_z051_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.51,
+                  "observable_axis": "f_sigma8",
+                  "current_value": 0.458,
+                  "current_sigma": 0.038,
+                  "current_status": "published_summary_value_ready"
+              },
+              {
+                  "row_id": "boss_dr12_z061_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.61,
+                  "observable_axis": "f_sigma8",
+                  "current_value": 0.436,
+                  "current_sigma": 0.034,
+                  "current_status": "published_summary_value_ready"
+              }
+          ]
+
+          TARGET_FILE_PAIRS = [
+              {
+                  "pair_id": "final_consensus_dV_FAP_fsig",
+                  "results_member": "COMBINEDDR12_final_consensus_dV_FAP/final_consensus_results_dV_FAP_fsig.txt",
+                  "covariance_member": "COMBINEDDR12_final_consensus_dV_FAP/final_consensus_covtot_dV_FAP_fsig.txt",
+                  "role": "BAO_plus_FS_final_consensus_dV_FAP_fsigma8",
+                  "priority": 1
+              },
+              {
+                  "pair_id": "final_consensus_dM_Hz_fsig",
+                  "results_member": "COMBINEDDR12_final_consensus_dM_Hz/final_consensus_results_dM_Hz_fsig.txt",
+                  "covariance_member": "COMBINEDDR12_final_consensus_dM_Hz/final_consensus_covtot_dM_Hz_fsig.txt",
+                  "role": "BAO_plus_FS_final_consensus_dM_Hz_fsigma8",
+                  "priority": 2
+              },
+              {
+                  "pair_id": "FS_consensus_dV_FAP_fsig",
+                  "results_member": "COMBINEDDR12_FS_consensus_dV_FAP/FS_consensus_results_dV_FAP_fsig.txt",
+                  "covariance_member": "COMBINEDDR12_FS_consensus_dV_FAP/FS_consensus_covtot_dV_FAP_fsig.txt",
+                  "role": "full_shape_consensus_dV_FAP_fsigma8",
+                  "priority": 3
+              },
+              {
+                  "pair_id": "FS_consensus_dM_Hz_fsig",
+                  "results_member": "COMBINEDDR12_FS_consensus_dM_Hz/FS_consensus_results_dM_Hz_fsig.txt",
+                  "covariance_member": "COMBINEDDR12_FS_consensus_dM_Hz/FS_consensus_covtot_dM_Hz_fsig.txt",
+                  "role": "full_shape_consensus_dM_Hz_fsigma8",
+                  "priority": 4
+              }
+          ]
+
+          MAPPING_RULES = [
+              {
+                  "rule_id": "target_files_found",
+                  "description": "At least one final-consensus result/covariance pair must be present.",
+                  "failure_mode": "No package file can map to BOSS current rows."
+              },
+              {
+                  "rule_id": "fsigma8_rows_parsed",
+                  "description": "The target results file must contain f_sigma8 rows at z=0.38, 0.51, and 0.61.",
+                  "failure_mode": "No row-level f_sigma8 mapping."
+              },
+              {
+                  "rule_id": "current_values_match_package_rows",
+                  "description": "Parsed package f_sigma8 values must match current BOSS summary rows within tolerance.",
+                  "failure_mode": "Current BOSS rows do not match selected package row set."
+              },
+              {
+                  "rule_id": "covariance_file_dimension_compatible",
+                  "description": "The selected covariance file must have a square dimension compatible with the parsed result vector.",
+                  "failure_mode": "Covariance file cannot map to parsed result order."
+              },
+              {
+                  "rule_id": "BAO_RSD_boundary_preserved",
+                  "description": "The file pair may include BAO/distance quantities, but f_sigma8 remains the growth axis and BAO remains boundary/ruler.",
+                  "failure_mode": "BAO/distance covariance is treated as growth pressure."
+              },
+              {
+                  "rule_id": "no_covariance_application_or_pressure_now",
+                  "description": "This test may identify a compatible covariance file but must not apply it to residuals or compute pressure.",
+                  "failure_mode": "Mapping audit becomes covariance-aware pressure test."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "An RSD covariance matrix was applied to residuals.",
+              "A BOSS likelihood was run.",
+              "BOSS file mapping validates TAIRID.",
+              "BAO and f_sigma8 are one identical growth axis.",
+              "The full RSD lane is covariance-aware because BOSS mapping passed.",
+              "WiggleZ and eBOSS covariance are resolved by BOSS file mapping.",
+              "A likelihood, BIC, refit, or model comparison was run."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_36_BOSS_fsigma8_covariance_extraction_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Extract BOSS f_sigma8 covariance-position metadata from the mapped consensus covariance file without computing RSD pressure.",
+                  "must_include": "selected pair, observable order, f_sigma8 indices, covariance dimension, no pressure score.",
+                  "must_not_include": "residual pressure, validation claim, likelihood run."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_37_SDSS_DR16_child_product_selection",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Inspect SDSS DR16 final cosmology directory children and identify candidate eBOSS covariance/likelihood products.",
+                  "must_include": "child product paths, tracer labels, row mapping status, published-summary boundary.",
+                  "must_not_include": "final pressure score or direct chain claim without parsing."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_38_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before any stronger RSD comparison.",
+                  "must_include": "reference parameter uncertainty, Planck-chain boundary, growth curve uncertainty.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              }
+          ]
+
+          def fetch_package(url, max_bytes=150_000_000, timeout=120):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.35-BOSS-file-mapping-audit",
+                      "Accept": "application/gzip,application/x-tar,application/octet-stream,*/*"
+                  }
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  data = response.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      raise RuntimeError("package_exceeded_size_cap")
+                  return {
+                      "ok": True,
+                      "http_status": getattr(response, "status", 200),
+                      "content_type": response.headers.get("Content-Type", ""),
+                      "bytes_read": len(data),
+                      "data": data
+                  }
+
+          def read_member_text(tar, member_name):
+              try:
+                  member = tar.getmember(member_name)
+                  f = tar.extractfile(member)
+                  if f is None:
+                      return ""
+                  return f.read().decode("utf-8", errors="replace")
+              except Exception:
+                  return ""
+
+          def parse_results_text(text):
+              rows = []
+              pattern = re.compile(r"(?P<z>\d+\.\d+)\s+(?P<obs>[A-Za-z0-9_/\.\-]+)\s+(?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+              for idx, match in enumerate(pattern.finditer(text or "")):
+                  z = float(match.group("z"))
+                  obs = match.group("obs").strip()
+                  value = float(match.group("value"))
+                  obs_norm = obs.lower().replace("σ", "sigma")
+                  if obs_norm in ["fsig8", "f_sigma8", "fsigma8"]:
+                      axis = "f_sigma8"
+                  elif "dv" in obs_norm or "dm" in obs_norm or "hz" in obs_norm or "f_ap" in obs_norm or "fap" in obs_norm:
+                      axis = "distance_or_BAO_boundary"
+                  else:
+                      axis = "other"
+                  rows.append({
+                      "result_index": idx,
+                      "z_eff": z,
+                      "observable": obs,
+                      "observable_axis": axis,
+                      "value": value
+                  })
+              return rows
+
+          def parse_covariance_text(text):
+              values = []
+              for token in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text or ""):
+                  try:
+                      values.append(float(token))
+                  except Exception:
+                      pass
+              n = int(math.sqrt(len(values))) if values else 0
+              is_square = n * n == len(values) and n > 0
+              return {
+                  "value_count": len(values),
+                  "dimension": n if is_square else "",
+                  "is_square": is_square
+              }
+
+          def near(a, b, tol):
+              return abs(float(a) - float(b)) <= tol
+
+          failed_gates = []
+          warnings = []
+
+          download_info = {
+              "download_ok": False,
+              "http_status": "",
+              "content_type": "",
+              "bytes_read": 0,
+              "error": ""
+          }
+
+          pair_rows = []
+          parsed_result_rows = []
+          mapping_rows = []
+          selected_pair_id = ""
+          selected_pair_role = ""
+          selected_covariance_member = ""
+          selected_results_member = ""
+
+          try:
+              fetched = fetch_package(PACKAGE["package_url"])
+              download_info.update({
+                  "download_ok": fetched["ok"],
+                  "http_status": fetched["http_status"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": ""
+              })
+
+              with tarfile.open(fileobj=io.BytesIO(fetched["data"]), mode="r:gz") as tar:
+                  member_names = set(tar.getnames())
+
+                  for pair in TARGET_FILE_PAIRS:
+                      results_found = pair["results_member"] in member_names
+                      covariance_found = pair["covariance_member"] in member_names
+
+                      results_text = read_member_text(tar, pair["results_member"]) if results_found else ""
+                      covariance_text = read_member_text(tar, pair["covariance_member"]) if covariance_found else ""
+
+                      result_rows = parse_results_text(results_text)
+                      covariance_meta = parse_covariance_text(covariance_text)
+
+                      fsigma_rows = [
+                          row for row in result_rows
+                          if row["observable_axis"] == "f_sigma8"
+                      ]
+
+                      current_matches = 0
+                      fsigma_by_z = {round(row["z_eff"], 2): row for row in fsigma_rows}
+
+                      for current in CURRENT_BOSS_ROWS:
+                          z_key = round(float(current["z_eff"]), 2)
+                          parsed = fsigma_by_z.get(z_key)
+                          if parsed and near(parsed["value"], current["current_value"], 0.005):
+                              current_matches += 1
+
+                      covariance_dimension_compatible = (
+                          covariance_meta["is_square"]
+                          and covariance_meta["dimension"] == len(result_rows)
+                          and len(result_rows) > 0
+                      )
+
+                      if pair["priority"] <= 2 and results_found and covariance_found and len(fsigma_rows) == 3 and current_matches == 3 and covariance_dimension_compatible and not selected_pair_id:
+                          selected_pair_id = pair["pair_id"]
+                          selected_pair_role = pair["role"]
+                          selected_results_member = pair["results_member"]
+                          selected_covariance_member = pair["covariance_member"]
+
+                      pair_rows.append({
+                          "pair_id": pair["pair_id"],
+                          "role": pair["role"],
+                          "priority": pair["priority"],
+                          "results_member": pair["results_member"],
+                          "covariance_member": pair["covariance_member"],
+                          "results_found": results_found,
+                          "covariance_found": covariance_found,
+                          "parsed_result_row_count": len(result_rows),
+                          "parsed_fsigma8_row_count": len(fsigma_rows),
+                          "current_boss_match_count": current_matches,
+                          "covariance_value_count": covariance_meta["value_count"],
+                          "covariance_dimension": covariance_meta["dimension"],
+                          "covariance_is_square": covariance_meta["is_square"],
+                          "covariance_dimension_compatible": covariance_dimension_compatible,
+                          "maps_to_current_BOSS_rows_after_inspection": current_matches == 3 and len(fsigma_rows) == 3 and covariance_dimension_compatible,
+                          "covariance_applied_now": False,
+                          "pressure_score_allowed_now": False
+                      })
+
+                      for result in result_rows:
+                          parsed_result_rows.append({
+                              "pair_id": pair["pair_id"],
+                              "result_index": result["result_index"],
+                              "z_eff": result["z_eff"],
+                              "observable": result["observable"],
+                              "observable_axis": result["observable_axis"],
+                              "value": result["value"],
+                              "results_member": pair["results_member"]
+                          })
+
+          except Exception as exc:
+              download_info["error"] = repr(exc)
+
+          if not download_info["download_ok"]:
+              failed_gates.append("package_download_failed")
+
+          if not pair_rows:
+              failed_gates.append("no_target_pairs_inspected")
+
+          final_pair_candidates = [row for row in pair_rows if row["priority"] <= 2]
+          mapped_pairs = [row for row in pair_rows if row["maps_to_current_BOSS_rows_after_inspection"] is True]
+
+          if not final_pair_candidates:
+              failed_gates.append("no_final_consensus_pairs_inspected")
+
+          if not mapped_pairs:
+              failed_gates.append("no_pair_maps_to_current_BOSS_rows")
+
+          if not selected_pair_id:
+              failed_gates.append("no_selected_pair_for_next_covariance_extraction")
+
+          for row in pair_rows:
+              if row["covariance_applied_now"] is not False:
+                  failed_gates.append(row["pair_id"] + "_covariance_applied_violation")
+              if row["pressure_score_allowed_now"] is not False:
+                  failed_gates.append(row["pair_id"] + "_pressure_score_allowed_violation")
+
+          if len(mapped_pairs) > 1:
+              warnings.append("multiple_pairs_map_to_current_BOSS_rows_prefer_highest_priority_final_consensus_pair")
+
+          if selected_pair_id and selected_pair_id != "final_consensus_dV_FAP_fsig":
+              warnings.append("selected_pair_is_not_dV_FAP_first_priority_review_needed")
+
+          rule_results = [
+              {
+                  "rule_id": "target_files_found",
+                  "pass": any(row["results_found"] and row["covariance_found"] for row in pair_rows),
+                  "result": "target_result_and_covariance_files_found",
+                  "boundary": "Finding files is not covariance application."
+              },
+              {
+                  "rule_id": "fsigma8_rows_parsed",
+                  "pass": any(row["parsed_fsigma8_row_count"] == 3 for row in pair_rows),
+                  "result": "three_BOSS_fsigma8_rows_parsed",
+                  "boundary": "Parsed rows still need mapping and covariance extraction."
+              },
+              {
+                  "rule_id": "current_values_match_package_rows",
+                  "pass": any(row["current_boss_match_count"] == 3 for row in pair_rows),
+                  "result": "current_BOSS_rows_match_package_fsigma8_rows_within_tolerance",
+                  "boundary": "This supports BOSS row mapping only, not full RSD lane completion."
+              },
+              {
+                  "rule_id": "covariance_file_dimension_compatible",
+                  "pass": any(row["covariance_dimension_compatible"] is True for row in pair_rows),
+                  "result": "selected_package_has_dimension_compatible_covariance_file",
+                  "boundary": "Covariance compatibility is not covariance application."
+              },
+              {
+                  "rule_id": "BAO_RSD_boundary_preserved",
+                  "pass": all(row["pressure_score_allowed_now"] is False for row in pair_rows),
+                  "result": "distance_BAO_quantities_not_promoted_to_growth_pressure",
+                  "boundary": "BAO/distance quantities stay boundary/ruler; f_sigma8 is growth."
+              },
+              {
+                  "rule_id": "no_covariance_application_or_pressure_now",
+                  "pass": all(row["covariance_applied_now"] is False and row["pressure_score_allowed_now"] is False for row in pair_rows),
+                  "result": "no_covariance_application_no_pressure_score",
+                  "boundary": "Mapping audit only."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_file_mapping_rules_passed")
+
+          warnings.append("BOSS_file_mapping_does_not_complete_full_RSD_covariance_lane")
+          warnings.append("covariance_file_identified_but_not_applied")
+          warnings.append("f_sigma8_indices_still_need_extraction_audit")
+          warnings.append("WiggleZ_and_eBOSS_covariance_still_unresolved")
+          warnings.append("v4_29_RSD_preview_remains_nonfinal")
+
+          if failed_gates:
+              readiness_label = "boss_file_mapping_audit_failed"
+              next_step = "Repair BOSS file mapping before covariance extraction audit."
+          else:
+              readiness_label = "boss_file_mapping_audit_passed_ready_for_BOSS_fsigma8_covariance_extraction_audit"
+              next_step = (
+                  "Proceed to v4.36 BOSS f_sigma8 covariance extraction audit. "
+                  "Do not compute RSD pressure; first identify observable order and f_sigma8 covariance positions."
+              )
+
+          system_health = {
+              "download_ok": download_info["download_ok"],
+              "target_pair_count": len(TARGET_FILE_PAIRS),
+              "inspected_pair_count": len(pair_rows),
+              "mapped_pair_count": len(mapped_pairs),
+              "selected_pair_id": selected_pair_id,
+              "selected_pair_role": selected_pair_role,
+              "selected_results_member": selected_results_member,
+              "selected_covariance_member": selected_covariance_member,
+              "parsed_result_row_count_total": len(parsed_result_rows),
+              "current_boss_row_count": len(CURRENT_BOSS_ROWS),
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results),
+              "BOSS_row_mapping_complete": bool(selected_pair_id),
+              "full_RSD_row_mapping_complete": False,
+              "covariance_applied": False,
+              "likelihood_run": False,
+              "pressure_score_allowed_now": False,
+              "validation_claim_allowed": False
+          }
+
+          interpretation = (
+              "v4.35 audits whether BOSS DR12 consensus package files map to the current three BOSS f_sigma8 rows. "
+              "The selected final-consensus file pair is mapped only at the BOSS row/file level. "
+              "This does not apply covariance, does not run a likelihood, and does not compute a pressure score. "
+              "WiggleZ and eBOSS covariance remain unresolved, so the full RSD lane is not covariance-aware."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "package": PACKAGE,
+              "download_info": download_info,
+              "current_boss_rows": CURRENT_BOSS_ROWS,
+              "target_file_pairs": TARGET_FILE_PAIRS,
+              "pair_rows": pair_rows,
+              "parsed_result_rows": parsed_result_rows,
+              "mapping_rules": MAPPING_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "covariance_applied": False,
+                  "likelihood_run": False,
+                  "full_RSD_row_mapping_complete": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "boss_file_mapping_pairs_v4_35.csv",
+              pair_rows,
+              [
+                  "pair_id",
+                  "role",
+                  "priority",
+                  "results_member",
+                  "covariance_member",
+                  "results_found",
+                  "covariance_found",
+                  "parsed_result_row_count",
+                  "parsed_fsigma8_row_count",
+                  "current_boss_match_count",
+                  "covariance_value_count",
+                  "covariance_dimension",
+                  "covariance_is_square",
+                  "covariance_dimension_compatible",
+                  "maps_to_current_BOSS_rows_after_inspection",
+                  "covariance_applied_now",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_parsed_result_rows_v4_35.csv",
+              parsed_result_rows,
+              [
+                  "pair_id",
+                  "result_index",
+                  "z_eff",
+                  "observable",
+                  "observable_axis",
+                  "value",
+                  "results_member"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_current_rows_v4_35.csv",
+              CURRENT_BOSS_ROWS,
+              ["row_id", "survey_family", "z_eff", "observable_axis", "current_value", "current_sigma", "current_status"]
+          )
+
+          write_csv(
+              OUTDIR / "boss_file_mapping_rule_results_v4_35.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_35.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_35.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_35.csv",
+              [system_health],
+              [
+                  "download_ok",
+                  "target_pair_count",
+                  "inspected_pair_count",
+                  "mapped_pair_count",
+                  "selected_pair_id",
+                  "selected_pair_role",
+                  "selected_results_member",
+                  "selected_covariance_member",
+                  "parsed_result_row_count_total",
+                  "current_boss_row_count",
+                  "rule_pass_count",
+                  "rule_total_count",
+                  "BOSS_row_mapping_complete",
+                  "full_RSD_row_mapping_complete",
+                  "covariance_applied",
+                  "likelihood_run",
+                  "pressure_score_allowed_now",
+                  "validation_claim_allowed"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_35_boss_file_mapping_audit.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.35 — BOSS Consensus File Mapping Audit")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("BOSS package files were checked against the current three BOSS f_sigma8 rows.")
+          md.append("")
+          md.append("This can complete BOSS-only file mapping, but it does not apply covariance, run likelihood, compute pressure, or resolve WiggleZ/eBOSS covariance.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## File-pair mapping")
+          md.append("")
+          md.append("| Pair | Role | f_sigma8 rows | Current matches | Cov dim | Maps after inspection |")
+          md.append("|---|---|---:|---:|---:|---:|")
+          for row in pair_rows:
+              md.append(
+                  f"| `{row['pair_id']}` | `{row['role']}` | `{row['parsed_fsigma8_row_count']}` | "
+                  f"`{row['current_boss_match_count']}` | `{row['covariance_dimension']}` | `{row['maps_to_current_BOSS_rows_after_inspection']}` |"
+              )
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `boss_file_mapping_pairs_v4_35.csv`")
+          md.append("- `boss_parsed_result_rows_v4_35.csv`")
+          md.append("- `boss_current_rows_v4_35.csv`")
+          md.append("- `boss_file_mapping_rule_results_v4_35.csv`")
+          md.append("- `blocked_claims_v4_35.csv`")
+          md.append("- `next_test_ladder_v4_35.csv`")
+          md.append("- `system_health_v4_35.csv`")
+          md.append("- `tairid_v4_35_boss_file_mapping_audit.json`")
+          md.append("- `tairid_v4_35_boss_file_mapping_audit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_35_boss_file_mapping_audit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.35 BOSS file mapping audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-35-boss-file-mapping-audit
+          path: artifacts/tairid_v4_35_boss_file_mapping_audit/
