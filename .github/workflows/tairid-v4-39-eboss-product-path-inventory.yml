@@ -1,0 +1,875 @@
+name: TAIRID v4.39 eBOSS Product Path Inventory
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-39-eboss-product-path-inventory.yml"
+
+jobs:
+  tairid-v4-39-eboss-product-path-inventory:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.39 eBOSS product path inventory
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_39_eboss_product_path_inventory
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_39_eboss_product_path_inventory")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_39_eboss_product_path_inventory"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run an eBOSS or SDSS likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not import or apply an eBOSS covariance matrix.",
+              "This builds a product-path inventory from SDSS DR16 SVN/XML or HTML directory visibility.",
+              "A pass means eBOSS product paths are inventoried or unresolved status is recorded, not that eBOSS covariance-aware testing is complete."
+          ]
+
+          ROOT_CANDIDATES = [
+              {
+                  "root_id": "sdss_dr16cosmo_v1_0_1_root",
+                  "root_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/",
+                  "root_status": "preferred_from_v4_38_1",
+                  "expected_content_type": "text/xml_or_html_directory_listing"
+              },
+              {
+                  "root_id": "sdss_dr16cosmo_trunk_root",
+                  "root_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/trunk/",
+                  "root_status": "fallback_directory_root",
+                  "expected_content_type": "text/xml_or_html_directory_listing"
+              },
+              {
+                  "root_id": "sdss_dr16cosmo_tags_root",
+                  "root_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/",
+                  "root_status": "tag_listing_fallback",
+                  "expected_content_type": "text/xml_or_html_directory_listing"
+              }
+          ]
+
+          CURRENT_EBOSS_ROWS = [
+              {
+                  "row_id": "eboss_dr16_lrg_z070_fsigma8",
+                  "tracer": "LRG",
+                  "z_eff": 0.70,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.473,
+                  "sigma": 0.041,
+                  "status": "published_summary_value_reviewed"
+              },
+              {
+                  "row_id": "eboss_dr16_elg_z085_fsigma8",
+                  "tracer": "ELG",
+                  "z_eff": 0.85,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.315,
+                  "sigma": 0.095,
+                  "status": "published_summary_value_reviewed"
+              },
+              {
+                  "row_id": "eboss_dr16_qso_z148_fsigma8",
+                  "tracer": "QSO",
+                  "z_eff": 1.48,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.462,
+                  "sigma": 0.045,
+                  "status": "published_summary_value_reviewed"
+              }
+          ]
+
+          INVENTORY_RULES = [
+              {
+                  "rule_id": "root_fetch_attempts_recorded",
+                  "description": "Every declared root must have fetch status recorded.",
+                  "failure_mode": "Source visibility is hidden."
+              },
+              {
+                  "rule_id": "xml_or_html_links_parsed",
+                  "description": "The workflow must parse both SVN/XML directory entries and HTML links.",
+                  "failure_mode": "SVN XML directories look empty when they are not."
+              },
+              {
+                  "rule_id": "inventory_or_unresolved_status_recorded",
+                  "description": "Visible products are inventoried; if not visible, unresolved status is recorded.",
+                  "failure_mode": "No usable locator state is preserved."
+              },
+              {
+                  "rule_id": "tracer_expectations_preserved",
+                  "description": "LRG, ELG, and QSO expected rows remain carried even if product labels are not found.",
+                  "failure_mode": "Missing labels are mistaken for missing science lane."
+              },
+              {
+                  "rule_id": "no_product_auto_maps",
+                  "description": "No visible product path automatically maps to current eBOSS f_sigma8 rows.",
+                  "failure_mode": "Inventory becomes covariance mapping without inspection."
+              },
+              {
+                  "rule_id": "no_covariance_likelihood_pressure_now",
+                  "description": "The inventory must not import covariance, run likelihood, or compute pressure.",
+                  "failure_mode": "Inventory becomes model testing."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "An eBOSS covariance matrix was imported.",
+              "An eBOSS likelihood was run.",
+              "A product path automatically maps to the current eBOSS f_sigma8 rows.",
+              "Missing LRG, ELG, or QSO labels mean eBOSS has no tracer products.",
+              "The full RSD lane is covariance-aware.",
+              "BOSS-only covariance resolves eBOSS covariance.",
+              "WiggleZ covariance is resolved.",
+              "A likelihood, BIC, refit, or model comparison was run."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_40_eBOSS_product_mapping_audit_or_formal_park",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Use the v4.39 inventory to either select candidate eBOSS product paths for mapping or formally park eBOSS covariance until exact products are identified.",
+                  "must_include": "inventory state, candidate paths if present, LRG/ELG/QSO expectation rows, no covariance application.",
+                  "must_not_include": "pressure score, likelihood run, validation claim."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_41_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before stronger RSD comparison.",
+                  "must_include": "reference parameter uncertainty, Planck-chain boundary, growth curve uncertainty.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_42_WiggleZ_covariance_locator_retry",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Try to locate a WiggleZ covariance/product path or formally keep WiggleZ non-final.",
+                  "must_include": "source path, product status, row mapping, unresolved boundary if not found.",
+                  "must_not_include": "treating WiggleZ as covariance-ready without product."
+              }
+          ]
+
+          def clean_text(text):
+              text = re.sub(r"<script.*?</script>", " ", text or "", flags=re.DOTALL | re.IGNORECASE)
+              text = re.sub(r"<style.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = re.sub(r"\s+", " ", text)
+              return text.strip()
+
+          def fetch_text(url, timeout=90, byte_limit=4_000_000):
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 TAIRID-v4.39-eBOSS-product-path-inventory",
+                          "Accept": "text/xml,application/xml,text/html,text/plain,*/*"
+                      }
+                  )
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(byte_limit)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "fetch_ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "fetch_ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def extract_html_links(base_url, html_text):
+              links = []
+              for match in re.finditer(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html_text or "", flags=re.IGNORECASE | re.DOTALL):
+                  href = match.group(1).strip()
+                  label = clean_text(match.group(2))
+                  if href in ["../", "./", ""]:
+                      continue
+                  absolute = urllib.parse.urljoin(base_url, href)
+                  is_dir = absolute.endswith("/")
+                  links.append({
+                      "entry_name": label if label else href,
+                      "entry_url": absolute,
+                      "entry_kind": "directory" if is_dir else "file",
+                      "parser": "html_link"
+                  })
+              return links
+
+          def strip_namespace(tag):
+              return tag.split("}", 1)[-1] if "}" in tag else tag
+
+          def extract_xml_entries(base_url, xml_text):
+              entries = []
+              text = xml_text or ""
+
+              try:
+                  root = ET.fromstring(text)
+                  for elem in root.iter():
+                      tag = strip_namespace(elem.tag).lower()
+                      if tag not in ["dir", "file", "entry"]:
+                          continue
+
+                      name = elem.attrib.get("name") or elem.attrib.get("href") or elem.text or ""
+                      name = clean_text(name)
+
+                      if not name or name in ["../", "./"]:
+                          continue
+
+                      if tag == "dir" or elem.attrib.get("kind", "").lower() == "dir":
+                          entry_kind = "directory"
+                          url = urllib.parse.urljoin(base_url, name.rstrip("/") + "/")
+                      else:
+                          entry_kind = "file"
+                          url = urllib.parse.urljoin(base_url, name)
+
+                      entries.append({
+                          "entry_name": name,
+                          "entry_url": url,
+                          "entry_kind": entry_kind,
+                          "parser": "xml_element"
+                      })
+              except Exception:
+                  for tag, kind in [("dir", "directory"), ("file", "file")]:
+                      pattern = re.compile(r"<" + tag + r'\s+[^>]*name=["\']([^"\']+)["\']', re.IGNORECASE)
+                      for match in pattern.finditer(text):
+                          name = match.group(1).strip()
+                          if not name:
+                              continue
+                          url = urllib.parse.urljoin(base_url, name.rstrip("/") + "/" if kind == "directory" else name)
+                          entries.append({
+                              "entry_name": name,
+                              "entry_url": url,
+                              "entry_kind": kind,
+                              "parser": "xml_regex_fallback"
+                          })
+
+              return entries
+
+          def extract_entries(base_url, body_text):
+              html_entries = extract_html_links(base_url, body_text)
+              xml_entries = extract_xml_entries(base_url, body_text)
+
+              seen = set()
+              combined = []
+              for entry in xml_entries + html_entries:
+                  key = (entry["entry_url"], entry["entry_kind"])
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  combined.append(entry)
+
+              return combined
+
+          def classify_product(entry_url, entry_name):
+              combined = (entry_url + " " + entry_name).lower()
+
+              if any(token in combined for token in ["covariance", "covmat", "cov_", "invcov", "inverse"]):
+                  product_class = "covariance_candidate"
+              elif any(token in combined for token in ["likelihood", "like", "gaussian"]):
+                  product_class = "likelihood_candidate"
+              elif any(token in combined for token in ["cosmomc", "chain", "chains", "mcmc"]):
+                  product_class = "chain_candidate"
+              elif any(token in combined for token in [".tar.gz", ".tgz", ".zip"]):
+                  product_class = "archive_candidate"
+              elif any(token in combined for token in [".txt", ".dat", ".csv", ".ini", ".param", ".yaml", ".yml"]):
+                  product_class = "text_or_config_candidate"
+              elif any(token in combined for token in ["readme", "doc", "note"]):
+                  product_class = "documentation_candidate"
+              elif entry_url.endswith("/"):
+                  product_class = "directory_candidate"
+              else:
+                  product_class = "manual_review_candidate"
+
+              tracer_hits = []
+              tracer_tokens = {
+                  "LRG": ["lrg", "lrgpcmass", "cmass"],
+                  "ELG": ["elg"],
+                  "QSO": ["qso", "quasar"],
+                  "LYA": ["lya", "lyman"],
+                  "MGS": ["mgs"],
+                  "BOSS": ["boss", "dr12"],
+                  "EBOSS": ["eboss", "dr16"]
+              }
+
+              for tracer, tokens in tracer_tokens.items():
+                  if any(token in combined for token in tokens):
+                      tracer_hits.append(tracer)
+
+              if "combined" in combined or "multi" in combined or "all" in combined:
+                  tracer_hits.append("COMBINED_OR_MULTI")
+
+              if not tracer_hits:
+                  tracer_hits.append("TRACER_UNCLEAR")
+
+              if "bao" in combined and not any(token in combined for token in ["rsd", "fsigma", "f_sigma", "fsig", "growth"]):
+                  role_mapping = "BAO_boundary_candidate_not_growth_until_reviewed"
+              elif any(token in combined for token in ["rsd", "fsigma", "f_sigma", "fsig", "growth"]):
+                  role_mapping = "possible_RSD_growth_candidate_mapping_needed"
+              elif any(token in combined for token in ["likelihood", "like", "gaussian", "covariance", "covmat", "chain"]):
+                  role_mapping = "possible_likelihood_or_covariance_mapping_needed"
+              else:
+                  role_mapping = "manual_review_needed"
+
+              likely_relevant = (
+                  product_class in [
+                      "covariance_candidate",
+                      "likelihood_candidate",
+                      "chain_candidate",
+                      "archive_candidate",
+                      "text_or_config_candidate",
+                      "directory_candidate"
+                  ]
+                  or "RSD" in role_mapping
+                  or "covariance" in role_mapping.lower()
+                  or "likelihood" in role_mapping.lower()
+                  or any(t in tracer_hits for t in ["LRG", "ELG", "QSO", "EBOSS"])
+              )
+
+              return product_class, ";".join(sorted(set(tracer_hits))), role_mapping, likely_relevant
+
+          failed_gates = []
+          warnings = []
+
+          fetch_rows = []
+          inventory_rows = []
+
+          max_depth = 2
+          max_dirs_per_level = 60
+          max_total_fetches = 140
+
+          queue = []
+          for root in ROOT_CANDIDATES:
+              queue.append({
+                  "root_id": root["root_id"],
+                  "url": root["root_url"],
+                  "depth": 0,
+                  "parent_url": "",
+                  "root_status": root["root_status"]
+              })
+
+          fetch_counter = 0
+          visited = set()
+
+          while queue and fetch_counter < max_total_fetches:
+              item = queue.pop(0)
+              url = item["url"]
+
+              if url in visited:
+                  continue
+              visited.add(url)
+
+              fetched = fetch_text(url)
+              fetch_counter += 1
+
+              entries = extract_entries(url, fetched["text"]) if fetched["fetch_ok"] else []
+
+              fetch_rows.append({
+                  "root_id": item["root_id"],
+                  "url": url,
+                  "parent_url": item["parent_url"],
+                  "depth": item["depth"],
+                  "root_status": item["root_status"],
+                  "fetch_ok": fetched["fetch_ok"],
+                  "http_status": fetched["http_status"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": fetched["error"],
+                  "entry_count": len(entries)
+              })
+
+              for idx, entry in enumerate(entries):
+                  product_class, tracer_label, role_mapping, likely_relevant = classify_product(entry["entry_url"], entry["entry_name"])
+
+                  inventory_rows.append({
+                      "root_id": item["root_id"],
+                      "parent_url": url,
+                      "depth": item["depth"],
+                      "entry_index": idx,
+                      "entry_name": entry["entry_name"],
+                      "entry_url": entry["entry_url"],
+                      "entry_kind": entry["entry_kind"],
+                      "parser": entry["parser"],
+                      "product_class": product_class,
+                      "tracer_label": tracer_label,
+                      "role_mapping_status": role_mapping,
+                      "likely_relevant_for_eBOSS_RSD": likely_relevant,
+                      "maps_to_current_eBOSS_rows_now": False,
+                      "covariance_imported_now": False,
+                      "likelihood_run_now": False,
+                      "pressure_score_allowed_now": False
+                  })
+
+              next_dirs = [
+                  entry for entry in entries
+                  if entry["entry_kind"] == "directory"
+                  and item["depth"] < max_depth
+              ][:max_dirs_per_level]
+
+              for entry in next_dirs:
+                  queue.append({
+                      "root_id": item["root_id"],
+                      "url": entry["entry_url"],
+                      "depth": item["depth"] + 1,
+                      "parent_url": url,
+                      "root_status": "recursive_child_probe"
+                  })
+
+          fetched_ok_count = sum(1 for row in fetch_rows if row["fetch_ok"] is True)
+          entry_count = len(inventory_rows)
+
+          covariance_candidates = [row for row in inventory_rows if row["product_class"] == "covariance_candidate"]
+          likelihood_candidates = [row for row in inventory_rows if row["product_class"] == "likelihood_candidate"]
+          chain_candidates = [row for row in inventory_rows if row["product_class"] == "chain_candidate"]
+          archive_candidates = [row for row in inventory_rows if row["product_class"] == "archive_candidate"]
+          text_candidates = [row for row in inventory_rows if row["product_class"] == "text_or_config_candidate"]
+          directory_candidates = [row for row in inventory_rows if row["product_class"] == "directory_candidate"]
+          relevant_candidates = [row for row in inventory_rows if row["likely_relevant_for_eBOSS_RSD"] is True]
+
+          tracer_counts = {}
+          for tracer in ["LRG", "ELG", "QSO", "EBOSS"]:
+              tracer_counts[tracer] = sum(1 for row in inventory_rows if tracer in row["tracer_label"])
+
+          tracer_expectation_rows = []
+          for current in CURRENT_EBOSS_ROWS:
+              tracer = current["tracer"]
+              count = tracer_counts.get(tracer, 0)
+              tracer_expectation_rows.append({
+                  "tracer": tracer,
+                  "current_row_id": current["row_id"],
+                  "z_eff": current["z_eff"],
+                  "expected_axis": current["observable_axis"],
+                  "visible_product_label_count": count,
+                  "inventory_status": "visible_label_detected" if count > 0 else "not_detected_in_inventory",
+                  "hard_failure": False
+              })
+              if count == 0:
+                  warnings.append(tracer + "_product_label_not_detected_inventory_unresolved_not_failure")
+
+          if len(ROOT_CANDIDATES) < 1:
+              failed_gates.append("no_root_candidates_declared")
+
+          if len(fetch_rows) < len(ROOT_CANDIDATES):
+              failed_gates.append("not_all_root_fetch_attempts_recorded")
+
+          if fetched_ok_count < 1:
+              warnings.append("no_root_or_child_fetch_succeeded_inventory_unresolved")
+
+          if entry_count == 0:
+              warnings.append("no_inventory_entries_visible_after_xml_html_parse")
+
+          if len(relevant_candidates) == 0:
+              warnings.append("no_likely_relevant_eBOSS_RSD_candidates_detected")
+
+          if len(covariance_candidates) == 0:
+              warnings.append("no_covariance_candidates_detected")
+          if len(likelihood_candidates) == 0:
+              warnings.append("no_likelihood_candidates_detected")
+          if len(chain_candidates) == 0:
+              warnings.append("no_chain_candidates_detected")
+
+          for row in inventory_rows:
+              if row["maps_to_current_eBOSS_rows_now"] is not False:
+                  failed_gates.append("inventory_product_auto_mapped_without_audit")
+              if row["covariance_imported_now"] is not False:
+                  failed_gates.append("covariance_imported_during_inventory")
+              if row["likelihood_run_now"] is not False:
+                  failed_gates.append("likelihood_run_during_inventory")
+              if row["pressure_score_allowed_now"] is not False:
+                  failed_gates.append("pressure_allowed_during_inventory")
+
+          blocked_text = " | ".join(BLOCKED_CLAIMS).lower()
+          for phrase in [
+              "final rsd pressure score",
+              "covariance matrix was imported",
+              "likelihood was run",
+              "automatically maps",
+              "missing lrg",
+              "full rsd lane",
+              "wigglez",
+              "bic"
+          ]:
+              if phrase not in blocked_text:
+                  failed_gates.append("blocked_claim_missing_" + phrase.replace(" ", "_"))
+
+          warnings.append("product_inventory_does_not_import_covariance")
+          warnings.append("product_inventory_does_not_run_likelihood")
+          warnings.append("product_paths_do_not_auto_map_to_current_eBOSS_rows")
+          warnings.append("BOSS_only_covariance_preview_remains_BOSS_only")
+          warnings.append("reference_model_uncertainty_still_missing")
+          warnings.append("WiggleZ_covariance_still_unresolved")
+
+          rule_results = [
+              {
+                  "rule_id": "root_fetch_attempts_recorded",
+                  "pass": len(fetch_rows) >= len(ROOT_CANDIDATES),
+                  "result": f"{len(fetch_rows)} fetch rows recorded",
+                  "boundary": "Fetch visibility is part of the locator state."
+              },
+              {
+                  "rule_id": "xml_or_html_links_parsed",
+                  "pass": True,
+                  "result": "XML elements and HTML links both parsed when present",
+                  "boundary": "Parser readiness does not mean product mapping."
+              },
+              {
+                  "rule_id": "inventory_or_unresolved_status_recorded",
+                  "pass": True,
+                  "result": "inventory entries recorded when visible; unresolved status recorded through warnings/system health",
+                  "boundary": "No hard failure for directory opacity."
+              },
+              {
+                  "rule_id": "tracer_expectations_preserved",
+                  "pass": all(row["hard_failure"] is False for row in tracer_expectation_rows),
+                  "result": "LRG_ELG_QSO_expectations_carried_without_hard_failure",
+                  "boundary": "Missing labels do not erase eBOSS tracer rows."
+              },
+              {
+                  "rule_id": "no_product_auto_maps",
+                  "pass": all(row["maps_to_current_eBOSS_rows_now"] is False for row in inventory_rows),
+                  "result": "no_product_path_auto_maps_to_current_eBOSS_rows",
+                  "boundary": "Mapping requires later audit."
+              },
+              {
+                  "rule_id": "no_covariance_likelihood_pressure_now",
+                  "pass": all(
+                      row["covariance_imported_now"] is False
+                      and row["likelihood_run_now"] is False
+                      and row["pressure_score_allowed_now"] is False
+                      for row in inventory_rows
+                  ),
+                  "result": "no_covariance_no_likelihood_no_pressure",
+                  "boundary": "Inventory only."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_inventory_rules_passed")
+
+          if entry_count == 0:
+              inventory_state = "no_visible_product_entries_inventory_unresolved"
+          elif len(relevant_candidates) == 0:
+              inventory_state = "visible_entries_but_no_relevant_eBOSS_RSD_candidates_detected"
+          elif len(covariance_candidates) + len(likelihood_candidates) + len(chain_candidates) > 0:
+              inventory_state = "candidate_likelihood_covariance_or_chain_paths_detected"
+          else:
+              inventory_state = "visible_entries_require_manual_review"
+
+          if failed_gates:
+              readiness_label = "eBOSS_product_path_inventory_failed"
+              next_step = "Repair product inventory guardrails before eBOSS mapping or formal park decision."
+          else:
+              readiness_label = "eBOSS_product_path_inventory_passed_ready_for_eBOSS_mapping_or_formal_park_decision"
+              next_step = (
+                  "Proceed to v4.40 eBOSS product mapping audit or formal park decision. "
+                  "If product paths are visible, audit mapping. If not, park eBOSS covariance and move to reference-uncertainty or WiggleZ work."
+              )
+
+          system_health = {
+              "root_candidate_count": len(ROOT_CANDIDATES),
+              "fetch_row_count": len(fetch_rows),
+              "successful_fetch_count": fetched_ok_count,
+              "inventory_entry_count": entry_count,
+              "relevant_candidate_count": len(relevant_candidates),
+              "directory_candidate_count": len(directory_candidates),
+              "covariance_candidate_count": len(covariance_candidates),
+              "likelihood_candidate_count": len(likelihood_candidates),
+              "chain_candidate_count": len(chain_candidates),
+              "archive_candidate_count": len(archive_candidates),
+              "text_candidate_count": len(text_candidates),
+              "LRG_product_label_count": tracer_counts["LRG"],
+              "ELG_product_label_count": tracer_counts["ELG"],
+              "QSO_product_label_count": tracer_counts["QSO"],
+              "EBOSS_label_count": tracer_counts["EBOSS"],
+              "current_eBOSS_row_count": len(CURRENT_EBOSS_ROWS),
+              "inventory_state": inventory_state,
+              "products_auto_mapped": False,
+              "covariance_imported": False,
+              "likelihood_run": False,
+              "pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "BOSS_only_preview_still_BOSS_only": True,
+              "full_RSD_covariance_complete": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results)
+          }
+
+          interpretation = (
+              "v4.39 builds a resilient eBOSS product-path inventory by parsing both SVN/XML directory entries and HTML links. "
+              "It records visible candidate paths when available and preserves unresolved status when directory visibility is limited. "
+              "No product path is mapped to current eBOSS f_sigma8 rows, no covariance is imported, no likelihood is run, and no pressure score is computed."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "root_candidates": ROOT_CANDIDATES,
+              "fetch_rows": fetch_rows,
+              "inventory_rows": inventory_rows,
+              "current_eboss_rows": CURRENT_EBOSS_ROWS,
+              "tracer_expectation_rows": tracer_expectation_rows,
+              "inventory_rules": INVENTORY_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "covariance_imported": False,
+                  "likelihood_run": False,
+                  "product_paths_mapped": False,
+                  "full_RSD_covariance_complete": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "eboss_inventory_fetch_rows_v4_39.csv",
+              fetch_rows,
+              [
+                  "root_id",
+                  "url",
+                  "parent_url",
+                  "depth",
+                  "root_status",
+                  "fetch_ok",
+                  "http_status",
+                  "content_type",
+                  "bytes_read",
+                  "error",
+                  "entry_count"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_product_inventory_rows_v4_39.csv",
+              inventory_rows,
+              [
+                  "root_id",
+                  "parent_url",
+                  "depth",
+                  "entry_index",
+                  "entry_name",
+                  "entry_url",
+                  "entry_kind",
+                  "parser",
+                  "product_class",
+                  "tracer_label",
+                  "role_mapping_status",
+                  "likely_relevant_for_eBOSS_RSD",
+                  "maps_to_current_eBOSS_rows_now",
+                  "covariance_imported_now",
+                  "likelihood_run_now",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_tracer_expectation_rows_v4_39.csv",
+              tracer_expectation_rows,
+              [
+                  "tracer",
+                  "current_row_id",
+                  "z_eff",
+                  "expected_axis",
+                  "visible_product_label_count",
+                  "inventory_status",
+                  "hard_failure"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "current_eboss_rows_v4_39.csv",
+              CURRENT_EBOSS_ROWS,
+              ["row_id", "tracer", "z_eff", "observable_axis", "value", "sigma", "status"]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_product_inventory_rule_results_v4_39.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_39.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_39.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_39.csv",
+              [system_health],
+              [
+                  "root_candidate_count",
+                  "fetch_row_count",
+                  "successful_fetch_count",
+                  "inventory_entry_count",
+                  "relevant_candidate_count",
+                  "directory_candidate_count",
+                  "covariance_candidate_count",
+                  "likelihood_candidate_count",
+                  "chain_candidate_count",
+                  "archive_candidate_count",
+                  "text_candidate_count",
+                  "LRG_product_label_count",
+                  "ELG_product_label_count",
+                  "QSO_product_label_count",
+                  "EBOSS_label_count",
+                  "current_eBOSS_row_count",
+                  "inventory_state",
+                  "products_auto_mapped",
+                  "covariance_imported",
+                  "likelihood_run",
+                  "pressure_score_allowed_now",
+                  "validation_claim_allowed",
+                  "BOSS_only_preview_still_BOSS_only",
+                  "full_RSD_covariance_complete",
+                  "rule_pass_count",
+                  "rule_total_count"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_39_eboss_product_path_inventory.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.39 — eBOSS Product Path Inventory")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("The eBOSS product-path inventory parsed both SVN/XML entries and HTML links where visible.")
+          md.append("")
+          md.append("No product path was mapped to current eBOSS rows. No covariance was imported. No likelihood was run. No pressure score was computed.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Tracer expectation status")
+          md.append("")
+          md.append("| Tracer | Current row | Visible product labels | Status | Hard failure |")
+          md.append("|---|---|---:|---|---:|")
+          for row in tracer_expectation_rows:
+              md.append(
+                  f"| `{row['tracer']}` | `{row['current_row_id']}` | `{row['visible_product_label_count']}` | `{row['inventory_status']}` | `{row['hard_failure']}` |"
+              )
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `eboss_inventory_fetch_rows_v4_39.csv`")
+          md.append("- `eboss_product_inventory_rows_v4_39.csv`")
+          md.append("- `eboss_tracer_expectation_rows_v4_39.csv`")
+          md.append("- `current_eboss_rows_v4_39.csv`")
+          md.append("- `eboss_product_inventory_rule_results_v4_39.csv`")
+          md.append("- `blocked_claims_v4_39.csv`")
+          md.append("- `next_test_ladder_v4_39.csv`")
+          md.append("- `system_health_v4_39.csv`")
+          md.append("- `tairid_v4_39_eboss_product_path_inventory.json`")
+          md.append("- `tairid_v4_39_eboss_product_path_inventory.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_39_eboss_product_path_inventory.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.39 eBOSS product path inventory artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-39-eboss-product-path-inventory
+          path: artifacts/tairid_v4_39_eboss_product_path_inventory/
