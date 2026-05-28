@@ -1,0 +1,770 @@
+name: TAIRID v4.41 eBOSS LRG QSO File Mapping
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-41-eboss-lrg-qso-file-mapping.yml"
+
+jobs:
+  tairid-v4-41-eboss-lrg-qso-file-mapping:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.41 eBOSS LRG QSO file mapping
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_41_eboss_lrg_qso_file_mapping
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_41_eboss_lrg_qso_file_mapping")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_41_eboss_lrg_qso_file_mapping"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run an eBOSS or SDSS likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not apply an eBOSS covariance matrix to residuals.",
+              "This audits whether the visible eBOSS LRG and QSO result/covtot files map to current f_sigma8 rows.",
+              "ELG remains a grid-likelihood parser-needed lane and is not simple covariance-ready in this test.",
+              "A pass means LRG/QSO file mapping is classified, not that eBOSS covariance-aware testing is complete."
+          ]
+
+          CURRENT_EBOSS_ROWS = [
+              {
+                  "row_id": "eboss_dr16_lrg_z070_fsigma8",
+                  "tracer": "LRG",
+                  "z_eff": 0.70,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.473,
+                  "sigma": 0.041,
+                  "status": "published_summary_value_reviewed"
+              },
+              {
+                  "row_id": "eboss_dr16_qso_z148_fsigma8",
+                  "tracer": "QSO",
+                  "z_eff": 1.48,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.462,
+                  "sigma": 0.045,
+                  "status": "published_summary_value_reviewed"
+              }
+          ]
+
+          ELG_PARKED_ROW = {
+              "row_id": "eboss_dr16_elg_z085_fsigma8",
+              "tracer": "ELG",
+              "z_eff": 0.85,
+              "observable_axis": "f_sigma8",
+              "value": 0.315,
+              "sigma": 0.095,
+              "status": "grid_likelihood_visible_parser_needed_not_simple_covariance_ready",
+              "grid_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_ELG_FSBAO_DMDHfs8gridlikelihood.txt"
+          }
+
+          PRODUCT_PAIRS = [
+              {
+                  "pair_id": "eboss_dr16_lrg_baoplus_dmdhfs8",
+                  "tracer": "LRG",
+                  "current_row_id": "eboss_dr16_lrg_z070_fsigma8",
+                  "z_eff": 0.70,
+                  "expected_value": 0.473,
+                  "expected_sigma": 0.041,
+                  "product_role": "BAO_plus_RSD_DMDHfs8_result_covtot_candidate",
+                  "result_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+                  "covtot_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+                  "declared_observable_order": "DM_DH_fsigma8",
+                  "declared_fsigma8_index": 2
+              },
+              {
+                  "pair_id": "eboss_dr16_qso_baoplus_dmdhfs8",
+                  "tracer": "QSO",
+                  "current_row_id": "eboss_dr16_qso_z148_fsigma8",
+                  "z_eff": 1.48,
+                  "expected_value": 0.462,
+                  "expected_sigma": 0.045,
+                  "product_role": "BAO_plus_RSD_DMDHfs8_result_covtot_candidate",
+                  "result_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+                  "covtot_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+                  "declared_observable_order": "DM_DH_fsigma8",
+                  "declared_fsigma8_index": 2
+              }
+          ]
+
+          MAPPING_RULES = [
+              {
+                  "rule_id": "primary_LRG_QSO_pairs_declared",
+                  "description": "LRG and QSO BAO-plus DMDHfs8 result/covtot pairs must be declared.",
+                  "failure_mode": "No mapped eBOSS simple file candidate exists."
+              },
+              {
+                  "rule_id": "result_and_covtot_files_fetch",
+                  "description": "Each LRG/QSO pair must fetch both result and covtot files.",
+                  "failure_mode": "Visible v4.40 product cannot be inspected."
+              },
+              {
+                  "rule_id": "DMDHfs8_order_declared",
+                  "description": "DMDHfs8 filename order must be carried as DM, DH, f_sigma8 with f_sigma8 index 2.",
+                  "failure_mode": "f_sigma8 covariance position is guessed without order."
+              },
+              {
+                  "rule_id": "expected_value_and_z_seen",
+                  "description": "The result file must contain the expected z/value signal for the current row.",
+                  "failure_mode": "Product does not map to the current published-summary row."
+              },
+              {
+                  "rule_id": "covtot_dimension_compatible",
+                  "description": "The covtot file must parse as a 3x3 square matrix for DM, DH, f_sigma8.",
+                  "failure_mode": "Covariance file cannot map to the declared observable order."
+              },
+              {
+                  "rule_id": "ELG_grid_lane_parked",
+                  "description": "ELG remains parser-needed and is not simple covariance-ready here.",
+                  "failure_mode": "ELG grid likelihood is promoted into simple covariance without parser."
+              },
+              {
+                  "rule_id": "no_covariance_application_or_pressure_now",
+                  "description": "This test may map files but must not apply covariance to residuals or compute pressure.",
+                  "failure_mode": "File mapping becomes model testing."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "An eBOSS covariance matrix was applied to residuals.",
+              "An eBOSS likelihood was run.",
+              "LRG/QSO file mapping completes the full eBOSS covariance lane.",
+              "ELG grid likelihood is simple covariance-ready without a parser.",
+              "The full RSD lane is covariance-aware.",
+              "BOSS-only covariance resolves eBOSS covariance.",
+              "WiggleZ covariance is resolved.",
+              "A likelihood, BIC, refit, or model comparison was run."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_42_eBOSS_LRG_QSO_fsigma8_covariance_extraction_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Extract LRG/QSO f_sigma8 covariance metadata from mapped DMDHfs8 covtot files without applying covariance to residuals.",
+                  "must_include": "LRG/QSO mapped pair, observable order, f_sigma8 index, covariance diagonal, no pressure score.",
+                  "must_not_include": "full eBOSS covariance claim, ELG covariance claim, likelihood run, validation claim."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_43_ELG_grid_likelihood_parser_or_formal_park",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Decide whether to build an ELG grid-likelihood parser or formally park ELG for covariance-aware RSD.",
+                  "must_include": "ELG grid path, parser requirements, no simple covariance claim.",
+                  "must_not_include": "ELG covariance-ready claim without parser."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_44_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before stronger RSD comparison.",
+                  "must_include": "reference parameter uncertainty, Planck-chain boundary, growth curve uncertainty.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              },
+              {
+                  "priority": 4,
+                  "next_test": "v4_45_WiggleZ_covariance_locator_retry",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Try to locate a WiggleZ covariance/product path or formally keep WiggleZ non-final.",
+                  "must_include": "source path, product status, row mapping, unresolved boundary if not found.",
+                  "must_not_include": "treating WiggleZ as covariance-ready without product."
+              }
+          ]
+
+          def fetch_text(url, timeout=90, byte_limit=2_000_000):
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "Mozilla/5.0 TAIRID-v4.41-eBOSS-LRG-QSO-file-mapping",
+                          "Accept": "text/plain,text/html,application/xml,*/*"
+                      }
+                  )
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(byte_limit)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "fetch_ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "fetch_ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def numeric_values(text):
+              vals = []
+              for token in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text or ""):
+                  try:
+                      vals.append(float(token))
+                  except Exception:
+                      pass
+              return vals
+
+          def square_matrix(values):
+              n = int(math.sqrt(len(values))) if values else 0
+              if n * n != len(values) or n == 0:
+                  return "", False, []
+              matrix = []
+              for i in range(n):
+                  matrix.append(values[i*n:(i+1)*n])
+              return n, True, matrix
+
+          def value_seen(values, target, tolerance=0.006):
+              return any(abs(v - target) <= tolerance for v in values)
+
+          def z_seen(values, target, tolerance=0.03):
+              return any(abs(v - target) <= tolerance for v in values)
+
+          def has_fsigma8_signal(text, url):
+              combo = ((text or "")[:5000] + " " + (url or "")).lower()
+              return any(token in combo for token in ["fs8", "fsig", "fsigma8", "f_sigma8", "fσ8"])
+
+          failed_gates = []
+          warnings = []
+
+          fetch_rows = []
+          mapping_rows = []
+          covariance_metadata_rows = []
+
+          for pair in PRODUCT_PAIRS:
+              result_fetch = fetch_text(pair["result_url"])
+              cov_fetch = fetch_text(pair["covtot_url"])
+
+              fetch_rows.append({
+                  "pair_id": pair["pair_id"],
+                  "tracer": pair["tracer"],
+                  "url_role": "result_url",
+                  "url": pair["result_url"],
+                  "fetch_ok": result_fetch["fetch_ok"],
+                  "http_status": result_fetch["http_status"],
+                  "content_type": result_fetch["content_type"],
+                  "bytes_read": result_fetch["bytes_read"],
+                  "error": result_fetch["error"]
+              })
+
+              fetch_rows.append({
+                  "pair_id": pair["pair_id"],
+                  "tracer": pair["tracer"],
+                  "url_role": "covtot_url",
+                  "url": pair["covtot_url"],
+                  "fetch_ok": cov_fetch["fetch_ok"],
+                  "http_status": cov_fetch["http_status"],
+                  "content_type": cov_fetch["content_type"],
+                  "bytes_read": cov_fetch["bytes_read"],
+                  "error": cov_fetch["error"]
+              })
+
+              result_values = numeric_values(result_fetch["text"])
+              cov_values = numeric_values(cov_fetch["text"])
+              cov_dim, cov_square, cov_matrix = square_matrix(cov_values)
+
+              result_has_fsigma8 = has_fsigma8_signal(result_fetch["text"], pair["result_url"])
+              expected_value_seen = value_seen(result_values, pair["expected_value"])
+              expected_z_seen = z_seen(result_values, pair["z_eff"])
+
+              fsigma8_index = pair["declared_fsigma8_index"]
+              fsigma8_cov_diagonal = ""
+              implied_sigma = ""
+              sigma_abs_delta = ""
+              sigma_close = False
+
+              if cov_square and cov_dim == 3 and fsigma8_index < 3:
+                  fsigma8_cov_diagonal = cov_matrix[fsigma8_index][fsigma8_index]
+                  if fsigma8_cov_diagonal > 0:
+                      implied_sigma = math.sqrt(fsigma8_cov_diagonal)
+                      sigma_abs_delta = abs(implied_sigma - pair["expected_sigma"])
+                      sigma_close = sigma_abs_delta <= 0.02
+
+                  for i in range(3):
+                      for j in range(3):
+                          covariance_metadata_rows.append({
+                              "pair_id": pair["pair_id"],
+                              "tracer": pair["tracer"],
+                              "obs_i": ["DM", "DH", "f_sigma8"][i],
+                              "obs_j": ["DM", "DH", "f_sigma8"][j],
+                              "i": i,
+                              "j": j,
+                              "covariance_value": cov_matrix[i][j],
+                              "covariance_applied_to_residuals_now": False,
+                              "pressure_score_allowed_now": False
+                          })
+
+              maps_after_inspection = (
+                  result_fetch["fetch_ok"] is True
+                  and cov_fetch["fetch_ok"] is True
+                  and result_has_fsigma8 is True
+                  and expected_value_seen is True
+                  and expected_z_seen is True
+                  and cov_square is True
+                  and cov_dim == 3
+                  and fsigma8_index == 2
+              )
+
+              if not sigma_close:
+                  warnings.append(pair["tracer"] + "_implied_covariance_sigma_needs_review_or_rounding_check")
+
+              mapping_rows.append({
+                  "pair_id": pair["pair_id"],
+                  "tracer": pair["tracer"],
+                  "current_row_id": pair["current_row_id"],
+                  "z_eff": pair["z_eff"],
+                  "expected_value": pair["expected_value"],
+                  "expected_sigma": pair["expected_sigma"],
+                  "product_role": pair["product_role"],
+                  "declared_observable_order": pair["declared_observable_order"],
+                  "declared_fsigma8_index": fsigma8_index,
+                  "result_fetch_ok": result_fetch["fetch_ok"],
+                  "covtot_fetch_ok": cov_fetch["fetch_ok"],
+                  "result_numeric_count": len(result_values),
+                  "covtot_numeric_count": len(cov_values),
+                  "covtot_square_dimension": cov_dim,
+                  "covtot_is_square": cov_square,
+                  "result_has_fsigma8_signal": result_has_fsigma8,
+                  "expected_value_seen_in_result": expected_value_seen,
+                  "expected_z_seen_in_result": expected_z_seen,
+                  "fsigma8_covariance_diagonal": fsigma8_cov_diagonal,
+                  "implied_sigma_from_covariance": implied_sigma,
+                  "sigma_abs_delta_from_current": sigma_abs_delta,
+                  "sigma_close_to_current_summary": sigma_close,
+                  "maps_to_current_eBOSS_row_after_inspection": maps_after_inspection,
+                  "covariance_applied_to_residuals_now": False,
+                  "likelihood_run_now": False,
+                  "pressure_score_allowed_now": False,
+                  "validation_claim_allowed": False
+              })
+
+          if len(PRODUCT_PAIRS) != 2:
+              failed_gates.append("primary_LRG_QSO_pairs_not_declared")
+
+          if len(fetch_rows) != 4:
+              failed_gates.append("fetch_attempt_count_wrong")
+
+          lrg_rows = [row for row in mapping_rows if row["tracer"] == "LRG"]
+          qso_rows = [row for row in mapping_rows if row["tracer"] == "QSO"]
+
+          if len(lrg_rows) != 1:
+              failed_gates.append("LRG_mapping_row_missing")
+          if len(qso_rows) != 1:
+              failed_gates.append("QSO_mapping_row_missing")
+
+          for row in mapping_rows:
+              if row["result_fetch_ok"] is not True:
+                  failed_gates.append(row["pair_id"] + "_result_fetch_failed")
+              if row["covtot_fetch_ok"] is not True:
+                  failed_gates.append(row["pair_id"] + "_covtot_fetch_failed")
+              if row["declared_observable_order"] != "DM_DH_fsigma8":
+                  failed_gates.append(row["pair_id"] + "_observable_order_wrong")
+              if row["declared_fsigma8_index"] != 2:
+                  failed_gates.append(row["pair_id"] + "_fsigma8_index_wrong")
+              if row["expected_value_seen_in_result"] is not True:
+                  failed_gates.append(row["pair_id"] + "_expected_value_not_seen")
+              if row["expected_z_seen_in_result"] is not True:
+                  failed_gates.append(row["pair_id"] + "_expected_z_not_seen")
+              if row["covtot_is_square"] is not True or row["covtot_square_dimension"] != 3:
+                  failed_gates.append(row["pair_id"] + "_covtot_not_3x3")
+              if row["maps_to_current_eBOSS_row_after_inspection"] is not True:
+                  failed_gates.append(row["pair_id"] + "_does_not_map_after_inspection")
+              if row["covariance_applied_to_residuals_now"] is not False:
+                  failed_gates.append(row["pair_id"] + "_covariance_application_violation")
+              if row["likelihood_run_now"] is not False:
+                  failed_gates.append(row["pair_id"] + "_likelihood_run_violation")
+              if row["pressure_score_allowed_now"] is not False:
+                  failed_gates.append(row["pair_id"] + "_pressure_allowed_violation")
+              if row["validation_claim_allowed"] is not False:
+                  failed_gates.append(row["pair_id"] + "_validation_allowed_violation")
+
+          if ELG_PARKED_ROW["status"] != "grid_likelihood_visible_parser_needed_not_simple_covariance_ready":
+              failed_gates.append("ELG_not_parked_as_parser_needed")
+
+          blocked_text = " | ".join(BLOCKED_CLAIMS).lower()
+          for phrase in [
+              "final rsd pressure score",
+              "covariance matrix was applied",
+              "likelihood was run",
+              "full eboss covariance",
+              "elg grid",
+              "full rsd lane",
+              "wigglez",
+              "bic"
+          ]:
+              if phrase not in blocked_text:
+                  failed_gates.append("blocked_claim_missing_" + phrase.replace(" ", "_"))
+
+          warnings.append("eBOSS_LRG_QSO_file_mapping_does_not_apply_covariance")
+          warnings.append("eBOSS_LRG_QSO_file_mapping_does_not_run_likelihood")
+          warnings.append("eBOSS_LRG_QSO_file_mapping_does_not_compute_pressure")
+          warnings.append("ELG_grid_likelihood_still_parser_needed")
+          warnings.append("BOSS_only_covariance_preview_remains_BOSS_only")
+          warnings.append("reference_model_uncertainty_still_missing")
+          warnings.append("WiggleZ_covariance_still_unresolved")
+
+          rule_results = [
+              {
+                  "rule_id": "primary_LRG_QSO_pairs_declared",
+                  "pass": len(PRODUCT_PAIRS) == 2 and len(lrg_rows) == 1 and len(qso_rows) == 1,
+                  "result": "LRG_and_QSO_primary_pairs_declared",
+                  "boundary": "Declared products are mapping candidates only."
+              },
+              {
+                  "rule_id": "result_and_covtot_files_fetch",
+                  "pass": all(row["result_fetch_ok"] is True and row["covtot_fetch_ok"] is True for row in mapping_rows),
+                  "result": "LRG_and_QSO_result_covtot_files_fetched",
+                  "boundary": "Fetched files are not covariance application."
+              },
+              {
+                  "rule_id": "DMDHfs8_order_declared",
+                  "pass": all(row["declared_observable_order"] == "DM_DH_fsigma8" and row["declared_fsigma8_index"] == 2 for row in mapping_rows),
+                  "result": "DMDHfs8_order_declared_with_fsigma8_index_2",
+                  "boundary": "Observable order supports extraction audit, not pressure."
+              },
+              {
+                  "rule_id": "expected_value_and_z_seen",
+                  "pass": all(row["expected_value_seen_in_result"] is True and row["expected_z_seen_in_result"] is True for row in mapping_rows),
+                  "result": "current_LRG_QSO_row_values_seen_in_result_files",
+                  "boundary": "Row matching is file mapping only."
+              },
+              {
+                  "rule_id": "covtot_dimension_compatible",
+                  "pass": all(row["covtot_is_square"] is True and row["covtot_square_dimension"] == 3 for row in mapping_rows),
+                  "result": "LRG_and_QSO_covtot_files_parse_as_3x3",
+                  "boundary": "Compatible covtot does not mean covariance has been applied."
+              },
+              {
+                  "rule_id": "ELG_grid_lane_parked",
+                  "pass": ELG_PARKED_ROW["status"] == "grid_likelihood_visible_parser_needed_not_simple_covariance_ready",
+                  "result": "ELG_grid_lane_remains_parser_needed",
+                  "boundary": "ELG is not simple covariance-ready."
+              },
+              {
+                  "rule_id": "no_covariance_application_or_pressure_now",
+                  "pass": all(
+                      row["covariance_applied_to_residuals_now"] is False
+                      and row["likelihood_run_now"] is False
+                      and row["pressure_score_allowed_now"] is False
+                      for row in mapping_rows
+                  ),
+                  "result": "no_covariance_no_likelihood_no_pressure",
+                  "boundary": "File mapping only."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_LRG_QSO_file_mapping_rules_passed")
+
+          if failed_gates:
+              readiness_label = "eBOSS_LRG_QSO_file_mapping_audit_failed"
+              next_step = "Repair LRG/QSO file mapping before covariance extraction."
+          else:
+              readiness_label = "eBOSS_LRG_QSO_file_mapping_audit_passed_ready_for_LRG_QSO_fsigma8_covariance_extraction"
+              next_step = (
+                  "Proceed to v4.42 eBOSS LRG/QSO f_sigma8 covariance extraction audit. "
+                  "Do not apply covariance to residuals or claim full eBOSS/RSD covariance awareness."
+              )
+
+          system_health = {
+              "product_pair_count": len(PRODUCT_PAIRS),
+              "fetch_attempt_count": len(fetch_rows),
+              "mapping_row_count": len(mapping_rows),
+              "LRG_maps_after_inspection": bool(lrg_rows and lrg_rows[0]["maps_to_current_eBOSS_row_after_inspection"]),
+              "QSO_maps_after_inspection": bool(qso_rows and qso_rows[0]["maps_to_current_eBOSS_row_after_inspection"]),
+              "ELG_grid_parser_needed": True,
+              "covariance_metadata_entry_count": len(covariance_metadata_rows),
+              "LRG_QSO_file_mapping_complete": len(failed_gates) == 0,
+              "complete_eBOSS_covariance_mapping_now": False,
+              "covariance_applied": False,
+              "likelihood_run": False,
+              "pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "BOSS_only_preview_still_BOSS_only": True,
+              "full_RSD_covariance_complete": False,
+              "reference_model_uncertainty_included": False,
+              "WiggleZ_covariance_resolved": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results)
+          }
+
+          interpretation = (
+              "v4.41 audits whether the visible eBOSS LRG and QSO BAO-plus DMDHfs8 result/covtot files map to the current LRG and QSO f_sigma8 rows. "
+              "The test carries DMDHfs8 order as DM, DH, f_sigma8 and checks that the covtot files are 3x3. "
+              "ELG remains a grid-likelihood parser-needed lane. "
+              "No covariance is applied to residuals, no likelihood is run, no pressure score is computed, and the full RSD lane remains incomplete."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "current_eboss_rows": CURRENT_EBOSS_ROWS,
+              "elg_parked_row": ELG_PARKED_ROW,
+              "product_pairs": PRODUCT_PAIRS,
+              "fetch_rows": fetch_rows,
+              "mapping_rows": mapping_rows,
+              "covariance_metadata_rows": covariance_metadata_rows,
+              "mapping_rules": MAPPING_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "covariance_applied": False,
+                  "likelihood_run": False,
+                  "LRG_QSO_file_mapping_complete": len(failed_gates) == 0,
+                  "complete_eBOSS_covariance_mapping_now": False,
+                  "full_RSD_covariance_complete": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "eboss_lrg_qso_fetch_rows_v4_41.csv",
+              fetch_rows,
+              ["pair_id", "tracer", "url_role", "url", "fetch_ok", "http_status", "content_type", "bytes_read", "error"]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_lrg_qso_mapping_rows_v4_41.csv",
+              mapping_rows,
+              [
+                  "pair_id",
+                  "tracer",
+                  "current_row_id",
+                  "z_eff",
+                  "expected_value",
+                  "expected_sigma",
+                  "product_role",
+                  "declared_observable_order",
+                  "declared_fsigma8_index",
+                  "result_fetch_ok",
+                  "covtot_fetch_ok",
+                  "result_numeric_count",
+                  "covtot_numeric_count",
+                  "covtot_square_dimension",
+                  "covtot_is_square",
+                  "result_has_fsigma8_signal",
+                  "expected_value_seen_in_result",
+                  "expected_z_seen_in_result",
+                  "fsigma8_covariance_diagonal",
+                  "implied_sigma_from_covariance",
+                  "sigma_abs_delta_from_current",
+                  "sigma_close_to_current_summary",
+                  "maps_to_current_eBOSS_row_after_inspection",
+                  "covariance_applied_to_residuals_now",
+                  "likelihood_run_now",
+                  "pressure_score_allowed_now",
+                  "validation_claim_allowed"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_lrg_qso_covariance_metadata_v4_41.csv",
+              covariance_metadata_rows,
+              [
+                  "pair_id",
+                  "tracer",
+                  "obs_i",
+                  "obs_j",
+                  "i",
+                  "j",
+                  "covariance_value",
+                  "covariance_applied_to_residuals_now",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_elg_parked_row_v4_41.csv",
+              [ELG_PARKED_ROW],
+              ["row_id", "tracer", "z_eff", "observable_axis", "value", "sigma", "status", "grid_url"]
+          )
+
+          write_csv(
+              OUTDIR / "eboss_lrg_qso_file_mapping_rule_results_v4_41.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_41.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_41.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_41.csv",
+              [system_health],
+              [
+                  "product_pair_count",
+                  "fetch_attempt_count",
+                  "mapping_row_count",
+                  "LRG_maps_after_inspection",
+                  "QSO_maps_after_inspection",
+                  "ELG_grid_parser_needed",
+                  "covariance_metadata_entry_count",
+                  "LRG_QSO_file_mapping_complete",
+                  "complete_eBOSS_covariance_mapping_now",
+                  "covariance_applied",
+                  "likelihood_run",
+                  "pressure_score_allowed_now",
+                  "validation_claim_allowed",
+                  "BOSS_only_preview_still_BOSS_only",
+                  "full_RSD_covariance_complete",
+                  "reference_model_uncertainty_included",
+                  "WiggleZ_covariance_resolved",
+                  "rule_pass_count",
+                  "rule_total_count"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_41_eboss_lrg_qso_file_mapping.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.41 — eBOSS LRG/QSO File Mapping Audit")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("eBOSS LRG and QSO result/covtot files were checked for whether they map to current f_sigma8 rows.")
+          md.append("")
+          md.append("ELG remains grid-likelihood/parser-needed. No covariance was applied. No likelihood was run. No pressure score was computed.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Mapping rows")
+          md.append("")
+          md.append("| Pair | Tracer | z | Expected value seen | Cov dim | Maps after inspection |")
+          md.append("|---|---|---:|---:|---:|---:|")
+          for row in mapping_rows:
+              md.append(
+                  f"| `{row['pair_id']}` | `{row['tracer']}` | `{row['z_eff']}` | "
+                  f"`{row['expected_value_seen_in_result']}` | `{row['covtot_square_dimension']}` | `{row['maps_to_current_eBOSS_row_after_inspection']}` |"
+              )
+          md.append("")
+          md.append("## ELG status")
+          md.append("")
+          md.append(f"`{ELG_PARKED_ROW['status']}`")
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `eboss_lrg_qso_fetch_rows_v4_41.csv`")
+          md.append("- `eboss_lrg_qso_mapping_rows_v4_41.csv`")
+          md.append("- `eboss_lrg_qso_covariance_metadata_v4_41.csv`")
+          md.append("- `eboss_elg_parked_row_v4_41.csv`")
+          md.append("- `eboss_lrg_qso_file_mapping_rule_results_v4_41.csv`")
+          md.append("- `blocked_claims_v4_41.csv`")
+          md.append("- `next_test_ladder_v4_41.csv`")
+          md.append("- `system_health_v4_41.csv`")
+          md.append("- `tairid_v4_41_eboss_lrg_qso_file_mapping.json`")
+          md.append("- `tairid_v4_41_eboss_lrg_qso_file_mapping.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_41_eboss_lrg_qso_file_mapping.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.41 eBOSS LRG QSO file mapping artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-41-eboss-lrg-qso-file-mapping
+          path: artifacts/tairid_v4_41_eboss_lrg_qso_file_mapping/
