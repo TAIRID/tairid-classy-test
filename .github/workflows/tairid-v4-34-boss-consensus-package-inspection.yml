@@ -1,0 +1,615 @@
+name: TAIRID v4.34 BOSS Consensus Package Inspection
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-34-boss-consensus-package-inspection.yml"
+
+jobs:
+  tairid-v4-34-boss-consensus-package-inspection:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.34 BOSS consensus package inspection
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_34_boss_consensus_package_inspection
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import re
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_34_boss_consensus_package_inspection")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_34_boss_consensus_package_inspection"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run an RSD likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not apply an RSD covariance matrix.",
+              "This downloads and inspects the BOSS DR12 consensus package contents only.",
+              "A pass means the package contents were inspected and candidate mapping files were classified, not that covariance-aware testing is complete."
+          ]
+
+          PACKAGE = {
+              "package_id": "boss_dr12_consensus_gaussian_constraints",
+              "survey_family": "BOSS_DR12",
+              "package_url": "https://data.sdss.org/sas/dr12/boss/papers/clustering/ALAM_ET_AL_2016_consensus_and_individual_Gaussian_constraints.tar.gz",
+              "package_role": "candidate compressed Gaussian constraints package for BOSS DR12 consensus and individual constraints",
+              "selected_from": "v4.33 RSD row mapping audit",
+              "inspection_status": "download_and_list_contents_only"
+          }
+
+          CURRENT_BOSS_ROWS = [
+              {
+                  "row_id": "boss_dr12_z038_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.38,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.497,
+                  "sigma": 0.045,
+                  "current_status": "published_summary_value_ready"
+              },
+              {
+                  "row_id": "boss_dr12_z051_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.51,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.458,
+                  "sigma": 0.038,
+                  "current_status": "published_summary_value_ready"
+              },
+              {
+                  "row_id": "boss_dr12_z061_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.61,
+                  "observable_axis": "f_sigma8",
+                  "value": 0.436,
+                  "sigma": 0.034,
+                  "current_status": "published_summary_value_ready"
+              }
+          ]
+
+          INSPECTION_RULES = [
+              {
+                  "rule_id": "package_url_declared",
+                  "description": "The exact BOSS DR12 package URL must be recorded.",
+                  "failure_mode": "Inspection proceeds from an unnamed package."
+              },
+              {
+                  "rule_id": "package_downloaded",
+                  "description": "The package should be downloaded before contents can be classified.",
+                  "failure_mode": "Mapping audit proceeds without package inspection."
+              },
+              {
+                  "rule_id": "archive_opened",
+                  "description": "The tar.gz archive should open and list members.",
+                  "failure_mode": "Candidate package cannot be inspected."
+              },
+              {
+                  "rule_id": "contents_classified",
+                  "description": "Archive members should be classified by likely measurement, covariance, likelihood, chain, README, or manual-review role.",
+                  "failure_mode": "Files are listed but not sorted into mapping-relevant classes."
+              },
+              {
+                  "rule_id": "row_mapping_not_completed",
+                  "description": "Package inspection alone must not claim current f_sigma8 row mapping is complete.",
+                  "failure_mode": "Inspection becomes covariance-aware scoring."
+              },
+              {
+                  "rule_id": "no_pressure_or_likelihood_now",
+                  "description": "The package may be inspected, but no likelihood, covariance application, or pressure score may be run.",
+                  "failure_mode": "Inspection turns into model testing."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "An RSD covariance matrix was applied.",
+              "A BOSS likelihood was run.",
+              "The package automatically maps to the current f_sigma8 rows.",
+              "The package inspection proves growth suppression.",
+              "A likelihood, BIC, refit, or model comparison was run."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_35_BOSS_consensus_file_mapping_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Inspect candidate file names and readable text snippets to decide whether any file maps to the current BOSS f_sigma8 rows and covariance.",
+                  "must_include": "candidate file names, measurement/covariance flags, row-label evidence, no pressure score.",
+                  "must_not_include": "covariance application, likelihood run, validation claim."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_36_SDSS_DR16_child_product_selection",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Inspect SDSS DR16 final cosmology directory children and identify candidate eBOSS covariance/likelihood products.",
+                  "must_include": "child product paths, tracer labels, row mapping status, published-summary boundary.",
+                  "must_not_include": "final pressure score or direct chain claim without parsing."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_37_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before any stronger RSD comparison.",
+                  "must_include": "reference parameter uncertainty, Planck-chain boundary, growth curve uncertainty.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              }
+          ]
+
+          def classify_member(name):
+              lower = name.lower()
+
+              if any(x in lower for x in ["readme", "README".lower(), "description", "notes"]):
+                  return "readme_or_documentation"
+              if any(x in lower for x in ["cov", "covariance", "covmat", "invcov", "inverse"]):
+                  return "covariance_candidate"
+              if any(x in lower for x in ["like", "likelihood", "gaussian", "constraints", "constraint"]):
+                  return "likelihood_or_constraint_candidate"
+              if any(x in lower for x in ["fsigma", "f_sigma", "sigma8", "growth", "rsd"]):
+                  return "rsd_growth_axis_candidate"
+              if any(x in lower for x in ["bao", "dm", "dv", "hz", "hubble", "da"]):
+                  return "bao_distance_boundary_candidate"
+              if any(x in lower for x in ["chain", "cosmomc", "mcmc"]):
+                  return "chain_candidate"
+              if lower.endswith((".txt", ".dat", ".csv", ".table", ".param", ".ini")):
+                  return "plain_text_candidate"
+              return "manual_review_candidate"
+
+          def member_mapping_hint(name):
+              lower = name.lower()
+              hints = []
+
+              for token in ["0.38", "0p38", "z038", "z0.38", "0.51", "0p51", "z051", "z0.51", "0.61", "0p61", "z061", "z0.61"]:
+                  if token in lower:
+                      hints.append(token)
+
+              for token in ["fsigma8", "f_sigma8", "sigma8", "rsd", "growth", "consensus", "combined", "dr12", "lowz", "cmass"]:
+                  if token in lower:
+                      hints.append(token)
+
+              return ";".join(hints)
+
+          def safe_text_preview(tar, member, max_bytes=20000):
+              if not member.isfile():
+                  return ""
+              if member.size > 2_000_000:
+                  return ""
+              lower = member.name.lower()
+              if not lower.endswith((".txt", ".dat", ".csv", ".ini", ".param", ".table", ".md", ".readme")) and "readme" not in lower:
+                  return ""
+              try:
+                  f = tar.extractfile(member)
+                  if f is None:
+                      return ""
+                  raw = f.read(max_bytes)
+                  text = raw.decode("utf-8", errors="replace")
+                  text = re.sub(r"\s+", " ", text).strip()
+                  return text[:1000]
+              except Exception:
+                  return ""
+
+          def fetch_package(url, max_bytes=150_000_000, timeout=120):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.34-BOSS-consensus-package-inspection",
+                      "Accept": "application/gzip,application/x-tar,application/octet-stream,*/*"
+                  }
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  data = response.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      raise RuntimeError("package_exceeded_size_cap")
+                  return {
+                      "ok": True,
+                      "http_status": getattr(response, "status", 200),
+                      "content_type": response.headers.get("Content-Type", ""),
+                      "bytes_read": len(data),
+                      "data": data
+                  }
+
+          failed_gates = []
+          warnings = []
+
+          download_info = {
+              "download_ok": False,
+              "http_status": "",
+              "content_type": "",
+              "bytes_read": 0,
+              "error": ""
+          }
+
+          member_rows = []
+          text_preview_rows = []
+
+          archive_opened = False
+
+          if not PACKAGE.get("package_url"):
+              failed_gates.append("package_url_missing")
+
+          try:
+              fetched = fetch_package(PACKAGE["package_url"])
+              download_info.update({
+                  "download_ok": fetched["ok"],
+                  "http_status": fetched["http_status"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": ""
+              })
+
+              with tarfile.open(fileobj=io.BytesIO(fetched["data"]), mode="r:gz") as tar:
+                  archive_opened = True
+                  members = tar.getmembers()
+
+                  for idx, member in enumerate(members):
+                      classification = classify_member(member.name)
+                      hint = member_mapping_hint(member.name)
+                      member_rows.append({
+                          "member_index": idx,
+                          "member_name": member.name,
+                          "member_size": member.size,
+                          "is_file": member.isfile(),
+                          "classification": classification,
+                          "mapping_hint_tokens": hint,
+                          "maps_to_current_rows_now": False,
+                          "covariance_applied_now": False,
+                          "pressure_score_allowed_now": False
+                      })
+
+                      preview = safe_text_preview(tar, member)
+                      if preview:
+                          text_preview_rows.append({
+                              "member_name": member.name,
+                              "classification": classification,
+                              "mapping_hint_tokens": hint,
+                              "text_preview": preview
+                          })
+
+          except Exception as exc:
+              download_info["error"] = repr(exc)
+
+          if not download_info["download_ok"]:
+              failed_gates.append("package_download_failed")
+
+          if not archive_opened:
+              failed_gates.append("archive_not_opened")
+
+          if not member_rows:
+              failed_gates.append("no_archive_members_listed")
+
+          covariance_candidates = [row for row in member_rows if row["classification"] == "covariance_candidate"]
+          constraint_candidates = [row for row in member_rows if row["classification"] == "likelihood_or_constraint_candidate"]
+          rsd_candidates = [row for row in member_rows if row["classification"] == "rsd_growth_axis_candidate"]
+          bao_boundary_candidates = [row for row in member_rows if row["classification"] == "bao_distance_boundary_candidate"]
+          documentation_candidates = [row for row in member_rows if row["classification"] == "readme_or_documentation"]
+
+          mapping_hint_candidates = [row for row in member_rows if row["mapping_hint_tokens"]]
+
+          if archive_opened and not any(row["classification"] != "manual_review_candidate" for row in member_rows):
+              failed_gates.append("contents_not_classified")
+
+          if not (covariance_candidates or constraint_candidates or rsd_candidates or mapping_hint_candidates):
+              warnings.append("no_obvious_covariance_constraint_or_rsd_candidates_found_by_filename")
+
+          if not documentation_candidates:
+              warnings.append("no_readme_or_documentation_detected_by_filename")
+
+          if not text_preview_rows:
+              warnings.append("no_readable_text_preview_rows_extracted")
+
+          unsafe_maps = [row for row in member_rows if row["maps_to_current_rows_now"] is True]
+          covariance_applied = [row for row in member_rows if row["covariance_applied_now"] is True]
+          pressure_allowed = [row for row in member_rows if row["pressure_score_allowed_now"] is True]
+
+          if unsafe_maps:
+              failed_gates.append("member_auto_mapped_without_audit")
+          if covariance_applied:
+              failed_gates.append("covariance_applied_during_inspection")
+          if pressure_allowed:
+              failed_gates.append("pressure_score_allowed_during_inspection")
+
+          rule_results = [
+              {
+                  "rule_id": "package_url_declared",
+                  "pass": bool(PACKAGE.get("package_url")),
+                  "result": "package_url_declared",
+                  "boundary": "Exact package path is recorded."
+              },
+              {
+                  "rule_id": "package_downloaded",
+                  "pass": download_info["download_ok"] is True,
+                  "result": "package_downloaded" if download_info["download_ok"] else "package_not_downloaded",
+                  "boundary": "Download permits inspection but not scoring."
+              },
+              {
+                  "rule_id": "archive_opened",
+                  "pass": archive_opened is True,
+                  "result": "archive_opened_and_members_listed" if archive_opened else "archive_not_opened",
+                  "boundary": "Archive inspection only."
+              },
+              {
+                  "rule_id": "contents_classified",
+                  "pass": bool(member_rows) and any(row["classification"] != "manual_review_candidate" for row in member_rows),
+                  "result": "member_classifications_created",
+                  "boundary": "Classification is not row mapping."
+              },
+              {
+                  "rule_id": "row_mapping_not_completed",
+                  "pass": len(unsafe_maps) == 0,
+                  "result": "no_member_auto_mapped_to_current_rows",
+                  "boundary": "Mapping requires a later audit."
+              },
+              {
+                  "rule_id": "no_pressure_or_likelihood_now",
+                  "pass": len(covariance_applied) == 0 and len(pressure_allowed) == 0,
+                  "result": "no_covariance_or_pressure_applied",
+                  "boundary": "No likelihood, no pressure score, no validation."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_package_inspection_rules_passed")
+
+          warnings.append("package_inspection_does_not_apply_covariance")
+          warnings.append("row_mapping_still_required")
+          warnings.append("current_BOSS_fsigma8_rows_remain_published_summary_until_mapped")
+          warnings.append("v4_29_RSD_preview_remains_nonfinal")
+          warnings.append("next_step_should_inspect_file_mapping_not_score_pressure")
+
+          if failed_gates:
+              readiness_label = "boss_consensus_package_inspection_failed"
+              next_step = "Repair package download/opening or contents classification before file mapping audit."
+          else:
+              readiness_label = "boss_consensus_package_inspection_passed_ready_for_file_mapping_audit"
+              next_step = (
+                  "Proceed to v4.35 BOSS consensus file mapping audit. "
+                  "Do not apply covariance or compute pressure; first decide whether candidate files map to the current BOSS f_sigma8 rows."
+              )
+
+          system_health = {
+              "download_ok": download_info["download_ok"],
+              "archive_opened": archive_opened,
+              "member_count": len(member_rows),
+              "text_preview_row_count": len(text_preview_rows),
+              "covariance_candidate_count": len(covariance_candidates),
+              "constraint_candidate_count": len(constraint_candidates),
+              "rsd_candidate_count": len(rsd_candidates),
+              "bao_boundary_candidate_count": len(bao_boundary_candidates),
+              "documentation_candidate_count": len(documentation_candidates),
+              "mapping_hint_candidate_count": len(mapping_hint_candidates),
+              "current_boss_row_count": len(CURRENT_BOSS_ROWS),
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results),
+              "row_mapping_complete": False,
+              "covariance_applied": False,
+              "likelihood_run": False,
+              "pressure_score_allowed_now": False,
+              "validation_claim_allowed": False
+          }
+
+          interpretation = (
+              "v4.34 inspects the BOSS DR12 consensus Gaussian constraints package. "
+              "The package is downloaded and archive members are classified by likely role. "
+              "This still does not mean the files map to the current three BOSS f_sigma8 rows. "
+              "No covariance is applied, no likelihood is run, and no pressure score is computed. "
+              "The next step is a file mapping audit using the inspected package contents."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "package": PACKAGE,
+              "download_info": download_info,
+              "current_boss_rows": CURRENT_BOSS_ROWS,
+              "member_rows": member_rows,
+              "text_preview_rows": text_preview_rows,
+              "inspection_rules": INSPECTION_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "covariance_applied": False,
+                  "likelihood_run": False,
+                  "row_mapping_complete": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "boss_package_download_info_v4_34.csv",
+              [download_info],
+              ["download_ok", "http_status", "content_type", "bytes_read", "error"]
+          )
+
+          write_csv(
+              OUTDIR / "boss_package_member_rows_v4_34.csv",
+              member_rows,
+              [
+                  "member_index",
+                  "member_name",
+                  "member_size",
+                  "is_file",
+                  "classification",
+                  "mapping_hint_tokens",
+                  "maps_to_current_rows_now",
+                  "covariance_applied_now",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_package_text_previews_v4_34.csv",
+              text_preview_rows,
+              ["member_name", "classification", "mapping_hint_tokens", "text_preview"]
+          )
+
+          write_csv(
+              OUTDIR / "current_boss_rows_v4_34.csv",
+              CURRENT_BOSS_ROWS,
+              ["row_id", "survey_family", "z_eff", "observable_axis", "value", "sigma", "current_status"]
+          )
+
+          write_csv(
+              OUTDIR / "package_inspection_rule_results_v4_34.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_34.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_34.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_34.csv",
+              [system_health],
+              [
+                  "download_ok",
+                  "archive_opened",
+                  "member_count",
+                  "text_preview_row_count",
+                  "covariance_candidate_count",
+                  "constraint_candidate_count",
+                  "rsd_candidate_count",
+                  "bao_boundary_candidate_count",
+                  "documentation_candidate_count",
+                  "mapping_hint_candidate_count",
+                  "current_boss_row_count",
+                  "rule_pass_count",
+                  "rule_total_count",
+                  "row_mapping_complete",
+                  "covariance_applied",
+                  "likelihood_run",
+                  "pressure_score_allowed_now",
+                  "validation_claim_allowed"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_34_boss_consensus_package_inspection.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.34 — BOSS DR12 Consensus Package Inspection")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("The BOSS DR12 consensus package was inspected and archive members were classified.")
+          md.append("")
+          md.append("No covariance was applied. No likelihood was run. No pressure score was computed. Row mapping is still not complete.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `boss_package_download_info_v4_34.csv`")
+          md.append("- `boss_package_member_rows_v4_34.csv`")
+          md.append("- `boss_package_text_previews_v4_34.csv`")
+          md.append("- `current_boss_rows_v4_34.csv`")
+          md.append("- `package_inspection_rule_results_v4_34.csv`")
+          md.append("- `blocked_claims_v4_34.csv`")
+          md.append("- `next_test_ladder_v4_34.csv`")
+          md.append("- `system_health_v4_34.csv`")
+          md.append("- `tairid_v4_34_boss_consensus_package_inspection.json`")
+          md.append("- `tairid_v4_34_boss_consensus_package_inspection.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_34_boss_consensus_package_inspection.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.34 BOSS consensus package inspection artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-34-boss-consensus-package-inspection
+          path: artifacts/tairid_v4_34_boss_consensus_package_inspection/
