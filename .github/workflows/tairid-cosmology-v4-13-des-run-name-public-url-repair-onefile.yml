@@ -1,0 +1,721 @@
+name: TAIRID Cosmology v4.13 DES Run Name Public URL Repair Onefile
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-cosmology-v4-13-des-run-name-public-url-repair-onefile.yml"
+
+jobs:
+  des-run-name-public-url-repair-onefile:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.13 DES run name public URL repair onefile
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not combine KiDS, DES, and HSC into one posterior.",
+              "This does not parse DES posterior chains unless a reachable numeric chain file is actually found.",
+              "This does not run a DES likelihood.",
+              "This repairs the DES final-paper chain template by searching for RUN_NAME values and probing possible public URLs.",
+              "A pass means DES run-name/public-URL status was classified, not that DES posterior parsing succeeded."
+          ]
+
+          PPD_REPO_API = "https://api.github.com/repos/des-science/y3-3x2pt-ppd-postunblinding"
+          PPD_RAW_BASE = "https://raw.githubusercontent.com/des-science/y3-3x2pt-ppd-postunblinding"
+          PPD_PARAMS_RAW = "https://raw.githubusercontent.com/des-science/y3-3x2pt-ppd-postunblinding/main/params_ppd.ini"
+
+          PUBLIC_BASES = [
+              "https://des.ncsa.illinois.edu/releases/y3a2/Y3key-products/y3_chains/3x2pt/final_paper_chains/",
+              "https://des.ncsa.illinois.edu/releases/y3a2/y3_chains/3x2pt/final_paper_chains/",
+              "https://des.ncsa.illinois.edu/y3_chains/3x2pt/final_paper_chains/",
+              "https://www.darkenergysurvey.org/y3_chains/3x2pt/final_paper_chains/"
+          ]
+
+          SEARCH_EXTENSIONS = [".ini", ".yaml", ".yml", ".json", ".py", ".sh", ".txt", ".md"]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def fetch_text(url, timeout=90, byte_limit=5_000_000):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.13-DES-run-name-url-repair",
+                      "Accept": "*/*"
+                  }
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(byte_limit)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def fetch_json(url):
+              result = fetch_text(url, byte_limit=10_000_000)
+              if not result["ok"]:
+                  return result, None
+              try:
+                  return result, json.loads(result["text"])
+              except Exception as exc:
+                  result["ok"] = False
+                  result["error"] = f"json_parse_error:{repr(exc)}"
+                  return result, None
+
+          def repo_default_branch():
+              result, data = fetch_json(PPD_REPO_API)
+              if result["ok"] and isinstance(data, dict):
+                  return data.get("default_branch") or "main", result
+              return "main", result
+
+          def fetch_repo_tree(branch):
+              result, data = fetch_json(f"{PPD_REPO_API}/git/trees/{branch}?recursive=1")
+              if result["ok"] and isinstance(data, dict):
+                  return result, data.get("tree", [])
+              return result, []
+
+          def raw_url_for(branch, path):
+              return f"{PPD_RAW_BASE}/{branch}/{path}"
+
+          def clean_value(value):
+              value = str(value or "").strip()
+              value = value.strip("'\"")
+              value = value.split("#")[0].strip()
+              value = value.split(";")[0].strip()
+              return value
+
+          def safe_run_name(value):
+              value = clean_value(value)
+              if not value:
+                  return ""
+              if "%(" in value or "${" in value or " " in value:
+                  return ""
+              if len(value) > 160:
+                  return ""
+              if not re.match(r"^[A-Za-z0-9_.+=:-]+$", value):
+                  return ""
+              return value
+
+          def extract_run_names(text, source_url):
+              rows = []
+
+              assignment_patterns = [
+                  r"(?i)\bRUN_NAME\s*=\s*([A-Za-z0-9_.+=:-]+)",
+                  r"(?i)\bRUNNAME\s*=\s*([A-Za-z0-9_.+=:-]+)",
+                  r"(?i)\brun_name\s*=\s*([A-Za-z0-9_.+=:-]+)",
+                  r"(?i)\brunname\s*=\s*([A-Za-z0-9_.+=:-]+)",
+                  r"(?i)\bname\s*=\s*([A-Za-z0-9_.+=:-]*3x2pt[A-Za-z0-9_.+=:-]*)"
+              ]
+
+              for pattern in assignment_patterns:
+                  for match in re.finditer(pattern, text or ""):
+                      candidate = safe_run_name(match.group(1))
+                      if candidate:
+                          rows.append({
+                              "source_url": source_url,
+                              "run_name": candidate,
+                              "discovery_method": "assignment_or_name_pattern",
+                              "context": match.group(0)[:240]
+                          })
+
+              chain_file_patterns = [
+                  r"chain_([A-Za-z0-9_.+=:-]+)\.txt",
+                  r"final_paper_chains/chain_([A-Za-z0-9_.+=:-]+)\.txt",
+                  r"y3_chains/3x2pt/final_paper_chains/chain_([A-Za-z0-9_.+=:-]+)\.txt"
+              ]
+
+              for pattern in chain_file_patterns:
+                  for match in re.finditer(pattern, text or ""):
+                      candidate = safe_run_name(match.group(1))
+                      if candidate:
+                          rows.append({
+                              "source_url": source_url,
+                              "run_name": candidate,
+                              "discovery_method": "chain_filename_pattern",
+                              "context": match.group(0)[:240]
+                          })
+
+              # Some files contain explicit template pieces or final paper names in long strings.
+              loose_patterns = [
+                  r"([A-Za-z0-9_.+=:-]*3x2pt[A-Za-z0-9_.+=:-]*)",
+                  r"([A-Za-z0-9_.+=:-]*fiducial[A-Za-z0-9_.+=:-]*)",
+                  r"([A-Za-z0-9_.+=:-]*baseline[A-Za-z0-9_.+=:-]*)"
+              ]
+
+              for pattern in loose_patterns:
+                  for match in re.finditer(pattern, text or ""):
+                      candidate = safe_run_name(match.group(1))
+                      if candidate and len(candidate) >= 6:
+                          rows.append({
+                              "source_url": source_url,
+                              "run_name": candidate,
+                              "discovery_method": "loose_context_pattern",
+                              "context": match.group(0)[:240]
+                          })
+
+              dedup = {}
+              for row in rows:
+                  key = (row["source_url"], row["run_name"], row["discovery_method"])
+                  if key not in dedup:
+                      dedup[key] = row
+
+              return list(dedup.values())
+
+          def score_run_name(row):
+              name = row["run_name"].lower()
+              score = 0
+              reasons = []
+
+              if "3x2pt" in name:
+                  score += 20
+                  reasons.append("contains_3x2pt")
+              if "fid" in name or "fiducial" in name:
+                  score += 16
+                  reasons.append("contains_fiducial")
+              if "baseline" in name:
+                  score += 14
+                  reasons.append("contains_baseline")
+              if "lcdm" in name or "lambda" in name:
+                  score += 10
+                  reasons.append("contains_lcdm")
+              if "final" in row.get("context", "").lower():
+                  score += 8
+                  reasons.append("final_context")
+              if row["discovery_method"] == "chain_filename_pattern":
+                  score += 18
+                  reasons.append("from_chain_filename")
+              if row["discovery_method"] == "assignment_or_name_pattern":
+                  score += 12
+                  reasons.append("from_assignment")
+              if "test" in name or "save_2pt" in name or "flask" in name:
+                  score -= 12
+                  reasons.append("test_or_save2pt_penalty")
+
+              return score, ";".join(reasons)
+
+          def build_candidate_urls(run_name):
+              filename = f"chain_{run_name}.txt"
+              return [urllib.parse.urljoin(base, filename) for base in PUBLIC_BASES]
+
+          def probe_url(url):
+              result = fetch_text(url, timeout=45, byte_limit=500000)
+              text = result["text"] or ""
+              lower = text[:200000].lower()
+
+              numeric_line_count = 0
+              first_numeric_preview = ""
+              header_preview = ""
+
+              for raw in text.splitlines()[:1000]:
+                  line = raw.strip()
+                  if not line:
+                      continue
+                  if not header_preview:
+                      header_preview = line[:240]
+
+                  parts = line.replace(",", " ").split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      [float(x) for x in parts]
+                      numeric_line_count += 1
+                      if not first_numeric_preview:
+                          first_numeric_preview = line[:240]
+                  except Exception:
+                      pass
+
+              is_des_placeholder = (
+                  result["ok"]
+                  and "text/html" in result["content_type"].lower()
+                  and result["bytes_read"] <= 1500
+                  and numeric_line_count == 0
+              )
+
+              contains_axis = any(axis in lower for axis in ["s8", "s_8", "sigma8", "sigma_8", "omega_m", "omegam"])
+              contains_chain_language = any(word in lower for word in ["chain", "posterior", "mcmc", "multinest", "sample"])
+
+              if result["ok"] and not is_des_placeholder and numeric_line_count >= 50:
+                  classification = "reachable_numeric_chain_candidate"
+              elif result["ok"] and not is_des_placeholder and numeric_line_count >= 10:
+                  classification = "reachable_numeric_product_needs_column_map"
+              elif is_des_placeholder:
+                  classification = "reachable_des_placeholder_html_not_chain"
+              elif result["ok"]:
+                  classification = "reachable_non_numeric_product_not_chain"
+              else:
+                  classification = "not_reachable"
+
+              return {
+                  "candidate_url": url,
+                  "fetch_ok": result["ok"],
+                  "http_status": result["http_status"],
+                  "content_type": result["content_type"],
+                  "bytes_read": result["bytes_read"],
+                  "error": result["error"],
+                  "numeric_line_count_first_1000": numeric_line_count,
+                  "first_numeric_preview": first_numeric_preview,
+                  "header_preview": header_preview,
+                  "contains_axis_words": contains_axis,
+                  "contains_chain_language": contains_chain_language,
+                  "is_des_placeholder_html": is_des_placeholder,
+                  "probe_classification": classification
+              }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          created_at = now_iso()
+
+          default_branch, repo_meta_fetch = repo_default_branch()
+          repo_tree_fetch, repo_tree = fetch_repo_tree(default_branch)
+
+          searched_file_rows = []
+          run_name_rows = []
+
+          # Search params first.
+          params_fetch = fetch_text(PPD_PARAMS_RAW)
+          searched_file_rows.append({
+              "path": "params_ppd.ini",
+              "raw_url": PPD_PARAMS_RAW,
+              "fetch_ok": params_fetch["ok"],
+              "http_status": params_fetch["http_status"],
+              "content_type": params_fetch["content_type"],
+              "bytes_read": params_fetch["bytes_read"],
+              "error": params_fetch["error"]
+          })
+          if params_fetch["ok"]:
+              run_name_rows.extend(extract_run_names(params_fetch["text"], PPD_PARAMS_RAW))
+
+          # Search likely config/code files from the repo.
+          repo_files_to_search = []
+          if repo_tree_fetch["ok"]:
+              for item in repo_tree:
+                  if item.get("type") != "blob":
+                      continue
+                  path = item.get("path", "")
+                  lower = path.lower()
+                  if not any(lower.endswith(ext) for ext in SEARCH_EXTENSIONS):
+                      continue
+                  if any(key in lower for key in ["chain", "ppd", "fiducial", "params", "config", "ini", "submit", "run", "preprocess"]):
+                      repo_files_to_search.append(path)
+
+          # Keep this bounded so the workflow stays quick.
+          for path in sorted(set(repo_files_to_search))[:80]:
+              raw_url = raw_url_for(default_branch, path)
+              fetched = fetch_text(raw_url)
+              searched_file_rows.append({
+                  "path": path,
+                  "raw_url": raw_url,
+                  "fetch_ok": fetched["ok"],
+                  "http_status": fetched["http_status"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": fetched["error"]
+              })
+              if fetched["ok"]:
+                  run_name_rows.extend(extract_run_names(fetched["text"], raw_url))
+
+          scored_run_rows = []
+          seen_run_names = {}
+
+          for row in run_name_rows:
+              score, reasons = score_run_name(row)
+              row = dict(row)
+              row["run_name_score"] = score
+              row["score_reasons"] = reasons
+
+              # Keep best scoring copy per run name.
+              key = row["run_name"]
+              if key not in seen_run_names or score > seen_run_names[key]["run_name_score"]:
+                  seen_run_names[key] = row
+
+          scored_run_rows = sorted(seen_run_names.values(), key=lambda row: row["run_name_score"], reverse=True)
+
+          probe_rows = []
+
+          for row in scored_run_rows[:40]:
+              for url in build_candidate_urls(row["run_name"]):
+                  probe = probe_url(url)
+                  probe_rows.append({
+                      "run_name": row["run_name"],
+                      "run_name_score": row["run_name_score"],
+                      "run_score_reasons": row["score_reasons"],
+                      "run_discovery_method": row["discovery_method"],
+                      "run_source_url": row["source_url"],
+                      **probe
+                  })
+
+          probe_rows.sort(
+              key=lambda row: (
+                  row["probe_classification"] == "reachable_numeric_chain_candidate",
+                  row["probe_classification"] == "reachable_numeric_product_needs_column_map",
+                  row["fetch_ok"],
+                  row["numeric_line_count_first_1000"],
+                  row["run_name_score"]
+              ),
+              reverse=True
+          )
+
+          reachable_chain_rows = [
+              row for row in probe_rows
+              if row["probe_classification"] == "reachable_numeric_chain_candidate"
+          ]
+
+          numeric_unclear_rows = [
+              row for row in probe_rows
+              if row["probe_classification"] == "reachable_numeric_product_needs_column_map"
+          ]
+
+          placeholder_rows = [
+              row for row in probe_rows
+              if row["probe_classification"] == "reachable_des_placeholder_html_not_chain"
+          ]
+
+          failed_gates = []
+          warnings = []
+
+          if not params_fetch["ok"] and not repo_tree_fetch["ok"]:
+              failed_gates.append("des_params_and_repo_tree_not_fetchable")
+
+          if not scored_run_rows:
+              warnings.append("no_des_run_names_recovered_from_ppd_repo")
+
+          if placeholder_rows:
+              warnings.append("des_public_url_probes_hit_placeholder_html_pages")
+
+          if not reachable_chain_rows:
+              warnings.append("no_reachable_des_numeric_chain_file_confirmed")
+
+          if numeric_unclear_rows:
+              warnings.append("des_numeric_product_found_but_column_map_needed")
+
+          if failed_gates:
+              readiness_label = "des_run_name_public_url_repair_onefile_failed"
+              next_step = "Repair DES PPD repo access before chain URL repair."
+          elif reachable_chain_rows:
+              readiness_label = "des_run_name_public_url_repair_onefile_completed_reachable_numeric_chain_found"
+              next_step = (
+                  "Proceed to v4.14 DES numeric chain parser probe for the selected reachable chain candidate. "
+                  "Do not run likelihood or combine surveys."
+              )
+          elif numeric_unclear_rows:
+              readiness_label = "des_run_name_public_url_repair_onefile_completed_numeric_product_column_map_needed"
+              next_step = (
+                  "Proceed to v4.14 DES numeric product column-map audit only if the selected product is confirmed to be a posterior chain."
+              )
+          elif scored_run_rows:
+              readiness_label = "des_run_name_public_url_repair_onefile_completed_run_names_found_no_public_chain"
+              next_step = (
+                  "Keep DES as a published-summary row for now. "
+                  "Proceed to v4.x robustness handoff unless a direct public DES chain URL is supplied."
+              )
+          else:
+              readiness_label = "des_run_name_public_url_repair_onefile_completed_no_run_names"
+              next_step = (
+                  "Keep DES as a published-summary row. "
+                  "Proceed to v4.x robustness handoff or manual DES chain URL search."
+              )
+
+          selected = reachable_chain_rows[0] if reachable_chain_rows else (numeric_unclear_rows[0] if numeric_unclear_rows else (probe_rows[0] if probe_rows else {}))
+
+          selector_decision = {
+              "run_name_candidate_count": len(scored_run_rows),
+              "public_url_probe_count": len(probe_rows),
+              "reachable_numeric_chain_candidate_count": len(reachable_chain_rows),
+              "reachable_numeric_unclear_count": len(numeric_unclear_rows),
+              "placeholder_html_count": len(placeholder_rows),
+              "des_direct_chain_replacement_allowed": bool(reachable_chain_rows),
+              "des_summary_row_should_remain_active": not bool(reachable_chain_rows),
+              "selected_run_name": selected.get("run_name", ""),
+              "selected_url": selected.get("candidate_url", ""),
+              "selected_probe_classification": selected.get("probe_classification", ""),
+              "next_action": next_step
+          }
+
+          interpretation = (
+              "v4.13 repairs the DES final-paper chain template by searching the PPD repository for RUN_NAME candidates and probing derived public URLs. "
+              "If only run names or placeholder HTML pages are found, DES remains a published-summary row. "
+              "A DES direct-chain replacement is allowed only if a reachable numeric chain file is confirmed."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "repo_fetch": {
+                  "repo_meta_ok": repo_meta_fetch["ok"],
+                  "repo_tree_ok": repo_tree_fetch["ok"],
+                  "default_branch": default_branch,
+                  "repo_meta_error": repo_meta_fetch["error"],
+                  "repo_tree_error": repo_tree_fetch["error"]
+              },
+              "searched_file_rows": searched_file_rows,
+              "run_name_rows": scored_run_rows,
+              "public_url_probe_rows": probe_rows,
+              "selector_decision": selector_decision,
+              "interpretation": interpretation,
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "combined_growth_posterior_built": False,
+                  "new_cosmological_model_fit": False,
+                  "posterior_chain_parsed": False
+              },
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False,
+                  "posterior_chain_parsed": False
+              }
+          }
+
+          write_csv(
+              OUTDIR / "des_searched_repo_files_v4_13.csv",
+              searched_file_rows,
+              ["path", "raw_url", "fetch_ok", "http_status", "content_type", "bytes_read", "error"]
+          )
+
+          write_csv(
+              OUTDIR / "des_run_name_candidates_v4_13.csv",
+              scored_run_rows,
+              ["source_url", "run_name", "discovery_method", "context", "run_name_score", "score_reasons"]
+          )
+
+          write_csv(
+              OUTDIR / "des_public_chain_url_probes_v4_13.csv",
+              probe_rows,
+              [
+                  "run_name",
+                  "run_name_score",
+                  "run_score_reasons",
+                  "run_discovery_method",
+                  "run_source_url",
+                  "candidate_url",
+                  "fetch_ok",
+                  "http_status",
+                  "content_type",
+                  "bytes_read",
+                  "error",
+                  "numeric_line_count_first_1000",
+                  "first_numeric_preview",
+                  "header_preview",
+                  "contains_axis_words",
+                  "contains_chain_language",
+                  "is_des_placeholder_html",
+                  "probe_classification"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "des_selector_decision_v4_13.csv",
+              [selector_decision],
+              [
+                  "run_name_candidate_count",
+                  "public_url_probe_count",
+                  "reachable_numeric_chain_candidate_count",
+                  "reachable_numeric_unclear_count",
+                  "placeholder_html_count",
+                  "des_direct_chain_replacement_allowed",
+                  "des_summary_row_should_remain_active",
+                  "selected_run_name",
+                  "selected_url",
+                  "selected_probe_classification",
+                  "next_action"
+              ]
+          )
+
+          interpretation_rows = [
+              {
+                  "interpretation_id": "allowed_des_run_name_repair",
+                  "status": "allowed_with_boundary",
+                  "wording": "DES RUN_NAME candidates and derived public chain URLs were probed.",
+                  "boundary": "URL repair only, not posterior parsing."
+              },
+              {
+                  "interpretation_id": "allowed_placeholder_boundary",
+                  "status": "allowed_with_boundary",
+                  "wording": "DES placeholder HTML pages do not count as reachable chain products.",
+                  "boundary": "Blocks false positive URL claims."
+              },
+              {
+                  "interpretation_id": "allowed_summary_row_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "If no reachable numeric DES chain file is found, DES remains a published-summary row.",
+                  "boundary": "No direct-chain DES replacement claim."
+              },
+              {
+                  "interpretation_id": "forbidden_likelihood_claim",
+                  "status": "forbidden",
+                  "wording": "A DES likelihood was run.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_posterior_parse_claim",
+                  "status": "forbidden",
+                  "wording": "DES posterior chains were parsed.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_validation_claim",
+                  "status": "forbidden",
+                  "wording": "TAIRID is validated.",
+                  "boundary": "Blocked."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "interpretation_boundaries_v4_13.csv",
+              interpretation_rows,
+              ["interpretation_id", "status", "wording", "boundary"]
+          )
+
+          json_path = OUTDIR / "tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v4.13 — DES Run-Name / Public-URL Repair Onefile")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v4.13 repairs the DES final-paper chain template by searching for RUN_NAME candidates and probing possible public URLs.")
+          md.append("")
+          md.append("It does not run a DES likelihood and does not parse DES posterior chains unless a real numeric chain file is reachable.")
+          md.append("")
+          md.append("## URL repair counts")
+          md.append("")
+          md.append("| Boundary | Count |")
+          md.append("|---|---:|")
+          md.append(f"| RUN_NAME candidates | `{len(scored_run_rows)}` |")
+          md.append(f"| Public URL probes | `{len(probe_rows)}` |")
+          md.append(f"| Reachable numeric chain candidates | `{len(reachable_chain_rows)}` |")
+          md.append(f"| Reachable numeric unclear products | `{len(numeric_unclear_rows)}` |")
+          md.append(f"| Placeholder HTML hits | `{len(placeholder_rows)}` |")
+          md.append("")
+          md.append("## Selector decision")
+          md.append("")
+          md.append("| Field | Value |")
+          md.append("|---|---|")
+          for key, value in selector_decision.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append(interpretation)
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `des_searched_repo_files_v4_13.csv`")
+          md.append("- `des_run_name_candidates_v4_13.csv`")
+          md.append("- `des_public_chain_url_probes_v4_13.csv`")
+          md.append("- `des_selector_decision_v4_13.csv`")
+          md.append("- `interpretation_boundaries_v4_13.csv`")
+          md.append("- `tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile.json`")
+          md.append("- `tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile.md"
+          md_path.write_text("\\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Selector decision:")
+          print(json.dumps(selector_decision, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.13 DES run name public URL repair onefile artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-13-des-run-name-public-url-repair-onefile
+          path: artifacts/tairid_cosmology_v4_13_des_run_name_public_url_repair_onefile/
