@@ -1,0 +1,1005 @@
+name: TAIRID Cosmology v4.4 KiDS Direct Chain Parser Probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kids-direct-chain-parser-probe:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.4 KiDS direct chain parser probe
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_4_kids_direct_chain_parser_probe
+
+          python - <<'PY'
+          import csv
+          import gzip
+          import json
+          import math
+          import os
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_4_kids_direct_chain_parser_probe")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_4_kids_direct_chain_parser_probe"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not combine KiDS, DES, and HSC into one posterior.",
+              "This does not promote KiDS 3x2pt into a final replacement row unless parameter parsing succeeds cleanly.",
+              "This is a direct product parser probe for the KiDS candidate chain product found in v4.3.",
+              "A pass means the KiDS chain product was downloaded, inventoried, and parser-readiness was assessed, not that TAIRID is validated."
+          ]
+
+          KIDS_CHAIN_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          KIDS_README_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          ARCHIVE_PATH = OUTDIR / "KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          README_PATH = OUTDIR / "KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          # Carried from v4.2 Planck chain decomposition.
+          PLANCK_AXIS_REFERENCE = {
+              "S8": {"q50": 0.824821, "sigma_68": 0.012218},
+              "sigma8": {"q50": 0.810123, "sigma_68": 0.006639},
+              "Omega_m": {"q50": 0.310797, "sigma_68": 0.006153}
+          }
+
+          SOURCE_LEDGER = [
+              {
+                  "source_id": "kids1000_3x2pt_fiducial_chains_tarball",
+                  "family": "KiDS",
+                  "source_url": KIDS_CHAIN_URL,
+                  "used_for": "Direct KiDS 3x2pt fiducial chain parser probe."
+              },
+              {
+                  "source_id": "kids1000_3x2pt_fiducial_chains_readme",
+                  "family": "KiDS",
+                  "source_url": KIDS_README_URL,
+                  "used_for": "Column/product documentation if reachable."
+              },
+              {
+                  "source_id": "v4_2_planck_axis_reference",
+                  "family": "Planck",
+                  "source_url": "local_prior_artifact_values",
+                  "used_for": "Planck chain-derived S8, sigma8, and Omega_m medians and widths carried forward for optional diagnostic comparison."
+              }
+          ]
+
+          S8_ALIASES = {"s8", "s_8", "sigma8omegam05", "sigma8_omegam_0p5", "s8omegamp5"}
+          SIGMA8_ALIASES = {"sigma8", "sigma_8", "sig8"}
+          OMEGAM_ALIASES = {"omegam", "omega_m", "omega_m_0", "omegam0", "omega_matter", "om"}
+          H0_ALIASES = {"h0", "hubble", "hubble0"}
+          OMEGABH2_ALIASES = {"omegabh2", "omega_b_h2", "ombh2"}
+          OMEGACH2_ALIASES = {"omegach2", "omega_c_h2", "omch2"}
+
+          NUMERIC_EXTENSIONS = {
+              ".txt", ".dat", ".csv", ".chain", ".samples", ".post", ".param", ".gz"
+          }
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def finite(x):
+              try:
+                  return math.isfinite(float(x))
+              except Exception:
+                  return False
+
+          def normalize_name(name):
+              token = str(name).strip().split()[0]
+              token = token.rstrip("*")
+              token = token.replace("\\", "")
+              token = token.replace("{", "").replace("}", "")
+              token = token.replace("/", "_")
+              token = token.replace("-", "_")
+              token = token.lower()
+              token = token.replace("omega", "omega")
+              token = re.sub(r"[^a-z0-9_]+", "", token)
+              token = re.sub(r"_+", "_", token).strip("_")
+              return token
+
+          def download_url(url, path, timeout=240):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Mozilla/5.0 TAIRID-v4.4-KiDS-parser-probe"}
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  with path.open("wb") as f:
+                      shutil.copyfileobj(response, f)
+                  return {
+                      "ok": True,
+                      "http_status": getattr(response, "status", 200),
+                      "content_type": response.headers.get("Content-Type", ""),
+                      "bytes": path.stat().st_size,
+                      "error": ""
+                  }
+
+          def try_download_url(url, path):
+              try:
+                  return download_url(url, path)
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes": 0,
+                      "error": repr(exc)
+                  }
+
+          def safe_extract_tar(tar, path):
+              base = path.resolve()
+              for member in tar.getmembers():
+                  target = (path / member.name).resolve()
+                  if not str(target).startswith(str(base)):
+                      raise RuntimeError(f"Blocked unsafe tar path: {member.name}")
+              tar.extractall(path)
+
+          def open_text_maybe_gzip(path):
+              path = Path(path)
+              if path.suffix.lower() == ".gz":
+                  return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
+              return path.open("r", encoding="utf-8", errors="ignore")
+
+          def read_text_preview(path, max_chars=200000):
+              try:
+                  with open_text_maybe_gzip(path) as f:
+                      return f.read(max_chars)
+              except Exception:
+                  return ""
+
+          def read_paramnames(path):
+              text = read_text_preview(path)
+              names = []
+              for raw in text.splitlines():
+                  line = raw.strip()
+                  if not line:
+                      continue
+                  if line.startswith("#"):
+                      line = line.lstrip("#").strip()
+                  if not line:
+                      continue
+                  if any(skip in line.lower() for skip in ["readme", "copyright", "http://", "https://"]):
+                      continue
+                  token = normalize_name(line.split()[0])
+                  if token and not token.isdigit():
+                      names.append(token)
+              return names
+
+          def find_column(names, aliases):
+              normalized_aliases = {normalize_name(a) for a in aliases}
+              normalized_names = [normalize_name(n) for n in names]
+
+              for idx, name in enumerate(normalized_names):
+                  if name in normalized_aliases:
+                      return idx
+
+              for idx, name in enumerate(normalized_names):
+                  for alias in normalized_aliases:
+                      if alias and (name.endswith(alias) or alias in name):
+                          return idx
+
+              return None
+
+          def numeric_profile(path, max_lines=4000):
+              ncols_counter = Counter()
+              numeric_line_count = 0
+              text_line_count = 0
+              first_numeric_preview = ""
+              first_text_preview = ""
+              first_numeric_ncols = None
+
+              try:
+                  with open_text_maybe_gzip(path) as f:
+                      for raw in f:
+                          if numeric_line_count + text_line_count >= max_lines:
+                              break
+
+                          line = raw.strip()
+                          if not line:
+                              continue
+
+                          parts = line.replace(",", " ").split()
+                          floats = []
+                          numeric = True
+
+                          for part in parts:
+                              try:
+                                  floats.append(float(part))
+                              except Exception:
+                                  numeric = False
+                                  break
+
+                          if numeric and len(floats) >= 3:
+                              numeric_line_count += 1
+                              ncols_counter[len(floats)] += 1
+                              if first_numeric_preview == "":
+                                  first_numeric_preview = line[:300]
+                                  first_numeric_ncols = len(floats)
+                          else:
+                              text_line_count += 1
+                              if first_text_preview == "":
+                                  first_text_preview = line[:300]
+
+              except Exception:
+                  pass
+
+              best_ncols = ""
+              best_ncols_count = 0
+              if ncols_counter:
+                  best_ncols, best_ncols_count = ncols_counter.most_common(1)[0]
+
+              return {
+                  "numeric_line_count": numeric_line_count,
+                  "text_line_count": text_line_count,
+                  "best_ncols": best_ncols,
+                  "best_ncols_count": best_ncols_count,
+                  "first_numeric_ncols": first_numeric_ncols if first_numeric_ncols is not None else "",
+                  "first_numeric_preview": first_numeric_preview,
+                  "first_text_preview": first_text_preview
+              }
+
+          def weighted_quantile(values, quantiles, weights):
+              pairs = []
+              for v, w in zip(values, weights):
+                  if finite(v) and finite(w) and float(w) > 0:
+                      pairs.append((float(v), float(w)))
+
+              if not pairs:
+                  raise ValueError("No finite positive-weight samples remained.")
+
+              pairs.sort(key=lambda x: x[0])
+              total = sum(w for _, w in pairs)
+              output = []
+
+              for q in quantiles:
+                  target = float(q) * total
+                  cumulative = 0.0
+                  chosen = pairs[-1][0]
+                  for value, weight in pairs:
+                      cumulative += weight
+                      if cumulative >= target:
+                          chosen = value
+                          break
+                  output.append(chosen)
+
+              return output
+
+          def weighted_mean_std(values, weights):
+              pairs = []
+              for v, w in zip(values, weights):
+                  if finite(v) and finite(w) and float(w) > 0:
+                      pairs.append((float(v), float(w)))
+
+              if not pairs:
+                  raise ValueError("No finite positive-weight samples remained.")
+
+              total = sum(w for _, w in pairs)
+              mean = sum(v * w for v, w in pairs) / total
+              var = sum(w * (v - mean) ** 2 for v, w in pairs) / total
+              return mean, math.sqrt(max(var, 0.0))
+
+          def summarize_axis(values, weights):
+              q16, q50, q84 = weighted_quantile(values, [0.16, 0.50, 0.84], weights)
+              mean, std = weighted_mean_std(values, weights)
+              return {
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "sigma_68": (q84 - q16) / 2.0,
+                  "weighted_mean": mean,
+                  "weighted_std": std,
+                  "sample_count": len(values)
+              }
+
+          def pressure_against_planck(axis, value, sigma):
+              if axis not in PLANCK_AXIS_REFERENCE:
+                  return None
+              ref = PLANCK_AXIS_REFERENCE[axis]
+              combined = math.sqrt(float(sigma) ** 2 + float(ref["sigma_68"]) ** 2)
+              delta = float(value) - float(ref["q50"])
+              z = delta / combined if combined > 0 else float("nan")
+              return {
+                  "axis": axis,
+                  "observable_value": value,
+                  "observable_sigma": sigma,
+                  "planck_value": ref["q50"],
+                  "planck_sigma": ref["sigma_68"],
+                  "delta_observable_minus_planck": delta,
+                  "combined_sigma": combined,
+                  "pressure_z": z,
+                  "direction": "negative" if delta < 0 else "positive_or_zero"
+              }
+
+          def score_numeric_candidate(path, profile):
+              name = str(path).lower()
+              score = 0
+              reasons = []
+
+              if profile["numeric_line_count"] >= 100:
+                  score += 20
+                  reasons.append("many_numeric_lines")
+              elif profile["numeric_line_count"] >= 10:
+                  score += 10
+                  reasons.append("some_numeric_lines")
+
+              if isinstance(profile["best_ncols"], int) and profile["best_ncols"] >= 5:
+                  score += 12
+                  reasons.append("wide_numeric_rows")
+
+              for token in ["chain", "chains", "posterior", "sample", "samples", "multinest", "fiducial"]:
+                  if token in name:
+                      score += 8
+                      reasons.append(f"name_token:{token}")
+
+              for token in ["readme", "cov", "covariance", "data_vector", "data", "mask", "catalog"]:
+                  if token in name:
+                      score -= 8
+                      reasons.append(f"penalty_token:{token}")
+
+              return score, ";".join(reasons)
+
+          def parse_chain_with_paramnames(chain_path, param_path, skip_columns, max_rows=300000):
+              names = read_paramnames(param_path)
+              if not names:
+                  return None
+
+              s8_idx = find_column(names, S8_ALIASES)
+              sigma8_idx = find_column(names, SIGMA8_ALIASES)
+              omegam_idx = find_column(names, OMEGAM_ALIASES)
+              h0_idx = find_column(names, H0_ALIASES)
+              obh2_idx = find_column(names, OMEGABH2_ALIASES)
+              och2_idx = find_column(names, OMEGACH2_ALIASES)
+
+              if s8_idx is None and sigma8_idx is None:
+                  return None
+
+              axis_values = {"S8": [], "sigma8": [], "Omega_m": []}
+              weights = []
+              rows_read = 0
+              rows_used = 0
+              rows_skipped = 0
+
+              try:
+                  with open_text_maybe_gzip(chain_path) as f:
+                      for raw in f:
+                          if rows_read >= max_rows:
+                              break
+
+                          line = raw.strip()
+                          if not line or line.startswith("#"):
+                              continue
+
+                          parts = line.replace(",", " ").split()
+
+                          try:
+                              floats = [float(x) for x in parts]
+                          except Exception:
+                              rows_skipped += 1
+                              continue
+
+                          rows_read += 1
+
+                          if len(floats) < len(names) + skip_columns:
+                              rows_skipped += 1
+                              continue
+
+                          weight = 1.0
+                          if skip_columns >= 1 and floats[0] > 0:
+                              weight = floats[0]
+
+                          def param_value(param_idx):
+                              return floats[skip_columns + param_idx]
+
+                          try:
+                              s8 = param_value(s8_idx) if s8_idx is not None else None
+                              sigma8 = param_value(sigma8_idx) if sigma8_idx is not None else None
+
+                              omegam = None
+                              if omegam_idx is not None:
+                                  omegam = param_value(omegam_idx)
+                              elif obh2_idx is not None and och2_idx is not None and h0_idx is not None:
+                                  h0 = param_value(h0_idx)
+                                  h = h0 / 100.0 if h0 > 10 else h0
+                                  if h > 0:
+                                      omegam = (param_value(obh2_idx) + param_value(och2_idx)) / (h * h)
+
+                              if s8 is None and sigma8 is not None and omegam is not None and omegam > 0:
+                                  s8 = sigma8 * math.sqrt(omegam / 0.3)
+
+                              if sigma8 is None and s8 is not None and omegam is not None and omegam > 0:
+                                  sigma8 = s8 / math.sqrt(omegam / 0.3)
+
+                              used_any = False
+
+                              if s8 is not None and finite(s8):
+                                  axis_values["S8"].append(float(s8))
+                                  used_any = True
+                              else:
+                                  axis_values["S8"].append(float("nan"))
+
+                              if sigma8 is not None and finite(sigma8):
+                                  axis_values["sigma8"].append(float(sigma8))
+                                  used_any = True
+                              else:
+                                  axis_values["sigma8"].append(float("nan"))
+
+                              if omegam is not None and finite(omegam):
+                                  axis_values["Omega_m"].append(float(omegam))
+                                  used_any = True
+                              else:
+                                  axis_values["Omega_m"].append(float("nan"))
+
+                              if used_any:
+                                  weights.append(float(weight))
+                                  rows_used += 1
+                              else:
+                                  rows_skipped += 1
+
+                          except Exception:
+                              rows_skipped += 1
+
+              except Exception:
+                  return None
+
+              summaries = {}
+              pressure_rows = []
+
+              for axis, values in axis_values.items():
+                  clean_values = []
+                  clean_weights = []
+                  for value, weight in zip(values, weights):
+                      if finite(value) and finite(weight) and weight > 0:
+                          clean_values.append(float(value))
+                          clean_weights.append(float(weight))
+
+                  if len(clean_values) >= 50:
+                      summary = summarize_axis(clean_values, clean_weights)
+                      summaries[axis] = summary
+
+                      pressure = pressure_against_planck(axis, summary["q50"], summary["sigma_68"])
+                      if pressure is not None:
+                          pressure_rows.append({
+                              "axis": axis,
+                              "q16": summary["q16"],
+                              "q50": summary["q50"],
+                              "q84": summary["q84"],
+                              "sigma_68": summary["sigma_68"],
+                              "weighted_mean": summary["weighted_mean"],
+                              "weighted_std": summary["weighted_std"],
+                              "sample_count": summary["sample_count"],
+                              **pressure
+                          })
+
+              if not summaries:
+                  return None
+
+              parse_score = len(summaries) * 50 + min(rows_used / 1000.0, 50)
+
+              return {
+                  "chain_path": str(chain_path),
+                  "param_path": str(param_path),
+                  "skip_columns": skip_columns,
+                  "param_count": len(names),
+                  "rows_read": rows_read,
+                  "rows_used": rows_used,
+                  "rows_skipped": rows_skipped,
+                  "parsed_axes": sorted(summaries.keys()),
+                  "summaries": summaries,
+                  "pressure_rows": pressure_rows,
+                  "parse_score": parse_score,
+                  "s8_column_found": s8_idx is not None,
+                  "sigma8_column_found": sigma8_idx is not None,
+                  "omegam_column_found": omegam_idx is not None,
+                  "omega_fallback_possible": obh2_idx is not None and och2_idx is not None and h0_idx is not None
+              }
+
+          created_at = now_iso()
+
+          archive_download = try_download_url(KIDS_CHAIN_URL, ARCHIVE_PATH)
+          readme_download = try_download_url(KIDS_README_URL, README_PATH)
+
+          archive_inventory_rows = []
+          numeric_candidate_rows = []
+          paramname_rows = []
+          parser_attempt_rows = []
+          best_parse = None
+
+          failed_gates = []
+          warnings = []
+
+          if not archive_download["ok"]:
+              failed_gates.append("kids_chain_archive_download_failed")
+          else:
+              with TemporaryDirectory() as tmp_name:
+                  tmp = Path(tmp_name)
+                  extract_dir = tmp / "extracted"
+                  extract_dir.mkdir(parents=True, exist_ok=True)
+
+                  try:
+                      with tarfile.open(ARCHIVE_PATH, "r:gz") as tar:
+                          safe_extract_tar(tar, extract_dir)
+                  except Exception as exc:
+                      failed_gates.append(f"archive_extract_failed:{repr(exc)}")
+
+                  if not failed_gates:
+                      all_files = [p for p in extract_dir.rglob("*") if p.is_file()]
+
+                      for path in all_files:
+                          rel = str(path.relative_to(extract_dir))
+                          suffixes = "".join(path.suffixes).lower()
+                          size = path.stat().st_size
+                          archive_inventory_rows.append({
+                              "relative_path": rel,
+                              "size_bytes": size,
+                              "suffixes": suffixes,
+                              "name_lower": path.name.lower()
+                          })
+
+                      param_candidates = []
+                      for path in all_files:
+                          rel_lower = str(path.relative_to(extract_dir)).lower()
+                          if path.suffix.lower() == ".paramnames" or "paramname" in rel_lower or "parameters" in rel_lower:
+                              names = read_paramnames(path)
+                              if names:
+                                  param_candidates.append(path)
+                                  paramname_rows.append({
+                                      "relative_path": str(path.relative_to(extract_dir)),
+                                      "param_count": len(names),
+                                      "contains_s8": find_column(names, S8_ALIASES) is not None,
+                                      "contains_sigma8": find_column(names, SIGMA8_ALIASES) is not None,
+                                      "contains_omegam": find_column(names, OMEGAM_ALIASES) is not None,
+                                      "contains_h0": find_column(names, H0_ALIASES) is not None,
+                                      "first_20_params": ";".join(names[:20])
+                                  })
+
+                      for path in all_files:
+                          rel_lower = str(path.relative_to(extract_dir)).lower()
+                          if any(rel_lower.endswith(ext) for ext in NUMERIC_EXTENSIONS):
+                              if any(block in rel_lower for block in ["readme", "license", "copyright"]):
+                                  continue
+                              profile = numeric_profile(path)
+                              score, reasons = score_numeric_candidate(path, profile)
+
+                              if score > 0 or profile["numeric_line_count"] > 0:
+                                  row = {
+                                      "relative_path": str(path.relative_to(extract_dir)),
+                                      "size_bytes": path.stat().st_size,
+                                      "candidate_score": score,
+                                      "score_reasons": reasons,
+                                      **profile
+                                  }
+                                  numeric_candidate_rows.append(row)
+
+                      numeric_candidate_rows.sort(key=lambda row: row["candidate_score"], reverse=True)
+
+                      for candidate in numeric_candidate_rows[:20]:
+                          chain_path = extract_dir / candidate["relative_path"]
+                          best_ncols = candidate["best_ncols"]
+
+                          if not isinstance(best_ncols, int):
+                              continue
+
+                          for param_path in param_candidates:
+                              names = read_paramnames(param_path)
+                              for skip_columns in [0, 1, 2, 3]:
+                                  if len(names) + skip_columns != best_ncols:
+                                      continue
+
+                                  parsed = parse_chain_with_paramnames(chain_path, param_path, skip_columns)
+
+                                  attempt_row = {
+                                      "chain_relative_path": candidate["relative_path"],
+                                      "param_relative_path": str(param_path.relative_to(extract_dir)),
+                                      "skip_columns": skip_columns,
+                                      "best_ncols": best_ncols,
+                                      "param_count": len(names),
+                                      "parse_success": parsed is not None,
+                                      "parse_score": parsed["parse_score"] if parsed else "",
+                                      "parsed_axes": ";".join(parsed["parsed_axes"]) if parsed else "",
+                                      "rows_used": parsed["rows_used"] if parsed else "",
+                                      "rows_skipped": parsed["rows_skipped"] if parsed else ""
+                                  }
+                                  parser_attempt_rows.append(attempt_row)
+
+                                  if parsed is not None:
+                                      if best_parse is None or parsed["parse_score"] > best_parse["parse_score"]:
+                                          best_parse = parsed
+
+          if archive_download["ok"] and len(archive_inventory_rows) == 0 and not failed_gates:
+              failed_gates.append("archive_downloaded_but_no_files_inventoried")
+
+          if archive_download["ok"] and len(numeric_candidate_rows) == 0 and not failed_gates:
+              warnings.append("archive_inventoried_but_no_numeric_chain_candidates_detected")
+
+          if archive_download["ok"] and len(paramname_rows) == 0 and not failed_gates:
+              warnings.append("no_paramnames_or_parameter_files_detected")
+
+          if best_parse is None and archive_download["ok"] and not failed_gates:
+              warnings.append("no_clean_axis_parse_yet_column_mapping_needed")
+
+          if best_parse is not None:
+              parsed_axes = set(best_parse["parsed_axes"])
+              if "S8" not in parsed_axes:
+                  warnings.append("best_parse_did_not_include_S8_axis")
+              if "sigma8" not in parsed_axes:
+                  warnings.append("best_parse_did_not_include_sigma8_axis")
+              if "Omega_m" not in parsed_axes:
+                  warnings.append("best_parse_did_not_include_Omega_m_axis")
+
+          if failed_gates:
+              readiness_label = "kids_direct_chain_parser_probe_failed"
+              next_step = "Repair archive download/extraction before parser work."
+          elif best_parse is not None and "S8" in set(best_parse["parsed_axes"]):
+              readiness_label = "kids_direct_chain_parser_probe_completed_axis_parse_success"
+              next_step = (
+                  "Proceed to v4.5 KiDS direct-chain pressure replacement audit. "
+                  "Use the parsed KiDS chain axes as a candidate direct posterior replacement, but preserve product-role boundaries."
+              )
+          elif best_parse is not None:
+              readiness_label = "kids_direct_chain_parser_probe_completed_partial_axis_parse"
+              next_step = (
+                  "Proceed to v4.4.1 KiDS column-map repair. "
+                  "The chain parsed partially, but S8 was not cleanly recovered."
+              )
+          else:
+              readiness_label = "kids_direct_chain_parser_probe_completed_column_mapping_needed"
+              next_step = (
+                  "Proceed to v4.4.1 KiDS column-map repair. "
+                  "The product was inventoried, but chain/parameter mapping needs repair before pressure replacement."
+              )
+
+          pressure_rows = []
+          axis_summary_rows = []
+
+          if best_parse is not None:
+              for axis, summary in best_parse["summaries"].items():
+                  axis_summary_rows.append({
+                      "axis": axis,
+                      "q16": summary["q16"],
+                      "q50": summary["q50"],
+                      "q84": summary["q84"],
+                      "sigma_68": summary["sigma_68"],
+                      "weighted_mean": summary["weighted_mean"],
+                      "weighted_std": summary["weighted_std"],
+                      "sample_count": summary["sample_count"]
+                  })
+
+              for row in best_parse["pressure_rows"]:
+                  pressure_rows.append({
+                      "axis": row["axis"],
+                      "observable_value": row["observable_value"],
+                      "observable_sigma": row["observable_sigma"],
+                      "planck_value": row["planck_value"],
+                      "planck_sigma": row["planck_sigma"],
+                      "delta_observable_minus_planck": row["delta_observable_minus_planck"],
+                      "combined_sigma": row["combined_sigma"],
+                      "pressure_z": row["pressure_z"],
+                      "direction": row["direction"]
+                  })
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_ledger": SOURCE_LEDGER,
+              "download_status": {
+                  "archive": archive_download,
+                  "readme": readme_download
+              },
+              "archive_inventory_count": len(archive_inventory_rows),
+              "numeric_candidate_count": len(numeric_candidate_rows),
+              "paramname_candidate_count": len(paramname_rows),
+              "parser_attempt_count": len(parser_attempt_rows),
+              "best_parse_summary": None if best_parse is None else {
+                  "chain_path": best_parse["chain_path"],
+                  "param_path": best_parse["param_path"],
+                  "skip_columns": best_parse["skip_columns"],
+                  "param_count": best_parse["param_count"],
+                  "rows_read": best_parse["rows_read"],
+                  "rows_used": best_parse["rows_used"],
+                  "rows_skipped": best_parse["rows_skipped"],
+                  "parsed_axes": best_parse["parsed_axes"],
+                  "parse_score": best_parse["parse_score"],
+                  "s8_column_found": best_parse["s8_column_found"],
+                  "sigma8_column_found": best_parse["sigma8_column_found"],
+                  "omegam_column_found": best_parse["omegam_column_found"],
+                  "omega_fallback_possible": best_parse["omega_fallback_possible"],
+                  "axis_summaries": best_parse["summaries"],
+                  "pressure_rows": pressure_rows
+              },
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "combined_growth_posterior_built": False,
+                  "new_cosmological_model_fit": False
+              },
+              "gate_result": {
+                  "failed_gates": failed_gates,
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "archive_inventory_v4_4.csv",
+              archive_inventory_rows,
+              ["relative_path", "size_bytes", "suffixes", "name_lower"]
+          )
+
+          write_csv(
+              OUTDIR / "numeric_candidate_files_v4_4.csv",
+              numeric_candidate_rows,
+              [
+                  "relative_path",
+                  "size_bytes",
+                  "candidate_score",
+                  "score_reasons",
+                  "numeric_line_count",
+                  "text_line_count",
+                  "best_ncols",
+                  "best_ncols_count",
+                  "first_numeric_ncols",
+                  "first_numeric_preview",
+                  "first_text_preview"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "paramnames_inventory_v4_4.csv",
+              paramname_rows,
+              [
+                  "relative_path",
+                  "param_count",
+                  "contains_s8",
+                  "contains_sigma8",
+                  "contains_omegam",
+                  "contains_h0",
+                  "first_20_params"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "parser_attempts_v4_4.csv",
+              parser_attempt_rows,
+              [
+                  "chain_relative_path",
+                  "param_relative_path",
+                  "skip_columns",
+                  "best_ncols",
+                  "param_count",
+                  "parse_success",
+                  "parse_score",
+                  "parsed_axes",
+                  "rows_used",
+                  "rows_skipped"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "best_parse_axis_summary_v4_4.csv",
+              axis_summary_rows,
+              ["axis", "q16", "q50", "q84", "sigma_68", "weighted_mean", "weighted_std", "sample_count"]
+          )
+
+          write_csv(
+              OUTDIR / "best_parse_pressure_vs_planck_v4_4.csv",
+              pressure_rows,
+              [
+                  "axis",
+                  "observable_value",
+                  "observable_sigma",
+                  "planck_value",
+                  "planck_sigma",
+                  "delta_observable_minus_planck",
+                  "combined_sigma",
+                  "pressure_z",
+                  "direction"
+              ]
+          )
+
+          interpretation_rows = [
+              {
+                  "interpretation_id": "allowed_parser_probe_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "The KiDS candidate chain product was downloaded and parser-readiness was assessed.",
+                  "boundary": "Parser probe only, not validation."
+              },
+              {
+                  "interpretation_id": "allowed_axis_parse_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "If axes are parsed, they are candidate direct-chain values pending product-role review.",
+                  "boundary": "Parsed values do not automatically replace the prior KiDS cosmic-shear row."
+              },
+              {
+                  "interpretation_id": "forbidden_validation_claim",
+                  "status": "forbidden",
+                  "wording": "TAIRID is validated.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_model_comparison_claim",
+                  "status": "forbidden",
+                  "wording": "A likelihood, BIC, or model comparison was run.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_family_combination_claim",
+                  "status": "forbidden",
+                  "wording": "KiDS, DES, and HSC have been combined into a posterior.",
+                  "boundary": "Blocked."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "interpretation_boundaries_v4_4.csv",
+              interpretation_rows,
+              ["interpretation_id", "status", "wording", "boundary"]
+          )
+
+          json_path = OUTDIR / "tairid_cosmology_v4_4_kids_direct_chain_parser_probe.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v4.4 — KiDS Direct Chain Parser Probe")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v4.3 found KiDS as the clearest automatic posterior-chain candidate family.")
+          md.append("")
+          md.append("v4.4 downloads the KiDS-1000 3x2pt fiducial chain tarball, inventories the archive, searches for parameter-name files, probes numeric chain candidates, and attempts to parse S8, sigma8, and Omega_m if the column mapping is recoverable.")
+          md.append("")
+          md.append("It does not validate TAIRID, does not run a likelihood, and does not combine surveys.")
+          md.append("")
+          md.append("## Download status")
+          md.append("")
+          md.append("| Product | OK | Bytes | Error |")
+          md.append("|---|---:|---:|---|")
+          md.append(f"| KiDS chain archive | `{archive_download['ok']}` | `{archive_download['bytes']}` | `{archive_download['error']}` |")
+          md.append(f"| KiDS README | `{readme_download['ok']}` | `{readme_download['bytes']}` | `{readme_download['error']}` |")
+          md.append("")
+          md.append("## Inventory counts")
+          md.append("")
+          md.append("| Count | Value |")
+          md.append("|---|---:|")
+          md.append(f"| Archive files inventoried | `{len(archive_inventory_rows)}` |")
+          md.append(f"| Numeric candidate files | `{len(numeric_candidate_rows)}` |")
+          md.append(f"| Parameter-name candidates | `{len(paramname_rows)}` |")
+          md.append(f"| Parser attempts | `{len(parser_attempt_rows)}` |")
+          md.append("")
+          md.append("## Best parse")
+          md.append("")
+          if best_parse is None:
+              md.append("No clean axis parse was recovered yet. Use `numeric_candidate_files_v4_4.csv`, `paramnames_inventory_v4_4.csv`, and `parser_attempts_v4_4.csv` to repair the column map.")
+          else:
+              md.append(f"Best chain path: `{best_parse['chain_path']}`")
+              md.append("")
+              md.append(f"Best param path: `{best_parse['param_path']}`")
+              md.append("")
+              md.append(f"Skip columns: `{best_parse['skip_columns']}`")
+              md.append("")
+              md.append(f"Rows used: `{best_parse['rows_used']}`")
+              md.append("")
+              md.append(f"Parsed axes: `{', '.join(best_parse['parsed_axes'])}`")
+              md.append("")
+              md.append("### Axis summary")
+              md.append("")
+              md.append("| Axis | q16 | q50 | q84 | sigma 68 | sample count |")
+              md.append("|---|---:|---:|---:|---:|---:|")
+              for row in axis_summary_rows:
+                  md.append(
+                      f"| `{row['axis']}` | `{row['q16']:.12f}` | `{row['q50']:.12f}` | "
+                      f"`{row['q84']:.12f}` | `{row['sigma_68']:.12f}` | `{row['sample_count']}` |"
+                  )
+              md.append("")
+              md.append("### Optional pressure vs Planck")
+              md.append("")
+              md.append("| Axis | Delta | Pressure z | Direction |")
+              md.append("|---|---:|---:|---|")
+              for row in pressure_rows:
+                  md.append(
+                      f"| `{row['axis']}` | `{row['delta_observable_minus_planck']:.12f}` | "
+                      f"`{row['pressure_z']:.12f}` | `{row['direction']}` |"
+                  )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `archive_inventory_v4_4.csv`")
+          md.append("- `numeric_candidate_files_v4_4.csv`")
+          md.append("- `paramnames_inventory_v4_4.csv`")
+          md.append("- `parser_attempts_v4_4.csv`")
+          md.append("- `best_parse_axis_summary_v4_4.csv`")
+          md.append("- `best_parse_pressure_vs_planck_v4_4.csv`")
+          md.append("- `interpretation_boundaries_v4_4.csv`")
+          md.append("- `tairid_cosmology_v4_4_kids_direct_chain_parser_probe.json`")
+          md.append("- `tairid_cosmology_v4_4_kids_direct_chain_parser_probe.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_4_kids_direct_chain_parser_probe.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Inventory counts:")
+          print(json.dumps({
+              "archive_inventory_count": len(archive_inventory_rows),
+              "numeric_candidate_count": len(numeric_candidate_rows),
+              "paramname_candidate_count": len(paramname_rows),
+              "parser_attempt_count": len(parser_attempt_rows)
+          }, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.4 KiDS direct chain parser probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-4-kids-direct-chain-parser-probe
+          path: artifacts/tairid_cosmology_v4_4_kids_direct_chain_parser_probe/
