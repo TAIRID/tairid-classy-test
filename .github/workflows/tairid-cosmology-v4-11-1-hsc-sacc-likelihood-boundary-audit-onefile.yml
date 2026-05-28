@@ -1,0 +1,624 @@
+name: TAIRID Cosmology v4.11.1 HSC SACC Likelihood Boundary Audit Onefile
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  hsc-sacc-likelihood-boundary-audit-onefile:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.11.1 HSC SACC likelihood boundary audit onefile
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not combine KiDS, DES, and HSC into one posterior.",
+              "This does not parse HSC posterior chains.",
+              "This does not run the HSC likelihood.",
+              "This audits whether HSC products are data-vector/config/likelihood infrastructure rather than posterior-chain replacement rows."
+          ]
+
+          CONFIG_URLS = [
+              "https://raw.githubusercontent.com/joezuntz/cosmosis-standard-library/main/examples/hsc-y3-shear-real.ini",
+              "https://raw.githubusercontent.com/joezuntz/cosmosis-standard-library/main/examples/hsc-y3-shear-real-values.ini",
+              "https://raw.githubusercontent.com/joezuntz/cosmosis-standard-library/main/examples/hsc-y3-shear-real-priors.ini"
+          ]
+
+          REPO_API = "https://api.github.com/repos/HSC-S19A-cosmology-analysis/hscs19a3x2pt-likelihood"
+          REPO_RAW_BASE = "https://raw.githubusercontent.com/HSC-S19A-cosmology-analysis/hscs19a3x2pt-likelihood"
+
+          DATA_VECTOR_WORDS = ["sacc", "data_vector", "datavector", "fits", "covariance", "cov", "2pt", "shear", "xi", "cl", "fourier", "real"]
+          LIKELIHOOD_WORDS = ["likelihood", "cosmosis", "firecrown", "cobaya", "pipeline", "module", "config", "values", "priors", "chainutils"]
+          POSTERIOR_WORDS = ["posterior", "posteriors", "chain", "chains", "sample", "samples", "mcmc", "multinest"]
+
+          DATA_EXTENSIONS = [".sacc", ".fits", ".fit", ".h5", ".hdf5", ".npz", ".npy", ".dat", ".txt", ".csv", ".pkl", ".pickle"]
+          CONFIG_EXTENSIONS = [".py", ".ini", ".yaml", ".yml", ".json", ".md"]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def fetch_text(url, timeout=90, byte_limit=5_000_000):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.11.1-HSC-boundary-audit",
+                      "Accept": "*/*"
+                  }
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      body = response.read(byte_limit)
+                      charset = response.headers.get_content_charset() or "utf-8"
+                      text = body.decode(charset, errors="replace")
+                      return {
+                          "ok": True,
+                          "http_status": getattr(response, "status", 200),
+                          "content_type": response.headers.get("Content-Type", ""),
+                          "bytes_read": len(body),
+                          "text": text,
+                          "error": ""
+                      }
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes_read": 0,
+                      "text": "",
+                      "error": repr(exc)
+                  }
+
+          def fetch_json(url):
+              result = fetch_text(url, byte_limit=10_000_000)
+              if not result["ok"]:
+                  return result, None
+              try:
+                  return result, json.loads(result["text"])
+              except Exception as exc:
+                  result["ok"] = False
+                  result["error"] = f"json_parse_error:{repr(exc)}"
+                  return result, None
+
+          def normalize_path(value):
+              value = str(value or "").strip().strip("'\"")
+              value = value.split("#")[0].strip()
+              value = value.replace("\\", "/")
+              return value
+
+          def classify_path(path, context=""):
+              lower = f"{path} {context}".lower()
+              has_data_vector = any(word in lower for word in DATA_VECTOR_WORDS)
+              has_likelihood = any(word in lower for word in LIKELIHOOD_WORDS)
+              has_posterior = any(word in lower for word in POSTERIOR_WORDS)
+              has_data_ext = any(ext in lower for ext in DATA_EXTENSIONS)
+              has_config_ext = any(ext in lower for ext in CONFIG_EXTENSIONS)
+
+              if has_posterior and has_data_ext:
+                  return "possible_posterior_chain_or_sample_product"
+              if has_data_vector and has_data_ext:
+                  return "data_vector_or_sacc_product_not_posterior_chain"
+              if has_likelihood and has_config_ext:
+                  return "likelihood_code_or_config_not_posterior_chain"
+              if has_likelihood:
+                  return "likelihood_infrastructure_not_posterior_chain"
+              if has_data_ext:
+                  return "supporting_data_product_role_unclear"
+              if has_config_ext:
+                  return "supporting_config_or_code_product"
+              return "context_or_unknown_product"
+
+          def score_path(path, context=""):
+              lower = f"{path} {context}".lower()
+              score = 0
+              reasons = []
+
+              for word in DATA_VECTOR_WORDS:
+                  if word in lower:
+                      score += 7
+                      reasons.append(f"data_vector_word:{word}")
+
+              for word in LIKELIHOOD_WORDS:
+                  if word in lower:
+                      score += 6
+                      reasons.append(f"likelihood_word:{word}")
+
+              for word in POSTERIOR_WORDS:
+                  if word in lower:
+                      score += 8
+                      reasons.append(f"posterior_word:{word}")
+
+              for ext in DATA_EXTENSIONS:
+                  if ext in lower:
+                      score += 6
+                      reasons.append(f"data_extension:{ext}")
+
+              for ext in CONFIG_EXTENSIONS:
+                  if ext in lower:
+                      score += 3
+                      reasons.append(f"config_extension:{ext}")
+
+              return score, ";".join(reasons)
+
+          def parse_ini_paths(source_url, text):
+              rows = []
+              current_section = "GLOBAL"
+
+              for line_number, raw in enumerate((text or "").splitlines(), start=1):
+                  line = raw.strip()
+
+                  if not line or line.startswith("#") or line.startswith(";"):
+                      continue
+
+                  section = re.match(r"^\[([^\]]+)\]$", line)
+                  if section:
+                      current_section = section.group(1).strip()
+                      continue
+
+                  if "=" not in line:
+                      continue
+
+                  key, value = line.split("=", 1)
+                  key = key.strip()
+                  value = normalize_path(value)
+
+                  if not value:
+                      continue
+
+                  looks_like_product = (
+                      "/" in value
+                      or "\\" in value
+                      or value.startswith("http://")
+                      or value.startswith("https://")
+                      or any(ext in value.lower() for ext in DATA_EXTENSIONS + CONFIG_EXTENSIONS)
+                  )
+
+                  if not looks_like_product:
+                      continue
+
+                  if value.startswith("http://") or value.startswith("https://"):
+                      candidate_url = value
+                  else:
+                      candidate_url = urllib.parse.urljoin(
+                          "https://raw.githubusercontent.com/joezuntz/cosmosis-standard-library/main/",
+                          value
+                      )
+
+                  score, reasons = score_path(candidate_url, f"{current_section} {key}")
+
+                  rows.append({
+                      "source_url": source_url,
+                      "section": current_section,
+                      "key": key,
+                      "value": value,
+                      "candidate_url": candidate_url,
+                      "line_number": line_number,
+                      "candidate_score": score,
+                      "score_reasons": reasons,
+                      "classification": classify_path(candidate_url, f"{current_section} {key}")
+                  })
+
+              return rows
+
+          def repo_default_branch():
+              result, data = fetch_json(REPO_API)
+              if result["ok"] and isinstance(data, dict):
+                  return data.get("default_branch") or "main", result
+              return "main", result
+
+          def fetch_repo_tree(branch):
+              tree_url = f"{REPO_API}/git/trees/{branch}?recursive=1"
+              result, data = fetch_json(tree_url)
+              if result["ok"] and isinstance(data, dict):
+                  return result, data.get("tree", [])
+              return result, []
+
+          def repo_raw_url(branch, path):
+              return f"{REPO_RAW_BASE}/{branch}/{path}"
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          created_at = now_iso()
+
+          config_fetch_rows = []
+          config_candidate_rows = []
+
+          for url in CONFIG_URLS:
+              result = fetch_text(url)
+              config_fetch_rows.append({
+                  "url": url,
+                  "fetch_ok": result["ok"],
+                  "http_status": result["http_status"],
+                  "content_type": result["content_type"],
+                  "bytes_read": result["bytes_read"],
+                  "error": result["error"]
+              })
+
+              if result["ok"]:
+                  config_candidate_rows.extend(parse_ini_paths(url, result["text"]))
+
+          default_branch, repo_meta_fetch = repo_default_branch()
+          repo_tree_fetch, repo_tree = fetch_repo_tree(default_branch)
+
+          repo_candidate_rows = []
+
+          for item in repo_tree:
+              if item.get("type") != "blob":
+                  continue
+
+              path = item.get("path", "")
+              if not path:
+                  continue
+
+              score, reasons = score_path(path, "HSC S19A 3x2pt likelihood repository")
+              classification = classify_path(path, "HSC S19A 3x2pt likelihood repository")
+
+              if score <= 0:
+                  continue
+
+              repo_candidate_rows.append({
+                  "path": path,
+                  "raw_url": repo_raw_url(default_branch, path),
+                  "size": item.get("size", ""),
+                  "candidate_score": score,
+                  "score_reasons": reasons,
+                  "classification": classification
+              })
+
+          repo_candidate_rows.sort(key=lambda row: row["candidate_score"], reverse=True)
+          config_candidate_rows.sort(key=lambda row: row["candidate_score"], reverse=True)
+
+          all_product_rows = []
+
+          for row in config_candidate_rows:
+              all_product_rows.append({
+                  "source": "config",
+                  "product_id": f"{row['section']}::{row['key']}",
+                  "url_or_path": row["candidate_url"],
+                  "classification": row["classification"],
+                  "candidate_score": row["candidate_score"],
+                  "score_reasons": row["score_reasons"]
+              })
+
+          for row in repo_candidate_rows:
+              all_product_rows.append({
+                  "source": "repo_tree",
+                  "product_id": row["path"],
+                  "url_or_path": row["raw_url"],
+                  "classification": row["classification"],
+                  "candidate_score": row["candidate_score"],
+                  "score_reasons": row["score_reasons"]
+              })
+
+          posterior_candidates = [
+              row for row in all_product_rows
+              if row["classification"] == "possible_posterior_chain_or_sample_product"
+          ]
+
+          data_vector_rows = [
+              row for row in all_product_rows
+              if row["classification"] == "data_vector_or_sacc_product_not_posterior_chain"
+          ]
+
+          likelihood_rows = [
+              row for row in all_product_rows
+              if row["classification"] in [
+                  "likelihood_code_or_config_not_posterior_chain",
+                  "likelihood_infrastructure_not_posterior_chain"
+              ]
+          ]
+
+          supporting_data_rows = [
+              row for row in all_product_rows
+              if row["classification"] == "supporting_data_product_role_unclear"
+          ]
+
+          failed_gates = []
+          warnings = []
+
+          if not any(row["fetch_ok"] for row in config_fetch_rows):
+              failed_gates.append("no_hsc_config_files_fetchable")
+
+          if not repo_tree_fetch["ok"]:
+              warnings.append("hsc_repository_tree_not_fetchable")
+
+          if not posterior_candidates:
+              warnings.append("no_hsc_posterior_chain_or_sample_product_found")
+
+          if data_vector_rows:
+              warnings.append("hsc_data_vector_or_sacc_products_exist_but_are_not_posterior_chains")
+
+          if likelihood_rows:
+              warnings.append("hsc_likelihood_code_or_config_exists_but_likelihood_not_run")
+
+          if failed_gates:
+              readiness_label = "hsc_sacc_likelihood_boundary_audit_onefile_failed"
+              next_step = "Repair HSC config access before deciding HSC row status."
+          elif posterior_candidates:
+              readiness_label = "hsc_sacc_likelihood_boundary_audit_onefile_completed_possible_posterior_candidate_found"
+              next_step = (
+                  "Proceed to a parser probe only for the selected possible posterior/sample product. "
+                  "Do not run likelihood or combine surveys."
+              )
+          elif data_vector_rows or likelihood_rows:
+              readiness_label = "hsc_sacc_likelihood_boundary_audit_onefile_passed_keep_hsc_summary_row"
+              next_step = (
+                  "Keep HSC as a published-summary row for the growth-family checkpoint. "
+                  "Proceed to DES direct-product repair or write a v4.x robustness handoff."
+              )
+          else:
+              readiness_label = "hsc_sacc_likelihood_boundary_audit_onefile_completed_manual_selection_needed"
+              next_step = (
+                  "Manual HSC product selection is needed. Until then, keep HSC as a published-summary row."
+              )
+
+          selector_decision = {
+              "posterior_candidate_count": len(posterior_candidates),
+              "data_vector_or_sacc_count": len(data_vector_rows),
+              "likelihood_code_or_config_count": len(likelihood_rows),
+              "supporting_data_unclear_count": len(supporting_data_rows),
+              "hsc_direct_chain_replacement_allowed": bool(posterior_candidates),
+              "hsc_summary_row_should_remain_active": not bool(posterior_candidates),
+              "next_action": next_step
+          }
+
+          interpretation = (
+              "v4.11.1 checks the HSC product boundary after v4.10 showed chainutils.py is code, not posterior samples. "
+              "If HSC has SACC/data-vector and likelihood infrastructure but no posterior-chain samples, HSC should remain a published-summary row. "
+              "That does not weaken the v4.6 role-explicit checkpoint; it prevents a false direct-chain replacement claim."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "config_fetch_rows": config_fetch_rows,
+              "repo_fetch": {
+                  "repo_meta_ok": repo_meta_fetch["ok"],
+                  "repo_tree_ok": repo_tree_fetch["ok"],
+                  "default_branch": default_branch,
+                  "repo_meta_error": repo_meta_fetch["error"],
+                  "repo_tree_error": repo_tree_fetch["error"]
+              },
+              "config_candidate_rows": config_candidate_rows,
+              "repo_candidate_rows_top_100": repo_candidate_rows[:100],
+              "posterior_candidates": posterior_candidates,
+              "data_vector_or_sacc_rows": data_vector_rows,
+              "likelihood_rows": likelihood_rows,
+              "supporting_data_rows": supporting_data_rows,
+              "selector_decision": selector_decision,
+              "interpretation": interpretation,
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "combined_growth_posterior_built": False,
+                  "new_cosmological_model_fit": False,
+                  "posterior_chain_parsed": False
+              },
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False,
+                  "posterior_chain_parsed": False
+              }
+          }
+
+          write_csv(
+              OUTDIR / "hsc_config_fetch_v4_11_1.csv",
+              config_fetch_rows,
+              ["url", "fetch_ok", "http_status", "content_type", "bytes_read", "error"]
+          )
+
+          write_csv(
+              OUTDIR / "hsc_config_product_candidates_v4_11_1.csv",
+              config_candidate_rows,
+              [
+                  "source_url",
+                  "section",
+                  "key",
+                  "value",
+                  "candidate_url",
+                  "line_number",
+                  "candidate_score",
+                  "score_reasons",
+                  "classification"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "hsc_repo_product_candidates_v4_11_1.csv",
+              repo_candidate_rows[:300],
+              ["path", "raw_url", "size", "candidate_score", "score_reasons", "classification"]
+          )
+
+          write_csv(
+              OUTDIR / "hsc_product_boundary_summary_v4_11_1.csv",
+              all_product_rows,
+              ["source", "product_id", "url_or_path", "classification", "candidate_score", "score_reasons"]
+          )
+
+          write_csv(
+              OUTDIR / "hsc_selector_decision_v4_11_1.csv",
+              [selector_decision],
+              [
+                  "posterior_candidate_count",
+                  "data_vector_or_sacc_count",
+                  "likelihood_code_or_config_count",
+                  "supporting_data_unclear_count",
+                  "hsc_direct_chain_replacement_allowed",
+                  "hsc_summary_row_should_remain_active",
+                  "next_action"
+              ]
+          )
+
+          interpretation_rows = [
+              {
+                  "interpretation_id": "allowed_hsc_boundary_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "HSC product paths were classified as posterior candidates, SACC/data-vector products, likelihood/config/code, or unclear supporting data.",
+                  "boundary": "Product-boundary audit only, not posterior parsing."
+              },
+              {
+                  "interpretation_id": "allowed_summary_row_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "If no HSC posterior sample product is found, HSC remains a published-summary row in the growth-family checkpoint.",
+                  "boundary": "No direct-chain HSC replacement claim."
+              },
+              {
+                  "interpretation_id": "forbidden_likelihood_claim",
+                  "status": "forbidden",
+                  "wording": "An HSC likelihood was run.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_posterior_parse_claim",
+                  "status": "forbidden",
+                  "wording": "HSC posterior chains were parsed.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_validation_claim",
+                  "status": "forbidden",
+                  "wording": "TAIRID is validated.",
+                  "boundary": "Blocked."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "interpretation_boundaries_v4_11_1.csv",
+              interpretation_rows,
+              ["interpretation_id", "status", "wording", "boundary"]
+          )
+
+          json_path = OUTDIR / "tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v4.11.1 — HSC SACC / Likelihood Boundary Audit Onefile")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v4.11.1 checks whether HSC has a direct posterior-chain replacement product or only data-vector/config/likelihood infrastructure.")
+          md.append("")
+          md.append("This does not run an HSC likelihood and does not parse posterior chains.")
+          md.append("")
+          md.append("## Product boundary counts")
+          md.append("")
+          md.append("| Boundary | Count |")
+          md.append("|---|---:|")
+          md.append(f"| Possible posterior/sample products | `{len(posterior_candidates)}` |")
+          md.append(f"| SACC/data-vector products | `{len(data_vector_rows)}` |")
+          md.append(f"| Likelihood/config/code products | `{len(likelihood_rows)}` |")
+          md.append(f"| Supporting data unclear | `{len(supporting_data_rows)}` |")
+          md.append("")
+          md.append("## Selector decision")
+          md.append("")
+          md.append("| Field | Value |")
+          md.append("|---|---|")
+          for key, value in selector_decision.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append(interpretation)
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `hsc_config_fetch_v4_11_1.csv`")
+          md.append("- `hsc_config_product_candidates_v4_11_1.csv`")
+          md.append("- `hsc_repo_product_candidates_v4_11_1.csv`")
+          md.append("- `hsc_product_boundary_summary_v4_11_1.csv`")
+          md.append("- `hsc_selector_decision_v4_11_1.csv`")
+          md.append("- `interpretation_boundaries_v4_11_1.csv`")
+          md.append("- `tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile.json`")
+          md.append("- `tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Selector decision:")
+          print(json.dumps(selector_decision, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.11.1 HSC SACC likelihood boundary audit onefile artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-11-1-hsc-sacc-likelihood-boundary-audit-onefile
+          path: artifacts/tairid_cosmology_v4_11_1_hsc_sacc_likelihood_boundary_audit_onefile/
