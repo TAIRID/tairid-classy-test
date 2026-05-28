@@ -1,0 +1,775 @@
+name: TAIRID v4.36 BOSS fsigma8 Covariance Extraction
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-36-boss-fsigma8-covariance-extraction.yml"
+
+jobs:
+  tairid-v4-36-boss-fsigma8-covariance-extraction:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.36 BOSS fsigma8 covariance extraction
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_36_boss_fsigma8_covariance_extraction
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_36_boss_fsigma8_covariance_extraction")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_36_boss_fsigma8_covariance_extraction"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not run an RSD likelihood.",
+              "This does not compute a final RSD pressure score.",
+              "This does not apply covariance to residuals.",
+              "This extracts BOSS-only f_sigma8 covariance position metadata from the mapped BOSS DR12 consensus file.",
+              "A pass means BOSS f_sigma8 covariance positions are identified, not that the full RSD lane is covariance-aware."
+          ]
+
+          PACKAGE = {
+              "package_id": "boss_dr12_consensus_gaussian_constraints",
+              "survey_family": "BOSS_DR12",
+              "package_url": "https://data.sdss.org/sas/dr12/boss/papers/clustering/ALAM_ET_AL_2016_consensus_and_individual_Gaussian_constraints.tar.gz",
+              "selected_from": "v4.35 BOSS file mapping audit"
+          }
+
+          SELECTED_PAIR = {
+              "pair_id": "final_consensus_dV_FAP_fsig",
+              "role": "BAO_plus_FS_final_consensus_dV_FAP_fsigma8",
+              "results_member": "COMBINEDDR12_final_consensus_dV_FAP/final_consensus_results_dV_FAP_fsig.txt",
+              "covariance_member": "COMBINEDDR12_final_consensus_dV_FAP/final_consensus_covtot_dV_FAP_fsig.txt",
+              "v4_35_status": "mapped_to_current_BOSS_rows_after_inspection"
+          }
+
+          CURRENT_BOSS_ROWS = [
+              {
+                  "row_id": "boss_dr12_z038_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.38,
+                  "observable_axis": "f_sigma8",
+                  "current_value": 0.497,
+                  "current_sigma": 0.045,
+                  "current_status": "published_summary_value_ready"
+              },
+              {
+                  "row_id": "boss_dr12_z051_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.51,
+                  "observable_axis": "f_sigma8",
+                  "current_value": 0.458,
+                  "current_sigma": 0.038,
+                  "current_status": "published_summary_value_ready"
+              },
+              {
+                  "row_id": "boss_dr12_z061_fsigma8",
+                  "survey_family": "BOSS_DR12",
+                  "z_eff": 0.61,
+                  "observable_axis": "f_sigma8",
+                  "current_value": 0.436,
+                  "current_sigma": 0.034,
+                  "current_status": "published_summary_value_ready"
+              }
+          ]
+
+          EXTRACTION_RULES = [
+              {
+                  "rule_id": "selected_pair_carried_forward",
+                  "description": "The selected v4.35 pair must be carried forward exactly.",
+                  "failure_mode": "Wrong result/covariance file pair is extracted."
+              },
+              {
+                  "rule_id": "observable_order_extracted",
+                  "description": "The selected results file must provide the observable order used by the covariance matrix.",
+                  "failure_mode": "Covariance positions are guessed without observable order."
+              },
+              {
+                  "rule_id": "fsigma8_indices_identified",
+                  "description": "Exactly three f_sigma8 positions must be identified for z=0.38, 0.51, and 0.61.",
+                  "failure_mode": "BOSS f_sigma8 covariance submatrix cannot be extracted."
+              },
+              {
+                  "rule_id": "covariance_dimension_matches_result_vector",
+                  "description": "The covariance matrix dimension must match the full parsed result vector.",
+                  "failure_mode": "Covariance matrix and result order are incompatible."
+              },
+              {
+                  "rule_id": "fsigma8_submatrix_extracted",
+                  "description": "The BOSS f_sigma8 3x3 covariance submatrix must be extracted as metadata only.",
+                  "failure_mode": "No covariance submatrix available for later bounded preview."
+              },
+              {
+                  "rule_id": "no_covariance_application_or_pressure_now",
+                  "description": "The submatrix may be extracted, but not applied to residuals and not used for a pressure score.",
+                  "failure_mode": "Extraction audit becomes pressure testing."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "A final RSD pressure score was computed.",
+              "BOSS covariance was applied to residuals.",
+              "A BOSS likelihood was run.",
+              "The full RSD lane is covariance-aware because BOSS covariance was extracted.",
+              "WiggleZ and eBOSS covariance are resolved by BOSS covariance extraction.",
+              "BAO and f_sigma8 are one identical growth axis.",
+              "A likelihood, BIC, refit, or model comparison was run."
+          ]
+
+          NEXT_TEST_LADDER = [
+              {
+                  "priority": 1,
+                  "next_test": "v4_37_BOSS_only_covariance_residual_preview_guard",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Use the extracted BOSS-only f_sigma8 covariance submatrix for a bounded BOSS-only covariance residual preview, not a final RSD score.",
+                  "must_include": "BOSS-only status, f_sigma8 indices, covariance submatrix, reference uncertainty missing warning, no full-lane claim.",
+                  "must_not_include": "full RSD pressure score, validation claim, WiggleZ/eBOSS covariance claim."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "v4_38_SDSS_DR16_child_product_selection",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Inspect SDSS DR16 final cosmology directory children and identify candidate eBOSS covariance/likelihood products.",
+                  "must_include": "child product paths, tracer labels, row mapping status, published-summary boundary.",
+                  "must_not_include": "final pressure score or direct chain claim without parsing."
+              },
+              {
+                  "priority": 3,
+                  "next_test": "v4_39_RSD_reference_uncertainty_boundary_audit",
+                  "role_focus": "rsd_fsigma8_growth",
+                  "purpose": "Define how reference-model uncertainty must enter before stronger RSD comparison.",
+                  "must_include": "reference parameter uncertainty, Planck-chain boundary, growth curve uncertainty.",
+                  "must_not_include": "treating approximate reference curve as full posterior."
+              }
+          ]
+
+          def fetch_package(url, max_bytes=150_000_000, timeout=120):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0 TAIRID-v4.36-BOSS-fsigma8-covariance-extraction",
+                      "Accept": "application/gzip,application/x-tar,application/octet-stream,*/*"
+                  }
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  data = response.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      raise RuntimeError("package_exceeded_size_cap")
+                  return {
+                      "ok": True,
+                      "http_status": getattr(response, "status", 200),
+                      "content_type": response.headers.get("Content-Type", ""),
+                      "bytes_read": len(data),
+                      "data": data
+                  }
+
+          def read_member_text(tar, member_name):
+              member = tar.getmember(member_name)
+              f = tar.extractfile(member)
+              if f is None:
+                  return ""
+              return f.read().decode("utf-8", errors="replace")
+
+          def parse_results_text(text):
+              rows = []
+              pattern = re.compile(r"(?P<z>\d+\.\d+)\s+(?P<obs>[A-Za-z0-9_/\.\-]+)\s+(?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+              for idx, match in enumerate(pattern.finditer(text or "")):
+                  z = float(match.group("z"))
+                  obs = match.group("obs").strip()
+                  value = float(match.group("value"))
+                  obs_norm = obs.lower().replace("σ", "sigma")
+
+                  if obs_norm in ["fsig8", "f_sigma8", "fsigma8"]:
+                      axis = "f_sigma8"
+                  elif "dv" in obs_norm or "dm" in obs_norm or "hz" in obs_norm or "f_ap" in obs_norm or "fap" in obs_norm:
+                      axis = "distance_or_BAO_boundary"
+                  else:
+                      axis = "other"
+
+                  rows.append({
+                      "result_index": idx,
+                      "z_eff": z,
+                      "observable": obs,
+                      "observable_axis": axis,
+                      "value": value
+                  })
+              return rows
+
+          def parse_covariance_text(text):
+              values = []
+              for token in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text or ""):
+                  try:
+                      values.append(float(token))
+                  except Exception:
+                      pass
+
+              n = int(math.sqrt(len(values))) if values else 0
+              is_square = n * n == len(values) and n > 0
+
+              matrix = []
+              if is_square:
+                  for i in range(n):
+                      matrix.append(values[i*n:(i+1)*n])
+
+              return {
+                  "value_count": len(values),
+                  "dimension": n if is_square else "",
+                  "is_square": is_square,
+                  "matrix": matrix
+              }
+
+          def near(a, b, tol):
+              return abs(float(a) - float(b)) <= tol
+
+          failed_gates = []
+          warnings = []
+
+          download_info = {
+              "download_ok": False,
+              "http_status": "",
+              "content_type": "",
+              "bytes_read": 0,
+              "error": ""
+          }
+
+          parsed_result_rows = []
+          covariance_summary = {
+              "covariance_value_count": 0,
+              "covariance_dimension": "",
+              "covariance_is_square": False,
+              "dimension_matches_result_vector": False
+          }
+
+          fsigma_index_rows = []
+          fsigma_covariance_entries = []
+          fsigma_correlation_entries = []
+          fsigma_sigma_rows = []
+
+          selected_results_found = False
+          selected_covariance_found = False
+
+          try:
+              fetched = fetch_package(PACKAGE["package_url"])
+              download_info.update({
+                  "download_ok": fetched["ok"],
+                  "http_status": fetched["http_status"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": ""
+              })
+
+              with tarfile.open(fileobj=io.BytesIO(fetched["data"]), mode="r:gz") as tar:
+                  member_names = set(tar.getnames())
+
+                  selected_results_found = SELECTED_PAIR["results_member"] in member_names
+                  selected_covariance_found = SELECTED_PAIR["covariance_member"] in member_names
+
+                  results_text = read_member_text(tar, SELECTED_PAIR["results_member"]) if selected_results_found else ""
+                  covariance_text = read_member_text(tar, SELECTED_PAIR["covariance_member"]) if selected_covariance_found else ""
+
+                  parsed_result_rows = parse_results_text(results_text)
+                  cov = parse_covariance_text(covariance_text)
+
+                  covariance_summary = {
+                      "covariance_value_count": cov["value_count"],
+                      "covariance_dimension": cov["dimension"],
+                      "covariance_is_square": cov["is_square"],
+                      "dimension_matches_result_vector": cov["is_square"] and cov["dimension"] == len(parsed_result_rows)
+                  }
+
+                  fsigma_rows = [
+                      row for row in parsed_result_rows
+                      if row["observable_axis"] == "f_sigma8"
+                  ]
+
+                  current_by_z = {
+                      round(row["z_eff"], 2): row
+                      for row in CURRENT_BOSS_ROWS
+                  }
+
+                  for row in fsigma_rows:
+                      z_key = round(row["z_eff"], 2)
+                      current = current_by_z.get(z_key)
+                      current_value = current["current_value"] if current else ""
+                      current_sigma = current["current_sigma"] if current else ""
+                      value_matches_current = bool(current) and near(row["value"], current_value, 0.005)
+
+                      fsigma_index_rows.append({
+                          "result_index": row["result_index"],
+                          "z_eff": row["z_eff"],
+                          "observable": row["observable"],
+                          "observable_axis": row["observable_axis"],
+                          "package_value": row["value"],
+                          "current_row_id": current["row_id"] if current else "",
+                          "current_value": current_value,
+                          "current_sigma": current_sigma,
+                          "value_matches_current": value_matches_current
+                      })
+
+                  if cov["is_square"] and cov["dimension"] == len(parsed_result_rows):
+                      fsigma_indices = [row["result_index"] for row in fsigma_rows]
+
+                      for a, idx_i in enumerate(fsigma_indices):
+                          for b, idx_j in enumerate(fsigma_indices):
+                              cov_value = cov["matrix"][idx_i][idx_j]
+                              diag_i = cov["matrix"][idx_i][idx_i]
+                              diag_j = cov["matrix"][idx_j][idx_j]
+
+                              if diag_i > 0 and diag_j > 0:
+                                  corr_value = cov_value / math.sqrt(diag_i * diag_j)
+                              else:
+                                  corr_value = ""
+
+                              row_i = fsigma_rows[a]
+                              row_j = fsigma_rows[b]
+
+                              fsigma_covariance_entries.append({
+                                  "sub_i": a,
+                                  "sub_j": b,
+                                  "result_index_i": idx_i,
+                                  "result_index_j": idx_j,
+                                  "z_i": row_i["z_eff"],
+                                  "z_j": row_j["z_eff"],
+                                  "covariance_value": cov_value,
+                                  "covariance_applied_to_residuals_now": False,
+                                  "pressure_score_allowed_now": False
+                              })
+
+                              fsigma_correlation_entries.append({
+                                  "sub_i": a,
+                                  "sub_j": b,
+                                  "result_index_i": idx_i,
+                                  "result_index_j": idx_j,
+                                  "z_i": row_i["z_eff"],
+                                  "z_j": row_j["z_eff"],
+                                  "correlation_value": corr_value,
+                                  "covariance_applied_to_residuals_now": False,
+                                  "pressure_score_allowed_now": False
+                              })
+
+                      for row in fsigma_rows:
+                          idx = row["result_index"]
+                          diag = cov["matrix"][idx][idx]
+                          implied_sigma = math.sqrt(diag) if diag > 0 else ""
+                          current = current_by_z.get(round(row["z_eff"], 2))
+                          current_sigma = current["current_sigma"] if current else ""
+                          sigma_delta = abs(implied_sigma - current_sigma) if implied_sigma != "" and current_sigma != "" else ""
+
+                          fsigma_sigma_rows.append({
+                              "result_index": idx,
+                              "z_eff": row["z_eff"],
+                              "package_value": row["value"],
+                              "covariance_diagonal": diag,
+                              "implied_sigma_from_covariance": implied_sigma,
+                              "current_summary_sigma": current_sigma,
+                              "sigma_abs_delta": sigma_delta,
+                              "sigma_close_to_current_summary": sigma_delta != "" and sigma_delta <= 0.01
+                          })
+
+          except Exception as exc:
+              download_info["error"] = repr(exc)
+
+          if not download_info["download_ok"]:
+              failed_gates.append("package_download_failed")
+
+          if not selected_results_found:
+              failed_gates.append("selected_results_member_missing")
+
+          if not selected_covariance_found:
+              failed_gates.append("selected_covariance_member_missing")
+
+          if len(parsed_result_rows) == 0:
+              failed_gates.append("no_result_rows_parsed")
+
+          if len(fsigma_index_rows) != 3:
+              failed_gates.append("not_exactly_three_fsigma8_indices_identified")
+
+          expected_z = [0.38, 0.51, 0.61]
+          parsed_z = sorted(round(row["z_eff"], 2) for row in fsigma_index_rows)
+
+          if parsed_z != expected_z:
+              failed_gates.append("fsigma8_z_values_do_not_match_current_BOSS_rows")
+
+          if not all(row["value_matches_current"] is True for row in fsigma_index_rows):
+              failed_gates.append("package_fsigma8_values_do_not_match_current_BOSS_values")
+
+          if covariance_summary["dimension_matches_result_vector"] is not True:
+              failed_gates.append("covariance_dimension_does_not_match_result_vector")
+
+          if len(fsigma_covariance_entries) != 9:
+              failed_gates.append("fsigma8_3x3_covariance_submatrix_not_extracted")
+
+          if len(fsigma_correlation_entries) != 9:
+              failed_gates.append("fsigma8_3x3_correlation_submatrix_not_extracted")
+
+          if not all(row["covariance_diagonal"] > 0 for row in fsigma_sigma_rows):
+              failed_gates.append("nonpositive_fsigma8_covariance_diagonal")
+
+          if fsigma_sigma_rows and not all(row["sigma_close_to_current_summary"] is True for row in fsigma_sigma_rows):
+              warnings.append("implied_covariance_sigma_differs_from_current_summary_sigma_review_rounding_or_units")
+
+          for row in fsigma_covariance_entries + fsigma_correlation_entries:
+              if row["covariance_applied_to_residuals_now"] is not False:
+                  failed_gates.append("covariance_applied_to_residuals_violation")
+              if row["pressure_score_allowed_now"] is not False:
+                  failed_gates.append("pressure_score_allowed_violation")
+
+          rule_results = [
+              {
+                  "rule_id": "selected_pair_carried_forward",
+                  "pass": SELECTED_PAIR["pair_id"] == "final_consensus_dV_FAP_fsig",
+                  "result": SELECTED_PAIR["pair_id"],
+                  "boundary": "Uses the v4.35 selected pair."
+              },
+              {
+                  "rule_id": "observable_order_extracted",
+                  "pass": len(parsed_result_rows) > 0,
+                  "result": f"{len(parsed_result_rows)} result rows parsed",
+                  "boundary": "Observable order is metadata, not pressure."
+              },
+              {
+                  "rule_id": "fsigma8_indices_identified",
+                  "pass": len(fsigma_index_rows) == 3 and parsed_z == expected_z,
+                  "result": "three BOSS f_sigma8 indices identified at z=0.38,0.51,0.61",
+                  "boundary": "BOSS-only f_sigma8 positions identified."
+              },
+              {
+                  "rule_id": "covariance_dimension_matches_result_vector",
+                  "pass": covariance_summary["dimension_matches_result_vector"] is True,
+                  "result": f"covariance dimension {covariance_summary['covariance_dimension']} vs result rows {len(parsed_result_rows)}",
+                  "boundary": "Compatible dimension does not mean covariance has been applied."
+              },
+              {
+                  "rule_id": "fsigma8_submatrix_extracted",
+                  "pass": len(fsigma_covariance_entries) == 9 and len(fsigma_correlation_entries) == 9,
+                  "result": "BOSS f_sigma8 3x3 covariance and correlation entries extracted",
+                  "boundary": "Extraction only, no residual pressure."
+              },
+              {
+                  "rule_id": "no_covariance_application_or_pressure_now",
+                  "pass": all(row["covariance_applied_to_residuals_now"] is False and row["pressure_score_allowed_now"] is False for row in fsigma_covariance_entries),
+                  "result": "covariance not applied and pressure score blocked",
+                  "boundary": "No likelihood, no pressure score, no validation."
+              }
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_covariance_extraction_rules_passed")
+
+          warnings.append("BOSS_only_covariance_extraction_does_not_complete_full_RSD_lane")
+          warnings.append("WiggleZ_and_eBOSS_covariance_still_unresolved")
+          warnings.append("reference_model_uncertainty_still_missing")
+          warnings.append("covariance_extracted_but_not_applied")
+          warnings.append("v4_29_RSD_preview_remains_nonfinal")
+
+          if failed_gates:
+              readiness_label = "boss_fsigma8_covariance_extraction_failed"
+              next_step = "Repair BOSS f_sigma8 covariance extraction before any BOSS-only covariance preview."
+          else:
+              readiness_label = "boss_fsigma8_covariance_extraction_passed_ready_for_BOSS_only_covariance_residual_preview_guard"
+              next_step = (
+                  "Proceed to v4.37 BOSS-only covariance residual preview guard. "
+                  "Do not claim full RSD covariance awareness because WiggleZ and eBOSS covariance remain unresolved."
+              )
+
+          system_health = {
+              "download_ok": download_info["download_ok"],
+              "selected_pair_id": SELECTED_PAIR["pair_id"],
+              "selected_results_found": selected_results_found,
+              "selected_covariance_found": selected_covariance_found,
+              "parsed_result_row_count": len(parsed_result_rows),
+              "covariance_value_count": covariance_summary["covariance_value_count"],
+              "covariance_dimension": covariance_summary["covariance_dimension"],
+              "covariance_is_square": covariance_summary["covariance_is_square"],
+              "dimension_matches_result_vector": covariance_summary["dimension_matches_result_vector"],
+              "fsigma8_index_count": len(fsigma_index_rows),
+              "fsigma8_covariance_entry_count": len(fsigma_covariance_entries),
+              "fsigma8_correlation_entry_count": len(fsigma_correlation_entries),
+              "BOSS_fsigma8_covariance_extracted": len(fsigma_covariance_entries) == 9,
+              "full_RSD_covariance_complete": False,
+              "covariance_applied_to_residuals": False,
+              "likelihood_run": False,
+              "pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results)
+          }
+
+          interpretation = (
+              "v4.36 extracts the BOSS-only f_sigma8 covariance positions from the selected BOSS DR12 final-consensus file pair. "
+              "It identifies the full observable order, the three f_sigma8 indices, and the 3x3 BOSS f_sigma8 covariance/correlation entries. "
+              "This is still not a pressure test. Covariance is not applied to residuals, no likelihood is run, and the full RSD lane remains incomplete because WiggleZ and eBOSS covariance are unresolved."
+          )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "package": PACKAGE,
+              "selected_pair": SELECTED_PAIR,
+              "download_info": download_info,
+              "current_boss_rows": CURRENT_BOSS_ROWS,
+              "parsed_result_rows": parsed_result_rows,
+              "covariance_summary": covariance_summary,
+              "fsigma_index_rows": fsigma_index_rows,
+              "fsigma_sigma_rows": fsigma_sigma_rows,
+              "fsigma_covariance_entries": fsigma_covariance_entries,
+              "fsigma_correlation_entries": fsigma_correlation_entries,
+              "extraction_rules": EXTRACTION_RULES,
+              "rule_results": rule_results,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_test_ladder": NEXT_TEST_LADDER,
+              "system_health": system_health,
+              "interpretation": interpretation,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "new_final_pressure_score_built": False,
+                  "covariance_applied_to_residuals": False,
+                  "likelihood_run": False,
+                  "full_RSD_covariance_complete": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "posterior_model_comparison_run": False
+              }
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "boss_parsed_result_order_v4_36.csv",
+              parsed_result_rows,
+              ["result_index", "z_eff", "observable", "observable_axis", "value"]
+          )
+
+          write_csv(
+              OUTDIR / "boss_fsigma8_index_rows_v4_36.csv",
+              fsigma_index_rows,
+              [
+                  "result_index",
+                  "z_eff",
+                  "observable",
+                  "observable_axis",
+                  "package_value",
+                  "current_row_id",
+                  "current_value",
+                  "current_sigma",
+                  "value_matches_current"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_fsigma8_sigma_check_v4_36.csv",
+              fsigma_sigma_rows,
+              [
+                  "result_index",
+                  "z_eff",
+                  "package_value",
+                  "covariance_diagonal",
+                  "implied_sigma_from_covariance",
+                  "current_summary_sigma",
+                  "sigma_abs_delta",
+                  "sigma_close_to_current_summary"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_fsigma8_covariance_entries_v4_36.csv",
+              fsigma_covariance_entries,
+              [
+                  "sub_i",
+                  "sub_j",
+                  "result_index_i",
+                  "result_index_j",
+                  "z_i",
+                  "z_j",
+                  "covariance_value",
+                  "covariance_applied_to_residuals_now",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_fsigma8_correlation_entries_v4_36.csv",
+              fsigma_correlation_entries,
+              [
+                  "sub_i",
+                  "sub_j",
+                  "result_index_i",
+                  "result_index_j",
+                  "z_i",
+                  "z_j",
+                  "correlation_value",
+                  "covariance_applied_to_residuals_now",
+                  "pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "boss_covariance_extraction_rule_results_v4_36.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_36.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_ladder_v4_36.csv",
+              NEXT_TEST_LADDER,
+              ["priority", "next_test", "role_focus", "purpose", "must_include", "must_not_include"]
+          )
+
+          write_csv(
+              OUTDIR / "system_health_v4_36.csv",
+              [system_health],
+              [
+                  "download_ok",
+                  "selected_pair_id",
+                  "selected_results_found",
+                  "selected_covariance_found",
+                  "parsed_result_row_count",
+                  "covariance_value_count",
+                  "covariance_dimension",
+                  "covariance_is_square",
+                  "dimension_matches_result_vector",
+                  "fsigma8_index_count",
+                  "fsigma8_covariance_entry_count",
+                  "fsigma8_correlation_entry_count",
+                  "BOSS_fsigma8_covariance_extracted",
+                  "full_RSD_covariance_complete",
+                  "covariance_applied_to_residuals",
+                  "likelihood_run",
+                  "pressure_score_allowed_now",
+                  "validation_claim_allowed",
+                  "rule_pass_count",
+                  "rule_total_count"
+              ]
+          )
+
+          json_path = OUTDIR / "tairid_v4_36_boss_fsigma8_covariance_extraction.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID v4.36 — BOSS f_sigma8 Covariance Extraction Audit")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("The BOSS-only f_sigma8 covariance positions were extracted from the selected BOSS DR12 final-consensus file pair.")
+          md.append("")
+          md.append("This does not apply covariance to residuals, run a likelihood, compute pressure, or resolve WiggleZ/eBOSS covariance.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## BOSS f_sigma8 indices")
+          md.append("")
+          md.append("| Index | z | Package value | Current row | Current value | Match |")
+          md.append("|---:|---:|---:|---|---:|---:|")
+          for row in fsigma_index_rows:
+              md.append(
+                  f"| `{row['result_index']}` | `{row['z_eff']}` | `{row['package_value']}` | "
+                  f"`{row['current_row_id']}` | `{row['current_value']}` | `{row['value_matches_current']}` |"
+              )
+          md.append("")
+          md.append("## Rule results")
+          md.append("")
+          md.append("| Rule | Pass | Result | Boundary |")
+          md.append("|---|---:|---|---|")
+          for row in rule_results:
+              md.append(f"| `{row['rule_id']}` | `{row['pass']}` | `{row['result']}` | {row['boundary']} |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `boss_parsed_result_order_v4_36.csv`")
+          md.append("- `boss_fsigma8_index_rows_v4_36.csv`")
+          md.append("- `boss_fsigma8_sigma_check_v4_36.csv`")
+          md.append("- `boss_fsigma8_covariance_entries_v4_36.csv`")
+          md.append("- `boss_fsigma8_correlation_entries_v4_36.csv`")
+          md.append("- `boss_covariance_extraction_rule_results_v4_36.csv`")
+          md.append("- `blocked_claims_v4_36.csv`")
+          md.append("- `next_test_ladder_v4_36.csv`")
+          md.append("- `system_health_v4_36.csv`")
+          md.append("- `tairid_v4_36_boss_fsigma8_covariance_extraction.json`")
+          md.append("- `tairid_v4_36_boss_fsigma8_covariance_extraction.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_v4_36_boss_fsigma8_covariance_extraction.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.36 BOSS fsigma8 covariance extraction artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-36-boss-fsigma8-covariance-extraction
+          path: artifacts/tairid_v4_36_boss_fsigma8_covariance_extraction/
