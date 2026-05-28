@@ -1,0 +1,950 @@
+name: TAIRID Cosmology v3.33 Independent Reach Lane Contrast Audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  independent-reach-lane-contrast-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install scientific Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      - name: Run TAIRID v3.33 independent reach lane contrast audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_33
+
+          python - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_33")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_33_independent_reach_lane_contrast_audit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This contrasts independent reach lanes after v3.32 blocked global BAO reach-anchor promotion.",
+              "BAO remains a mixed/subfamily diagnostic unless a later audit says otherwise.",
+              "SH0ES is tested only as a local-ladder H0 reach lane if a source value and uncertainty can be parsed.",
+              "H0LiCOW is inspected as a time-delay reach lane candidate but is not pressure-scored here.",
+              "DESI remains excluded because v3.25 showed the mapped DESI reach rows are scaled counterparts.",
+              "TDCOSMO remains parked because v3.30 flagged TDLMC seed-row provenance review.",
+              "No row may be promoted to model-anchor status.",
+              "No refit is allowed from this contrast audit."
+          ]
+
+          C_LIGHT = 299792.458
+
+          PLANCK_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PLANCK_MARGESTATS_PATH = "base/plikHM_TTTEEE_lowl_lowE/dist/base_plikHM_TTTEEE_lowl_lowE.margestats"
+
+          SH0ES_LSTSQ_URL = "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/SH0ES_Data/lstsq_results.txt"
+          SH0ES_LADDER_DATA_URL = "https://raw.githubusercontent.com/PantheonPlusSH0ES/DataRelease/main/SH0ES_Data/optical_wes_R22_for19fromR16.dat"
+
+          H0LICOW_DATA_PAGE_URL = "https://shsuyu.github.io/H0LiCOW/site/h0licow_data.html"
+
+          EBOSS_PRODUCTS = [
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_LRG",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_LRG_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR16_QSO",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR16_QSO_BAO_DMDH_covtot.txt"
+              },
+              {
+                  "source": "SDSS_eBOSS_DR16",
+                  "family": "eBOSS_DR12_LRG",
+                  "data_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH.txt",
+                  "cov_url": "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_0/likelihoods/BAO-only/sdss_DR12_LRG_BAO_DMDH_covtot.txt"
+              }
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def safe_name(url):
+              name = url.split("?")[0].rstrip("/").split("/")[-1]
+              name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+              return name or "downloaded_product"
+
+          def download(url, path, timeout=300):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.33-independent-reach-lane-contrast-audit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  status = getattr(resp, "status", None)
+                  if status is None or not (200 <= status < 400):
+                      raise RuntimeError(f"Download failed: HTTP {status}")
+
+                  with open(path, "wb") as f:
+                      shutil.copyfileobj(resp, f)
+
+                  return {
+                      "url": url,
+                      "path": str(path),
+                      "status": status,
+                      "size_bytes": path.stat().st_size,
+                      "content_type": resp.headers.get("Content-Type"),
+                      "content_length_header": resp.headers.get("Content-Length")
+                  }
+
+          def fetch_text(url, timeout=120):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v3.33-independent-reach-lane-contrast-audit/1.0",
+                      "Accept": "*/*"
+                  }
+              )
+              with urllib.request.urlopen(req, timeout=timeout) as resp:
+                  text = resp.read(2_000_000).decode("utf-8", errors="replace")
+                  return {
+                      "url": url,
+                      "status": getattr(resp, "status", None),
+                      "content_type": resp.headers.get("Content-Type"),
+                      "text": text
+                  }
+
+          def parse_planck_margestats(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("Marginalized") or stripped.startswith("parameter"):
+                      continue
+
+                  parts = stripped.split()
+                  if len(parts) < 12:
+                      continue
+
+                  name = parts[0].rstrip("*")
+                  try:
+                      rows.append({
+                          "parameter": name,
+                          "mean": float(parts[1]),
+                          "sddev": float(parts[2]),
+                          "label": " ".join(parts[12:]) if len(parts) > 12 else ""
+                      })
+                  except Exception:
+                      continue
+
+              return rows
+
+          def load_planck_reference():
+              planck_dir = DOWNLOADS / "Planck_2018"
+              zip_path = planck_dir / "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+              dl = download(PLANCK_ZIP_URL, zip_path)
+
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  if PLANCK_MARGESTATS_PATH not in zf.namelist():
+                      raise RuntimeError(f"Missing Planck margestats product: {PLANCK_MARGESTATS_PATH}")
+                  text = zf.read(PLANCK_MARGESTATS_PATH).decode("utf-8", errors="replace")
+
+              rows = parse_planck_margestats(text)
+              marg = {r["parameter"]: r for r in rows}
+              required = ["H0", "omegam", "rdrag"]
+              missing = [p for p in required if p not in marg]
+              if missing:
+                  raise RuntimeError(f"Missing Planck reference parameters: {missing}")
+
+              return {
+                  "download": dl,
+                  "H0": float(marg["H0"]["mean"]),
+                  "H0_sigma": float(marg["H0"]["sddev"]),
+                  "omegam": float(marg["omegam"]["mean"]),
+                  "omegam_sigma": float(marg["omegam"]["sddev"]),
+                  "rdrag": float(marg["rdrag"]["mean"]),
+                  "rdrag_sigma": float(marg["rdrag"]["sddev"]),
+                  "boundary": "Planck margestats are used only as a baseline reference, not a full likelihood."
+              }
+
+          def E_z(z, om):
+              return math.sqrt(om * (1.0 + z) ** 3 + (1.0 - om))
+
+          def integrate_simpson(func, a, b, n=1200):
+              if b <= a:
+                  return 0.0
+              if n % 2 == 1:
+                  n += 1
+              h = (b - a) / n
+              s = func(a) + func(b)
+              for i in range(1, n):
+                  x = a + i * h
+                  s += (4 if i % 2 == 1 else 2) * func(x)
+              return s * h / 3.0
+
+          def comoving_distance(z, H0, om):
+              integral = integrate_simpson(lambda x: 1.0 / E_z(x, om), 0.0, z)
+              return (C_LIGHT / H0) * integral
+
+          def dm_distance(z, H0, om):
+              return comoving_distance(z, H0, om)
+
+          def dh_distance(z, H0, om):
+              return C_LIGHT / (H0 * E_z(z, om))
+
+          def baseline_value(z, kind, planck):
+              if kind == "DM_over_rd":
+                  return dm_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              if kind == "DH_over_rd":
+                  return dh_distance(z, planck["H0"], planck["omegam"]) / planck["rdrag"]
+              raise RuntimeError(f"Unknown BAO baseline kind: {kind}")
+
+          def baseline_sigma_finite_difference(z, kind, planck):
+              base = baseline_value(z, kind, planck)
+              params = [
+                  ("H0", planck["H0"], planck["H0_sigma"]),
+                  ("omegam", planck["omegam"], planck["omegam_sigma"]),
+                  ("rdrag", planck["rdrag"], planck["rdrag_sigma"])
+              ]
+
+              variance = 0.0
+              for name, mean, sigma in params:
+                  if sigma <= 0:
+                      continue
+                  plus = dict(planck)
+                  minus = dict(planck)
+                  plus[name] = mean + sigma
+                  minus[name] = mean - sigma
+
+                  if name == "omegam":
+                      plus[name] = min(max(plus[name], 0.01), 0.99)
+                      minus[name] = min(max(minus[name], 0.01), 0.99)
+
+                  f_plus = baseline_value(z, kind, plus)
+                  f_minus = baseline_value(z, kind, minus)
+                  variance += ((f_plus - f_minus) / 2.0) ** 2
+
+              return math.sqrt(max(variance, 0.0)), base
+
+          def load_numeric_matrix(path):
+              text = path.read_text(encoding="utf-8", errors="replace")
+              lines = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+              arr = np.loadtxt(io.StringIO("\n".join(lines)))
+              if arr.ndim == 0:
+                  arr = arr.reshape((1, 1))
+              elif arr.ndim == 1:
+                  arr = arr.reshape((1, -1))
+              return arr
+
+          def parse_bao_data_table(path):
+              rows = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  parts = stripped.split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      rows.append({
+                          "z_eff": float(parts[0]),
+                          "value": float(parts[1]),
+                          "parameter": parts[2],
+                          "raw_line": stripped
+                      })
+                  except Exception:
+                      continue
+              return rows
+
+          def classify_bao_parameter(parameter):
+              lower = str(parameter).lower()
+              if "dm" in lower:
+                  return "DM_over_rd", "bao_transverse_reach"
+              if "dh" in lower:
+                  return "DH_over_rd", "bao_radial_reach"
+              return "unknown", "bao_unknown"
+
+          def ingest_eboss_pressure(planck):
+              eboss_dir = DOWNLOADS / "SDSS_eBOSS_DR16"
+              rows = []
+              source_rows = []
+
+              for product in EBOSS_PRODUCTS:
+                  data_path = eboss_dir / safe_name(product["data_url"])
+                  cov_path = eboss_dir / safe_name(product["cov_url"])
+                  download(product["data_url"], data_path)
+                  download(product["cov_url"], cov_path)
+
+                  data_rows = parse_bao_data_table(data_path)
+                  cov = load_numeric_matrix(cov_path)
+                  covariance_match = cov.ndim == 2 and cov.shape[0] == cov.shape[1] == len(data_rows)
+
+                  if not covariance_match:
+                      raise RuntimeError(f"Covariance mismatch for {product['family']}")
+
+                  family_pressure_count = 0
+
+                  for i, row in enumerate(data_rows):
+                      kind, role = classify_bao_parameter(row["parameter"])
+                      if kind == "unknown":
+                          continue
+
+                      diag = float(cov[i, i])
+                      if diag < 0:
+                          raise RuntimeError(f"Negative covariance diagonal for {product['family']} row {i}")
+
+                      sigma_obs = math.sqrt(diag)
+                      sigma_base, baseline = baseline_sigma_finite_difference(row["z_eff"], kind, planck)
+                      combined_sigma = math.sqrt(sigma_obs ** 2 + sigma_base ** 2)
+                      residual = row["value"] - baseline
+                      pressure = residual / combined_sigma if combined_sigma > 0 else None
+
+                      rows.append({
+                          "lane": "BAO",
+                          "source": product["source"],
+                          "family": product["family"],
+                          "standard_role": role,
+                          "parameter": row["parameter"],
+                          "z_eff": row["z_eff"],
+                          "observed_value": row["value"],
+                          "observed_sigma": sigma_obs,
+                          "baseline_value": baseline,
+                          "baseline_sigma": sigma_base,
+                          "combined_sigma": combined_sigma,
+                          "pressure_z": pressure if pressure is not None else "",
+                          "pressure_sign": "positive" if pressure is not None and pressure > 0 else "negative" if pressure is not None and pressure < 0 else "zero",
+                          "diagnostic_only": True,
+                          "model_anchor_allowed_now": False,
+                          "eligible_for_global_reach_anchor": False,
+                          "boundary_note": "Clean eBOSS BAO pressure row; reviewed only as mixed/subfamily diagnostic."
+                      })
+                      family_pressure_count += 1
+
+                  source_rows.append({
+                      "source": product["source"],
+                      "family": product["family"],
+                      "data_rows": len(data_rows),
+                      "pressure_rows": family_pressure_count,
+                      "covariance_match": covariance_match
+                  })
+
+              return rows, source_rows
+
+          def summarize_bao_families(bao_rows):
+              out = []
+              for family in sorted(set(r["family"] for r in bao_rows)):
+                  subset = [r for r in bao_rows if r["family"] == family]
+                  pressures = [float(r["pressure_z"]) for r in subset if r["pressure_z"] != ""]
+                  pos = sum(1 for p in pressures if p > 0)
+                  neg = sum(1 for p in pressures if p < 0)
+                  mean = float(np.mean(pressures)) if pressures else None
+                  all_positive = len(pressures) > 0 and pos == len(pressures)
+                  mixed_or_negative = not all_positive
+
+                  out.append({
+                      "lane": "BAO",
+                      "source": "SDSS_eBOSS_DR16",
+                      "family": family,
+                      "row_count": len(subset),
+                      "mean_pressure_z": mean,
+                      "positive_count": pos,
+                      "negative_count": neg,
+                      "family_all_positive": all_positive,
+                      "family_mixed_or_negative": mixed_or_negative,
+                      "eligible_for_global_reach_anchor": False,
+                      "eligible_for_subfamily_record": all_positive,
+                      "diagnostic_only": True,
+                      "model_anchor_allowed_now": False,
+                      "boundary_note": "BAO family summary. Positive subfamily can be recorded, but global BAO anchor remains blocked."
+                  })
+              return out
+
+          def parse_shoes_h0_result(text, planck):
+              candidate_lines = []
+              for line in text.splitlines():
+                  low = line.lower()
+                  if "h0" in low or "h_0" in low or "hubble" in low:
+                      nums = []
+                      for token in re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", line):
+                          try:
+                              nums.append(float(token))
+                          except Exception:
+                              pass
+                      h0_candidates = [x for x in nums if 50.0 <= x <= 90.0]
+                      sigma_candidates = [x for x in nums if 0.1 <= x <= 5.0]
+
+                      if h0_candidates:
+                          candidate_lines.append({
+                              "line": line.strip()[:500],
+                              "numbers": nums,
+                              "h0_candidates": h0_candidates,
+                              "sigma_candidates": sigma_candidates
+                          })
+
+              if not candidate_lines:
+                  return None, candidate_lines
+
+              # Prefer a line that has both an H0-looking value and an uncertainty-looking value.
+              sorted_lines = sorted(
+                  candidate_lines,
+                  key=lambda x: (len(x["sigma_candidates"]) == 0, len(x["h0_candidates"]) == 0)
+              )
+              chosen = sorted_lines[0]
+
+              h0_value = chosen["h0_candidates"][0]
+              sigma_options = [s for s in chosen["sigma_candidates"] if abs(s - h0_value) > 10.0]
+              h0_sigma = sigma_options[0] if sigma_options else None
+
+              pressure = None
+              combined_sigma = None
+              if h0_sigma is not None:
+                  combined_sigma = math.sqrt(h0_sigma ** 2 + planck["H0_sigma"] ** 2)
+                  pressure = (h0_value - planck["H0"]) / combined_sigma if combined_sigma > 0 else None
+
+              row = {
+                  "lane": "SH0ES_local_ladder",
+                  "source": "PantheonPlus_SH0ES",
+                  "family": "SH0ES_lstsq_results",
+                  "standard_role": "local_ladder_H0_reach",
+                  "parameter": "H0",
+                  "observed_value": h0_value,
+                  "observed_sigma": h0_sigma if h0_sigma is not None else "",
+                  "baseline_family": "Planck_2018_H0_reference",
+                  "baseline_value": planck["H0"],
+                  "baseline_sigma": planck["H0_sigma"],
+                  "combined_sigma": combined_sigma if combined_sigma is not None else "",
+                  "pressure_z": pressure if pressure is not None else "",
+                  "pressure_sign": "positive" if pressure is not None and pressure > 0 else "negative" if pressure is not None and pressure < 0 else "unscored",
+                  "parser_line": chosen["line"],
+                  "pressure_score_built": pressure is not None,
+                  "diagnostic_only": True,
+                  "model_anchor_allowed_now": False,
+                  "eligible_for_reach_lane_contrast": pressure is not None,
+                  "boundary_note": "SH0ES H0 parsed from source text as local-ladder reach diagnostic; not a model anchor."
+              }
+
+              return row, candidate_lines
+
+          def inspect_shoes(planck):
+              shoes_dir = DOWNLOADS / "PantheonPlus_SH0ES"
+              shoes_dir.mkdir(parents=True, exist_ok=True)
+
+              lstsq_path = shoes_dir / safe_name(SH0ES_LSTSQ_URL)
+              ladder_path = shoes_dir / safe_name(SH0ES_LADDER_DATA_URL)
+
+              dl1 = download(SH0ES_LSTSQ_URL, lstsq_path)
+              dl2 = download(SH0ES_LADDER_DATA_URL, ladder_path)
+
+              text = lstsq_path.read_text(encoding="utf-8", errors="replace")
+              row, candidate_lines = parse_shoes_h0_result(text, planck)
+
+              # ladder shape only
+              ladder_text = ladder_path.read_text(encoding="utf-8", errors="replace")
+              ladder_rows = [
+                  line for line in ladder_text.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              ]
+
+              summary = {
+                  "source": "PantheonPlus_SH0ES",
+                  "lane": "local_ladder_sn_reach",
+                  "lstsq_downloaded": True,
+                  "ladder_downloaded": True,
+                  "candidate_line_count": len(candidate_lines),
+                  "h0_row_parsed": row is not None,
+                  "h0_pressure_scored": row is not None and row["pressure_score_built"] is True,
+                  "ladder_data_noncomment_rows": len(ladder_rows),
+                  "diagnostic_only": True,
+                  "model_anchor_allowed_now": False
+              }
+
+              return row, candidate_lines, summary, [dl1, dl2]
+
+          def inspect_h0licow():
+              page = fetch_text(H0LICOW_DATA_PAGE_URL)
+              text = page["text"]
+
+              links = []
+              for raw in re.findall(r'''href\s*=\s*["']([^"']+)["']''', text, flags=re.IGNORECASE):
+                  if raw.startswith("#") or raw.startswith("mailto:"):
+                      continue
+                  links.append(urllib.parse.urljoin(H0LICOW_DATA_PAGE_URL, raw))
+
+              lower = text.lower()
+              h0_terms = sum(lower.count(term) for term in ["h0", "time-delay", "time delay", "timedelay", "cosmography"])
+              data_links = [
+                  link for link in links
+                  if any(term in link.lower() for term in ["h0", "time", "delay", "data", ".dat", ".csv", ".tar", ".zip"])
+              ]
+
+              summary = {
+                  "source": "H0LiCOW",
+                  "lane": "strong_lens_time_delay_reach",
+                  "page_reachable": page["status"] is not None and 200 <= int(page["status"]) < 400,
+                  "status": page["status"],
+                  "content_type": page["content_type"],
+                  "h0_time_delay_term_hits": h0_terms,
+                  "link_count": len(links),
+                  "data_like_link_count": len(data_links),
+                  "pressure_scored": False,
+                  "diagnostic_only": True,
+                  "model_anchor_allowed_now": False,
+                  "boundary_note": "H0LiCOW is recorded as non-BAO time-delay reach lane candidate; no pressure score is built in v3.33."
+              }
+
+              link_rows = []
+              for link in data_links[:50]:
+                  link_rows.append({
+                      "source": "H0LiCOW",
+                      "lane": "strong_lens_time_delay_reach",
+                      "candidate_url": link,
+                      "diagnostic_only": True,
+                      "model_anchor_allowed_now": False
+                  })
+
+              return summary, link_rows
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": now_iso(),
+              "previous_milestone": {
+                  "v3_32_status": "independent_bao_eligibility_passed_subfamily_only_global_anchor_blocked",
+                  "v3_32_next_allowed_step": "Build v3.33 independent reach-lane contrast audit."
+              },
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_results": {},
+              "gate_result": {}
+          }
+
+          print("TAIRID Cosmology v3.33 independent reach-lane contrast audit")
+          print("Truth boundary: contrast audit only; no refit; no validation claim.")
+          print()
+
+          failed_gates = []
+          source_errors = {}
+
+          try:
+              planck = load_planck_reference()
+              inventory["source_results"]["Planck_2018"] = {
+                  "loaded": True,
+                  "H0": planck["H0"],
+                  "H0_sigma": planck["H0_sigma"],
+                  "omegam": planck["omegam"],
+                  "rdrag": planck["rdrag"],
+                  "boundary": planck["boundary"]
+              }
+              print("Planck baseline reference loaded.")
+          except Exception as e:
+              planck = None
+              failed_gates.append("planck_reference_load_failed")
+              source_errors["Planck_2018"] = f"{type(e).__name__}: {e}"
+              inventory["source_results"]["Planck_2018"] = {"loaded": False, "error": source_errors["Planck_2018"]}
+              print(f"Planck failed: {source_errors['Planck_2018']}")
+
+          bao_rows = []
+          bao_family_rows = []
+          bao_source_rows = []
+          shoes_row = None
+          shoes_candidate_lines = []
+          shoes_summary = {}
+          h0licow_summary = {}
+          h0licow_links = []
+
+          if planck is not None:
+              try:
+                  bao_rows, bao_source_rows = ingest_eboss_pressure(planck)
+                  bao_family_rows = summarize_bao_families(bao_rows)
+                  inventory["source_results"]["SDSS_eBOSS_DR16"] = {
+                      "loaded": True,
+                      "pressure_row_count": len(bao_rows),
+                      "family_count": len(bao_family_rows)
+                  }
+                  print(f"eBOSS BAO rows: {len(bao_rows)}")
+              except Exception as e:
+                  failed_gates.append("eboss_bao_contrast_failed")
+                  source_errors["SDSS_eBOSS_DR16"] = f"{type(e).__name__}: {e}"
+                  inventory["source_results"]["SDSS_eBOSS_DR16"] = {"loaded": False, "error": source_errors["SDSS_eBOSS_DR16"]}
+                  print(f"eBOSS failed: {source_errors['SDSS_eBOSS_DR16']}")
+
+              try:
+                  shoes_row, shoes_candidate_lines, shoes_summary, downloads = inspect_shoes(planck)
+                  inventory["source_results"]["PantheonPlus_SH0ES"] = shoes_summary
+                  print(f"SH0ES H0 parsed: {shoes_summary.get('h0_row_parsed')}")
+              except Exception as e:
+                  failed_gates.append("shoes_contrast_source_failed")
+                  source_errors["PantheonPlus_SH0ES"] = f"{type(e).__name__}: {e}"
+                  inventory["source_results"]["PantheonPlus_SH0ES"] = {"loaded": False, "error": source_errors["PantheonPlus_SH0ES"]}
+                  print(f"SH0ES failed: {source_errors['PantheonPlus_SH0ES']}")
+
+              try:
+                  h0licow_summary, h0licow_links = inspect_h0licow()
+                  inventory["source_results"]["H0LiCOW"] = h0licow_summary
+                  print(f"H0LiCOW reachable: {h0licow_summary.get('page_reachable')}")
+              except Exception as e:
+                  failed_gates.append("h0licow_contrast_source_failed")
+                  source_errors["H0LiCOW"] = f"{type(e).__name__}: {e}"
+                  inventory["source_results"]["H0LiCOW"] = {"loaded": False, "error": source_errors["H0LiCOW"]}
+                  print(f"H0LiCOW failed: {source_errors['H0LiCOW']}")
+
+          contrast_rows = []
+
+          eboss_pressures = [float(r["pressure_z"]) for r in bao_rows if r["pressure_z"] != ""]
+          eboss_positive = sum(1 for p in eboss_pressures if p > 0)
+          eboss_negative = sum(1 for p in eboss_pressures if p < 0)
+          eboss_mean = float(np.mean(eboss_pressures)) if eboss_pressures else None
+
+          positive_bao_subfamilies = [r for r in bao_family_rows if r["eligible_for_subfamily_record"] is True]
+          negative_or_mixed_bao_subfamilies = [r for r in bao_family_rows if r["family_mixed_or_negative"] is True]
+          global_bao_anchor_blocked = len(negative_or_mixed_bao_subfamilies) > 0
+
+          contrast_rows.append({
+              "lane": "BAO",
+              "source": "SDSS_eBOSS_DR16",
+              "contrast_role": "mixed_bao_reach_ruler_diagnostic",
+              "row_count": len(bao_rows),
+              "family_count": len(bao_family_rows),
+              "mean_pressure_z": eboss_mean if eboss_mean is not None else "",
+              "positive_count": eboss_positive,
+              "negative_count": eboss_negative,
+              "pressure_sign_summary": "mixed" if eboss_positive > 0 and eboss_negative > 0 else "positive" if eboss_positive > 0 else "negative" if eboss_negative > 0 else "unscored",
+              "global_reach_anchor_allowed": False,
+              "subfamily_candidate_count": len(positive_bao_subfamilies),
+              "diagnostic_only": True,
+              "model_anchor_allowed_now": False,
+              "boundary_note": "Independent BAO remains mixed/subfamily diagnostic after v3.32."
+          })
+
+          if shoes_row is not None:
+              contrast_rows.append({
+                  "lane": "SH0ES_local_ladder",
+                  "source": "PantheonPlus_SH0ES",
+                  "contrast_role": "non_bao_local_ladder_h0_reach",
+                  "row_count": 1,
+                  "family_count": 1,
+                  "mean_pressure_z": shoes_row["pressure_z"],
+                  "positive_count": 1 if shoes_row["pressure_sign"] == "positive" else 0,
+                  "negative_count": 1 if shoes_row["pressure_sign"] == "negative" else 0,
+                  "pressure_sign_summary": shoes_row["pressure_sign"],
+                  "global_reach_anchor_allowed": False,
+                  "subfamily_candidate_count": 0,
+                  "diagnostic_only": True,
+                  "model_anchor_allowed_now": False,
+                  "boundary_note": "SH0ES is a non-BAO local reach diagnostic if source H0 parsing succeeded; no model promotion."
+              })
+
+          contrast_rows.append({
+              "lane": "H0LiCOW_time_delay",
+              "source": "H0LiCOW",
+              "contrast_role": "non_bao_time_delay_reach_candidate_shape_only",
+              "row_count": h0licow_summary.get("data_like_link_count", 0),
+              "family_count": 0,
+              "mean_pressure_z": "",
+              "positive_count": "",
+              "negative_count": "",
+              "pressure_sign_summary": "not_pressure_scored",
+              "global_reach_anchor_allowed": False,
+              "subfamily_candidate_count": 0,
+              "diagnostic_only": True,
+              "model_anchor_allowed_now": False,
+              "boundary_note": "H0LiCOW is retained as a time-delay lane candidate; parser/pressure construction is deferred."
+          })
+
+          # Write outputs.
+          contrast_csv = OUTDIR / "independent_reach_lane_contrast_summary_v3_33.csv"
+          contrast_fields = [
+              "lane", "source", "contrast_role", "row_count", "family_count",
+              "mean_pressure_z", "positive_count", "negative_count",
+              "pressure_sign_summary", "global_reach_anchor_allowed",
+              "subfamily_candidate_count", "diagnostic_only",
+              "model_anchor_allowed_now", "boundary_note"
+          ]
+          with contrast_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=contrast_fields)
+              writer.writeheader()
+              for row in contrast_rows:
+                  writer.writerow({k: row.get(k, "") for k in contrast_fields})
+
+          bao_csv = OUTDIR / "independent_reach_lane_contrast_bao_rows_v3_33.csv"
+          bao_fields = [
+              "lane", "source", "family", "standard_role", "parameter",
+              "z_eff", "observed_value", "observed_sigma", "baseline_value",
+              "baseline_sigma", "combined_sigma", "pressure_z",
+              "pressure_sign", "diagnostic_only",
+              "model_anchor_allowed_now",
+              "eligible_for_global_reach_anchor",
+              "boundary_note"
+          ]
+          with bao_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=bao_fields)
+              writer.writeheader()
+              for row in bao_rows:
+                  writer.writerow({k: row.get(k, "") for k in bao_fields})
+
+          bao_family_csv = OUTDIR / "independent_reach_lane_contrast_bao_family_summary_v3_33.csv"
+          bao_family_fields = [
+              "lane", "source", "family", "row_count", "mean_pressure_z",
+              "positive_count", "negative_count", "family_all_positive",
+              "family_mixed_or_negative", "eligible_for_global_reach_anchor",
+              "eligible_for_subfamily_record", "diagnostic_only",
+              "model_anchor_allowed_now", "boundary_note"
+          ]
+          with bao_family_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=bao_family_fields)
+              writer.writeheader()
+              for row in bao_family_rows:
+                  writer.writerow({k: row.get(k, "") for k in bao_family_fields})
+
+          shoes_csv = OUTDIR / "independent_reach_lane_contrast_shoes_h0_v3_33.csv"
+          shoes_fields = [
+              "lane", "source", "family", "standard_role", "parameter",
+              "observed_value", "observed_sigma", "baseline_family",
+              "baseline_value", "baseline_sigma", "combined_sigma",
+              "pressure_z", "pressure_sign", "parser_line",
+              "pressure_score_built", "diagnostic_only",
+              "model_anchor_allowed_now", "eligible_for_reach_lane_contrast",
+              "boundary_note"
+          ]
+          with shoes_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=shoes_fields)
+              writer.writeheader()
+              if shoes_row is not None:
+                  writer.writerow({k: shoes_row.get(k, "") for k in shoes_fields})
+
+          h0licow_csv = OUTDIR / "independent_reach_lane_contrast_h0licow_links_v3_33.csv"
+          h0licow_fields = ["source", "lane", "candidate_url", "diagnostic_only", "model_anchor_allowed_now"]
+          with h0licow_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=h0licow_fields)
+              writer.writeheader()
+              for row in h0licow_links:
+                  writer.writerow({k: row.get(k, "") for k in h0licow_fields})
+
+          # Audit.
+          shoes_pressure_ready = shoes_row is not None and shoes_row.get("pressure_score_built") is True
+          h0licow_shape_ready = bool(h0licow_summary.get("page_reachable")) and h0licow_summary.get("data_like_link_count", 0) > 0
+
+          diagnostic_only_count = sum(1 for r in contrast_rows if r["diagnostic_only"] is True)
+          model_anchor_count = sum(1 for r in contrast_rows if r["model_anchor_allowed_now"] is True)
+
+          audit_rows = [
+              {
+                  "audit_gate": "source_contrast_loads_completed",
+                  "pass": len(source_errors) == 0,
+                  "value": json.dumps(source_errors, sort_keys=True),
+                  "boundary": "Planck, eBOSS, SH0ES, and H0LiCOW should be inspected for contrast."
+              },
+              {
+                  "audit_gate": "bao_global_anchor_blocked",
+                  "pass": global_bao_anchor_blocked,
+                  "value": f"positive_subfamilies={len(positive_bao_subfamilies)}; negative_or_mixed={len(negative_or_mixed_bao_subfamilies)}",
+                  "boundary": "BAO remains mixed/subfamily diagnostic, not a global reach anchor."
+              },
+              {
+                  "audit_gate": "shoes_local_ladder_pressure_parsed",
+                  "pass": shoes_pressure_ready,
+                  "value": shoes_row.get("pressure_z", "") if shoes_row else "",
+                  "boundary": "SH0ES may become the next non-BAO reach-lane parser target if source H0 parsing works."
+              },
+              {
+                  "audit_gate": "h0licow_time_delay_shape_ready",
+                  "pass": h0licow_shape_ready,
+                  "value": h0licow_summary.get("data_like_link_count", 0),
+                  "boundary": "H0LiCOW is shape-ready only; no pressure score is built here."
+              },
+              {
+                  "audit_gate": "non_bao_reach_lanes_available_for_next_test",
+                  "pass": shoes_pressure_ready or h0licow_shape_ready,
+                  "value": f"SH0ES={shoes_pressure_ready}; H0LiCOW={h0licow_shape_ready}",
+                  "boundary": "At least one non-BAO reach lane should be available after BAO global anchor was blocked."
+              },
+              {
+                  "audit_gate": "all_contrast_rows_diagnostic_only",
+                  "pass": diagnostic_only_count == len(contrast_rows) and model_anchor_count == 0,
+                  "value": f"diagnostic={diagnostic_only_count}; model_anchor={model_anchor_count}",
+                  "boundary": "No contrast row may be promoted to model anchor."
+              },
+              {
+                  "audit_gate": "refit_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No refit is allowed from v3.33."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          audit_csv = OUTDIR / "independent_reach_lane_contrast_audit_v3_33.csv"
+          with audit_csv.open("w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(f, fieldnames=["audit_gate", "pass", "value", "boundary"])
+              writer.writeheader()
+              for row in audit_rows:
+                  writer.writerow(row)
+
+          hard_failed = []
+          if planck is None:
+              hard_failed.append("planck_reference_missing")
+          if not bao_rows:
+              hard_failed.append("bao_contrast_rows_missing")
+          if not global_bao_anchor_blocked:
+              hard_failed.append("bao_global_anchor_unexpectedly_unblocked")
+          if not (shoes_pressure_ready or h0licow_shape_ready):
+              hard_failed.append("no_non_bao_reach_lane_available")
+          if model_anchor_count != 0:
+              hard_failed.append("model_anchor_promotion_violation")
+
+          if hard_failed:
+              readiness_label = "independent_reach_lane_contrast_needs_followup"
+          elif shoes_pressure_ready and h0licow_shape_ready:
+              readiness_label = "independent_reach_lane_contrast_passed_non_bao_lanes_ready"
+          elif shoes_pressure_ready:
+              readiness_label = "independent_reach_lane_contrast_passed_shoes_ready_h0licow_followup_needed"
+          else:
+              readiness_label = "independent_reach_lane_contrast_passed_h0licow_shape_ready_shoes_parser_followup_needed"
+
+          if shoes_pressure_ready:
+              next_step = "Build v3.34 SH0ES local-ladder reach pressure eligibility audit; keep BAO mixed and H0LiCOW shape-only unless parsed."
+          elif h0licow_shape_ready:
+              next_step = "Build v3.34 H0LiCOW time-delay parser/provenance audit; keep BAO mixed and do not refit."
+          else:
+              next_step = "Repair SH0ES/H0LiCOW non-BAO reach source parsing before continuing."
+
+          inventory["contrast_row_count"] = len(contrast_rows)
+          inventory["bao_row_count"] = len(bao_rows)
+          inventory["bao_family_count"] = len(bao_family_rows)
+          inventory["bao_global_anchor_blocked"] = global_bao_anchor_blocked
+          inventory["bao_positive_subfamilies"] = [r["family"] for r in positive_bao_subfamilies]
+          inventory["bao_negative_or_mixed_subfamilies"] = [r["family"] for r in negative_or_mixed_bao_subfamilies]
+          inventory["eboss_mean_pressure_z"] = eboss_mean
+          inventory["shoes_pressure_ready"] = shoes_pressure_ready
+          inventory["shoes_pressure_z"] = shoes_row.get("pressure_z") if shoes_row else None
+          inventory["h0licow_shape_ready"] = h0licow_shape_ready
+          inventory["h0licow_data_like_link_count"] = h0licow_summary.get("data_like_link_count", 0)
+          inventory["source_errors"] = source_errors
+
+          inventory["gate_result"] = {
+              "failed_gates": hard_failed,
+              "readiness_label": readiness_label,
+              "bao_global_anchor_blocked": global_bao_anchor_blocked,
+              "bao_positive_subfamilies": [r["family"] for r in positive_bao_subfamilies],
+              "bao_negative_or_mixed_subfamilies": [r["family"] for r in negative_or_mixed_bao_subfamilies],
+              "shoes_pressure_ready": shoes_pressure_ready,
+              "shoes_pressure_z": shoes_row.get("pressure_z") if shoes_row else None,
+              "h0licow_shape_ready": h0licow_shape_ready,
+              "model_claim_allowed": False,
+              "refit_allowed": False,
+              "next_allowed_step": next_step
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_33_independent_reach_lane_contrast_audit.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.33 — Independent Reach Lane Contrast Audit")
+          md.append("")
+          md.append(f"Created UTC: `{inventory['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v3.33 contrasts the mixed independent BAO lane against non-BAO reach lanes.")
+          md.append("")
+          md.append("BAO is kept as a mixed/subfamily diagnostic. SH0ES is tested as a local-ladder H0 reach diagnostic if the source value can be parsed. H0LiCOW is inspected as a time-delay reach candidate, but no pressure score is built for it here.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- BAO rows: `{len(bao_rows)}`")
+          md.append(f"- BAO families: `{len(bao_family_rows)}`")
+          md.append(f"- BAO global anchor blocked: `{global_bao_anchor_blocked}`")
+          md.append(f"- BAO positive subfamilies: `{', '.join([r['family'] for r in positive_bao_subfamilies]) if positive_bao_subfamilies else 'none'}`")
+          md.append(f"- BAO negative/mixed subfamilies: `{', '.join([r['family'] for r in negative_or_mixed_bao_subfamilies]) if negative_or_mixed_bao_subfamilies else 'none'}`")
+          md.append(f"- SH0ES pressure ready: `{shoes_pressure_ready}`")
+          md.append(f"- SH0ES pressure z: `{shoes_row.get('pressure_z') if shoes_row else None}`")
+          md.append(f"- H0LiCOW shape ready: `{h0licow_shape_ready}`")
+          md.append(f"- H0LiCOW data-like links: `{h0licow_summary.get('data_like_link_count', 0)}`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          md.append("The audit keeps BAO from being forced into a global reach-positive role. It then checks whether non-BAO reach lanes are ready for more focused parsing.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `independent_reach_lane_contrast_summary_v3_33.csv`")
+          md.append("- `independent_reach_lane_contrast_bao_rows_v3_33.csv`")
+          md.append("- `independent_reach_lane_contrast_bao_family_summary_v3_33.csv`")
+          md.append("- `independent_reach_lane_contrast_shoes_h0_v3_33.csv`")
+          md.append("- `independent_reach_lane_contrast_h0licow_links_v3_33.csv`")
+          md.append("- `independent_reach_lane_contrast_audit_v3_33.csv`")
+          md.append("- `tairid_cosmology_v3_33_independent_reach_lane_contrast_audit.json`")
+          md.append("- `tairid_cosmology_v3_33_independent_reach_lane_contrast_audit.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_33_independent_reach_lane_contrast_audit.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.33 independent reach lane contrast audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-33-independent-reach-lane-contrast-audit
+          path: artifacts/tairid_cosmology_v3_33/
