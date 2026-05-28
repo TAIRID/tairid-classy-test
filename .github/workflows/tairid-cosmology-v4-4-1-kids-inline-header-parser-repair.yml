@@ -1,0 +1,888 @@
+name: TAIRID Cosmology v4.4.1 KiDS Inline Header Parser Repair
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kids-inline-header-parser-repair:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.4.1 KiDS inline header parser repair
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v4_4_1_kids_inline_header_parser_repair
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import shutil
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v4_4_1_kids_inline_header_parser_repair")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v4_4_1_kids_inline_header_parser_repair"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute BIC, likelihood, posterior model comparison, or model selection.",
+              "This does not combine KiDS, DES, and HSC into one posterior.",
+              "This does not promote KiDS 3x2pt into a final replacement row without a later role-boundary audit.",
+              "This repairs the KiDS parser by reading CosmoSIS parameter names from the first header line of each sample file.",
+              "A pass means KiDS direct-chain axes were recovered from the product, not that TAIRID is validated."
+          ]
+
+          KIDS_CHAIN_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          KIDS_README_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          ARCHIVE_PATH = OUTDIR / "KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          README_PATH = OUTDIR / "KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          # Carried from v4.2 Planck-chain axis summary.
+          PLANCK_AXIS_REFERENCE = {
+              "S8": {"q50": 0.824821, "sigma_68": 0.012218},
+              "sigma8": {"q50": 0.810123, "sigma_68": 0.006639},
+              "Omega_m": {"q50": 0.310797, "sigma_68": 0.006153}
+          }
+
+          # Carried historical checks.
+          KIDS_CARRIED_3X2PT_S8_Q50 = 0.764565
+          KIDS_PUBLISHED_COSMIC_SHEAR_S8_Q50 = 0.759
+
+          SOURCE_LEDGER = [
+              {
+                  "source_id": "kids1000_3x2pt_fiducial_chains_tarball",
+                  "family": "KiDS",
+                  "source_url": KIDS_CHAIN_URL,
+                  "used_for": "Direct KiDS 3x2pt fiducial chain inline-header parser repair."
+              },
+              {
+                  "source_id": "kids1000_3x2pt_fiducial_chains_readme",
+                  "family": "KiDS",
+                  "source_url": KIDS_README_URL,
+                  "used_for": "Product documentation: CosmoSIS sample files list parameter names on the first line; last columns include prior, like, post, weight."
+              },
+              {
+                  "source_id": "v4_2_planck_axis_reference",
+                  "family": "Planck",
+                  "source_url": "local_prior_artifact_values",
+                  "used_for": "Planck chain-derived S8, sigma8, and Omega_m medians and widths carried forward for diagnostic comparison."
+              }
+          ]
+
+          EXPECTED_ROLES = {
+              "samples_multinest_blindC_EE.txt": "cosmic_shear_bandpower",
+              "samples_multinest_blindC_w.txt": "boss_dr12_galaxy_clustering",
+              "samples_multinest_blindC_EE_nE.txt": "cosmic_shear_plus_ggl",
+              "samples_multinest_blindC_EE_w.txt": "cosmic_shear_plus_galaxy_clustering",
+              "samples_multinest_blindC_EE_nE_w.txt": "fiducial_3x2pt_cosmic_shear_ggl_galaxy_clustering"
+          }
+
+          FIDUCIAL_3X2PT_FILENAME = "samples_multinest_blindC_EE_nE_w.txt"
+
+          S8_ALIASES = {
+              "cosmological_parameters__s_8",
+              "cosmological_parameters_s_8",
+              "s_8",
+              "s8"
+          }
+
+          SIGMA8_ALIASES = {
+              "cosmological_parameters__sigma_8",
+              "cosmological_parameters_sigma_8",
+              "sigma_8",
+              "sigma8"
+          }
+
+          OMEGAM_ALIASES = {
+              "cosmological_parameters__omega_m",
+              "cosmological_parameters_omega_m",
+              "omega_m",
+              "omegam"
+          }
+
+          WEIGHT_ALIASES = {"weight", "multinest_weight"}
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def finite(x):
+              try:
+                  return math.isfinite(float(x))
+              except Exception:
+                  return False
+
+          def normalize_name(name):
+              token = str(name).strip()
+              token = token.lstrip("#").strip()
+              token = token.replace("--", "__")
+              token = token.replace("-", "_")
+              token = token.replace("/", "_")
+              token = token.replace("\\", "_")
+              token = token.lower()
+              token = re.sub(r"[^a-z0-9_]+", "_", token)
+              token = re.sub(r"_+", "_", token).strip("_")
+              return token
+
+          def download_url(url, path, timeout=240):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Mozilla/5.0 TAIRID-v4.4.1-KiDS-inline-header-parser"}
+              )
+              with urllib.request.urlopen(request, timeout=timeout) as response:
+                  with path.open("wb") as f:
+                      shutil.copyfileobj(response, f)
+                  return {
+                      "ok": True,
+                      "http_status": getattr(response, "status", 200),
+                      "content_type": response.headers.get("Content-Type", ""),
+                      "bytes": path.stat().st_size,
+                      "error": ""
+                  }
+
+          def try_download_url(url, path):
+              try:
+                  return download_url(url, path)
+              except Exception as exc:
+                  return {
+                      "ok": False,
+                      "http_status": "",
+                      "content_type": "",
+                      "bytes": 0,
+                      "error": repr(exc)
+                  }
+
+          def safe_extract_tar(tar, path):
+              base = path.resolve()
+              for member in tar.getmembers():
+                  target = (path / member.name).resolve()
+                  if not str(target).startswith(str(base)):
+                      raise RuntimeError(f"Blocked unsafe tar path: {member.name}")
+              tar.extractall(path)
+
+          def find_column(header_names, aliases):
+              alias_set = {normalize_name(a) for a in aliases}
+              normalized = [normalize_name(h) for h in header_names]
+
+              for idx, name in enumerate(normalized):
+                  if name in alias_set:
+                      return idx
+
+              for idx, name in enumerate(normalized):
+                  for alias in alias_set:
+                      if alias and (name.endswith(alias) or alias in name):
+                          return idx
+
+              return None
+
+          def detect_inline_header(path):
+              with path.open("r", encoding="utf-8", errors="ignore") as f:
+                  for raw in f:
+                      line = raw.strip()
+                      if not line.startswith("#"):
+                          continue
+
+                      candidate = line.lstrip("#").strip()
+                      parts = candidate.replace(",", " ").split()
+
+                      if len(parts) < 10:
+                          continue
+
+                      normalized = [normalize_name(p) for p in parts]
+                      has_cosmosis = any("__" in p for p in normalized)
+                      has_s8 = find_column(normalized, S8_ALIASES) is not None
+                      has_sigma8 = find_column(normalized, SIGMA8_ALIASES) is not None
+                      has_omegam = find_column(normalized, OMEGAM_ALIASES) is not None
+                      has_weight = find_column(normalized, WEIGHT_ALIASES) is not None
+
+                      if has_cosmosis and (has_s8 or has_sigma8 or has_omegam) and has_weight:
+                          return normalized
+
+              return []
+
+          def weighted_quantile(values, quantiles, weights):
+              pairs = []
+              for v, w in zip(values, weights):
+                  if finite(v) and finite(w) and float(w) > 0:
+                      pairs.append((float(v), float(w)))
+
+              if not pairs:
+                  raise ValueError("No finite positive-weight samples remained.")
+
+              pairs.sort(key=lambda x: x[0])
+              total = sum(w for _, w in pairs)
+              output = []
+
+              for q in quantiles:
+                  target = float(q) * total
+                  cumulative = 0.0
+                  chosen = pairs[-1][0]
+
+                  for value, weight in pairs:
+                      cumulative += weight
+                      if cumulative >= target:
+                          chosen = value
+                          break
+
+                  output.append(chosen)
+
+              return output
+
+          def weighted_mean_std(values, weights):
+              pairs = []
+              for v, w in zip(values, weights):
+                  if finite(v) and finite(w) and float(w) > 0:
+                      pairs.append((float(v), float(w)))
+
+              if not pairs:
+                  raise ValueError("No finite positive-weight samples remained.")
+
+              total = sum(w for _, w in pairs)
+              mean = sum(v * w for v, w in pairs) / total
+              var = sum(w * (v - mean) ** 2 for v, w in pairs) / total
+              return mean, math.sqrt(max(var, 0.0))
+
+          def summarize_axis(values, weights):
+              q16, q50, q84 = weighted_quantile(values, [0.16, 0.50, 0.84], weights)
+              mean, std = weighted_mean_std(values, weights)
+
+              return {
+                  "q16": q16,
+                  "q50": q50,
+                  "q84": q84,
+                  "sigma_68": (q84 - q16) / 2.0,
+                  "weighted_mean": mean,
+                  "weighted_std": std,
+                  "sample_count": len(values)
+              }
+
+          def pressure_against_planck(axis, value, sigma):
+              ref = PLANCK_AXIS_REFERENCE[axis]
+              combined = math.sqrt(float(sigma) ** 2 + float(ref["sigma_68"]) ** 2)
+              delta = float(value) - float(ref["q50"])
+              z = delta / combined if combined > 0 else float("nan")
+
+              if delta < 0:
+                  direction = "negative"
+              elif delta > 0:
+                  direction = "positive"
+              else:
+                  direction = "zero"
+
+              abs_z = abs(z)
+
+              if abs_z >= 2.5:
+                  strength = "strong"
+              elif abs_z >= 1.5:
+                  strength = "moderate"
+              elif abs_z >= 0.25:
+                  strength = "weak"
+              else:
+                  strength = "near_zero"
+
+              return {
+                  "axis": axis,
+                  "observable_value": value,
+                  "observable_sigma": sigma,
+                  "planck_value": ref["q50"],
+                  "planck_sigma": ref["sigma_68"],
+                  "delta_observable_minus_planck": delta,
+                  "combined_sigma": combined,
+                  "pressure_z": z,
+                  "direction": direction,
+                  "strength": strength
+              }
+
+          def parse_cosmosis_sample_file(path, max_rows=None):
+              header = detect_inline_header(path)
+
+              if not header:
+                  return {
+                      "parse_success": False,
+                      "error": "inline_header_not_detected",
+                      "relative_header": "",
+                      "axis_summaries": {},
+                      "pressure_rows": [],
+                      "rows_used": 0,
+                      "rows_skipped": 0
+                  }
+
+              s8_idx = find_column(header, S8_ALIASES)
+              sigma8_idx = find_column(header, SIGMA8_ALIASES)
+              omegam_idx = find_column(header, OMEGAM_ALIASES)
+              weight_idx = find_column(header, WEIGHT_ALIASES)
+
+              if weight_idx is None:
+                  return {
+                      "parse_success": False,
+                      "error": "weight_column_not_detected",
+                      "relative_header": ";".join(header),
+                      "axis_summaries": {},
+                      "pressure_rows": [],
+                      "rows_used": 0,
+                      "rows_skipped": 0
+                  }
+
+              axis_values = {
+                  "S8": [],
+                  "sigma8": [],
+                  "Omega_m": []
+              }
+              weights = []
+
+              rows_used = 0
+              rows_skipped = 0
+              rows_read = 0
+
+              with path.open("r", encoding="utf-8", errors="ignore") as f:
+                  for raw in f:
+                      line = raw.strip()
+
+                      if not line:
+                          continue
+
+                      if line.startswith("#"):
+                          continue
+
+                      if max_rows is not None and rows_read >= max_rows:
+                          break
+
+                      parts = line.replace(",", " ").split()
+
+                      try:
+                          floats = [float(x) for x in parts]
+                      except Exception:
+                          rows_skipped += 1
+                          continue
+
+                      rows_read += 1
+
+                      if len(floats) < len(header):
+                          rows_skipped += 1
+                          continue
+
+                      weight = floats[weight_idx]
+
+                      if not finite(weight) or weight <= 0:
+                          rows_skipped += 1
+                          continue
+
+                      used_any = False
+
+                      if s8_idx is not None and s8_idx < len(floats) and finite(floats[s8_idx]):
+                          axis_values["S8"].append(float(floats[s8_idx]))
+                          used_any = True
+                      else:
+                          axis_values["S8"].append(float("nan"))
+
+                      if sigma8_idx is not None and sigma8_idx < len(floats) and finite(floats[sigma8_idx]):
+                          axis_values["sigma8"].append(float(floats[sigma8_idx]))
+                          used_any = True
+                      else:
+                          axis_values["sigma8"].append(float("nan"))
+
+                      if omegam_idx is not None and omegam_idx < len(floats) and finite(floats[omegam_idx]):
+                          axis_values["Omega_m"].append(float(floats[omegam_idx]))
+                          used_any = True
+                      else:
+                          axis_values["Omega_m"].append(float("nan"))
+
+                      if used_any:
+                          weights.append(float(weight))
+                          rows_used += 1
+                      else:
+                          rows_skipped += 1
+
+              axis_summaries = {}
+              pressure_rows = []
+
+              for axis, values in axis_values.items():
+                  clean_values = []
+                  clean_weights = []
+
+                  for value, weight in zip(values, weights):
+                      if finite(value) and finite(weight) and weight > 0:
+                          clean_values.append(float(value))
+                          clean_weights.append(float(weight))
+
+                  if len(clean_values) >= 50:
+                      summary = summarize_axis(clean_values, clean_weights)
+                      axis_summaries[axis] = summary
+                      pressure_rows.append(pressure_against_planck(axis, summary["q50"], summary["sigma_68"]))
+
+              return {
+                  "parse_success": bool(axis_summaries),
+                  "error": "" if axis_summaries else "no_axes_summarized",
+                  "relative_header": ";".join(header),
+                  "s8_column_found": s8_idx is not None,
+                  "sigma8_column_found": sigma8_idx is not None,
+                  "omegam_column_found": omegam_idx is not None,
+                  "weight_column_found": weight_idx is not None,
+                  "s8_column_index": s8_idx if s8_idx is not None else "",
+                  "sigma8_column_index": sigma8_idx if sigma8_idx is not None else "",
+                  "omegam_column_index": omegam_idx if omegam_idx is not None else "",
+                  "weight_column_index": weight_idx if weight_idx is not None else "",
+                  "header_column_count": len(header),
+                  "rows_read": rows_read,
+                  "rows_used": rows_used,
+                  "rows_skipped": rows_skipped,
+                  "axis_summaries": axis_summaries,
+                  "pressure_rows": pressure_rows
+              }
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          created_at = now_iso()
+
+          archive_download = try_download_url(KIDS_CHAIN_URL, ARCHIVE_PATH)
+          readme_download = try_download_url(KIDS_README_URL, README_PATH)
+
+          failed_gates = []
+          warnings = []
+
+          sample_file_rows = []
+          axis_summary_rows = []
+          pressure_rows = []
+          main_result = None
+
+          if not archive_download["ok"]:
+              failed_gates.append("kids_chain_archive_download_failed")
+          else:
+              with TemporaryDirectory() as tmp_name:
+                  tmp = Path(tmp_name)
+                  extract_dir = tmp / "extracted"
+                  extract_dir.mkdir(parents=True, exist_ok=True)
+
+                  try:
+                      with tarfile.open(ARCHIVE_PATH, "r:gz") as tar:
+                          safe_extract_tar(tar, extract_dir)
+                  except Exception as exc:
+                      failed_gates.append(f"archive_extract_failed:{repr(exc)}")
+
+                  if not failed_gates:
+                      sample_paths = [
+                          p for p in extract_dir.rglob("samples_multinest_*.txt")
+                          if p.is_file() and not p.name.startswith("._")
+                      ]
+
+                      if not sample_paths:
+                          failed_gates.append("no_samples_multinest_files_found")
+
+                      for path in sorted(sample_paths):
+                          parsed = parse_cosmosis_sample_file(path)
+                          role = EXPECTED_ROLES.get(path.name, "unknown_sample_role")
+                          rel = str(path.relative_to(extract_dir))
+
+                          sample_file_rows.append({
+                              "relative_path": rel,
+                              "filename": path.name,
+                              "role": role,
+                              "size_bytes": path.stat().st_size,
+                              "parse_success": parsed["parse_success"],
+                              "error": parsed["error"],
+                              "header_column_count": parsed.get("header_column_count", ""),
+                              "rows_read": parsed.get("rows_read", ""),
+                              "rows_used": parsed.get("rows_used", ""),
+                              "rows_skipped": parsed.get("rows_skipped", ""),
+                              "s8_column_found": parsed.get("s8_column_found", ""),
+                              "sigma8_column_found": parsed.get("sigma8_column_found", ""),
+                              "omegam_column_found": parsed.get("omegam_column_found", ""),
+                              "weight_column_found": parsed.get("weight_column_found", ""),
+                              "s8_column_index": parsed.get("s8_column_index", ""),
+                              "sigma8_column_index": parsed.get("sigma8_column_index", ""),
+                              "omegam_column_index": parsed.get("omegam_column_index", ""),
+                              "weight_column_index": parsed.get("weight_column_index", "")
+                          })
+
+                          for axis, summary in parsed["axis_summaries"].items():
+                              axis_summary_rows.append({
+                                  "relative_path": rel,
+                                  "filename": path.name,
+                                  "role": role,
+                                  "axis": axis,
+                                  "q16": summary["q16"],
+                                  "q50": summary["q50"],
+                                  "q84": summary["q84"],
+                                  "sigma_68": summary["sigma_68"],
+                                  "weighted_mean": summary["weighted_mean"],
+                                  "weighted_std": summary["weighted_std"],
+                                  "sample_count": summary["sample_count"]
+                              })
+
+                          for pressure in parsed["pressure_rows"]:
+                              pressure_rows.append({
+                                  "relative_path": rel,
+                                  "filename": path.name,
+                                  "role": role,
+                                  **pressure
+                              })
+
+                          if path.name == FIDUCIAL_3X2PT_FILENAME:
+                              main_result = {
+                                  "relative_path": rel,
+                                  "filename": path.name,
+                                  "role": role,
+                                  "parsed": parsed
+                              }
+
+          if not failed_gates and main_result is None:
+              failed_gates.append("fiducial_3x2pt_file_not_found")
+
+          if not failed_gates and main_result is not None and not main_result["parsed"]["parse_success"]:
+              failed_gates.append("fiducial_3x2pt_file_did_not_parse")
+
+          main_axis_summaries = {}
+          main_pressure_rows = []
+
+          if main_result is not None and main_result["parsed"]["parse_success"]:
+              main_axis_summaries = main_result["parsed"]["axis_summaries"]
+              main_pressure_rows = main_result["parsed"]["pressure_rows"]
+
+              if "S8" not in main_axis_summaries:
+                  failed_gates.append("fiducial_3x2pt_s8_not_recovered")
+
+              if "sigma8" not in main_axis_summaries:
+                  warnings.append("fiducial_3x2pt_sigma8_not_recovered")
+
+              if "Omega_m" not in main_axis_summaries:
+                  warnings.append("fiducial_3x2pt_omegam_not_recovered")
+
+              if "S8" in main_axis_summaries:
+                  diff_from_carried = abs(main_axis_summaries["S8"]["q50"] - KIDS_CARRIED_3X2PT_S8_Q50)
+
+                  if diff_from_carried <= 0.001:
+                      carried_value_check = "matches_carried_v3_58_3x2pt_s8_q50"
+                  else:
+                      carried_value_check = "does_not_match_carried_v3_58_3x2pt_s8_q50"
+                      warnings.append("fiducial_3x2pt_s8_differs_from_carried_value_by_more_than_0_001")
+              else:
+                  diff_from_carried = ""
+                  carried_value_check = "s8_not_available"
+
+          else:
+              diff_from_carried = ""
+              carried_value_check = "main_result_not_available"
+
+          parsed_file_count = sum(1 for row in sample_file_rows if row["parse_success"] is True)
+          s8_pressure_main = None
+
+          for row in main_pressure_rows:
+              if row["axis"] == "S8":
+                  s8_pressure_main = row
+
+          if s8_pressure_main is not None:
+              if s8_pressure_main["direction"] != "negative":
+                  failed_gates.append("fiducial_3x2pt_s8_pressure_not_negative_vs_planck")
+              elif abs(s8_pressure_main["pressure_z"]) < 1.5:
+                  warnings.append("fiducial_3x2pt_s8_pressure_below_moderate_1_5_sigma")
+          else:
+              if not failed_gates:
+                  failed_gates.append("fiducial_3x2pt_s8_pressure_not_computed")
+
+          if failed_gates:
+              readiness_label = "kids_inline_header_parser_repair_failed"
+              next_step = "Repair KiDS inline-header parsing before pressure replacement audit."
+          else:
+              readiness_label = "kids_inline_header_parser_repair_passed_direct_3x2pt_axes_recovered"
+              next_step = (
+                  "Proceed to v4.5 KiDS role-boundary pressure replacement audit. "
+                  "Use the recovered direct 3x2pt chain axes, but keep the distinction between KiDS cosmic shear and KiDS 3x2pt before replacing any row."
+              )
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_ledger": SOURCE_LEDGER,
+              "download_status": {
+                  "archive": archive_download,
+                  "readme": readme_download
+              },
+              "planck_axis_reference": PLANCK_AXIS_REFERENCE,
+              "sample_file_rows": sample_file_rows,
+              "axis_summary_rows": axis_summary_rows,
+              "pressure_rows": pressure_rows,
+              "main_fiducial_result": {
+                  "filename": FIDUCIAL_3X2PT_FILENAME,
+                  "role": "fiducial_3x2pt_cosmic_shear_ggl_galaxy_clustering",
+                  "axis_summaries": main_axis_summaries,
+                  "pressure_rows": main_pressure_rows,
+                  "diff_from_carried_3x2pt_s8_q50": diff_from_carried,
+                  "carried_value_check": carried_value_check,
+                  "published_cosmic_shear_s8_q50_for_role_boundary": KIDS_PUBLISHED_COSMIC_SHEAR_S8_Q50
+              },
+              "guardrail_check": {
+                  "validation_claim_allowed": False,
+                  "h0_solution_claim_allowed": False,
+                  "new_physics_claim_allowed": False,
+                  "standard_cosmology_disproof_claim_allowed": False,
+                  "refit_run": False,
+                  "bic_run": False,
+                  "likelihood_run": False,
+                  "posterior_model_comparison_run": False,
+                  "combined_growth_posterior_built": False,
+                  "new_cosmological_model_fit": False,
+                  "automatic_row_replacement_allowed": False
+              },
+              "gate_result": {
+                  "failed_gates": failed_gates,
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "parsed_file_count": parsed_file_count,
+                  "sample_file_count": len(sample_file_rows),
+                  "carried_value_check": carried_value_check,
+                  "next_allowed_step": next_step,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "bic_allowed": False,
+                  "likelihood_allowed": False,
+                  "posterior_model_comparison_allowed": False,
+                  "automatic_row_replacement_allowed": False
+              }
+          }
+
+          write_csv(
+              OUTDIR / "kids_sample_file_parse_inventory_v4_4_1.csv",
+              sample_file_rows,
+              [
+                  "relative_path",
+                  "filename",
+                  "role",
+                  "size_bytes",
+                  "parse_success",
+                  "error",
+                  "header_column_count",
+                  "rows_read",
+                  "rows_used",
+                  "rows_skipped",
+                  "s8_column_found",
+                  "sigma8_column_found",
+                  "omegam_column_found",
+                  "weight_column_found",
+                  "s8_column_index",
+                  "sigma8_column_index",
+                  "omegam_column_index",
+                  "weight_column_index"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids_axis_summary_v4_4_1.csv",
+              axis_summary_rows,
+              [
+                  "relative_path",
+                  "filename",
+                  "role",
+                  "axis",
+                  "q16",
+                  "q50",
+                  "q84",
+                  "sigma_68",
+                  "weighted_mean",
+                  "weighted_std",
+                  "sample_count"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids_pressure_vs_planck_v4_4_1.csv",
+              pressure_rows,
+              [
+                  "relative_path",
+                  "filename",
+                  "role",
+                  "axis",
+                  "observable_value",
+                  "observable_sigma",
+                  "planck_value",
+                  "planck_sigma",
+                  "delta_observable_minus_planck",
+                  "combined_sigma",
+                  "pressure_z",
+                  "direction",
+                  "strength"
+              ]
+          )
+
+          interpretation_rows = [
+              {
+                  "interpretation_id": "allowed_inline_header_parser_repair_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "The KiDS CosmoSIS sample files were parsed using their inline first-line parameter headers.",
+                  "boundary": "Parser repair only, not validation."
+              },
+              {
+                  "interpretation_id": "allowed_direct_3x2pt_axis_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "The fiducial KiDS 3x2pt chain axes may be used in a later role-boundary pressure replacement audit.",
+                  "boundary": "This does not automatically replace the KiDS cosmic-shear row."
+              },
+              {
+                  "interpretation_id": "allowed_role_boundary_statement",
+                  "status": "allowed_with_boundary",
+                  "wording": "KiDS 3x2pt and KiDS cosmic shear must remain role-distinct until a later audit decides which row belongs in each comparison.",
+                  "boundary": "Blocks hidden row substitution."
+              },
+              {
+                  "interpretation_id": "forbidden_validation_claim",
+                  "status": "forbidden",
+                  "wording": "TAIRID is validated.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_model_comparison_claim",
+                  "status": "forbidden",
+                  "wording": "A likelihood, BIC, or model comparison was run.",
+                  "boundary": "Blocked."
+              },
+              {
+                  "interpretation_id": "forbidden_automatic_replacement_claim",
+                  "status": "forbidden",
+                  "wording": "The KiDS 3x2pt chain automatically replaces every prior KiDS row.",
+                  "boundary": "Blocked."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "interpretation_boundaries_v4_4_1.csv",
+              interpretation_rows,
+              ["interpretation_id", "status", "wording", "boundary"]
+          )
+
+          json_path = OUTDIR / "tairid_cosmology_v4_4_1_kids_inline_header_parser_repair.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v4.4.1 — KiDS Inline-Header Parser Repair")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(failed_gates) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this test does")
+          md.append("")
+          md.append("v4.4 found the KiDS chain archive and README, but no separate `.paramnames` files.")
+          md.append("")
+          md.append("v4.4.1 repairs that by reading the CosmoSIS parameter names from the first header line of each sample file. It then parses S8, sigma8, Omega_m, and MultiNest weight where available.")
+          md.append("")
+          md.append("This does not automatically replace the previous KiDS row. The main parsed file is KiDS 3x2pt, while one earlier comparison also used the published KiDS cosmic-shear-only summary. Those roles must stay separate.")
+          md.append("")
+          md.append("## Download status")
+          md.append("")
+          md.append("| Product | OK | Bytes | Error |")
+          md.append("|---|---:|---:|---|")
+          md.append(f"| KiDS chain archive | `{archive_download['ok']}` | `{archive_download['bytes']}` | `{archive_download['error']}` |")
+          md.append(f"| KiDS README | `{readme_download['ok']}` | `{readme_download['bytes']}` | `{readme_download['error']}` |")
+          md.append("")
+          md.append("## Sample file parse inventory")
+          md.append("")
+          md.append("| File | Role | Parsed | Rows used | S8 | sigma8 | Omega_m | Weight |")
+          md.append("|---|---|---:|---:|---:|---:|---:|---:|")
+          for row in sample_file_rows:
+              md.append(
+                  f"| `{row['filename']}` | `{row['role']}` | `{row['parse_success']}` | `{row['rows_used']}` | "
+                  f"`{row['s8_column_found']}` | `{row['sigma8_column_found']}` | `{row['omegam_column_found']}` | `{row['weight_column_found']}` |"
+              )
+          md.append("")
+          md.append("## Fiducial 3x2pt main result")
+          md.append("")
+          if main_axis_summaries:
+              md.append("| Axis | q16 | q50 | q84 | sigma 68 | sample count |")
+              md.append("|---|---:|---:|---:|---:|---:|")
+              for axis, summary in main_axis_summaries.items():
+                  md.append(
+                      f"| `{axis}` | `{summary['q16']:.12f}` | `{summary['q50']:.12f}` | "
+                      f"`{summary['q84']:.12f}` | `{summary['sigma_68']:.12f}` | `{summary['sample_count']}` |"
+                  )
+              md.append("")
+              md.append(f"Carried v3.58 3x2pt S8 q50 check: `{carried_value_check}`")
+              md.append("")
+              md.append(f"Absolute difference from carried 3x2pt S8 q50: `{diff_from_carried}`")
+          else:
+              md.append("No fiducial 3x2pt axis summary was recovered.")
+          md.append("")
+          md.append("## Fiducial 3x2pt pressure vs Planck")
+          md.append("")
+          if main_pressure_rows:
+              md.append("| Axis | Delta | Pressure z | Direction | Strength |")
+              md.append("|---|---:|---:|---|---|")
+              for row in main_pressure_rows:
+                  md.append(
+                      f"| `{row['axis']}` | `{row['delta_observable_minus_planck']:.12f}` | "
+                      f"`{row['pressure_z']:.12f}` | `{row['direction']}` | `{row['strength']}` |"
+                  )
+          else:
+              md.append("No fiducial 3x2pt pressure rows were recovered.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `kids_sample_file_parse_inventory_v4_4_1.csv`")
+          md.append("- `kids_axis_summary_v4_4_1.csv`")
+          md.append("- `kids_pressure_vs_planck_v4_4_1.csv`")
+          md.append("- `interpretation_boundaries_v4_4_1.csv`")
+          md.append("- `tairid_cosmology_v4_4_1_kids_inline_header_parser_repair.json`")
+          md.append("- `tairid_cosmology_v4_4_1_kids_inline_header_parser_repair.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v4_4_1_kids_inline_header_parser_repair.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("Main fiducial result:")
+          print(json.dumps(audit["main_fiducial_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.4.1 KiDS inline header parser repair artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v4-4-1-kids-inline-header-parser-repair
+          path: artifacts/tairid_cosmology_v4_4_1_kids_inline_header_parser_repair/
