@@ -1,0 +1,902 @@
+name: TAIRID Cosmology v3.48 KiDS1000 Chain Parser Design
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kids1000-chain-parser-design:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v3.48 KiDS1000 chain parser design
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_cosmology_v3_48
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import tarfile
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_cosmology_v3_48")
+          DOWNLOADS = OUTDIR / "downloads"
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_cosmology_v3_48_kids1000_chain_parser_design"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove H0 correction.",
+              "This does not prove new physics.",
+              "This does not disprove standard cosmology.",
+              "This does not fit a full cosmological model.",
+              "This does not run a two-surface refit.",
+              "This does not compute growth pressure scores.",
+              "This does not compare KiDS growth against H0LiCOW.",
+              "This does not parse final KiDS cosmological constraints into a pressure claim.",
+              "This designs the KiDS-1000 chain parser only.",
+              "The purpose is to select exact chain files and map S8, sigma8, Omega_m, likelihood, posterior, and weight columns before parser implementation.",
+              "No KiDS product may be promoted to model-anchor status in this workflow."
+          ]
+
+          PREVIOUS_MILESTONE = {
+              "v3_47_1_status": "kids1000_archive_inventory_gate_fix_passed_ready_for_chain_parser_design",
+              "v3_47_1_failed_gates": [],
+              "archive_downloaded": True,
+              "readme_downloaded": True,
+              "member_count": 12,
+              "candidate_count": 12,
+              "chain_candidate_count": 10,
+              "metadata_candidate_count": 2,
+              "numeric_sample_required_for_pass": False,
+              "parameter_hit_candidate_count": 5,
+              "next_rule": "Select exact member files and define direct-text/compressed-member parser rules, S8/sigma8/Omega_m mapping, and weight/likelihood handling before parser implementation."
+          }
+
+          KIDS_ARCHIVE_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          KIDS_README_URL = "https://kids.strw.leidenuniv.nl/DR4/data_files/KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          MAX_DOWNLOAD_BYTES = 750 * 1024 * 1024
+          MAX_SCAN_LINES = 20000
+          NUMERIC_SAMPLE_TARGET = 50
+
+          REQUIRED_CONTRACT_FIELDS = [
+              "source",
+              "observable_role",
+              "pressure_surface",
+              "baseline",
+              "parser_status",
+              "provenance_status",
+              "block_condition",
+              "claim_boundary"
+          ]
+
+          REQUIRED_PARAMETER_KEYS = [
+              "COSMOLOGICAL_PARAMETERS--S_8",
+              "COSMOLOGICAL_PARAMETERS--SIGMA_8",
+              "COSMOLOGICAL_PARAMETERS--OMEGA_M",
+              "prior",
+              "like",
+              "post",
+              "weight"
+          ]
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def download_capped(url, path, timeout=600):
+              result = {
+                  "url": url,
+                  "path": str(path),
+                  "downloaded": False,
+                  "status": "",
+                  "content_type": "",
+                  "content_length": "",
+                  "size_bytes": 0,
+                  "error": ""
+              }
+
+              try:
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v3.48-kids1000-chain-parser-design/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      status = getattr(resp, "status", "")
+                      result["status"] = status
+                      result["content_type"] = resp.headers.get("Content-Type", "")
+                      result["content_length"] = resp.headers.get("Content-Length", "")
+
+                      if status is None or not (200 <= status < 400):
+                          raise RuntimeError(f"HTTP status {status}")
+
+                      total = 0
+                      with path.open("wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > MAX_DOWNLOAD_BYTES:
+                                  raise RuntimeError(f"download_exceeds_cap:{total}>{MAX_DOWNLOAD_BYTES}")
+                              f.write(chunk)
+
+                  result["downloaded"] = True
+                  result["size_bytes"] = path.stat().st_size
+                  return result
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+                  return result
+
+          def parse_float(value):
+              try:
+                  x = float(str(value).strip())
+              except Exception:
+                  return None
+              if not math.isfinite(x):
+                  return None
+              return x
+
+          def split_numeric_line(line):
+              parts = re.split(r"[,\s]+", line.strip())
+              if not parts or parts == [""]:
+                  return []
+              values = []
+              for p in parts:
+                  x = parse_float(p)
+                  if x is None:
+                      return []
+                  values.append(x)
+              return values
+
+          def classify_chain_role(member_name):
+              name = member_name.lower()
+
+              if "samples_multinest_blindc_ee_ne_w.txt" in name:
+                  return "primary_fiducial_3x2pt_full_chain"
+
+              if "samples_multinest_blindc_ee.txt" in name:
+                  return "secondary_cosmic_shear_only_chain"
+
+              if "samples_multinest_blindc_ee_ne.txt" in name:
+                  return "secondary_shear_plus_ggl_chain"
+
+              if "samples_multinest_blindc_ee_w.txt" in name:
+                  return "secondary_shear_plus_clustering_chain"
+
+              if "samples_multinest_blindc_w.txt" in name:
+                  return "support_boss_clustering_only_chain"
+
+              if "samples" in name or "chain" in name:
+                  return "other_chain_or_sample_candidate"
+
+              return "non_chain_member"
+
+          def read_chain_header_and_shape(tf, member):
+              result = {
+                  "header_found": False,
+                  "header_column_count": 0,
+                  "header_line": "",
+                  "numeric_rows_in_scan": 0,
+                  "numeric_column_count": 0,
+                  "first_numeric_line": "",
+                  "scan_lines": 0,
+                  "error": ""
+              }
+
+              try:
+                  f = tf.extractfile(member)
+                  if f is None:
+                      result["error"] = "extractfile_unavailable"
+                      return result
+
+                  header_cols = []
+                  numeric_rows = 0
+                  numeric_col_count = 0
+                  first_numeric_line = ""
+
+                  for line_index in range(MAX_SCAN_LINES):
+                      raw = f.readline()
+                      if not raw:
+                          break
+
+                      result["scan_lines"] += 1
+                      text = raw.decode("utf-8", errors="replace").rstrip("\n")
+                      stripped = text.strip()
+
+                      if not stripped:
+                          continue
+
+                      if stripped.startswith("#"):
+                          clean = stripped.lstrip("#").strip()
+                          if "\t" in clean and ("COSMOLOGICAL_PARAMETERS--" in clean or "cosmological_parameters--" in clean):
+                              header_cols = clean.split("\t")
+                              result["header_found"] = True
+                              result["header_column_count"] = len(header_cols)
+                              result["header_line"] = clean[:2000]
+                          continue
+
+                      values = split_numeric_line(stripped)
+                      if values:
+                          numeric_rows += 1
+                          numeric_col_count = max(numeric_col_count, len(values))
+                          if not first_numeric_line:
+                              first_numeric_line = stripped[:1000]
+
+                          if numeric_rows >= NUMERIC_SAMPLE_TARGET:
+                              break
+
+                  result["numeric_rows_in_scan"] = numeric_rows
+                  result["numeric_column_count"] = numeric_col_count
+                  result["first_numeric_line"] = first_numeric_line
+                  return result
+
+              except Exception as e:
+                  result["error"] = f"{type(e).__name__}: {e}"
+                  return result
+
+          def header_mapping(member_name, header_line):
+              if not header_line:
+                  return []
+
+              cols = header_line.split("\t")
+              rows = []
+
+              wanted = {
+                  "S8": ["COSMOLOGICAL_PARAMETERS--S_8", "cosmological_parameters--s_8_input"],
+                  "sigma8": ["COSMOLOGICAL_PARAMETERS--SIGMA_8"],
+                  "omega_m": ["COSMOLOGICAL_PARAMETERS--OMEGA_M"],
+                  "h0": ["cosmological_parameters--h0"],
+                  "prior": ["prior"],
+                  "like": ["like"],
+                  "post": ["post"],
+                  "weight": ["weight"]
+              }
+
+              for role, names in wanted.items():
+                  matched_name = ""
+                  matched_index = ""
+
+                  for name in names:
+                      if name in cols:
+                          matched_name = name
+                          matched_index = cols.index(name)
+                          break
+
+                  rows.append({
+                      "source": "KiDS_1000",
+                      "member_name": member_name,
+                      "parameter_role": role,
+                      "matched_column_name": matched_name,
+                      "column_index_zero_based": matched_index,
+                      "column_present": matched_name != "",
+                      "parser_use": (
+                          "primary_growth_parameter"
+                          if role in ["S8", "sigma8", "omega_m"]
+                          else "weight_column"
+                          if role == "weight"
+                          else "likelihood_context"
+                          if role in ["prior", "like", "post"]
+                          else "support_parameter"
+                      )
+                  })
+
+              return rows
+
+          def write_csv(path, rows, fields):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({k: row.get(k, "") for k in fields})
+
+          created_at = now_iso()
+
+          print("TAIRID Cosmology v3.48 KiDS-1000 chain parser design")
+          print("Truth boundary: parser design only; no growth scoring; no refit.")
+          print()
+
+          archive_path = DOWNLOADS / "KiDS1000_3x2pt_fiducial_chains.tar.gz"
+          readme_path = DOWNLOADS / "KiDS1000_3x2pt_fiducial_chains_readme.txt"
+
+          archive_dl = download_capped(KIDS_ARCHIVE_URL, archive_path)
+          readme_dl = download_capped(KIDS_README_URL, readme_path)
+
+          readme_text = ""
+          if readme_dl["downloaded"]:
+              readme_text = readme_path.read_text(encoding="utf-8", errors="replace")
+
+          source_errors = {}
+          failed_gates = []
+
+          if not archive_dl["downloaded"]:
+              failed_gates.append("kids_archive_download_failed")
+              source_errors["kids_archive"] = archive_dl["error"]
+
+          if not readme_dl["downloaded"]:
+              failed_gates.append("kids_readme_download_failed")
+              source_errors["kids_readme"] = readme_dl["error"]
+
+          chain_design_rows = []
+          column_mapping_rows = []
+          selected_parser_rows = []
+          archive_member_rows = []
+
+          if archive_dl["downloaded"]:
+              try:
+                  with tarfile.open(archive_path, "r:gz") as tf:
+                      members = [m for m in tf.getmembers() if m.isfile()]
+
+                      for m in members:
+                          member_name = m.name
+                          role = classify_chain_role(member_name)
+                          is_appledouble = "/._" in member_name or member_name.split("/")[-1].startswith("._")
+                          is_chain_file = role != "non_chain_member" and not is_appledouble
+
+                          archive_member_rows.append({
+                              "source": "KiDS_1000",
+                              "member_name": member_name,
+                              "member_size_bytes": int(m.size),
+                              "chain_role": role,
+                              "is_appledouble_metadata": is_appledouble,
+                              "eligible_for_parser_design": is_chain_file,
+                              "parser_status": "member_reviewed_for_parser_design",
+                              "provenance_status": "official_public_kids_archive_member",
+                              "observable_role": "weak_lensing_clustering_growth",
+                              "pressure_surface": "consolidation_growth",
+                              "baseline": "not_selected_parser_design_only",
+                              "block_condition": "blocked_until_chain_parser_implementation",
+                              "claim_boundary": "parser_design_only_not_model_anchor",
+                              "model_anchor_allowed_now": False,
+                              "refit_allowed_now": False,
+                              "new_pressure_score_allowed_now": False
+                          })
+
+                          if not is_chain_file:
+                              continue
+
+                          shape = read_chain_header_and_shape(tf, m)
+                          mapping = header_mapping(member_name, shape["header_line"])
+                          column_mapping_rows.extend(mapping)
+
+                          present_roles = {r["parameter_role"] for r in mapping if r["column_present"] is True}
+                          has_core_growth = all(x in present_roles for x in ["S8", "sigma8", "omega_m"])
+                          has_weight = "weight" in present_roles
+                          has_likelihood_context = all(x in present_roles for x in ["prior", "like", "post"])
+                          numeric_shape_ok = shape["numeric_rows_in_scan"] > 0 and shape["numeric_column_count"] == shape["header_column_count"]
+
+                          if role == "primary_fiducial_3x2pt_full_chain":
+                              parser_priority = 1
+                              parser_selection = "selected_primary_parser_target"
+                          elif role == "secondary_cosmic_shear_only_chain":
+                              parser_priority = 2
+                              parser_selection = "selected_secondary_shear_only_sanity_target"
+                          elif role in ["secondary_shear_plus_ggl_chain", "secondary_shear_plus_clustering_chain"]:
+                              parser_priority = 3
+                              parser_selection = "selected_secondary_component_chain_target"
+                          elif role == "support_boss_clustering_only_chain":
+                              parser_priority = 4
+                              parser_selection = "support_chain_not_primary_growth_target"
+                          else:
+                              parser_priority = 5
+                              parser_selection = "manual_review_only"
+
+                          chain_design_rows.append({
+                              "source": "KiDS_1000",
+                              "member_name": member_name,
+                              "member_size_bytes": int(m.size),
+                              "chain_role": role,
+                              "parser_priority": parser_priority,
+                              "parser_selection": parser_selection,
+                              "observable_role": "weak_lensing_clustering_growth",
+                              "pressure_surface": "consolidation_growth",
+                              "baseline": "not_selected_parser_design_only",
+                              "header_found": shape["header_found"],
+                              "header_column_count": shape["header_column_count"],
+                              "numeric_rows_in_scan": shape["numeric_rows_in_scan"],
+                              "numeric_column_count": shape["numeric_column_count"],
+                              "numeric_shape_ok": numeric_shape_ok,
+                              "has_core_growth_parameters": has_core_growth,
+                              "has_weight_column": has_weight,
+                              "has_likelihood_context": has_likelihood_context,
+                              "parser_status": "parser_design_ready" if has_core_growth and has_weight and numeric_shape_ok else "parser_design_followup_needed",
+                              "provenance_status": "official_public_kids_archive_member",
+                              "block_condition": "blocked_until_parser_implementation_reads_selected_columns_and_weights",
+                              "claim_boundary": "parser_design_only_not_model_anchor",
+                              "model_anchor_allowed_now": False,
+                              "refit_allowed_now": False,
+                              "new_pressure_score_allowed_now": False,
+                              "design_note": shape["error"] if shape["error"] else "Header and numeric shape inspected; no final parameter summary or pressure score built."
+                          })
+
+                  selected_parser_rows = [
+                      {
+                          "parser_design_id": "kids1000_primary_fiducial_3x2pt_parser",
+                          "source": "KiDS_1000",
+                          "selected_member": "KiDS1000_3x2pt_fiducial_chains/cosmology/samples_multinest_blindC_EE_nE_w.txt",
+                          "selection_role": "primary_growth_consolidation_chain",
+                          "why_selected": "README identifies EE_nE_w as joint cosmic shear plus galaxy-galaxy lensing plus galaxy clustering, the fiducial 3x2pt result.",
+                          "parameter_columns_required": "COSMOLOGICAL_PARAMETERS--S_8;COSMOLOGICAL_PARAMETERS--SIGMA_8;COSMOLOGICAL_PARAMETERS--OMEGA_M",
+                          "context_columns_required": "prior;like;post;weight",
+                          "parser_mode": "cosmosis_text_chain_header_first_line_tab_columns_weighted_multinest_samples",
+                          "weight_handling_rule": "Use weight column for weighted posterior summaries; do not treat raw rows as equal-weight samples.",
+                          "family_boundary_rule": "KiDS-1000 remains one survey family; chain files are internal variants, not independent external anchors.",
+                          "pressure_surface": "consolidation_growth",
+                          "baseline": "not_selected_parser_design_only",
+                          "parser_status": "selected_for_v3_49_parser_implementation",
+                          "provenance_status": "official_public_kids_archive_member",
+                          "block_condition": "blocked_until_v3_49_parser_implementation_creates_guarded_parameter_ledger",
+                          "claim_boundary": "parser_design_only_not_model_anchor",
+                          "model_anchor_allowed_now": False,
+                          "refit_allowed_now": False,
+                          "new_pressure_score_allowed_now": False
+                      },
+                      {
+                          "parser_design_id": "kids1000_secondary_shear_only_sanity_parser",
+                          "source": "KiDS_1000",
+                          "selected_member": "KiDS1000_3x2pt_fiducial_chains/cosmology/samples_multinest_blindC_EE.txt",
+                          "selection_role": "secondary_sanity_check_chain",
+                          "why_selected": "README identifies EE as KiDS-1000 bandpower cosmic shear; useful as a later internal comparison after primary parser works.",
+                          "parameter_columns_required": "COSMOLOGICAL_PARAMETERS--S_8;COSMOLOGICAL_PARAMETERS--SIGMA_8;COSMOLOGICAL_PARAMETERS--OMEGA_M",
+                          "context_columns_required": "prior;like;post;weight",
+                          "parser_mode": "cosmosis_text_chain_header_first_line_tab_columns_weighted_multinest_samples",
+                          "weight_handling_rule": "Use weight column for weighted posterior summaries; do not treat raw rows as equal-weight samples.",
+                          "family_boundary_rule": "Secondary KiDS chain is not an independent external anchor.",
+                          "pressure_surface": "consolidation_growth",
+                          "baseline": "not_selected_parser_design_only",
+                          "parser_status": "secondary_after_primary_parser",
+                          "provenance_status": "official_public_kids_archive_member",
+                          "block_condition": "blocked_until_primary_parser_succeeds",
+                          "claim_boundary": "parser_design_only_not_model_anchor",
+                          "model_anchor_allowed_now": False,
+                          "refit_allowed_now": False,
+                          "new_pressure_score_allowed_now": False
+                      }
+                  ]
+
+              except Exception as e:
+                  failed_gates.append("kids_archive_parser_design_failed")
+                  source_errors["kids_archive_parser_design"] = f"{type(e).__name__}: {e}"
+
+          parser_rules = [
+              {
+                  "rule_id": "cosmosis_header_rule",
+                  "rule": "Use the first comment/header line beginning with parameter names as the column map.",
+                  "required": True,
+                  "block_if_violated": "no_parser_implementation"
+              },
+              {
+                  "rule_id": "weighted_multinest_rule",
+                  "rule": "Use the weight column for weighted posterior summaries; do not treat rows as equal-weight samples.",
+                  "required": True,
+                  "block_if_violated": "no_growth_parameter_ledger"
+              },
+              {
+                  "rule_id": "primary_chain_rule",
+                  "rule": "Use samples_multinest_blindC_EE_nE_w.txt as the primary fiducial 3x2pt chain.",
+                  "required": True,
+                  "block_if_violated": "no_primary_growth_parser"
+              },
+              {
+                  "rule_id": "core_growth_parameter_rule",
+                  "rule": "Map S8, sigma8, and Omega_m before creating any growth parameter ledger.",
+                  "required": True,
+                  "block_if_violated": "no_growth_parameter_ledger"
+              },
+              {
+                  "rule_id": "no_growth_pressure_scoring_yet",
+                  "rule": "v3.48 is parser design only; no growth pressure score may be built.",
+                  "required": True,
+                  "block_if_violated": "hard_stop"
+              },
+              {
+                  "rule_id": "kids_family_boundary",
+                  "rule": "KiDS chain variants remain one survey family and cannot be treated as independent external anchors.",
+                  "required": True,
+                  "block_if_violated": "no_aggregation"
+              }
+          ]
+
+          next_test_queue = [
+              {
+                  "priority": 1,
+                  "next_test": "v3_49_kids1000_chain_parser_implementation",
+                  "purpose": "Parse the selected KiDS-1000 fiducial 3x2pt chain into a guarded growth parameter ledger with weighted S8, sigma8, and Omega_m summaries.",
+                  "must_include": "selected member, column mapping, sample counts, weighted posterior summaries, parser/provenance status, family boundary.",
+                  "must_not_include": "growth pressure scoring, H0LiCOW comparison, two-surface refit, model-anchor promotion, validation claim.",
+                  "readiness_if_passes": "Growth/consolidation pressure-design audit may be considered."
+              },
+              {
+                  "priority": 2,
+                  "next_test": "later_kids1000_secondary_chain_sanity_parser",
+                  "purpose": "Parse EE shear-only as a secondary KiDS internal sanity lane after the primary parser works.",
+                  "must_include": "same column and weight handling rules.",
+                  "must_not_include": "treating KiDS internal variants as independent anchors.",
+                  "readiness_if_passes": "KiDS family-internal consistency can be reviewed."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "kids1000_parser_design_archive_members_v3_48.csv",
+              archive_member_rows,
+              [
+                  "source", "member_name", "member_size_bytes", "chain_role",
+                  "is_appledouble_metadata", "eligible_for_parser_design",
+                  "parser_status", "provenance_status", "observable_role",
+                  "pressure_surface", "baseline", "block_condition",
+                  "claim_boundary", "model_anchor_allowed_now",
+                  "refit_allowed_now", "new_pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_chain_file_design_v3_48.csv",
+              chain_design_rows,
+              [
+                  "source", "member_name", "member_size_bytes", "chain_role",
+                  "parser_priority", "parser_selection", "observable_role",
+                  "pressure_surface", "baseline", "header_found",
+                  "header_column_count", "numeric_rows_in_scan",
+                  "numeric_column_count", "numeric_shape_ok",
+                  "has_core_growth_parameters", "has_weight_column",
+                  "has_likelihood_context", "parser_status",
+                  "provenance_status", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_allowed_now", "design_note"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_column_mapping_design_v3_48.csv",
+              column_mapping_rows,
+              [
+                  "source", "member_name", "parameter_role",
+                  "matched_column_name", "column_index_zero_based",
+                  "column_present", "parser_use"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_selected_parser_design_v3_48.csv",
+              selected_parser_rows,
+              [
+                  "parser_design_id", "source", "selected_member", "selection_role",
+                  "why_selected", "parameter_columns_required",
+                  "context_columns_required", "parser_mode",
+                  "weight_handling_rule", "family_boundary_rule",
+                  "pressure_surface", "baseline", "parser_status",
+                  "provenance_status", "block_condition", "claim_boundary",
+                  "model_anchor_allowed_now", "refit_allowed_now",
+                  "new_pressure_score_allowed_now"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "kids1000_parser_rules_v3_48.csv",
+              parser_rules,
+              ["rule_id", "rule", "required", "block_if_violated"]
+          )
+
+          write_csv(
+              OUTDIR / "next_test_queue_v3_48.csv",
+              next_test_queue,
+              [
+                  "priority", "next_test", "purpose", "must_include",
+                  "must_not_include", "readiness_if_passes"
+              ]
+          )
+
+          primary_rows = [
+              r for r in chain_design_rows
+              if r["chain_role"] == "primary_fiducial_3x2pt_full_chain"
+          ]
+
+          secondary_rows = [
+              r for r in chain_design_rows
+              if r["chain_role"] == "secondary_cosmic_shear_only_chain"
+          ]
+
+          primary_ready = (
+              len(primary_rows) == 1
+              and primary_rows[0]["header_found"] is True
+              and primary_rows[0]["numeric_shape_ok"] is True
+              and primary_rows[0]["has_core_growth_parameters"] is True
+              and primary_rows[0]["has_weight_column"] is True
+              and primary_rows[0]["has_likelihood_context"] is True
+          )
+
+          secondary_ready = (
+              len(secondary_rows) == 1
+              and secondary_rows[0]["header_found"] is True
+              and secondary_rows[0]["numeric_shape_ok"] is True
+              and secondary_rows[0]["has_core_growth_parameters"] is True
+              and secondary_rows[0]["has_weight_column"] is True
+          )
+
+          selected_primary_defined = any(
+              r["parser_design_id"] == "kids1000_primary_fiducial_3x2pt_parser"
+              and r["parser_status"] == "selected_for_v3_49_parser_implementation"
+              for r in selected_parser_rows
+          )
+
+          chain_file_count = len(chain_design_rows)
+          column_mapping_count = len(column_mapping_rows)
+          mapping_roles_present = {
+              r["parameter_role"]
+              for r in column_mapping_rows
+              if r["column_present"] is True
+              and r["member_name"] == "KiDS1000_3x2pt_fiducial_chains/cosmology/samples_multinest_blindC_EE_nE_w.txt"
+          }
+
+          primary_mapping_complete = all(
+              role in mapping_roles_present
+              for role in ["S8", "sigma8", "omega_m", "prior", "like", "post", "weight"]
+          )
+
+          no_model_anchors = all(r["model_anchor_allowed_now"] is False for r in chain_design_rows + selected_parser_rows)
+          no_refits = all(r["refit_allowed_now"] is False for r in chain_design_rows + selected_parser_rows)
+          no_scores = all(r["new_pressure_score_allowed_now"] is False for r in chain_design_rows + selected_parser_rows)
+
+          required_contract_present = True
+          for row in chain_design_rows + selected_parser_rows:
+              for field in REQUIRED_CONTRACT_FIELDS:
+                  if field not in row or row.get(field) in ["", None]:
+                      required_contract_present = False
+
+          next_test_ok = (
+              next_test_queue[0]["next_test"] == "v3_49_kids1000_chain_parser_implementation"
+              and "growth pressure scoring" in next_test_queue[0]["must_not_include"]
+              and "two-surface refit" in next_test_queue[0]["must_not_include"]
+              and "H0LiCOW comparison" in next_test_queue[0]["must_not_include"]
+          )
+
+          audit_rows = [
+              {
+                  "audit_gate": "archive_and_readme_downloaded",
+                  "pass": archive_dl["downloaded"] and readme_dl["downloaded"],
+                  "value": f"archive={archive_dl['downloaded']}; readme={readme_dl['downloaded']}",
+                  "boundary": "Archive and README must be available for parser design."
+              },
+              {
+                  "audit_gate": "chain_files_identified",
+                  "pass": chain_file_count >= 5,
+                  "value": chain_file_count,
+                  "boundary": "Expected KiDS sample chain files should be identified."
+              },
+              {
+                  "audit_gate": "primary_fiducial_chain_ready",
+                  "pass": primary_ready,
+                  "value": primary_rows[0] if primary_rows else {},
+                  "boundary": "Primary 3x2pt chain must have header, numeric shape, growth columns, and weight."
+              },
+              {
+                  "audit_gate": "primary_column_mapping_complete",
+                  "pass": primary_mapping_complete,
+                  "value": ";".join(sorted(mapping_roles_present)),
+                  "boundary": "Primary chain must map S8, sigma8, Omega_m, prior, likelihood, posterior, and weight."
+              },
+              {
+                  "audit_gate": "secondary_shear_chain_ready",
+                  "pass": secondary_ready,
+                  "value": secondary_rows[0] if secondary_rows else {},
+                  "boundary": "Secondary shear-only chain should be available for later sanity check."
+              },
+              {
+                  "audit_gate": "selected_primary_parser_defined",
+                  "pass": selected_primary_defined,
+                  "value": selected_primary_defined,
+                  "boundary": "v3.49 parser implementation must have an exact selected member."
+              },
+              {
+                  "audit_gate": "required_contract_fields_present",
+                  "pass": required_contract_present,
+                  "value": required_contract_present,
+                  "boundary": "source/role/surface/baseline/parser/provenance/block/claim contract must persist."
+              },
+              {
+                  "audit_gate": "no_new_pressure_scores",
+                  "pass": no_scores,
+                  "value": no_scores,
+                  "boundary": "No pressure scores in v3.48."
+              },
+              {
+                  "audit_gate": "no_model_anchors_promoted",
+                  "pass": no_model_anchors,
+                  "value": no_model_anchors,
+                  "boundary": "No model anchors in v3.48."
+              },
+              {
+                  "audit_gate": "no_refit_allowed",
+                  "pass": no_refits,
+                  "value": no_refits,
+                  "boundary": "No refit in v3.48."
+              },
+              {
+                  "audit_gate": "next_step_is_parser_implementation",
+                  "pass": next_test_ok,
+                  "value": next_test_queue[0]["next_test"],
+                  "boundary": "Next step should parse KiDS into a guarded ledger, not score growth."
+              },
+              {
+                  "audit_gate": "model_claim_allowed",
+                  "pass": False,
+                  "value": False,
+                  "boundary": "No model claim is allowed."
+              }
+          ]
+
+          write_csv(
+              OUTDIR / "kids1000_chain_parser_design_audit_v3_48.csv",
+              audit_rows,
+              ["audit_gate", "pass", "value", "boundary"]
+          )
+
+          hard_failed = list(failed_gates)
+
+          if not (archive_dl["downloaded"] and readme_dl["downloaded"]):
+              hard_failed.append("archive_or_readme_missing")
+          if chain_file_count < 5:
+              hard_failed.append("chain_files_missing")
+          if not primary_ready:
+              hard_failed.append("primary_fiducial_chain_not_ready")
+          if not primary_mapping_complete:
+              hard_failed.append("primary_column_mapping_incomplete")
+          if not selected_primary_defined:
+              hard_failed.append("selected_primary_parser_missing")
+          if not required_contract_present:
+              hard_failed.append("required_contract_fields_missing")
+          if not no_scores:
+              hard_failed.append("new_pressure_score_guard_violation")
+          if not no_model_anchors:
+              hard_failed.append("model_anchor_promotion_violation")
+          if not no_refits:
+              hard_failed.append("refit_guard_violation")
+          if not next_test_ok:
+              hard_failed.append("next_test_guard_incomplete")
+
+          if hard_failed:
+              readiness_label = "kids1000_chain_parser_design_needs_followup"
+          else:
+              readiness_label = "kids1000_chain_parser_design_passed_ready_for_parser_implementation"
+
+          next_step = (
+              "Build v3.49 KiDS-1000 chain parser implementation: parse the selected fiducial 3x2pt chain into a guarded weighted growth parameter ledger for S8, sigma8, and Omega_m, still with no growth pressure scoring, no H0LiCOW comparison, and no refit."
+              if not hard_failed
+              else "Inspect v3.48 parser design outputs and repair primary chain mapping before parser implementation."
+          )
+
+          inventory = {
+              "run_id": RUN_ID,
+              "created_at_utc": created_at,
+              "previous_milestone": PREVIOUS_MILESTONE,
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_errors": source_errors,
+              "archive_downloaded": archive_dl["downloaded"],
+              "readme_downloaded": readme_dl["downloaded"],
+              "chain_file_count": chain_file_count,
+              "column_mapping_count": column_mapping_count,
+              "primary_ready": primary_ready,
+              "primary_mapping_complete": primary_mapping_complete,
+              "secondary_ready": secondary_ready,
+              "selected_primary_defined": selected_primary_defined,
+              "gate_result": {
+                  "failed_gates": hard_failed,
+                  "readiness_label": readiness_label,
+                  "archive_downloaded": archive_dl["downloaded"],
+                  "readme_downloaded": readme_dl["downloaded"],
+                  "chain_file_count": chain_file_count,
+                  "column_mapping_count": column_mapping_count,
+                  "primary_ready": primary_ready,
+                  "primary_mapping_complete": primary_mapping_complete,
+                  "secondary_ready": secondary_ready,
+                  "selected_primary_defined": selected_primary_defined,
+                  "model_claim_allowed": False,
+                  "refit_allowed": False,
+                  "new_pressure_scores_built": False,
+                  "next_allowed_step": next_step
+              }
+          }
+
+          json_path = OUTDIR / "tairid_cosmology_v3_48_kids1000_chain_parser_design.json"
+          json_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+
+          md = []
+          md.append("# TAIRID Cosmology v3.48 — KiDS-1000 Chain Parser Design")
+          md.append("")
+          md.append(f"Created UTC: `{created_at}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(hard_failed) if hard_failed else 'none'}`")
+          md.append("")
+          md.append("## Truth boundary")
+          md.append("")
+          for line in TRUTH_BOUNDARY:
+              md.append(f"- {line}")
+          md.append("")
+          md.append("## What this design does")
+          md.append("")
+          md.append("v3.48 selects the exact KiDS-1000 fiducial 3x2pt chain for parser implementation and maps the required CosmoSIS columns.")
+          md.append("")
+          md.append("It identifies S8, sigma8, Omega_m, prior, likelihood, posterior, and weight columns, but does not create a growth pressure score, does not compare against H0LiCOW, and does not run a refit.")
+          md.append("")
+          md.append("## Results")
+          md.append("")
+          md.append(f"- Archive downloaded: `{archive_dl['downloaded']}`")
+          md.append(f"- README downloaded: `{readme_dl['downloaded']}`")
+          md.append(f"- Chain files identified: `{chain_file_count}`")
+          md.append(f"- Column mapping rows: `{column_mapping_count}`")
+          md.append(f"- Primary fiducial 3x2pt chain ready: `{primary_ready}`")
+          md.append(f"- Primary column mapping complete: `{primary_mapping_complete}`")
+          md.append(f"- Secondary shear-only chain ready: `{secondary_ready}`")
+          md.append(f"- Selected primary parser defined: `{selected_primary_defined}`")
+          md.append("")
+          md.append("## Selected primary chain")
+          md.append("")
+          md.append("`KiDS1000_3x2pt_fiducial_chains/cosmology/samples_multinest_blindC_EE_nE_w.txt`")
+          md.append("")
+          md.append("## Interpretation")
+          md.append("")
+          if not hard_failed:
+              md.append("The parser design passed. The next step may parse the selected KiDS chain into a guarded weighted growth parameter ledger. That still is not growth pressure scoring.")
+          else:
+              md.append("The parser design found blockers. Parser implementation should wait until the primary chain mapping is repaired.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `kids1000_parser_design_archive_members_v3_48.csv`")
+          md.append("- `kids1000_chain_file_design_v3_48.csv`")
+          md.append("- `kids1000_column_mapping_design_v3_48.csv`")
+          md.append("- `kids1000_selected_parser_design_v3_48.csv`")
+          md.append("- `kids1000_parser_rules_v3_48.csv`")
+          md.append("- `next_test_queue_v3_48.csv`")
+          md.append("- `kids1000_chain_parser_design_audit_v3_48.csv`")
+          md.append("- `tairid_cosmology_v3_48_kids1000_chain_parser_design.json`")
+          md.append("- `tairid_cosmology_v3_48_kids1000_chain_parser_design.md`")
+          md.append("")
+
+          md_path = OUTDIR / "tairid_cosmology_v3_48_kids1000_chain_parser_design.md"
+          md_path.write_text("\n".join(md), encoding="utf-8")
+
+          print("Gate result:")
+          print(json.dumps(inventory["gate_result"], indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if hard_failed:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v3.48 KiDS1000 chain parser design artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-cosmology-v3-48-kids1000-chain-parser-design
+          path: artifacts/tairid_cosmology_v3_48/
