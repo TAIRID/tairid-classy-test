@@ -1,0 +1,811 @@
+name: TAIRID v4.58 Planck FullGrid Selective Paramnames Extraction Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-58-planck-fullgrid-selective-paramnames-extraction-probe.yml"
+
+jobs:
+  tairid-v4-58-planck-fullgrid-selective-paramnames-extraction-probe:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.58 Planck fullGrid selective paramnames extraction probe
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import struct
+          import urllib.request
+          import hashlib
+          import zlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe"
+
+          FULL_GRID_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_fullGrid_R3.01.zip"
+
+          # Locked from v4.57 successful ZIP64 central-directory probe.
+          FULLGRID_CONTENT_LENGTH_EXPECTED = 11805855817
+          ZIP64_CENTRAL_DIRECTORY_OFFSET = 11803187830
+          ZIP64_CENTRAL_DIRECTORY_SIZE = 2667889
+
+          MAX_RANGE_READ_BYTES = 5_000_000
+          MAX_PARAMNAMES_COMPRESSED_BYTES = 50_000
+          MAX_SELECTED_PARAMNAMES = 80
+
+          SELECTED_PREFIXES = [
+              "base/plikHM_TTTEEE_lowl_lowE/",
+              "base/plikHM_TTTEEE_lowl_lowE_lensing/",
+              "base/plikHM_TT_lowl_lowE/",
+              "base/plikHM_TT_lowl_lowE_lensing/",
+              "base/plikHM_TTTEEE_lowl_lowE_BAO/",
+              "base/plikHM_TTTEEE_lowl_lowE_lensing_BAO/"
+          ]
+
+          TARGET_PARAMS = [
+              "fsigma8z015",
+              "fsigma8z038",
+              "fsigma8z051",
+              "fsigma8z061",
+              "fsigma8z233",
+              "sigma8z015",
+              "sigma8z038",
+              "sigma8z051",
+              "sigma8z061",
+              "sigma8z233",
+              "sigma8",
+              "S8",
+              "omegam",
+              "H0"
+          ]
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove new physics.",
+              "This does not solve H0.",
+              "This does not disprove standard cosmology.",
+              "This does not compute final RSD pressure.",
+              "This does not download the full Planck fullGrid zip.",
+              "This does not import Planck chains.",
+              "This does not parse chain sample rows.",
+              "This does not compute Planck reference uncertainty.",
+              "This only reads bounded byte ranges for selected small .paramnames files.",
+              "A pass means selected paramnames were extracted and target-column presence was audited, not that uncertainty was computed."
+          ]
+
+          def head_probe(label, url):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "accept_ranges": None,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      method="HEAD",
+                      headers={
+                          "User-Agent": "TAIRID-v4.58-selective-paramnames/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["accept_ranges"] = response.headers.get("Accept-Ranges")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record
+
+          def range_probe(label, url, range_header, max_read_bytes):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "range_header": range_header,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "content_range": None,
+                  "bytes_read": 0,
+                  "truncated_by_guard": False,
+                  "server_honored_range": False,
+                  "sha256_16": None,
+                  "error": None
+              }
+
+              data = b""
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v4.58-selective-paramnames/1.0",
+                          "Accept": "*/*",
+                          "Range": range_header
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=180) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["content_range"] = response.headers.get("Content-Range")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+                      record["server_honored_range"] = record["status"] == 206 or bool(record["content_range"])
+
+                      data = response.read(max_read_bytes + 1)
+
+                      if len(data) > max_read_bytes:
+                          record["truncated_by_guard"] = True
+                          data = data[:max_read_bytes]
+
+                      record["bytes_read"] = len(data)
+                      record["sha256_16"] = hashlib.sha256(data).hexdigest()[:16] if data else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record, data
+
+          def classify_member(name):
+              lower = name.lower()
+
+              if name.endswith("/"):
+                  return "directory"
+              if lower.endswith(".paramnames"):
+                  return "paramnames"
+              if re.search(r"_\d+\.txt$", name):
+                  return "chain_sample_text_member_not_read"
+              if lower.endswith(".minimum"):
+                  return "minimum"
+              if lower.endswith(".bestfit"):
+                  return "bestfit"
+              if lower.endswith(".likestats"):
+                  return "likestats"
+              if lower.endswith(".ranges"):
+                  return "ranges"
+              if lower.endswith(".converge"):
+                  return "converge"
+              if lower.endswith(".txt"):
+                  return "other_text_not_read"
+              if lower.endswith(".pdf"):
+                  return "pdf_not_read"
+              return "other"
+
+          def parse_zip64_extra(extra_bytes, need_uncompressed, need_compressed, need_local_offset):
+              result = {}
+              pos = 0
+
+              while pos + 4 <= len(extra_bytes):
+                  header_id, data_size = struct.unpack_from("<HH", extra_bytes, pos)
+                  data_start = pos + 4
+                  data_end = data_start + data_size
+
+                  if data_end > len(extra_bytes):
+                      break
+
+                  data = extra_bytes[data_start:data_end]
+
+                  if header_id == 0x0001:
+                      subpos = 0
+
+                      if need_uncompressed and subpos + 8 <= len(data):
+                          result["uncompressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                      if need_compressed and subpos + 8 <= len(data):
+                          result["compressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                      if need_local_offset and subpos + 8 <= len(data):
+                          result["local_header_offset"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                  pos = data_end
+
+              return result
+
+          def parse_central_directory(cd_bytes):
+              records = []
+              pos = 0
+
+              while pos + 46 <= len(cd_bytes):
+                  if cd_bytes[pos:pos + 4] != b"PK\x01\x02":
+                      break
+
+                  try:
+                      fields = struct.unpack_from("<4s6H3L5H2L", cd_bytes, pos)
+
+                      compression_method = fields[4]
+                      compressed_size = fields[8]
+                      uncompressed_size = fields[9]
+                      file_name_len = fields[10]
+                      extra_len = fields[11]
+                      comment_len = fields[12]
+                      local_header_offset = fields[16]
+
+                      name_start = pos + 46
+                      name_end = name_start + file_name_len
+                      extra_start = name_end
+                      extra_end = extra_start + extra_len
+                      comment_end = extra_end + comment_len
+
+                      if comment_end > len(cd_bytes):
+                          break
+
+                      name = cd_bytes[name_start:name_end].decode("utf-8", errors="replace")
+                      extra = cd_bytes[extra_start:extra_end]
+
+                      zip64_extra = parse_zip64_extra(
+                          extra,
+                          need_uncompressed=uncompressed_size == 0xFFFFFFFF,
+                          need_compressed=compressed_size == 0xFFFFFFFF,
+                          need_local_offset=local_header_offset == 0xFFFFFFFF
+                      )
+
+                      true_compressed_size = zip64_extra.get("compressed_size", compressed_size)
+                      true_uncompressed_size = zip64_extra.get("uncompressed_size", uncompressed_size)
+                      true_local_header_offset = zip64_extra.get("local_header_offset", local_header_offset)
+
+                      records.append({
+                          "member_name": name,
+                          "member_type": classify_member(name),
+                          "compression_method": compression_method,
+                          "compressed_size": true_compressed_size,
+                          "uncompressed_size": true_uncompressed_size,
+                          "local_header_offset": true_local_header_offset,
+                          "zip64_extra_used": bool(zip64_extra)
+                      })
+
+                      pos = comment_end
+
+                  except Exception:
+                      break
+
+              return records
+
+          def selected_paramnames_from_manifest(manifest_records):
+              selected = []
+
+              for row in manifest_records:
+                  name = row["member_name"]
+
+                  if row["member_type"] != "paramnames":
+                      continue
+
+                  if any(name.startswith(prefix) for prefix in SELECTED_PREFIXES):
+                      selected.append(row)
+
+              selected = sorted(selected, key=lambda row: row["member_name"])
+              return selected[:MAX_SELECTED_PARAMNAMES]
+
+          def fetch_member_bytes(member_record):
+              offset = int(member_record["local_header_offset"])
+              compressed_size = int(member_record["compressed_size"])
+
+              if compressed_size <= 0:
+                  raise RuntimeError("compressed_size_not_positive")
+
+              if compressed_size > MAX_PARAMNAMES_COMPRESSED_BYTES:
+                  raise RuntimeError("paramnames_member_too_large_for_guarded_fetch")
+
+              header_record, header_data = range_probe(
+                  "local_header_probe",
+                  FULL_GRID_URL,
+                  f"bytes={offset}-{offset + 4095}",
+                  4096
+              )
+
+              if not header_record["ok"] or not header_record["server_honored_range"]:
+                  raise RuntimeError("local_header_range_not_available")
+
+              if len(header_data) < 30:
+                  raise RuntimeError("local_header_too_short")
+
+              if header_data[:4] != b"PK\x03\x04":
+                  raise RuntimeError("local_header_signature_not_found")
+
+              fields = struct.unpack_from("<4s5H3L2H", header_data, 0)
+
+              compression_method = fields[3]
+              file_name_len = fields[9]
+              extra_len = fields[10]
+
+              data_start = offset + 30 + file_name_len + extra_len
+              data_end = data_start + compressed_size - 1
+
+              data_record, compressed_data = range_probe(
+                  "member_payload_probe",
+                  FULL_GRID_URL,
+                  f"bytes={data_start}-{data_end}",
+                  compressed_size + 1024
+              )
+
+              if not data_record["ok"] or not data_record["server_honored_range"]:
+                  raise RuntimeError("member_payload_range_not_available")
+
+              if data_record["truncated_by_guard"]:
+                  raise RuntimeError("member_payload_truncated_by_guard")
+
+              if len(compressed_data) != compressed_size:
+                  raise RuntimeError(f"member_payload_size_mismatch_expected_{compressed_size}_got_{len(compressed_data)}")
+
+              if compression_method == 0:
+                  return compressed_data, compression_method, header_record, data_record
+
+              if compression_method == 8:
+                  return zlib.decompress(compressed_data, -15), compression_method, header_record, data_record
+
+              raise RuntimeError(f"unsupported_compression_method_{compression_method}")
+
+          def parse_paramnames_text(text):
+              names = []
+
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+
+                  if not line or line.startswith("#"):
+                      continue
+
+                  first = line.split()[0]
+
+                  if first:
+                      names.append(first)
+
+              return names
+
+          def root_from_paramnames(name):
+              if name.endswith(".paramnames"):
+                  return name[:-len(".paramnames")]
+              return name
+
+          def target_hits(param_names):
+              hits = []
+
+              for target in TARGET_PARAMS:
+                  if target in param_names:
+                      hits.append(target)
+
+              return hits
+
+          failed_gates = []
+          warnings = [
+              "selective_paramnames_extraction_only",
+              "full_grid_not_downloaded",
+              "chain_sample_rows_not_read",
+              "reference_uncertainty_not_computed",
+              "final_RSD_pressure_not_computed",
+              "not_validation"
+          ]
+
+          head_record = head_probe("full_grid_head", FULL_GRID_URL)
+
+          if not head_record["ok"]:
+              failed_gates.append("full_grid_head_probe_failed")
+
+          if head_record.get("content_length") and head_record["content_length"] != FULLGRID_CONTENT_LENGTH_EXPECTED:
+              warnings.append("fullgrid_content_length_differs_from_v4_57_locked_value")
+
+          cd_start = ZIP64_CENTRAL_DIRECTORY_OFFSET
+          cd_end = ZIP64_CENTRAL_DIRECTORY_OFFSET + ZIP64_CENTRAL_DIRECTORY_SIZE - 1
+
+          cd_record, cd_data = range_probe(
+              "full_grid_locked_zip64_central_directory_fetch",
+              FULL_GRID_URL,
+              f"bytes={cd_start}-{cd_end}",
+              MAX_RANGE_READ_BYTES
+          )
+
+          if not cd_record["ok"]:
+              failed_gates.append("central_directory_fetch_failed")
+
+          if not cd_record.get("server_honored_range"):
+              failed_gates.append("central_directory_range_not_honored")
+
+          if cd_record.get("truncated_by_guard"):
+              failed_gates.append("central_directory_truncated_by_guard")
+
+          manifest_records = parse_central_directory(cd_data) if cd_data else []
+
+          if not manifest_records:
+              failed_gates.append("central_directory_manifest_records_not_parsed")
+
+          selected_paramnames = selected_paramnames_from_manifest(manifest_records)
+
+          if not selected_paramnames:
+              failed_gates.append("no_selected_paramnames_from_manifest")
+
+          extraction_records = []
+          all_detected_targets = []
+          roots_with_fsigma8 = []
+          roots_with_sigma8_like = []
+
+          for member in selected_paramnames:
+              member_name = member["member_name"]
+
+              record = {
+                  "member_name": member_name,
+                  "root": root_from_paramnames(member_name),
+                  "compressed_size": member["compressed_size"],
+                  "uncompressed_size": member["uncompressed_size"],
+                  "local_header_offset": member["local_header_offset"],
+                  "extraction_ok": False,
+                  "parameter_count": 0,
+                  "detected_targets": "",
+                  "detected_fsigma8_targets": "",
+                  "detected_sigma8_like_targets": "",
+                  "first_parameters_preview": "",
+                  "error": ""
+              }
+
+              try:
+                  payload, method, header_probe_record, payload_probe_record = fetch_member_bytes(member)
+                  text = payload.decode("utf-8", errors="replace")
+                  param_names = parse_paramnames_text(text)
+                  hits = target_hits(param_names)
+
+                  fsigma8_hits = [name for name in hits if name.startswith("fsigma8z")]
+                  sigma8_like_hits = [
+                      name for name in hits
+                      if name.startswith("sigma8z") or name in {"sigma8", "S8"}
+                  ]
+
+                  record["extraction_ok"] = True
+                  record["compression_method"] = method
+                  record["parameter_count"] = len(param_names)
+                  record["detected_targets"] = ", ".join(hits)
+                  record["detected_fsigma8_targets"] = ", ".join(fsigma8_hits)
+                  record["detected_sigma8_like_targets"] = ", ".join(sigma8_like_hits)
+                  record["first_parameters_preview"] = ", ".join(param_names[:12])
+
+                  all_detected_targets.extend(hits)
+
+                  if fsigma8_hits:
+                      roots_with_fsigma8.append(record["root"])
+
+                  if sigma8_like_hits:
+                      roots_with_sigma8_like.append(record["root"])
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              extraction_records.append(record)
+
+          extracted_ok_count = sum(1 for row in extraction_records if row["extraction_ok"])
+          extracted_fail_count = sum(1 for row in extraction_records if not row["extraction_ok"])
+
+          unique_detected_targets = sorted(set(all_detected_targets), key=lambda value: value.lower())
+          unique_fsigma8_targets = sorted([target for target in unique_detected_targets if target.startswith("fsigma8z")])
+          unique_sigma8_like_targets = sorted([
+              target for target in unique_detected_targets
+              if target.startswith("sigma8z") or target in {"sigma8", "S8"}
+          ])
+
+          direct_fsigma8_available = bool(unique_fsigma8_targets)
+          sigma8_like_available = bool(unique_sigma8_like_targets)
+
+          if extracted_ok_count == 0:
+              failed_gates.append("no_selected_paramnames_extracted_successfully")
+
+          if extracted_fail_count > 0:
+              warnings.append("some_selected_paramnames_failed_to_extract")
+
+          if not direct_fsigma8_available:
+              warnings.append("direct_fsigma8_targets_not_found_in_selected_paramnames")
+
+          if sigma8_like_available and not direct_fsigma8_available:
+              warnings.append("sigma8_like_targets_present_but_direct_fsigma8_absent")
+
+          if direct_fsigma8_available:
+              route_decision = "direct_fsigma8_columns_present_in_selected_paramnames_ready_for_guarded_chain_column_contract"
+          elif sigma8_like_available:
+              route_decision = "direct_fsigma8_absent_but_sigma8_like_columns_present_growth_rate_or_external_reference_route_needed"
+          else:
+              route_decision = "selected_paramnames_extracted_but_no_RSD_target_columns_found_external_reference_or_derived_growth_route_needed"
+
+          RULE_RESULTS = [
+              {
+                  "rule_id": "fullgrid_not_downloaded",
+                  "pass": True,
+                  "result": "only_bounded_ranges_read",
+                  "boundary": "No fullGrid download."
+              },
+              {
+                  "rule_id": "central_directory_fetched_from_v4_57_offsets",
+                  "pass": cd_record["ok"] and cd_record["server_honored_range"] and not cd_record["truncated_by_guard"],
+                  "result": f"central_directory_bytes_read_{cd_record.get('bytes_read')}",
+                  "boundary": "Central directory only."
+              },
+              {
+                  "rule_id": "manifest_records_parsed",
+                  "pass": bool(manifest_records),
+                  "result": f"{len(manifest_records)} manifest records parsed",
+                  "boundary": "Filenames and offsets only."
+              },
+              {
+                  "rule_id": "selected_paramnames_identified",
+                  "pass": bool(selected_paramnames),
+                  "result": f"{len(selected_paramnames)} selected paramnames records identified",
+                  "boundary": "Small selected paramnames only."
+              },
+              {
+                  "rule_id": "selected_paramnames_extracted",
+                  "pass": extracted_ok_count > 0,
+                  "result": f"{extracted_ok_count} selected paramnames extracted",
+                  "boundary": "No chain sample rows read."
+              },
+              {
+                  "rule_id": "target_presence_route_decision_recorded",
+                  "pass": route_decision != "undetermined",
+                  "result": route_decision,
+                  "boundary": "Presence audit only, no uncertainty."
+              },
+              {
+                  "rule_id": "no_chain_sample_rows_read",
+                  "pass": True,
+                  "result": "no_chain_samples_imported_or_read",
+                  "boundary": "No Planck posterior samples used."
+              },
+              {
+                  "rule_id": "no_final_pressure_or_validation",
+                  "pass": True,
+                  "result": "no_final_RSD_pressure_no_TAIRID_validation",
+                  "boundary": "Selective paramnames extraction only."
+              }
+          ]
+
+          if not all(row["pass"] for row in RULE_RESULTS):
+              failed_gates.append("not_all_v4_58_rules_passed")
+
+          if failed_gates:
+              readiness_label = "planck_fullgrid_selective_paramnames_extraction_probe_failed"
+              next_allowed_step = "Repair selective paramnames extraction before any chain-column or uncertainty work."
+          else:
+              readiness_label = "planck_fullgrid_selective_paramnames_extraction_probe_passed_with_target_presence_route_decision"
+              next_allowed_step = (
+                  "Proceed according to route_decision. If direct fsigma8 columns are present, design a guarded chain-column contract. "
+                  "If direct fsigma8 is absent, do not invent it; design a derived-growth or external-reference route before any chain import. "
+                  "Do not compute reference uncertainty or final RSD pressure yet."
+              )
+
+          system_health = {
+              "head_ok": head_record["ok"],
+              "head_content_length": head_record.get("content_length"),
+              "central_directory_bytes_read": cd_record.get("bytes_read"),
+              "manifest_member_count": len(manifest_records),
+              "selected_paramnames_count": len(selected_paramnames),
+              "selected_paramnames_extracted_ok_count": extracted_ok_count,
+              "selected_paramnames_extracted_fail_count": extracted_fail_count,
+              "unique_detected_targets": ", ".join(unique_detected_targets),
+              "unique_fsigma8_targets": ", ".join(unique_fsigma8_targets),
+              "unique_sigma8_like_targets": ", ".join(unique_sigma8_like_targets),
+              "direct_fsigma8_available": direct_fsigma8_available,
+              "sigma8_like_available": sigma8_like_available,
+              "roots_with_fsigma8_count": len(set(roots_with_fsigma8)),
+              "roots_with_sigma8_like_count": len(set(roots_with_sigma8_like)),
+              "route_decision": route_decision,
+              "fullGrid_downloaded": False,
+              "Planck_chains_imported": False,
+              "chain_sample_rows_read": False,
+              "reference_uncertainty_computed": False,
+              "final_RSD_pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in RULE_RESULTS if row["pass"]),
+              "rule_total_count": len(RULE_RESULTS)
+          }
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_url": FULL_GRID_URL,
+              "v4_57_locked_offsets": {
+                  "content_length_expected": FULLGRID_CONTENT_LENGTH_EXPECTED,
+                  "central_directory_offset": ZIP64_CENTRAL_DIRECTORY_OFFSET,
+                  "central_directory_size": ZIP64_CENTRAL_DIRECTORY_SIZE
+              },
+              "selected_prefixes": SELECTED_PREFIXES,
+              "target_params": TARGET_PARAMS,
+              "head_record": head_record,
+              "central_directory_range_record": cd_record,
+              "selected_paramnames": selected_paramnames,
+              "extraction_records": extraction_records,
+              "target_presence_audit": {
+                  "unique_detected_targets": unique_detected_targets,
+                  "unique_fsigma8_targets": unique_fsigma8_targets,
+                  "unique_sigma8_like_targets": unique_sigma8_like_targets,
+                  "direct_fsigma8_available": direct_fsigma8_available,
+                  "sigma8_like_available": sigma8_like_available,
+                  "roots_with_fsigma8": sorted(set(roots_with_fsigma8)),
+                  "roots_with_sigma8_like": sorted(set(roots_with_sigma8_like)),
+                  "route_decision": route_decision
+              },
+              "rule_results": RULE_RESULTS,
+              "system_health": system_health,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_allowed_step,
+                  "fullGrid_downloaded": False,
+                  "Planck_chains_imported": False,
+                  "chain_sample_rows_read": False,
+                  "reference_uncertainty_computed": False,
+                  "final_RSD_pressure_computed": False,
+                  "validation_claim_allowed": False
+              }
+          }
+
+          json_path = OUTDIR / "tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "selected_paramnames_extraction_v4_58.csv",
+              extraction_records,
+              [
+                  "member_name",
+                  "root",
+                  "compressed_size",
+                  "uncompressed_size",
+                  "local_header_offset",
+                  "extraction_ok",
+                  "compression_method",
+                  "parameter_count",
+                  "detected_targets",
+                  "detected_fsigma8_targets",
+                  "detected_sigma8_like_targets",
+                  "first_parameters_preview",
+                  "error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "target_presence_route_decision_v4_58.csv",
+              [
+                  {
+                      "route_decision": route_decision,
+                      "direct_fsigma8_available": direct_fsigma8_available,
+                      "sigma8_like_available": sigma8_like_available,
+                      "unique_detected_targets": ", ".join(unique_detected_targets),
+                      "unique_fsigma8_targets": ", ".join(unique_fsigma8_targets),
+                      "unique_sigma8_like_targets": ", ".join(unique_sigma8_like_targets),
+                      "fullGrid_downloaded": False,
+                      "chain_sample_rows_read": False,
+                      "reference_uncertainty_computed": False,
+                      "final_RSD_pressure_computed": False
+                  }
+              ],
+              [
+                  "route_decision",
+                  "direct_fsigma8_available",
+                  "sigma8_like_available",
+                  "unique_detected_targets",
+                  "unique_fsigma8_targets",
+                  "unique_sigma8_like_targets",
+                  "fullGrid_downloaded",
+                  "chain_sample_rows_read",
+                  "reference_uncertainty_computed",
+                  "final_RSD_pressure_computed"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "rule_results_v4_58.csv",
+              RULE_RESULTS,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          md = []
+          md.append("# TAIRID v4.58 — Planck FullGrid Selective Paramnames Extraction Probe")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("This test fetches only selected small `.paramnames` files from the Planck fullGrid ZIP using bounded byte ranges and v4.57 ZIP64 central-directory offsets.")
+          md.append("")
+          md.append("It audits whether direct `fsigma8z*` or related `sigma8` target columns are present in selected baseline Planck roots.")
+          md.append("")
+          md.append("It does not download fullGrid, import chains, read chain sample rows, compute Planck reference uncertainty, compute final RSD pressure, or validate TAIRID.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Route decision")
+          md.append("")
+          md.append(f"`{route_decision}`")
+          md.append("")
+          md.append("## Target presence")
+          md.append("")
+          md.append(f"- Direct fsigma8 available: `{direct_fsigma8_available}`")
+          md.append(f"- Sigma8-like available: `{sigma8_like_available}`")
+          md.append(f"- Unique fsigma8 targets: `{', '.join(unique_fsigma8_targets) if unique_fsigma8_targets else 'none'}`")
+          md.append(f"- Unique sigma8-like targets: `{', '.join(unique_sigma8_like_targets) if unique_sigma8_like_targets else 'none'}`")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_allowed_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe.json`")
+          md.append("- `tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe.md`")
+          md.append("- `selected_paramnames_extraction_v4_58.csv`")
+          md.append("- `target_presence_route_decision_v4_58.csv`")
+          md.append("- `rule_results_v4_58.csv`")
+          md.append("")
+
+          (OUTDIR / "tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe.md").write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.58 Planck fullGrid selective paramnames extraction probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-58-planck-fullgrid-selective-paramnames-extraction-probe
+          path: artifacts/tairid_v4_58_planck_fullgrid_selective_paramnames_extraction_probe/
