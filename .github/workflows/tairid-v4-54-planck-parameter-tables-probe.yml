@@ -1,0 +1,570 @@
+name: TAIRID v4.54 Planck Parameter Tables Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-54-planck-parameter-tables-probe.yml"
+
+jobs:
+  tairid-v4-54-planck-parameter-tables-probe:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.54 Planck parameter tables probe
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_54_planck_parameter_tables_probe
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import zipfile
+          import urllib.request
+          import hashlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_54_planck_parameter_tables_probe")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_54_planck_parameter_tables_probe"
+
+          PARAMETER_TABLES_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_parameter-tables_R3.01.zip"
+          FULL_GRID_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_fullGrid_R3.01.zip"
+
+          LOCAL_ZIP = Path("/tmp/COM_CosmoParams_parameter-tables_R3.01.zip")
+          MAX_DOWNLOAD_BYTES = 250_000_000
+          MAX_TEXT_MEMBER_BYTES = 2_000_000
+
+          SEARCH_TERMS = [
+              "fsigma8z015",
+              "fsigma8z038",
+              "fsigma8z051",
+              "fsigma8z061",
+              "fsigma8z233",
+              "f\\sigma_8",
+              "f sigma8",
+              "fsigma8",
+              "sigma8z015",
+              "sigma8z038",
+              "sigma8z051",
+              "sigma8z061",
+              "sigma8z233",
+              "sigma8",
+              "S_8",
+              "S8",
+              "omegam",
+              "H0"
+          ]
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove new physics.",
+              "This does not solve H0.",
+              "This does not disprove standard cosmology.",
+              "This does not compute final RSD pressure.",
+              "This does not download the full Planck full-grid zip.",
+              "This does not import Planck chains.",
+              "This does not parse chain sample rows.",
+              "This does not compute Planck reference uncertainty.",
+              "This only probes the smaller Planck parameter-tables product for reference-table material.",
+              "A pass means the parameter-tables route was audited, not that reference uncertainty is included."
+          ]
+
+          def head_probe(label, url):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      method="HEAD",
+                      headers={
+                          "User-Agent": "TAIRID-v4.54-parameter-tables-probe/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record
+
+          def guarded_download(url, path, max_bytes):
+              hasher = hashlib.sha256()
+              total_bytes = 0
+
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v4.54-parameter-tables-probe/1.0",
+                      "Accept": "application/zip,*/*"
+                  }
+              )
+
+              with urllib.request.urlopen(req, timeout=180) as response:
+                  with path.open("wb") as f:
+                      while True:
+                          chunk = response.read(1024 * 1024)
+                          if not chunk:
+                              break
+
+                          total_bytes += len(chunk)
+
+                          if total_bytes > max_bytes:
+                              raise RuntimeError(f"guarded_download_exceeded_{max_bytes}_bytes")
+
+                          f.write(chunk)
+                          hasher.update(chunk)
+
+              return {
+                  "downloaded": True,
+                  "bytes": total_bytes,
+                  "sha256_16": hasher.hexdigest()[:16]
+              }
+
+          def classify_member(name):
+              lower = name.lower()
+
+              if name.endswith("/"):
+                  return "directory"
+
+              if lower.endswith(".txt"):
+                  return "text"
+              if lower.endswith(".tex"):
+                  return "latex"
+              if lower.endswith(".csv"):
+                  return "csv"
+              if lower.endswith(".dat"):
+                  return "data_text"
+              if lower.endswith(".paramnames"):
+                  return "paramnames"
+              if lower.endswith(".pdf"):
+                  return "pdf_not_read"
+              if lower.endswith(".fits"):
+                  return "fits_not_read"
+              if lower.endswith(".zip"):
+                  return "nested_zip_not_read"
+
+              return "other"
+
+          def should_read_text_member(name, size):
+              kind = classify_member(name)
+              if kind not in {"text", "latex", "csv", "data_text", "paramnames"}:
+                  return False
+              if size > MAX_TEXT_MEMBER_BYTES:
+                  return False
+              return True
+
+          def normalized_hits(text, terms):
+              hits = []
+              lowered = text.lower()
+
+              for term in terms:
+                  if term.lower() in lowered:
+                      hits.append(term)
+
+              return sorted(set(hits), key=lambda x: x.lower())
+
+          failed_gates = []
+          warnings = [
+              "parameter_tables_probe_only",
+              "full_grid_not_downloaded",
+              "chain_sample_rows_not_read",
+              "reference_uncertainty_not_computed",
+              "final_RSD_pressure_not_computed",
+              "not_validation"
+          ]
+
+          full_grid_head = head_probe("full_grid_head_probe_only", FULL_GRID_URL)
+          parameter_tables_head = head_probe("parameter_tables_head_probe", PARAMETER_TABLES_URL)
+
+          if not full_grid_head["ok"]:
+              failed_gates.append("full_grid_head_probe_failed")
+
+          if not parameter_tables_head["ok"]:
+              failed_gates.append("parameter_tables_head_probe_failed")
+
+          if parameter_tables_head.get("content_length") is not None:
+              if parameter_tables_head["content_length"] <= 0:
+                  failed_gates.append("parameter_tables_content_length_not_positive")
+              if parameter_tables_head["content_length"] > MAX_DOWNLOAD_BYTES:
+                  failed_gates.append("parameter_tables_zip_too_large_for_guarded_probe")
+          else:
+              warnings.append("parameter_tables_content_length_missing_download_guard_will_enforce_limit")
+
+          download_record = {
+              "downloaded": False,
+              "bytes": 0,
+              "sha256_16": None
+          }
+
+          manifest_records = []
+          text_probe_records = []
+          all_hits = []
+          route_decision = "undetermined"
+
+          try:
+              if not failed_gates:
+                  download_record = guarded_download(PARAMETER_TABLES_URL, LOCAL_ZIP, MAX_DOWNLOAD_BYTES)
+
+                  if not LOCAL_ZIP.exists():
+                      failed_gates.append("parameter_tables_zip_download_missing_after_download")
+                  elif LOCAL_ZIP.stat().st_size <= 0:
+                      failed_gates.append("parameter_tables_zip_download_empty")
+                  else:
+                      with zipfile.ZipFile(LOCAL_ZIP, "r") as z:
+                          infos = z.infolist()
+
+                          for info in infos:
+                              kind = classify_member(info.filename)
+                              record = {
+                                  "member_name": info.filename,
+                                  "member_type": kind,
+                                  "file_size": info.file_size,
+                                  "compressed_size": info.compress_size,
+                                  "read_policy": "not_read"
+                              }
+
+                              if should_read_text_member(info.filename, info.file_size):
+                                  try:
+                                      raw = z.read(info.filename)
+                                      text = raw.decode("utf-8", errors="replace")
+                                      hits = normalized_hits(text, SEARCH_TERMS)
+
+                                      record["read_policy"] = "text_read_for_term_probe"
+                                      record["hit_count"] = len(hits)
+                                      record["hits"] = ", ".join(hits)
+
+                                      if hits:
+                                          text_probe_records.append({
+                                              "member_name": info.filename,
+                                              "member_type": kind,
+                                              "file_size": info.file_size,
+                                              "hit_count": len(hits),
+                                              "hits": ", ".join(hits),
+                                              "snippet": text[:500].replace("\n", " ")
+                                          })
+                                          all_hits.extend(hits)
+
+                                  except Exception as exc:
+                                      record["read_policy"] = "read_failed"
+                                      record["error"] = f"{type(exc).__name__}: {exc}"
+
+                              manifest_records.append(record)
+
+              if LOCAL_ZIP.exists():
+                  LOCAL_ZIP.unlink()
+
+          except zipfile.BadZipFile as exc:
+              failed_gates.append("downloaded_parameter_tables_zip_not_valid_zip")
+              warnings.append(f"zip_error_{type(exc).__name__}")
+
+              if LOCAL_ZIP.exists():
+                  LOCAL_ZIP.unlink()
+
+          except Exception as exc:
+              failed_gates.append("parameter_tables_probe_exception")
+              warnings.append(f"exception_{type(exc).__name__}_{exc}")
+
+              if LOCAL_ZIP.exists():
+                  LOCAL_ZIP.unlink()
+
+          unique_hits = sorted(set(all_hits), key=lambda x: x.lower())
+          fsigma8_like_hits = [
+              hit for hit in unique_hits
+              if "fsigma8" in hit.lower() or "f\\sigma_8" in hit.lower() or "f sigma8" in hit.lower()
+          ]
+          sigma8_like_hits = [
+              hit for hit in unique_hits
+              if "sigma8" in hit.lower() or hit in {"S8", "S_8"}
+          ]
+
+          if not manifest_records:
+              failed_gates.append("parameter_tables_manifest_not_read")
+
+          if text_probe_records:
+              route_decision = "parameter_tables_contains_relevant_reference_terms_but_not_posterior_samples"
+              warnings.append("parameter_tables_contains_reference_terms_table_route_possible_but_not_uncertainty_samples")
+          else:
+              route_decision = "parameter_tables_no_relevant_text_hits_move_to_fullgrid_member_identification"
+              warnings.append("negative_finding_parameter_tables_no_relevant_text_hits")
+
+          if not fsigma8_like_hits:
+              warnings.append("no_fsigma8_like_hits_in_parameter_tables_probe")
+
+          if LOCAL_ZIP.exists():
+              failed_gates.append("local_zip_not_deleted_after_parameter_tables_probe")
+
+          RULE_RESULTS = [
+              {
+                  "rule_id": "full_grid_not_downloaded",
+                  "pass": True,
+                  "result": "full_grid_used_for_HEAD_probe_only",
+                  "boundary": "No fullGrid download."
+              },
+              {
+                  "rule_id": "parameter_tables_zip_guarded",
+                  "pass": download_record["downloaded"] and 0 < download_record["bytes"] <= MAX_DOWNLOAD_BYTES,
+                  "result": f"parameter_tables_download_bytes_{download_record['bytes']}",
+                  "boundary": "Smaller parameter-tables product only."
+              },
+              {
+                  "rule_id": "parameter_tables_manifest_read",
+                  "pass": bool(manifest_records),
+                  "result": f"{len(manifest_records)} manifest members detected",
+                  "boundary": "Manifest names plus small text-file term search only."
+              },
+              {
+                  "rule_id": "text_probe_completed",
+                  "pass": True,
+                  "result": f"{len(text_probe_records)} text members with relevant hits",
+                  "boundary": "Term search only; no reference uncertainty."
+              },
+              {
+                  "rule_id": "route_decision_recorded",
+                  "pass": route_decision != "undetermined",
+                  "result": route_decision,
+                  "boundary": "Route decision does not compute uncertainty."
+              },
+              {
+                  "rule_id": "no_chain_sample_rows_read",
+                  "pass": True,
+                  "result": "no_chain_samples_imported_or_read",
+                  "boundary": "No Planck posterior samples used."
+              },
+              {
+                  "rule_id": "local_zip_deleted",
+                  "pass": not LOCAL_ZIP.exists(),
+                  "result": "local_zip_deleted_after_parameter_tables_probe",
+                  "boundary": "Do not upload or persist Planck zip."
+              },
+              {
+                  "rule_id": "no_final_pressure_or_validation",
+                  "pass": True,
+                  "result": "no_final_RSD_pressure_no_TAIRID_validation",
+                  "boundary": "Source route probe only."
+              }
+          ]
+
+          if not all(row["pass"] for row in RULE_RESULTS):
+              failed_gates.append("not_all_v4_54_rules_passed")
+
+          if failed_gates:
+              readiness_label = "planck_parameter_tables_probe_failed"
+              next_allowed_step = "Repair parameter-tables probe before choosing the next source route."
+          else:
+              readiness_label = "planck_parameter_tables_probe_passed_ready_for_table_route_review_or_fullgrid_member_identification"
+              next_allowed_step = (
+                  "Proceed based on route_decision. If relevant table terms were found, review table route boundaries. "
+                  "If not, proceed to guarded fullGrid member identification. Do not import chain samples, compute reference uncertainty, or compute final RSD pressure yet."
+              )
+
+          system_health = {
+              "full_grid_head_ok": full_grid_head["ok"],
+              "full_grid_downloaded": False,
+              "parameter_tables_head_ok": parameter_tables_head["ok"],
+              "parameter_tables_content_length": parameter_tables_head.get("content_length"),
+              "parameter_tables_downloaded_for_probe_only": download_record["downloaded"],
+              "parameter_tables_download_bytes": download_record["bytes"],
+              "parameter_tables_sha256_16": download_record["sha256_16"],
+              "manifest_member_count": len(manifest_records),
+              "text_members_with_relevant_hits": len(text_probe_records),
+              "unique_hit_count": len(unique_hits),
+              "fsigma8_like_hit_count": len(fsigma8_like_hits),
+              "sigma8_like_hit_count": len(sigma8_like_hits),
+              "route_decision": route_decision,
+              "Planck_chains_imported": False,
+              "chain_sample_rows_read": False,
+              "Planck_full_grid_downloaded": False,
+              "reference_uncertainty_computed": False,
+              "final_RSD_pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "local_zip_deleted": not LOCAL_ZIP.exists(),
+              "rule_pass_count": sum(1 for row in RULE_RESULTS if row["pass"]),
+              "rule_total_count": len(RULE_RESULTS)
+          }
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_urls": {
+                  "parameter_tables_zip": PARAMETER_TABLES_URL,
+                  "full_grid_head_probe_only": FULL_GRID_URL
+              },
+              "head_records": {
+                  "full_grid": full_grid_head,
+                  "parameter_tables": parameter_tables_head
+              },
+              "download_record": download_record,
+              "manifest_records": manifest_records,
+              "text_probe_records": text_probe_records,
+              "unique_hits": unique_hits,
+              "fsigma8_like_hits": fsigma8_like_hits,
+              "sigma8_like_hits": sigma8_like_hits,
+              "route_decision": route_decision,
+              "rule_results": RULE_RESULTS,
+              "system_health": system_health,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_allowed_step,
+                  "full_grid_downloaded": False,
+                  "Planck_chains_imported": False,
+                  "chain_sample_rows_read": False,
+                  "reference_uncertainty_computed": False,
+                  "final_RSD_pressure_computed": False,
+                  "validation_claim_allowed": False
+              }
+          }
+
+          json_path = OUTDIR / "tairid_v4_54_planck_parameter_tables_probe.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "parameter_tables_manifest_v4_54.csv",
+              manifest_records,
+              ["member_name", "member_type", "file_size", "compressed_size", "read_policy", "hit_count", "hits", "error"]
+          )
+
+          write_csv(
+              OUTDIR / "parameter_tables_text_hits_v4_54.csv",
+              text_probe_records,
+              ["member_name", "member_type", "file_size", "hit_count", "hits", "snippet"]
+          )
+
+          write_csv(
+              OUTDIR / "rule_results_v4_54.csv",
+              RULE_RESULTS,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "route_decision_v4_54.csv",
+              [
+                  {
+                      "route_decision": route_decision,
+                      "unique_hits": ", ".join(unique_hits),
+                      "fsigma8_like_hits": ", ".join(fsigma8_like_hits),
+                      "sigma8_like_hits": ", ".join(sigma8_like_hits),
+                      "reference_uncertainty_computed": False,
+                      "final_RSD_pressure_computed": False
+                  }
+              ],
+              [
+                  "route_decision",
+                  "unique_hits",
+                  "fsigma8_like_hits",
+                  "sigma8_like_hits",
+                  "reference_uncertainty_computed",
+                  "final_RSD_pressure_computed"
+              ]
+          )
+
+          md = []
+          md.append("# TAIRID v4.54 — Planck Parameter Tables Probe")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("This test probes the smaller Planck parameter-tables zip for relevant reference-table terms.")
+          md.append("")
+          md.append("It does not download the fullGrid zip, import chains, read chain sample rows, compute Planck reference uncertainty, compute final RSD pressure, or validate TAIRID.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Route decision")
+          md.append("")
+          md.append(f"`{route_decision}`")
+          md.append("")
+          md.append("## Hits")
+          md.append("")
+          md.append(f"- Unique hits: `{', '.join(unique_hits) if unique_hits else 'none'}`")
+          md.append(f"- fsigma8-like hits: `{', '.join(fsigma8_like_hits) if fsigma8_like_hits else 'none'}`")
+          md.append(f"- sigma8-like hits: `{', '.join(sigma8_like_hits) if sigma8_like_hits else 'none'}`")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_allowed_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_v4_54_planck_parameter_tables_probe.json`")
+          md.append("- `tairid_v4_54_planck_parameter_tables_probe.md`")
+          md.append("- `parameter_tables_manifest_v4_54.csv`")
+          md.append("- `parameter_tables_text_hits_v4_54.csv`")
+          md.append("- `rule_results_v4_54.csv`")
+          md.append("- `route_decision_v4_54.csv`")
+          md.append("")
+
+          (OUTDIR / "tairid_v4_54_planck_parameter_tables_probe.md").write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.54 Planck parameter tables probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-54-planck-parameter-tables-probe
+          path: artifacts/tairid_v4_54_planck_parameter_tables_probe/
