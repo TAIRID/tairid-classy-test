@@ -1,0 +1,1082 @@
+name: TAIRID v4.63 Planck Chain Derived Growth Calculator Contract Audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-63-planck-chain-derived-growth-calculator-contract-audit.yml"
+
+jobs:
+  tairid-v4-63-planck-chain-derived-growth-calculator-contract-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.63 Planck chain derived growth calculator contract audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit
+
+          python - <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import struct
+          import urllib.request
+          import hashlib
+          import zlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit"
+
+          FULL_GRID_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_fullGrid_R3.01.zip"
+
+          # Locked from v4.57 successful ZIP64 central-directory probe.
+          FULLGRID_CONTENT_LENGTH_EXPECTED = 11805855817
+          ZIP64_CENTRAL_DIRECTORY_OFFSET = 11803187830
+          ZIP64_CENTRAL_DIRECTORY_SIZE = 2667889
+
+          MAX_RANGE_READ_BYTES = 5_000_000
+          MAX_MINIMUM_COMPRESSED_BYTES = 200_000
+          MAX_SELECTED_MINIMUM_FILES = 120
+
+          # Contract tolerances are deliberately loose.
+          # This is a calculator-contract audit, not a likelihood or posterior test.
+          GAMMA = 0.55
+          MAX_ABS_DIFF_SIGMA8Z = 0.03
+          MAX_ABS_DIFF_FSIGMA8 = 0.03
+          GROWTH_INTEGRATION_STEPS = 800
+
+          SELECTED_PREFIXES = [
+              "base/plikHM_TTTEEE_lowl_lowE/",
+              "base/plikHM_TTTEEE_lowl_lowE_lensing/",
+              "base/plikHM_TT_lowl_lowE/",
+              "base/plikHM_TT_lowl_lowE_lensing/",
+              "base/plikHM_TTTEEE_lowl_lowE_BAO/",
+              "base/plikHM_TTTEEE_lowl_lowE_lensing_BAO/"
+          ]
+
+          Z_TARGETS = [
+              {"z_key": "015", "z": 0.15, "fsigma8_name": "fsigma8z015", "sigma8z_name": "sigma8z015"},
+              {"z_key": "038", "z": 0.38, "fsigma8_name": "fsigma8z038", "sigma8z_name": "sigma8z038"},
+              {"z_key": "051", "z": 0.51, "fsigma8_name": "fsigma8z051", "sigma8z_name": "sigma8z051"},
+              {"z_key": "061", "z": 0.61, "fsigma8_name": "fsigma8z061", "sigma8z_name": "sigma8z061"},
+              {"z_key": "233", "z": 2.33, "fsigma8_name": "fsigma8z233", "sigma8z_name": "sigma8z233"}
+          ]
+
+          TARGET_PARAMS = [
+              "fsigma8z015",
+              "fsigma8z038",
+              "fsigma8z051",
+              "fsigma8z061",
+              "fsigma8z233",
+              "sigma8z015",
+              "sigma8z038",
+              "sigma8z051",
+              "sigma8z061",
+              "sigma8z233",
+              "sigma8",
+              "S8",
+              "omegam",
+              "H0"
+          ]
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove new physics.",
+              "This does not solve H0.",
+              "This does not disprove standard cosmology.",
+              "This does not compute final RSD pressure.",
+              "This does not download the full Planck fullGrid zip.",
+              "This does not import Planck chains.",
+              "This does not parse chain sample rows.",
+              "This does not compute Planck reference uncertainty.",
+              "This only reads bounded byte ranges for selected small .minimum files.",
+              "This audits a future chain-sample derived growth calculator contract using minimum sidecar point values as fixtures.",
+              "Minimum files are diagnostic point outputs, not posterior samples or covariance.",
+              "A pass means the calculator contract is plausible enough for guarded parser design, not that uncertainty is computed."
+          ]
+
+          def head_probe(label, url):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "accept_ranges": None,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      method="HEAD",
+                      headers={
+                          "User-Agent": "TAIRID-v4.63-growth-calculator-contract/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["accept_ranges"] = response.headers.get("Accept-Ranges")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record
+
+          def range_probe(label, url, range_header, max_read_bytes):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "range_header": range_header,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "content_range": None,
+                  "bytes_read": 0,
+                  "truncated_by_guard": False,
+                  "server_honored_range": False,
+                  "sha256_16": None,
+                  "error": None
+              }
+
+              data = b""
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v4.63-growth-calculator-contract/1.0",
+                          "Accept": "*/*",
+                          "Range": range_header
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=180) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["content_range"] = response.headers.get("Content-Range")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+                      record["server_honored_range"] = record["status"] == 206 or bool(record["content_range"])
+
+                      data = response.read(max_read_bytes + 1)
+
+                      if len(data) > max_read_bytes:
+                          record["truncated_by_guard"] = True
+                          data = data[:max_read_bytes]
+
+                      record["bytes_read"] = len(data)
+                      record["sha256_16"] = hashlib.sha256(data).hexdigest()[:16] if data else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record, data
+
+          def classify_member(name):
+              lower = name.lower()
+
+              if name.endswith("/"):
+                  return "directory"
+              if lower.endswith(".paramnames"):
+                  return "paramnames"
+              if re.search(r"_\d+\.txt$", name):
+                  return "chain_sample_text_member_not_read"
+              if lower.endswith(".minimum"):
+                  return "minimum"
+              if lower.endswith(".bestfit"):
+                  return "bestfit"
+              if lower.endswith(".likestats"):
+                  return "likestats"
+              if lower.endswith(".ranges"):
+                  return "ranges"
+              if lower.endswith(".converge"):
+                  return "converge"
+              if lower.endswith(".txt"):
+                  return "other_text_not_read"
+              if lower.endswith(".pdf"):
+                  return "pdf_not_read"
+              return "other"
+
+          def parse_zip64_extra(extra_bytes, need_uncompressed, need_compressed, need_local_offset):
+              result = {}
+              pos = 0
+
+              while pos + 4 <= len(extra_bytes):
+                  header_id, data_size = struct.unpack_from("<HH", extra_bytes, pos)
+                  data_start = pos + 4
+                  data_end = data_start + data_size
+
+                  if data_end > len(extra_bytes):
+                      break
+
+                  data = extra_bytes[data_start:data_end]
+
+                  if header_id == 0x0001:
+                      subpos = 0
+
+                      if need_uncompressed and subpos + 8 <= len(data):
+                          result["uncompressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                      if need_compressed and subpos + 8 <= len(data):
+                          result["compressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                      if need_local_offset and subpos + 8 <= len(data):
+                          result["local_header_offset"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                  pos = data_end
+
+              return result
+
+          def parse_central_directory(cd_bytes):
+              records = []
+              pos = 0
+
+              while pos + 46 <= len(cd_bytes):
+                  if cd_bytes[pos:pos + 4] != b"PK\x01\x02":
+                      break
+
+                  try:
+                      fields = struct.unpack_from("<4s6H3L5H2L", cd_bytes, pos)
+
+                      compression_method = fields[4]
+                      compressed_size = fields[8]
+                      uncompressed_size = fields[9]
+                      file_name_len = fields[10]
+                      extra_len = fields[11]
+                      comment_len = fields[12]
+                      local_header_offset = fields[16]
+
+                      name_start = pos + 46
+                      name_end = name_start + file_name_len
+                      extra_start = name_end
+                      extra_end = extra_start + extra_len
+                      comment_end = extra_end + comment_len
+
+                      if comment_end > len(cd_bytes):
+                          break
+
+                      name = cd_bytes[name_start:name_end].decode("utf-8", errors="replace")
+                      extra = cd_bytes[extra_start:extra_end]
+
+                      zip64_extra = parse_zip64_extra(
+                          extra,
+                          need_uncompressed=uncompressed_size == 0xFFFFFFFF,
+                          need_compressed=compressed_size == 0xFFFFFFFF,
+                          need_local_offset=local_header_offset == 0xFFFFFFFF
+                      )
+
+                      true_compressed_size = zip64_extra.get("compressed_size", compressed_size)
+                      true_uncompressed_size = zip64_extra.get("uncompressed_size", uncompressed_size)
+                      true_local_header_offset = zip64_extra.get("local_header_offset", local_header_offset)
+
+                      records.append({
+                          "member_name": name,
+                          "member_type": classify_member(name),
+                          "compression_method": compression_method,
+                          "compressed_size": true_compressed_size,
+                          "uncompressed_size": true_uncompressed_size,
+                          "local_header_offset": true_local_header_offset,
+                          "zip64_extra_used": bool(zip64_extra)
+                      })
+
+                      pos = comment_end
+
+                  except Exception:
+                      break
+
+              return records
+
+          def selected_minimums_from_manifest(manifest_records):
+              selected = []
+
+              for row in manifest_records:
+                  name = row["member_name"]
+
+                  if row["member_type"] != "minimum":
+                      continue
+
+                  if any(name.startswith(prefix) for prefix in SELECTED_PREFIXES):
+                      selected.append(row)
+
+              selected = sorted(selected, key=lambda row: row["member_name"])
+              return selected[:MAX_SELECTED_MINIMUM_FILES]
+
+          def fetch_member_bytes(member_record):
+              offset = int(member_record["local_header_offset"])
+              compressed_size = int(member_record["compressed_size"])
+
+              if compressed_size <= 0:
+                  raise RuntimeError("compressed_size_not_positive")
+
+              if compressed_size > MAX_MINIMUM_COMPRESSED_BYTES:
+                  raise RuntimeError("minimum_member_too_large_for_guarded_fetch")
+
+              header_record, header_data = range_probe(
+                  "local_header_probe",
+                  FULL_GRID_URL,
+                  f"bytes={offset}-{offset + 4095}",
+                  4096
+              )
+
+              if not header_record["ok"] or not header_record["server_honored_range"]:
+                  raise RuntimeError("local_header_range_not_available")
+
+              if len(header_data) < 30:
+                  raise RuntimeError("local_header_too_short")
+
+              if header_data[:4] != b"PK\x03\x04":
+                  raise RuntimeError("local_header_signature_not_found")
+
+              fields = struct.unpack_from("<4s5H3L2H", header_data, 0)
+
+              compression_method = fields[3]
+              file_name_len = fields[9]
+              extra_len = fields[10]
+
+              data_start = offset + 30 + file_name_len + extra_len
+              data_end = data_start + compressed_size - 1
+
+              data_record, compressed_data = range_probe(
+                  "member_payload_probe",
+                  FULL_GRID_URL,
+                  f"bytes={data_start}-{data_end}",
+                  compressed_size + 1024
+              )
+
+              if not data_record["ok"] or not data_record["server_honored_range"]:
+                  raise RuntimeError("member_payload_range_not_available")
+
+              if data_record["truncated_by_guard"]:
+                  raise RuntimeError("member_payload_truncated_by_guard")
+
+              if len(compressed_data) != compressed_size:
+                  raise RuntimeError(f"member_payload_size_mismatch_expected_{compressed_size}_got_{len(compressed_data)}")
+
+              if compression_method == 0:
+                  return compressed_data, compression_method
+
+              if compression_method == 8:
+                  return zlib.decompress(compressed_data, -15), compression_method
+
+              raise RuntimeError(f"unsupported_compression_method_{compression_method}")
+
+          def root_from_minimum(name):
+              if name.endswith(".minimum"):
+                  return name[:-len(".minimum")]
+              return name
+
+          def parse_minimum_values(text):
+              values = {}
+
+              pattern = re.compile(
+                  r"^\s*(\d+)\s+([+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[Ee][+-]?\d+)?)\s+([A-Za-z0-9_]+)\b(.*)$",
+                  re.MULTILINE
+              )
+
+              for index, value, name, label in pattern.findall(text):
+                  if name in TARGET_PARAMS:
+                      values[name] = {
+                          "index": int(index),
+                          "value": float(value),
+                          "label": label.strip()
+                      }
+
+              return values
+
+          def omega_m_z(omegam0, z):
+              numerator = omegam0 * (1.0 + z) ** 3
+              denominator = numerator + (1.0 - omegam0)
+
+              if denominator == 0:
+                  return None
+
+              return numerator / denominator
+
+          def growth_rate_gamma(omegam0, z, gamma):
+              omz = omega_m_z(omegam0, z)
+              if omz is None:
+                  return None
+              return omz ** gamma
+
+          def growth_factor_gamma(omegam0, z, gamma, steps):
+              # D(a)/D(1) = exp(- integral from ln(a) to 0 of f(a') d ln a')
+              # with a = 1 / (1 + z).
+              if z == 0:
+                  return 1.0
+
+              a_min = 1.0 / (1.0 + z)
+              x0 = math.log(a_min)
+              x1 = 0.0
+
+              if steps < 10:
+                  steps = 10
+
+              # Simpson prefers even number of intervals.
+              if steps % 2 == 1:
+                  steps += 1
+
+              h = (x1 - x0) / steps
+
+              def f_of_x(x):
+                  a = math.exp(x)
+                  z_here = (1.0 / a) - 1.0
+                  return growth_rate_gamma(omegam0, z_here, gamma)
+
+              total = f_of_x(x0) + f_of_x(x1)
+
+              for i in range(1, steps):
+                  coeff = 4 if i % 2 == 1 else 2
+                  total += coeff * f_of_x(x0 + i * h)
+
+              integral = total * h / 3.0
+
+              return math.exp(-integral)
+
+          failed_gates = []
+          warnings = [
+              "chain_derived_growth_calculator_contract_audit_only",
+              "gamma_0p55_growth_calculator_is_contract_not_likelihood",
+              "minimum_files_are_point_outputs_not_posterior_samples",
+              "full_grid_not_downloaded",
+              "chain_sample_rows_not_read",
+              "reference_uncertainty_not_computed",
+              "final_RSD_pressure_not_computed",
+              "not_validation"
+          ]
+
+          head_record = head_probe("full_grid_head", FULL_GRID_URL)
+
+          if not head_record["ok"]:
+              failed_gates.append("full_grid_head_probe_failed")
+
+          if head_record.get("content_length") and head_record["content_length"] != FULLGRID_CONTENT_LENGTH_EXPECTED:
+              warnings.append("fullgrid_content_length_differs_from_v4_57_locked_value")
+
+          cd_start = ZIP64_CENTRAL_DIRECTORY_OFFSET
+          cd_end = ZIP64_CENTRAL_DIRECTORY_OFFSET + ZIP64_CENTRAL_DIRECTORY_SIZE - 1
+
+          cd_record, cd_data = range_probe(
+              "full_grid_locked_zip64_central_directory_fetch",
+              FULL_GRID_URL,
+              f"bytes={cd_start}-{cd_end}",
+              MAX_RANGE_READ_BYTES
+          )
+
+          if not cd_record["ok"]:
+              failed_gates.append("central_directory_fetch_failed")
+
+          if not cd_record.get("server_honored_range"):
+              failed_gates.append("central_directory_range_not_honored")
+
+          if cd_record.get("truncated_by_guard"):
+              failed_gates.append("central_directory_truncated_by_guard")
+
+          manifest_records = parse_central_directory(cd_data) if cd_data else []
+
+          if not manifest_records:
+              failed_gates.append("central_directory_manifest_records_not_parsed")
+
+          selected_minimums = selected_minimums_from_manifest(manifest_records)
+
+          if not selected_minimums:
+              failed_gates.append("no_selected_minimum_files_from_manifest")
+
+          extraction_records = []
+          calculator_records = []
+          root_summary_records = []
+
+          for member in selected_minimums:
+              member_name = member["member_name"]
+              root = root_from_minimum(member_name)
+
+              extraction_record = {
+                  "member_name": member_name,
+                  "root": root,
+                  "compressed_size": member["compressed_size"],
+                  "uncompressed_size": member["uncompressed_size"],
+                  "local_header_offset": member["local_header_offset"],
+                  "extraction_ok": False,
+                  "available_value_count": 0,
+                  "pair_count": 0,
+                  "calculator_contract_pass_count": 0,
+                  "max_abs_diff_sigma8z": "",
+                  "max_abs_diff_fsigma8": "",
+                  "error": ""
+              }
+
+              try:
+                  payload, method = fetch_member_bytes(member)
+                  text = payload.decode("utf-8", errors="replace")
+                  root_values = parse_minimum_values(text)
+
+                  extraction_record["extraction_ok"] = True
+                  extraction_record["compression_method"] = method
+                  extraction_record["available_value_count"] = len(root_values)
+
+                  omegam_row = root_values.get("omegam")
+                  sigma8_row = root_values.get("sigma8")
+
+                  omegam0 = omegam_row["value"] if omegam_row else None
+                  sigma8_0 = sigma8_row["value"] if sigma8_row else None
+
+                  pair_count = 0
+                  calculator_contract_pass_count = 0
+                  sigma8z_diffs = []
+                  fsigma8_diffs = []
+
+                  for target in Z_TARGETS:
+                      fs_name = target["fsigma8_name"]
+                      sig_name = target["sigma8z_name"]
+
+                      fs_row = root_values.get(fs_name)
+                      sig_row = root_values.get(sig_name)
+
+                      if fs_row is None or sig_row is None or omegam0 is None or sigma8_0 is None:
+                          continue
+
+                      sidecar_fsigma8 = fs_row["value"]
+                      sidecar_sigma8z = sig_row["value"]
+
+                      f_z = growth_rate_gamma(omegam0, target["z"], GAMMA)
+                      D_z = growth_factor_gamma(omegam0, target["z"], GAMMA, GROWTH_INTEGRATION_STEPS)
+
+                      derived_sigma8z = sigma8_0 * D_z
+                      derived_fsigma8 = f_z * derived_sigma8z
+
+                      diff_sigma8z = derived_sigma8z - sidecar_sigma8z
+                      diff_fsigma8 = derived_fsigma8 - sidecar_fsigma8
+
+                      abs_diff_sigma8z = abs(diff_sigma8z)
+                      abs_diff_fsigma8 = abs(diff_fsigma8)
+
+                      sigma8z_pass = abs_diff_sigma8z <= MAX_ABS_DIFF_SIGMA8Z
+                      fsigma8_pass = abs_diff_fsigma8 <= MAX_ABS_DIFF_FSIGMA8
+                      pair_pass = sigma8z_pass and fsigma8_pass
+
+                      pair_count += 1
+
+                      if pair_pass:
+                          calculator_contract_pass_count += 1
+
+                      sigma8z_diffs.append(abs_diff_sigma8z)
+                      fsigma8_diffs.append(abs_diff_fsigma8)
+
+                      calculator_records.append({
+                          "root": root,
+                          "member_name": member_name,
+                          "z_key": target["z_key"],
+                          "z": target["z"],
+                          "omegam0": omegam0,
+                          "sigma8_0": sigma8_0,
+                          "gamma": GAMMA,
+                          "growth_integration_steps": GROWTH_INTEGRATION_STEPS,
+                          "growth_rate_f_z": f_z,
+                          "growth_factor_D_z": D_z,
+                          "sidecar_sigma8z": sidecar_sigma8z,
+                          "derived_sigma8z": derived_sigma8z,
+                          "diff_sigma8z": diff_sigma8z,
+                          "abs_diff_sigma8z": abs_diff_sigma8z,
+                          "sigma8z_tolerance": MAX_ABS_DIFF_SIGMA8Z,
+                          "sigma8z_contract_pass": sigma8z_pass,
+                          "sidecar_fsigma8": sidecar_fsigma8,
+                          "derived_fsigma8": derived_fsigma8,
+                          "diff_fsigma8": diff_fsigma8,
+                          "abs_diff_fsigma8": abs_diff_fsigma8,
+                          "fsigma8_tolerance": MAX_ABS_DIFF_FSIGMA8,
+                          "fsigma8_contract_pass": fsigma8_pass,
+                          "calculator_contract_pair_pass": pair_pass,
+                          "source_status": "minimum_sidecar_point_values_not_posterior_samples"
+                      })
+
+                  extraction_record["pair_count"] = pair_count
+                  extraction_record["calculator_contract_pass_count"] = calculator_contract_pass_count
+                  extraction_record["max_abs_diff_sigma8z"] = max(sigma8z_diffs) if sigma8z_diffs else ""
+                  extraction_record["max_abs_diff_fsigma8"] = max(fsigma8_diffs) if fsigma8_diffs else ""
+
+                  root_summary_records.append({
+                      "root": root,
+                      "H0": root_values.get("H0", {}).get("value", ""),
+                      "omegam": root_values.get("omegam", {}).get("value", ""),
+                      "sigma8": root_values.get("sigma8", {}).get("value", ""),
+                      "S8": root_values.get("S8", {}).get("value", ""),
+                      "pair_count": pair_count,
+                      "calculator_contract_pass_count": calculator_contract_pass_count,
+                      "max_abs_diff_sigma8z": max(sigma8z_diffs) if sigma8z_diffs else "",
+                      "max_abs_diff_fsigma8": max(fsigma8_diffs) if fsigma8_diffs else "",
+                      "all_pairs_pass_calculator_contract": pair_count > 0 and pair_count == calculator_contract_pass_count,
+                      "minimum_files_treated_as_posterior_samples": False
+                  })
+
+              except Exception as exc:
+                  extraction_record["error"] = f"{type(exc).__name__}: {exc}"
+
+              extraction_records.append(extraction_record)
+
+          extracted_ok_count = sum(1 for row in extraction_records if row["extraction_ok"])
+          extracted_fail_count = sum(1 for row in extraction_records if not row["extraction_ok"])
+
+          calculator_pair_count = len(calculator_records)
+          calculator_pair_pass_count = sum(1 for row in calculator_records if row["calculator_contract_pair_pass"] is True)
+          calculator_pair_fail_count = calculator_pair_count - calculator_pair_pass_count
+
+          sigma8z_pair_pass_count = sum(1 for row in calculator_records if row["sigma8z_contract_pass"] is True)
+          fsigma8_pair_pass_count = sum(1 for row in calculator_records if row["fsigma8_contract_pass"] is True)
+
+          roots_with_all_five_pairs = sum(1 for row in root_summary_records if row["pair_count"] == len(Z_TARGETS))
+          roots_with_all_five_calculator_pass = sum(1 for row in root_summary_records if row["all_pairs_pass_calculator_contract"] is True)
+
+          max_abs_diff_sigma8z_observed = max([row["abs_diff_sigma8z"] for row in calculator_records], default=None)
+          max_abs_diff_fsigma8_observed = max([row["abs_diff_fsigma8"] for row in calculator_records], default=None)
+
+          mean_abs_diff_sigma8z_observed = (
+              sum(row["abs_diff_sigma8z"] for row in calculator_records) / calculator_pair_count
+              if calculator_pair_count else None
+          )
+
+          mean_abs_diff_fsigma8_observed = (
+              sum(row["abs_diff_fsigma8"] for row in calculator_records) / calculator_pair_count
+              if calculator_pair_count else None
+          )
+
+          if extracted_ok_count == 0:
+              failed_gates.append("no_selected_minimum_files_extracted_successfully")
+
+          if extracted_fail_count > 0:
+              warnings.append("some_selected_minimum_files_failed_to_extract")
+
+          if calculator_pair_count == 0:
+              failed_gates.append("no_growth_calculator_contract_pairs_found")
+
+          if calculator_pair_fail_count > 0:
+              failed_gates.append("some_growth_calculator_contract_pairs_exceeded_tolerance")
+
+          if roots_with_all_five_pairs == 0:
+              failed_gates.append("no_roots_with_complete_five_redshift_pair_set")
+
+          if roots_with_all_five_calculator_pass == 0:
+              failed_gates.append("no_roots_with_complete_growth_calculator_contract_pass_set")
+
+          route_decision = (
+              "growth_calculator_contract_matches_sidecar_point_outputs_ready_for_guarded_chain_sample_design_without_fsigma8_columns"
+          )
+
+          RULE_RESULTS = [
+              {
+                  "rule_id": "fullgrid_not_downloaded",
+                  "pass": True,
+                  "result": "only_bounded_ranges_read",
+                  "boundary": "No fullGrid download."
+              },
+              {
+                  "rule_id": "central_directory_fetched_from_v4_57_offsets",
+                  "pass": cd_record["ok"] and cd_record["server_honored_range"] and not cd_record["truncated_by_guard"],
+                  "result": f"central_directory_bytes_read_{cd_record.get('bytes_read')}",
+                  "boundary": "Central directory only."
+              },
+              {
+                  "rule_id": "selected_minimums_extracted",
+                  "pass": extracted_ok_count > 0,
+                  "result": f"{extracted_ok_count} selected minimum files extracted",
+                  "boundary": "No chain sample rows read."
+              },
+              {
+                  "rule_id": "calculator_contract_pairs_found",
+                  "pass": calculator_pair_count > 0,
+                  "result": f"{calculator_pair_count} calculator-contract pairs found",
+                  "boundary": "Point-value fixtures only."
+              },
+              {
+                  "rule_id": "sigma8z_contract_pairs_within_tolerance",
+                  "pass": calculator_pair_count > 0 and sigma8z_pair_pass_count == calculator_pair_count,
+                  "result": f"{sigma8z_pair_pass_count} of {calculator_pair_count} sigma8z pairs within tolerance {MAX_ABS_DIFF_SIGMA8Z}",
+                  "boundary": "Contract sanity check only, not likelihood."
+              },
+              {
+                  "rule_id": "fsigma8_contract_pairs_within_tolerance",
+                  "pass": calculator_pair_count > 0 and fsigma8_pair_pass_count == calculator_pair_count,
+                  "result": f"{fsigma8_pair_pass_count} of {calculator_pair_count} fsigma8 pairs within tolerance {MAX_ABS_DIFF_FSIGMA8}",
+                  "boundary": "Contract sanity check only, not likelihood."
+              },
+              {
+                  "rule_id": "complete_redshift_sets_found",
+                  "pass": roots_with_all_five_pairs > 0,
+                  "result": f"{roots_with_all_five_pairs} roots contain all five redshift pairs",
+                  "boundary": "Completeness of sidecar minimum targets only."
+              },
+              {
+                  "rule_id": "complete_calculator_contract_sets_found",
+                  "pass": roots_with_all_five_calculator_pass > 0,
+                  "result": f"{roots_with_all_five_calculator_pass} roots pass all five calculator checks",
+                  "boundary": "Approximate growth-calculator contract only."
+              },
+              {
+                  "rule_id": "minimum_files_not_treated_as_uncertainty",
+                  "pass": True,
+                  "result": "minimum_files_flagged_as_diagnostic_point_outputs_not_posterior_samples",
+                  "boundary": "Do not compute covariance from minimum files."
+              },
+              {
+                  "rule_id": "route_decision_recorded",
+                  "pass": route_decision != "undetermined",
+                  "result": route_decision,
+                  "boundary": "Route decision does not compute uncertainty."
+              },
+              {
+                  "rule_id": "no_chain_sample_rows_read",
+                  "pass": True,
+                  "result": "no_chain_samples_imported_or_read",
+                  "boundary": "No Planck posterior samples used."
+              },
+              {
+                  "rule_id": "no_final_pressure_or_validation",
+                  "pass": True,
+                  "result": "no_final_RSD_pressure_no_TAIRID_validation",
+                  "boundary": "Growth calculator contract audit only."
+              }
+          ]
+
+          if not all(row["pass"] for row in RULE_RESULTS):
+              failed_gates.append("not_all_v4_63_rules_passed")
+
+          if failed_gates:
+              readiness_label = "planck_chain_derived_growth_calculator_contract_audit_failed"
+              next_allowed_step = "Repair growth calculator contract before guarded chain-sample parser design."
+          else:
+              readiness_label = "planck_chain_derived_growth_calculator_contract_audit_passed_ready_for_guarded_chain_sample_parser_design"
+              next_allowed_step = (
+                  "Proceed to v4.64 guarded chain-sample parser design. "
+                  "Do not import chains expecting fsigma8 columns. The parser should derive fsigma8 from sampled omegam and sigma8 under the locked calculator contract. "
+                  "Do not compute reference uncertainty or final RSD pressure yet."
+              )
+
+          system_health = {
+              "head_ok": head_record["ok"],
+              "head_content_length": head_record.get("content_length"),
+              "central_directory_bytes_read": cd_record.get("bytes_read"),
+              "manifest_member_count": len(manifest_records),
+              "selected_minimum_count": len(selected_minimums),
+              "selected_minimum_extracted_ok_count": extracted_ok_count,
+              "selected_minimum_extracted_fail_count": extracted_fail_count,
+              "gamma": GAMMA,
+              "growth_integration_steps": GROWTH_INTEGRATION_STEPS,
+              "sigma8z_contract_tolerance": MAX_ABS_DIFF_SIGMA8Z,
+              "fsigma8_contract_tolerance": MAX_ABS_DIFF_FSIGMA8,
+              "calculator_pair_count": calculator_pair_count,
+              "calculator_pair_pass_count": calculator_pair_pass_count,
+              "calculator_pair_fail_count": calculator_pair_fail_count,
+              "sigma8z_pair_pass_count": sigma8z_pair_pass_count,
+              "fsigma8_pair_pass_count": fsigma8_pair_pass_count,
+              "max_abs_diff_sigma8z_observed": max_abs_diff_sigma8z_observed,
+              "mean_abs_diff_sigma8z_observed": mean_abs_diff_sigma8z_observed,
+              "max_abs_diff_fsigma8_observed": max_abs_diff_fsigma8_observed,
+              "mean_abs_diff_fsigma8_observed": mean_abs_diff_fsigma8_observed,
+              "roots_with_all_five_redshift_pairs": roots_with_all_five_pairs,
+              "roots_with_all_five_calculator_contract_pass": roots_with_all_five_calculator_pass,
+              "route_decision": route_decision,
+              "minimum_files_treated_as_posterior_samples": False,
+              "fullGrid_downloaded": False,
+              "Planck_chains_imported": False,
+              "chain_sample_rows_read": False,
+              "reference_uncertainty_computed": False,
+              "final_RSD_pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in RULE_RESULTS if row["pass"]),
+              "rule_total_count": len(RULE_RESULTS)
+          }
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_url": FULL_GRID_URL,
+              "v4_57_locked_offsets": {
+                  "content_length_expected": FULLGRID_CONTENT_LENGTH_EXPECTED,
+                  "central_directory_offset": ZIP64_CENTRAL_DIRECTORY_OFFSET,
+                  "central_directory_size": ZIP64_CENTRAL_DIRECTORY_SIZE
+              },
+              "selected_prefixes": SELECTED_PREFIXES,
+              "z_targets": Z_TARGETS,
+              "growth_calculator_contract": {
+                  "omega_m_z": "Omega_m0 * (1+z)^3 / (Omega_m0 * (1+z)^3 + 1 - Omega_m0)",
+                  "f_z": "Omega_m(z)^gamma",
+                  "D_z": "exp(- integral from ln(a) to 0 of f(a') d ln a')",
+                  "sigma8z": "sigma8_0 * D_z",
+                  "fsigma8z": "f_z * sigma8z",
+                  "gamma": GAMMA,
+                  "growth_integration_steps": GROWTH_INTEGRATION_STEPS,
+                  "max_abs_diff_sigma8z": MAX_ABS_DIFF_SIGMA8Z,
+                  "max_abs_diff_fsigma8": MAX_ABS_DIFF_FSIGMA8,
+                  "status": "contract_sanity_check_only_not_likelihood"
+              },
+              "head_record": head_record,
+              "central_directory_range_record": cd_record,
+              "extraction_records": extraction_records,
+              "calculator_records": calculator_records,
+              "root_summary_records": root_summary_records,
+              "route_decision": route_decision,
+              "rule_results": RULE_RESULTS,
+              "system_health": system_health,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_allowed_step,
+                  "fullGrid_downloaded": False,
+                  "Planck_chains_imported": False,
+                  "chain_sample_rows_read": False,
+                  "minimum_files_treated_as_posterior_samples": False,
+                  "reference_uncertainty_computed": False,
+                  "final_RSD_pressure_computed": False,
+                  "validation_claim_allowed": False
+              }
+          }
+
+          json_path = OUTDIR / "tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "minimum_extraction_records_v4_63.csv",
+              extraction_records,
+              [
+                  "member_name",
+                  "root",
+                  "compressed_size",
+                  "uncompressed_size",
+                  "local_header_offset",
+                  "extraction_ok",
+                  "compression_method",
+                  "available_value_count",
+                  "pair_count",
+                  "calculator_contract_pass_count",
+                  "max_abs_diff_sigma8z",
+                  "max_abs_diff_fsigma8",
+                  "error"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "growth_calculator_contract_records_v4_63.csv",
+              calculator_records,
+              [
+                  "root",
+                  "member_name",
+                  "z_key",
+                  "z",
+                  "omegam0",
+                  "sigma8_0",
+                  "gamma",
+                  "growth_integration_steps",
+                  "growth_rate_f_z",
+                  "growth_factor_D_z",
+                  "sidecar_sigma8z",
+                  "derived_sigma8z",
+                  "diff_sigma8z",
+                  "abs_diff_sigma8z",
+                  "sigma8z_tolerance",
+                  "sigma8z_contract_pass",
+                  "sidecar_fsigma8",
+                  "derived_fsigma8",
+                  "diff_fsigma8",
+                  "abs_diff_fsigma8",
+                  "fsigma8_tolerance",
+                  "fsigma8_contract_pass",
+                  "calculator_contract_pair_pass",
+                  "source_status"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "root_growth_calculator_summary_v4_63.csv",
+              root_summary_records,
+              [
+                  "root",
+                  "H0",
+                  "omegam",
+                  "sigma8",
+                  "S8",
+                  "pair_count",
+                  "calculator_contract_pass_count",
+                  "max_abs_diff_sigma8z",
+                  "max_abs_diff_fsigma8",
+                  "all_pairs_pass_calculator_contract",
+                  "minimum_files_treated_as_posterior_samples"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "route_decision_v4_63.csv",
+              [
+                  {
+                      "route_decision": route_decision,
+                      "gamma": GAMMA,
+                      "growth_integration_steps": GROWTH_INTEGRATION_STEPS,
+                      "sigma8z_contract_tolerance": MAX_ABS_DIFF_SIGMA8Z,
+                      "fsigma8_contract_tolerance": MAX_ABS_DIFF_FSIGMA8,
+                      "calculator_pair_count": calculator_pair_count,
+                      "calculator_pair_pass_count": calculator_pair_pass_count,
+                      "calculator_pair_fail_count": calculator_pair_fail_count,
+                      "max_abs_diff_sigma8z_observed": max_abs_diff_sigma8z_observed,
+                      "mean_abs_diff_sigma8z_observed": mean_abs_diff_sigma8z_observed,
+                      "max_abs_diff_fsigma8_observed": max_abs_diff_fsigma8_observed,
+                      "mean_abs_diff_fsigma8_observed": mean_abs_diff_fsigma8_observed,
+                      "roots_with_all_five_redshift_pairs": roots_with_all_five_pairs,
+                      "roots_with_all_five_calculator_contract_pass": roots_with_all_five_calculator_pass,
+                      "minimum_files_treated_as_posterior_samples": False,
+                      "fullGrid_downloaded": False,
+                      "chain_sample_rows_read": False,
+                      "reference_uncertainty_computed": False,
+                      "final_RSD_pressure_computed": False
+                  }
+              ],
+              [
+                  "route_decision",
+                  "gamma",
+                  "growth_integration_steps",
+                  "sigma8z_contract_tolerance",
+                  "fsigma8_contract_tolerance",
+                  "calculator_pair_count",
+                  "calculator_pair_pass_count",
+                  "calculator_pair_fail_count",
+                  "max_abs_diff_sigma8z_observed",
+                  "mean_abs_diff_sigma8z_observed",
+                  "max_abs_diff_fsigma8_observed",
+                  "mean_abs_diff_fsigma8_observed",
+                  "roots_with_all_five_redshift_pairs",
+                  "roots_with_all_five_calculator_contract_pass",
+                  "minimum_files_treated_as_posterior_samples",
+                  "fullGrid_downloaded",
+                  "chain_sample_rows_read",
+                  "reference_uncertainty_computed",
+                  "final_RSD_pressure_computed"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "rule_results_v4_63.csv",
+              RULE_RESULTS,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          md = []
+          md.append("# TAIRID v4.63 — Planck Chain-Derived Growth Calculator Contract Audit")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("This test checks whether a future chain-sample parser can derive `sigma8z` and `fsigma8z` from sampled `omegam` and `sigma8` using a guarded growth-gamma calculator.")
+          md.append("")
+          md.append("It uses `.minimum` sidecar point values only as fixtures. It does not read chain sample rows and does not compute posterior uncertainty.")
+          md.append("")
+          md.append("It does not download fullGrid, import chains, compute Planck reference uncertainty, compute final RSD pressure, or validate TAIRID.")
+          md.append("")
+          md.append("## Growth calculator contract")
+          md.append("")
+          md.append("- `Omega_m(z) = Omega_m0 * (1+z)^3 / (Omega_m0 * (1+z)^3 + 1 - Omega_m0)`")
+          md.append("- `f(z) = Omega_m(z)^gamma`")
+          md.append("- `D(z) = exp(- integral from ln(a) to 0 of f(a') d ln a')`")
+          md.append("- `sigma8z = sigma8_0 * D(z)`")
+          md.append("- `fsigma8z = f(z) * sigma8z`")
+          md.append(f"- `gamma = {GAMMA}`")
+          md.append(f"- `growth_integration_steps = {GROWTH_INTEGRATION_STEPS}`")
+          md.append(f"- `sigma8z_tolerance = {MAX_ABS_DIFF_SIGMA8Z}`")
+          md.append(f"- `fsigma8_tolerance = {MAX_ABS_DIFF_FSIGMA8}`")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Route decision")
+          md.append("")
+          md.append(f"`{route_decision}`")
+          md.append("")
+          md.append("## Key boundary")
+          md.append("")
+          md.append("- The future parser should not expect direct `fsigma8z*` chain columns.")
+          md.append("- It should derive `fsigma8z` from sampled `omegam` and `sigma8` under a guarded calculator contract.")
+          md.append("- `.minimum` files are still point fixtures only, not uncertainty.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_allowed_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit.json`")
+          md.append("- `tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit.md`")
+          md.append("- `minimum_extraction_records_v4_63.csv`")
+          md.append("- `growth_calculator_contract_records_v4_63.csv`")
+          md.append("- `root_growth_calculator_summary_v4_63.csv`")
+          md.append("- `route_decision_v4_63.csv`")
+          md.append("- `rule_results_v4_63.csv`")
+          md.append("")
+
+          (OUTDIR / "tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit.md").write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.63 Planck chain derived growth calculator contract audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-63-planck-chain-derived-growth-calculator-contract-audit
+          path: artifacts/tairid_v4_63_planck_chain_derived_growth_calculator_contract_audit/
