@@ -1,0 +1,872 @@
+name: TAIRID v4.57 Planck FullGrid ZIP64 Locator Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-57-planck-fullgrid-zip64-locator-probe.yml"
+
+jobs:
+  tairid-v4-57-planck-fullgrid-zip64-locator-probe:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.57 Planck fullGrid ZIP64 locator probe
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_57_planck_fullgrid_zip64_locator_probe
+
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import struct
+          import urllib.request
+          import hashlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_57_planck_fullgrid_zip64_locator_probe")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_57_planck_fullgrid_zip64_locator_probe"
+
+          FULL_GRID_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_fullGrid_R3.01.zip"
+
+          TAIL_PROBE_BYTES = 2_097_152
+          ZIP64_EOCD_FETCH_BYTES = 256
+          MAX_RANGE_READ_BYTES = 90_000_000
+          MAX_CENTRAL_DIRECTORY_BYTES = 80_000_000
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove new physics.",
+              "This does not solve H0.",
+              "This does not disprove standard cosmology.",
+              "This does not compute final RSD pressure.",
+              "This does not download the full Planck fullGrid zip.",
+              "This does not import Planck chains.",
+              "This does not parse chain sample rows.",
+              "This does not compute Planck reference uncertainty.",
+              "This only reads bounded byte ranges needed to locate and parse the ZIP64 central directory.",
+              "A pass means the fullGrid member list is identified from the ZIP64 central directory, not that any chain data were imported."
+          ]
+
+          def head_probe(label, url):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "accept_ranges": None,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      method="HEAD",
+                      headers={
+                          "User-Agent": "TAIRID-v4.57-zip64-locator-probe/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["accept_ranges"] = response.headers.get("Accept-Ranges")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record
+
+          def range_probe(label, url, range_header, max_read_bytes):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "range_header": range_header,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "content_range": None,
+                  "bytes_read": 0,
+                  "truncated_by_guard": False,
+                  "server_honored_range": False,
+                  "sha256_16": None,
+                  "error": None
+              }
+
+              data = b""
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v4.57-zip64-locator-probe/1.0",
+                          "Accept": "*/*",
+                          "Range": range_header
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=180) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["content_range"] = response.headers.get("Content-Range")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+                      record["server_honored_range"] = record["status"] == 206 or bool(record["content_range"])
+
+                      data = response.read(max_read_bytes + 1)
+
+                      if len(data) > max_read_bytes:
+                          record["truncated_by_guard"] = True
+                          data = data[:max_read_bytes]
+
+                      record["bytes_read"] = len(data)
+                      record["sha256_16"] = hashlib.sha256(data).hexdigest()[:16] if data else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record, data
+
+          def parse_total_from_content_range(content_range):
+              if not content_range:
+                  return None
+
+              match = re.search(r"/(\d+)$", content_range.strip())
+              if not match:
+                  return None
+
+              try:
+                  return int(match.group(1))
+              except ValueError:
+                  return None
+
+          def parse_eocd_from_tail(tail_bytes, total_size):
+              marker = b"PK\x05\x06"
+              index = tail_bytes.rfind(marker)
+
+              if index < 0:
+                  return {
+                      "found": False,
+                      "error": "EOCD marker not found in bounded tail bytes"
+                  }
+
+              try:
+                  unpacked = struct.unpack_from("<4s4H2LH", tail_bytes, index)
+                  signature = unpacked[0]
+                  disk_number = unpacked[1]
+                  central_directory_disk = unpacked[2]
+                  disk_entries = unpacked[3]
+                  total_entries = unpacked[4]
+                  central_directory_size_32 = unpacked[5]
+                  central_directory_offset_32 = unpacked[6]
+                  comment_length = unpacked[7]
+
+                  tail_start_absolute = total_size - len(tail_bytes) if total_size else None
+                  absolute_offset = tail_start_absolute + index if tail_start_absolute is not None else None
+
+                  return {
+                      "found": True,
+                      "eocd_offset_in_tail": index,
+                      "eocd_absolute_offset": absolute_offset,
+                      "signature": signature.hex(),
+                      "disk_number": disk_number,
+                      "central_directory_disk": central_directory_disk,
+                      "disk_entries_32": disk_entries,
+                      "total_entries_32": total_entries,
+                      "central_directory_size_32": central_directory_size_32,
+                      "central_directory_offset_32": central_directory_offset_32,
+                      "comment_length": comment_length,
+                      "zip64_possible": central_directory_size_32 == 0xFFFFFFFF or central_directory_offset_32 == 0xFFFFFFFF or total_entries == 0xFFFF
+                  }
+
+              except Exception as exc:
+                  return {
+                      "found": False,
+                      "error": f"{type(exc).__name__}: {exc}"
+                  }
+
+          def parse_zip64_locator_from_tail(tail_bytes, total_size, eocd_offset_in_tail):
+              marker = b"PK\x06\x07"
+              search_region = tail_bytes[:eocd_offset_in_tail]
+              index = search_region.rfind(marker)
+
+              if index < 0:
+                  return {
+                      "found": False,
+                      "error": "ZIP64 EOCD locator marker not found before EOCD"
+                  }
+
+              if index + 20 > len(tail_bytes):
+                  return {
+                      "found": False,
+                      "error": "ZIP64 locator truncated in tail bytes"
+                  }
+
+              try:
+                  signature, disk_with_zip64_eocd, zip64_eocd_offset, total_disks = struct.unpack_from("<4sLQL", tail_bytes, index)
+
+                  tail_start_absolute = total_size - len(tail_bytes) if total_size else None
+                  absolute_offset = tail_start_absolute + index if tail_start_absolute is not None else None
+
+                  return {
+                      "found": True,
+                      "locator_offset_in_tail": index,
+                      "locator_absolute_offset": absolute_offset,
+                      "signature": signature.hex(),
+                      "disk_with_zip64_eocd": disk_with_zip64_eocd,
+                      "zip64_eocd_offset": zip64_eocd_offset,
+                      "total_disks": total_disks
+                  }
+
+              except Exception as exc:
+                  return {
+                      "found": False,
+                      "error": f"{type(exc).__name__}: {exc}"
+                  }
+
+          def parse_zip64_eocd_record(data):
+              if len(data) < 56:
+                  return {
+                      "found": False,
+                      "error": "ZIP64 EOCD record fetch too short"
+                  }
+
+              if data[:4] != b"PK\x06\x06":
+                  return {
+                      "found": False,
+                      "error": "ZIP64 EOCD signature not found at requested offset",
+                      "first_16_bytes_hex": data[:16].hex()
+                  }
+
+              try:
+                  unpacked = struct.unpack_from("<4sQ2H2L4Q", data, 0)
+
+                  return {
+                      "found": True,
+                      "signature": unpacked[0].hex(),
+                      "zip64_eocd_record_size": unpacked[1],
+                      "version_made_by": unpacked[2],
+                      "version_needed_to_extract": unpacked[3],
+                      "disk_number": unpacked[4],
+                      "central_directory_start_disk": unpacked[5],
+                      "entries_on_this_disk": unpacked[6],
+                      "total_entries": unpacked[7],
+                      "central_directory_size": unpacked[8],
+                      "central_directory_offset": unpacked[9]
+                  }
+
+              except Exception as exc:
+                  return {
+                      "found": False,
+                      "error": f"{type(exc).__name__}: {exc}"
+                  }
+
+          def classify_member(name):
+              lower = name.lower()
+
+              if name.endswith("/"):
+                  return "directory"
+              if lower.endswith(".paramnames"):
+                  return "paramnames"
+              if re.search(r"_\d+\.txt$", name):
+                  return "chain_sample_text_member_not_read"
+              if lower.endswith(".minimum"):
+                  return "minimum"
+              if lower.endswith(".bestfit"):
+                  return "bestfit"
+              if lower.endswith(".likestats"):
+                  return "likestats"
+              if lower.endswith(".ranges"):
+                  return "ranges"
+              if lower.endswith(".converge"):
+                  return "converge"
+              if lower.endswith(".txt"):
+                  return "other_text_not_read"
+              if lower.endswith(".pdf"):
+                  return "pdf_not_read"
+              return "other"
+
+          def parse_zip64_extra(extra_bytes, need_uncompressed, need_compressed, need_local_offset):
+              result = {}
+              pos = 0
+
+              while pos + 4 <= len(extra_bytes):
+                  header_id, data_size = struct.unpack_from("<HH", extra_bytes, pos)
+                  data_start = pos + 4
+                  data_end = data_start + data_size
+
+                  if data_end > len(extra_bytes):
+                      break
+
+                  data = extra_bytes[data_start:data_end]
+
+                  if header_id == 0x0001:
+                      subpos = 0
+
+                      if need_uncompressed and subpos + 8 <= len(data):
+                          result["uncompressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                      if need_compressed and subpos + 8 <= len(data):
+                          result["compressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                      if need_local_offset and subpos + 8 <= len(data):
+                          result["local_header_offset"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+
+                  pos = data_end
+
+              return result
+
+          def parse_central_directory(cd_bytes):
+              records = []
+              pos = 0
+
+              while pos + 46 <= len(cd_bytes):
+                  if cd_bytes[pos:pos + 4] != b"PK\x01\x02":
+                      break
+
+                  try:
+                      fields = struct.unpack_from("<4s6H3L5H2L", cd_bytes, pos)
+
+                      compressed_size = fields[8]
+                      uncompressed_size = fields[9]
+                      file_name_len = fields[10]
+                      extra_len = fields[11]
+                      comment_len = fields[12]
+                      local_header_offset = fields[16]
+
+                      name_start = pos + 46
+                      name_end = name_start + file_name_len
+                      extra_start = name_end
+                      extra_end = extra_start + extra_len
+                      comment_end = extra_end + comment_len
+
+                      if comment_end > len(cd_bytes):
+                          break
+
+                      name = cd_bytes[name_start:name_end].decode("utf-8", errors="replace")
+                      extra = cd_bytes[extra_start:extra_end]
+
+                      zip64_extra = parse_zip64_extra(
+                          extra,
+                          need_uncompressed=uncompressed_size == 0xFFFFFFFF,
+                          need_compressed=compressed_size == 0xFFFFFFFF,
+                          need_local_offset=local_header_offset == 0xFFFFFFFF
+                      )
+
+                      true_compressed_size = zip64_extra.get("compressed_size", compressed_size)
+                      true_uncompressed_size = zip64_extra.get("uncompressed_size", uncompressed_size)
+                      true_local_header_offset = zip64_extra.get("local_header_offset", local_header_offset)
+
+                      records.append({
+                          "member_name": name,
+                          "member_type": classify_member(name),
+                          "compressed_size": true_compressed_size,
+                          "uncompressed_size": true_uncompressed_size,
+                          "local_header_offset": true_local_header_offset,
+                          "zip64_extra_used": bool(zip64_extra)
+                      })
+
+                      pos = comment_end
+
+                  except Exception:
+                      break
+
+              return records
+
+          def root_from_chain_member(name):
+              match = re.match(r"^(.*)_\d+\.txt$", name)
+              return match.group(1) if match else None
+
+          def root_from_paramnames(name):
+              if name.endswith(".paramnames"):
+                  return name[:-len(".paramnames")]
+              return None
+
+          failed_gates = []
+          warnings = [
+              "zip64_locator_probe_only",
+              "full_grid_not_downloaded",
+              "chain_sample_rows_not_read",
+              "reference_uncertainty_not_computed",
+              "final_RSD_pressure_not_computed",
+              "not_validation"
+          ]
+
+          head_record = head_probe("full_grid_head", FULL_GRID_URL)
+
+          tail_record, tail_data = range_probe(
+              "full_grid_tail_probe_for_zip64_locator",
+              FULL_GRID_URL,
+              f"bytes=-{TAIL_PROBE_BYTES}",
+              TAIL_PROBE_BYTES + 1024
+          )
+
+          total_size = head_record.get("content_length") or parse_total_from_content_range(tail_record.get("content_range"))
+
+          if not head_record["ok"]:
+              failed_gates.append("full_grid_head_probe_failed")
+
+          if not total_size:
+              failed_gates.append("full_grid_content_length_unavailable")
+
+          if not tail_record["ok"]:
+              failed_gates.append("full_grid_tail_probe_failed")
+
+          if tail_record.get("truncated_by_guard"):
+              failed_gates.append("tail_probe_truncated_by_guard")
+
+          if not tail_record.get("server_honored_range"):
+              failed_gates.append("tail_probe_range_not_honored")
+
+          eocd = parse_eocd_from_tail(tail_data, total_size) if total_size and tail_data else {
+              "found": False,
+              "error": "tail data or total size unavailable"
+          }
+
+          if not eocd.get("found"):
+              failed_gates.append("eocd_not_found")
+
+          zip64_locator = parse_zip64_locator_from_tail(tail_data, total_size, eocd.get("eocd_offset_in_tail", len(tail_data))) if eocd.get("found") else {
+              "found": False,
+              "error": "EOCD unavailable"
+          }
+
+          if not zip64_locator.get("found"):
+              failed_gates.append("zip64_locator_not_found")
+
+          zip64_eocd_record = {
+              "found": False,
+              "error": "ZIP64 EOCD not attempted"
+          }
+
+          zip64_eocd_range_record = {
+              "attempted": False,
+              "range_header": None,
+              "ok": False,
+              "bytes_read": 0,
+              "reason": "not_attempted"
+          }
+
+          if zip64_locator.get("found"):
+              start = zip64_locator["zip64_eocd_offset"]
+              end = start + ZIP64_EOCD_FETCH_BYTES - 1
+              range_header = f"bytes={start}-{end}"
+
+              zip64_eocd_range_record["attempted"] = True
+              zip64_eocd_range_record["range_header"] = range_header
+
+              zip64_range_record, zip64_data = range_probe(
+                  "full_grid_zip64_eocd_record_probe",
+                  FULL_GRID_URL,
+                  range_header,
+                  ZIP64_EOCD_FETCH_BYTES + 1024
+              )
+
+              zip64_eocd_range_record["ok"] = zip64_range_record["ok"] and zip64_range_record["server_honored_range"]
+              zip64_eocd_range_record["bytes_read"] = zip64_range_record["bytes_read"]
+              zip64_eocd_range_record["reason"] = "zip64_eocd_range_fetched" if zip64_eocd_range_record["ok"] else "zip64_eocd_range_not_fetched"
+
+              if zip64_eocd_range_record["ok"]:
+                  zip64_eocd_record = parse_zip64_eocd_record(zip64_data)
+              else:
+                  zip64_eocd_record = {
+                      "found": False,
+                      "error": "ZIP64 EOCD range not fetched"
+                  }
+
+          if not zip64_eocd_record.get("found"):
+              failed_gates.append("zip64_eocd_record_not_found")
+
+          central_directory_record = {
+              "attempted": False,
+              "range_header": None,
+              "ok": False,
+              "bytes_read": 0,
+              "reason": "not_attempted"
+          }
+
+          manifest_records = []
+          chain_roots = {}
+          paramnames_roots = {}
+          verified_roots = []
+
+          if zip64_eocd_record.get("found"):
+              cd_size = zip64_eocd_record["central_directory_size"]
+              cd_offset = zip64_eocd_record["central_directory_offset"]
+
+              if cd_size <= 0:
+                  failed_gates.append("central_directory_size_not_positive")
+                  central_directory_record["reason"] = "central_directory_size_not_positive"
+              elif cd_size > MAX_CENTRAL_DIRECTORY_BYTES:
+                  failed_gates.append("central_directory_too_large_for_guarded_probe")
+                  central_directory_record["reason"] = "central_directory_too_large_for_guarded_probe"
+              elif cd_offset <= 0:
+                  failed_gates.append("central_directory_offset_not_positive")
+                  central_directory_record["reason"] = "central_directory_offset_not_positive"
+              else:
+                  end = cd_offset + cd_size - 1
+                  range_header = f"bytes={cd_offset}-{end}"
+
+                  central_directory_record["attempted"] = True
+                  central_directory_record["range_header"] = range_header
+
+                  cd_range_record, cd_data = range_probe(
+                      "full_grid_zip64_central_directory_probe",
+                      FULL_GRID_URL,
+                      range_header,
+                      max(cd_size + 1024, MAX_RANGE_READ_BYTES)
+                  )
+
+                  central_directory_record["ok"] = cd_range_record["ok"] and cd_range_record["server_honored_range"] and not cd_range_record["truncated_by_guard"]
+                  central_directory_record["bytes_read"] = cd_range_record["bytes_read"]
+                  central_directory_record["reason"] = "central_directory_range_fetched" if central_directory_record["ok"] else "central_directory_range_not_fetched_or_truncated"
+
+                  if central_directory_record["ok"]:
+                      manifest_records = parse_central_directory(cd_data)
+
+          if not manifest_records:
+              failed_gates.append("central_directory_manifest_records_not_parsed")
+
+          for row in manifest_records:
+              chain_root = root_from_chain_member(row["member_name"])
+              if chain_root:
+                  chain_roots.setdefault(chain_root, []).append(row["member_name"])
+
+              param_root = root_from_paramnames(row["member_name"])
+              if param_root:
+                  paramnames_roots[param_root] = row["member_name"]
+
+          for root, param_member in sorted(paramnames_roots.items()):
+              chain_members = sorted(chain_roots.get(root, []))
+              if chain_members:
+                  verified_roots.append({
+                      "root": root,
+                      "paramnames_member": param_member,
+                      "chain_member_count": len(chain_members),
+                      "chain_members_preview": ", ".join(chain_members[:5]),
+                      "status": "verified_by_zip64_central_directory_filenames_only"
+                  })
+
+          if not verified_roots:
+              failed_gates.append("no_verified_roots_from_zip64_central_directory")
+
+          if manifest_records and verified_roots:
+              route_decision = "fullgrid_zip64_central_directory_parsed_ready_for_selective_paramnames_extraction_design"
+          else:
+              route_decision = "fullgrid_zip64_locator_probe_incomplete_external_manifest_or_mirror_required"
+
+          RULE_RESULTS = [
+              {
+                  "rule_id": "fullgrid_not_downloaded",
+                  "pass": True,
+                  "result": "only_bounded_ranges_read",
+                  "boundary": "No fullGrid download."
+              },
+              {
+                  "rule_id": "tail_range_worked",
+                  "pass": tail_record["ok"] and tail_record["server_honored_range"] and not tail_record["truncated_by_guard"],
+                  "result": f"tail_bytes_read_{tail_record.get('bytes_read')}",
+                  "boundary": "Tail probe only."
+              },
+              {
+                  "rule_id": "zip64_locator_found",
+                  "pass": zip64_locator.get("found") is True,
+                  "result": f"zip64_locator_offset_{zip64_locator.get('locator_absolute_offset')}",
+                  "boundary": "Locator only."
+              },
+              {
+                  "rule_id": "zip64_eocd_record_found",
+                  "pass": zip64_eocd_record.get("found") is True,
+                  "result": f"central_directory_offset_{zip64_eocd_record.get('central_directory_offset')}_size_{zip64_eocd_record.get('central_directory_size')}",
+                  "boundary": "ZIP64 metadata only."
+              },
+              {
+                  "rule_id": "central_directory_parsed",
+                  "pass": bool(manifest_records),
+                  "result": f"{len(manifest_records)} manifest members parsed",
+                  "boundary": "Filenames and sizes only."
+              },
+              {
+                  "rule_id": "verified_roots_identified",
+                  "pass": bool(verified_roots),
+                  "result": f"{len(verified_roots)} roots with paramnames and chain members",
+                  "boundary": "Chain sample rows not read."
+              },
+              {
+                  "rule_id": "no_chain_sample_rows_read",
+                  "pass": True,
+                  "result": "no_chain_samples_imported_or_read",
+                  "boundary": "No Planck posterior samples used."
+              },
+              {
+                  "rule_id": "route_decision_recorded",
+                  "pass": route_decision != "undetermined",
+                  "result": route_decision,
+                  "boundary": "Route decision does not compute uncertainty."
+              },
+              {
+                  "rule_id": "no_final_pressure_or_validation",
+                  "pass": True,
+                  "result": "no_final_RSD_pressure_no_TAIRID_validation",
+                  "boundary": "ZIP64 member-identification probe only."
+              }
+          ]
+
+          if not all(row["pass"] for row in RULE_RESULTS):
+              failed_gates.append("not_all_v4_57_rules_passed")
+
+          if failed_gates:
+              readiness_label = "planck_fullgrid_zip64_locator_probe_failed"
+              next_allowed_step = "Repair ZIP64 locator or central-directory parsing before selective member extraction design."
+          else:
+              readiness_label = "planck_fullgrid_zip64_locator_probe_passed_ready_for_selective_paramnames_extraction_design"
+              next_allowed_step = (
+                  "Proceed to v4.58 selective paramnames extraction design. "
+                  "Use the ZIP64 central directory member names and local header offsets to fetch only selected small paramnames files. "
+                  "Do not import chain samples, compute reference uncertainty, or compute final RSD pressure yet."
+              )
+
+          member_type_counts = {}
+          for row in manifest_records:
+              member_type_counts[row["member_type"]] = member_type_counts.get(row["member_type"], 0) + 1
+
+          system_health = {
+              "head_ok": head_record["ok"],
+              "content_length": total_size,
+              "accept_ranges": head_record.get("accept_ranges"),
+              "tail_probe_ok": tail_record["ok"],
+              "tail_server_honored_range": tail_record.get("server_honored_range"),
+              "tail_bytes_read": tail_record.get("bytes_read"),
+              "eocd_found": eocd.get("found"),
+              "eocd_zip64_possible": eocd.get("zip64_possible"),
+              "zip64_locator_found": zip64_locator.get("found"),
+              "zip64_eocd_offset": zip64_locator.get("zip64_eocd_offset"),
+              "zip64_eocd_record_found": zip64_eocd_record.get("found"),
+              "zip64_total_entries": zip64_eocd_record.get("total_entries"),
+              "zip64_central_directory_size": zip64_eocd_record.get("central_directory_size"),
+              "zip64_central_directory_offset": zip64_eocd_record.get("central_directory_offset"),
+              "central_directory_attempted": central_directory_record["attempted"],
+              "central_directory_ok": central_directory_record["ok"],
+              "central_directory_bytes_read": central_directory_record["bytes_read"],
+              "manifest_member_count": len(manifest_records),
+              "member_type_counts": member_type_counts,
+              "paramnames_root_count": len(paramnames_roots),
+              "chain_root_count": len(chain_roots),
+              "verified_root_count": len(verified_roots),
+              "route_decision": route_decision,
+              "fullGrid_downloaded": False,
+              "Planck_chains_imported": False,
+              "chain_sample_rows_read": False,
+              "reference_uncertainty_computed": False,
+              "final_RSD_pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in RULE_RESULTS if row["pass"]),
+              "rule_total_count": len(RULE_RESULTS)
+          }
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_url": FULL_GRID_URL,
+              "head_record": head_record,
+              "tail_record": tail_record,
+              "eocd": eocd,
+              "zip64_locator": zip64_locator,
+              "zip64_eocd_range_record": zip64_eocd_range_record,
+              "zip64_eocd_record": zip64_eocd_record,
+              "central_directory_record": central_directory_record,
+              "manifest_records": manifest_records,
+              "verified_roots": verified_roots,
+              "route_decision": route_decision,
+              "rule_results": RULE_RESULTS,
+              "system_health": system_health,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_allowed_step,
+                  "fullGrid_downloaded": False,
+                  "Planck_chains_imported": False,
+                  "chain_sample_rows_read": False,
+                  "reference_uncertainty_computed": False,
+                  "final_RSD_pressure_computed": False,
+                  "validation_claim_allowed": False
+              }
+          }
+
+          json_path = OUTDIR / "tairid_v4_57_planck_fullgrid_zip64_locator_probe.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "fullgrid_manifest_records_v4_57.csv",
+              manifest_records,
+              [
+                  "member_name",
+                  "member_type",
+                  "compressed_size",
+                  "uncompressed_size",
+                  "local_header_offset",
+                  "zip64_extra_used"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "verified_roots_v4_57.csv",
+              verified_roots,
+              [
+                  "root",
+                  "paramnames_member",
+                  "chain_member_count",
+                  "chain_members_preview",
+                  "status"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "rule_results_v4_57.csv",
+              RULE_RESULTS,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          write_csv(
+              OUTDIR / "route_decision_v4_57.csv",
+              [
+                  {
+                      "route_decision": route_decision,
+                      "content_length": total_size,
+                      "zip64_locator_found": zip64_locator.get("found"),
+                      "zip64_eocd_record_found": zip64_eocd_record.get("found"),
+                      "central_directory_size": zip64_eocd_record.get("central_directory_size"),
+                      "central_directory_offset": zip64_eocd_record.get("central_directory_offset"),
+                      "manifest_member_count": len(manifest_records),
+                      "verified_root_count": len(verified_roots),
+                      "fullGrid_downloaded": False,
+                      "chain_sample_rows_read": False,
+                      "reference_uncertainty_computed": False,
+                      "final_RSD_pressure_computed": False
+                  }
+              ],
+              [
+                  "route_decision",
+                  "content_length",
+                  "zip64_locator_found",
+                  "zip64_eocd_record_found",
+                  "central_directory_size",
+                  "central_directory_offset",
+                  "manifest_member_count",
+                  "verified_root_count",
+                  "fullGrid_downloaded",
+                  "chain_sample_rows_read",
+                  "reference_uncertainty_computed",
+                  "final_RSD_pressure_computed"
+              ]
+          )
+
+          md = []
+          md.append("# TAIRID v4.57 — Planck FullGrid ZIP64 Locator Probe")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("This test reads only bounded byte ranges from the Planck fullGrid ZIP to locate the ZIP64 EOCD record and parse the central directory.")
+          md.append("")
+          md.append("It identifies member filenames and verified roots with paramnames plus chain members, but it does not import chains or read chain sample rows.")
+          md.append("")
+          md.append("It does not download fullGrid, compute Planck reference uncertainty, compute final RSD pressure, or validate TAIRID.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Route decision")
+          md.append("")
+          md.append(f"`{route_decision}`")
+          md.append("")
+          md.append("## Verified roots preview")
+          md.append("")
+          md.append("| Root | Chain members | Status |")
+          md.append("|---|---:|---|")
+          for row in verified_roots[:50]:
+              md.append(f"| `{row['root']}` | `{row['chain_member_count']}` | `{row['status']}` |")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_allowed_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_v4_57_planck_fullgrid_zip64_locator_probe.json`")
+          md.append("- `tairid_v4_57_planck_fullgrid_zip64_locator_probe.md`")
+          md.append("- `fullgrid_manifest_records_v4_57.csv`")
+          md.append("- `verified_roots_v4_57.csv`")
+          md.append("- `rule_results_v4_57.csv`")
+          md.append("- `route_decision_v4_57.csv`")
+          md.append("")
+
+          (OUTDIR / "tairid_v4_57_planck_fullgrid_zip64_locator_probe.md").write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.57 Planck fullGrid ZIP64 locator probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-57-planck-fullgrid-zip64-locator-probe
+          path: artifacts/tairid_v4_57_planck_fullgrid_zip64_locator_probe/
