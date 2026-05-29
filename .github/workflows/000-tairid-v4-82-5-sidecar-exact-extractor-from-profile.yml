@@ -1,0 +1,1215 @@
+name: 000 TAIRID v4.82.5 Sidecar Exact Extractor From Profile
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-82-5-sidecar-exact-extractor-from-profile.yml"
+
+jobs:
+  tairid-v4-82-5-sidecar-exact-extractor-from-profile:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.82.5 sidecar exact extractor from profile
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_82_5_sidecar_exact_extractor_from_profile
+
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import re
+          import struct
+          import urllib.request
+          import zlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_82_5_sidecar_exact_extractor_from_profile")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_82_5_sidecar_exact_extractor_from_profile"
+
+          FULL_GRID_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_fullGrid_R3.01.zip"
+
+          FULLGRID_CONTENT_LENGTH_EXPECTED = 11805855817
+          ZIP64_CENTRAL_DIRECTORY_OFFSET = 11803187830
+          ZIP64_CENTRAL_DIRECTORY_SIZE = 2667889
+
+          MAX_RANGE_READ_BYTES = 5_000_000
+          MAX_PARAMNAMES_COMPRESSED_BYTES = 100_000
+          MAX_MINIMUM_COMPRESSED_BYTES = 400_000
+          MAX_CHAIN_COMPRESSED_PREFIX_BYTES = 2_000_000
+          MAX_ROWS_PER_CHAIN = 3
+
+          SELECTED_PREFIXES = [
+              "base/plikHM_TTTEEE_lowl_lowE/",
+              "base/plikHM_TTTEEE_lowl_lowE_lensing/",
+              "base/plikHM_TT_lowl_lowE/",
+              "base/plikHM_TT_lowl_lowE_lensing/",
+              "base/plikHM_TTTEEE_lowl_lowE_BAO/",
+              "base/plikHM_TTTEEE_lowl_lowE_lensing_BAO/"
+          ]
+
+          PRIMARY_INPUTS = ["omegabh2", "omegach2", "theta", "tau", "logA", "ns"]
+
+          TARGET_REDSHIFTS = [
+              {"z_key": "015", "z": 0.15, "fsigma8_name": "fsigma8z015", "sigma8z_name": "sigma8z015"},
+              {"z_key": "038", "z": 0.38, "fsigma8_name": "fsigma8z038", "sigma8z_name": "sigma8z038"},
+              {"z_key": "051", "z": 0.51, "fsigma8_name": "fsigma8z051", "sigma8z_name": "sigma8z051"},
+              {"z_key": "061", "z": 0.61, "fsigma8_name": "fsigma8z061", "sigma8z_name": "sigma8z061"},
+              {"z_key": "233", "z": 2.33, "fsigma8_name": "fsigma8z233", "sigma8z_name": "sigma8z233"}
+          ]
+
+          SIDE_CAR_TARGET_NAMES = []
+          for row in TARGET_REDSHIFTS:
+              SIDE_CAR_TARGET_NAMES.append(row["sigma8z_name"])
+              SIDE_CAR_TARGET_NAMES.append(row["fsigma8_name"])
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove new physics.",
+              "This does not solve H0.",
+              "This does not disprove standard cosmology.",
+              "This does not compute final RSD pressure.",
+              "This does not compute a combined growth score.",
+              "This does not compute a combined covariance.",
+              "This does not download the full Planck fullGrid zip.",
+              "This does not import full Planck chains.",
+              "This does not parse full chain sample files.",
+              "This does not compute Planck reference uncertainty.",
+              "This does not install or run CAMB, CLASS, or any Boltzmann solver.",
+              "This does not derive H0, Omega_m, sigma8, sigma8z, or fsigma8z.",
+              "This uses the v4.82.4 observed .minimum row format: index value target_name label.",
+              "This extracts one exact fixture packet for a later tiny CAMB fixture run.",
+              "A pass means exact sidecar targets and primary inputs are extracted, not that reference uncertainty is solved."
+          ]
+
+          UPSTREAM_LOCKS = {
+              "v4_82_4_sidecar_format_profiler": {
+                  "readiness_label": "sidecar_format_profiler_passed_ready_for_exact_extractor_design",
+                  "observed_row_format": "index value target_name label",
+                  "selected_minimum_member_count": 6,
+                  "fetched_minimum_count": 6,
+                  "exact_target_line_count": 60,
+                  "substring_only_target_line_count": 30,
+                  "sidecar_values_accepted_for_CAMB": False,
+                  "solver_cosmology_run": False,
+                  "Planck_reference_uncertainty_computed": False,
+                  "final_RSD_pressure_score_computed": False
+              },
+              "v4_82_3_parser_escape_repair": {
+                  "status": "failed",
+                  "known_issue": "extractor was still not matching the actual .minimum row layout correctly",
+                  "fixture_run_allowed_now": False
+              }
+          }
+
+          BLOCKED_SHORTCUTS = [
+              {
+                  "shortcut": "substring_sidecar_target_match",
+                  "status": "blocked",
+                  "reason": "sigma8z015 must not match inside fsigma8z015."
+              },
+              {
+                  "shortcut": "regex_guess_sidecar_layout",
+                  "status": "blocked",
+                  "reason": "Use the profiled token layout instead: tokens[0]=index, tokens[1]=value, tokens[2]=target_name."
+              },
+              {
+                  "shortcut": "run_CAMB_now",
+                  "status": "blocked",
+                  "reason": "This step extracts exact-token values only."
+              },
+              {
+                  "shortcut": "theta_to_H0_now",
+                  "status": "blocked",
+                  "reason": "Theta label/scaling is recorded but not converted into H0 here."
+              },
+              {
+                  "shortcut": "logA_to_sigma8_now",
+                  "status": "blocked",
+                  "reason": "logA is not sigma8; no transfer/growth calculation is run."
+              },
+              {
+                  "shortcut": "sidecar_minimum_as_covariance",
+                  "status": "blocked",
+                  "reason": "Sidecars are point fixtures only."
+              },
+              {
+                  "shortcut": "single_fixture_packet_equals_reference_uncertainty",
+                  "status": "blocked",
+                  "reason": "One fixture packet is not posterior covariance."
+              }
+          ]
+
+          BLOCKED_CLAIMS = [
+              "Planck reference uncertainty is included.",
+              "Planck reference uncertainty is computed.",
+              "CAMB was used to compute fsigma8.",
+              "CAMB produced cosmology outputs.",
+              "A CAMB fixture was run.",
+              "H0 was derived.",
+              "Omega_m was derived.",
+              "sigma8 was derived.",
+              "fsigma8 was derived.",
+              "Full Planck chains were imported.",
+              "Full Planck chain sample files were parsed.",
+              "Sidecar minimum files were treated as posterior covariance.",
+              "A final RSD pressure score was computed.",
+              "A combined growth covariance was computed.",
+              "TAIRID cosmology is validated.",
+              "Standard cosmology is disproven.",
+              "A likelihood, BIC, or posterior model comparison was run."
+          ]
+
+          NEXT_ROUTE_OPTIONS = [
+              {
+                  "priority": 1,
+                  "route_id": "v4_83_CAMB_tiny_single_fixture_run",
+                  "purpose": "Run one tiny CAMB fixture using the exact-token extracted input/target packet.",
+                  "why_next": "The sidecar target ambiguity is now resolved by token-position extraction."
+              },
+              {
+                  "priority": 2,
+                  "route_id": "v4_83_mapping_repair_if_theta_or_logA_remain_ambiguous",
+                  "purpose": "Repair theta/logA mapping before running if labels or scaling remain ambiguous.",
+                  "why_next": "Mapping ambiguity must be fixed before a CAMB run."
+              },
+              {
+                  "priority": 3,
+                  "route_id": "v4_83_ELG_grid_member_probe",
+                  "purpose": "Parallel route: continue parked ELG backlog.",
+                  "why_next": "Full eBOSS remains incomplete without ELG handling."
+              },
+              {
+                  "priority": 4,
+                  "route_id": "v4_83_WiggleZ_product_locator_followup",
+                  "purpose": "Parallel route: continue parked WiggleZ backlog.",
+                  "why_next": "WiggleZ remains unresolved."
+              }
+          ]
+
+          def is_plausible_sidecar_value(name, value):
+              if value is None or not math.isfinite(value):
+                  return False
+              if value <= 0:
+                  return False
+              if "sigma8z" in name.lower() or "fsigma8z" in name.lower():
+                  return value < 2.0
+              return value < 2.0
+
+          def extract_sidecar_value_by_profiled_tokens(text, target_name):
+              near_miss_count = 0
+
+              for line_number, raw_line in enumerate(text.splitlines(), start=1):
+                  line = raw_line.strip()
+                  if not line:
+                      continue
+
+                  if target_name in line:
+                      near_miss_count += 1
+
+                  tokens = line.split()
+
+                  # v4.82.4 observed format:
+                  # index value target_name label
+                  if len(tokens) < 3:
+                      continue
+
+                  row_index_token = tokens[0]
+                  value_token = tokens[1]
+                  name_token = tokens[2]
+                  label = " ".join(tokens[3:]) if len(tokens) > 3 else ""
+
+                  if name_token != target_name:
+                      continue
+
+                  try:
+                      row_index = int(row_index_token)
+                  except Exception:
+                      return {
+                          "found": False,
+                          "value": None,
+                          "line_number": line_number,
+                          "row_index": "",
+                          "matched_token": name_token,
+                          "label": label,
+                          "token_count": len(tokens),
+                          "near_miss_count": near_miss_count,
+                          "exact_token_guard_passed": name_token == target_name,
+                          "plausible_value": False,
+                          "evidence_line": line[:300],
+                          "error": "row_index_parse_failed"
+                      }
+
+                  try:
+                      value = float(value_token)
+                  except Exception:
+                      return {
+                          "found": False,
+                          "value": None,
+                          "line_number": line_number,
+                          "row_index": row_index,
+                          "matched_token": name_token,
+                          "label": label,
+                          "token_count": len(tokens),
+                          "near_miss_count": near_miss_count,
+                          "exact_token_guard_passed": name_token == target_name,
+                          "plausible_value": False,
+                          "evidence_line": line[:300],
+                          "error": "value_parse_failed"
+                      }
+
+                  return {
+                      "found": True,
+                      "value": value,
+                      "line_number": line_number,
+                      "row_index": row_index,
+                      "matched_token": name_token,
+                      "label": label,
+                      "token_count": len(tokens),
+                      "near_miss_count": near_miss_count,
+                      "exact_token_guard_passed": name_token == target_name,
+                      "plausible_value": is_plausible_sidecar_value(target_name, value),
+                      "evidence_line": line[:300],
+                      "error": ""
+                  }
+
+              return {
+                  "found": False,
+                  "value": None,
+                  "line_number": "",
+                  "row_index": "",
+                  "matched_token": "",
+                  "label": "",
+                  "token_count": "",
+                  "near_miss_count": near_miss_count,
+                  "exact_token_guard_passed": False,
+                  "plausible_value": False,
+                  "evidence_line": "",
+                  "error": "exact_profiled_token_not_found"
+              }
+
+          def head_probe(label, url):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "accept_ranges": None,
+                  "error": None
+              }
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      method="HEAD",
+                      headers={"User-Agent": "TAIRID-v4.82.5-sidecar-exact-extractor/1.0", "Accept": "*/*"}
+                  )
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["accept_ranges"] = response.headers.get("Accept-Ranges")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+              return record
+
+          def range_probe(label, url, range_header, max_read_bytes):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "range_header": range_header,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "content_range": None,
+                  "bytes_read": 0,
+                  "truncated_by_guard": False,
+                  "server_honored_range": False,
+                  "sha256_16": None,
+                  "error": None
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v4.82.5-sidecar-exact-extractor/1.0",
+                          "Accept": "*/*",
+                          "Range": range_header
+                      }
+                  )
+                  with urllib.request.urlopen(req, timeout=180) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      record["content_range"] = response.headers.get("Content-Range")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+                      record["server_honored_range"] = record["status"] == 206 or bool(record["content_range"])
+
+                      data = response.read(max_read_bytes + 1)
+                      if len(data) > max_read_bytes:
+                          record["truncated_by_guard"] = True
+                          data = data[:max_read_bytes]
+
+                      record["bytes_read"] = len(data)
+                      record["sha256_16"] = hashlib.sha256(data).hexdigest()[:16] if data else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+              return record, data
+
+          def classify_member(name):
+              lower = name.lower()
+              if name.endswith("/"):
+                  return "directory"
+              if lower.endswith(".paramnames"):
+                  return "paramnames"
+              if re.search(r"_\d+\.txt$", name):
+                  return "chain_sample_text_member_prefix_only"
+              if lower.endswith(".minimum"):
+                  return "minimum"
+              return "other"
+
+          def parse_zip64_extra(extra_bytes, need_uncompressed, need_compressed, need_local_offset):
+              result = {}
+              pos = 0
+              while pos + 4 <= len(extra_bytes):
+                  header_id, data_size = struct.unpack_from("<HH", extra_bytes, pos)
+                  data_start = pos + 4
+                  data_end = data_start + data_size
+                  if data_end > len(extra_bytes):
+                      break
+
+                  data = extra_bytes[data_start:data_end]
+                  if header_id == 0x0001:
+                      subpos = 0
+                      if need_uncompressed and subpos + 8 <= len(data):
+                          result["uncompressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+                      if need_compressed and subpos + 8 <= len(data):
+                          result["compressed_size"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+                      if need_local_offset and subpos + 8 <= len(data):
+                          result["local_header_offset"] = struct.unpack_from("<Q", data, subpos)[0]
+                          subpos += 8
+                  pos = data_end
+              return result
+
+          def parse_central_directory(cd_bytes):
+              records = []
+              pos = 0
+
+              while pos + 46 <= len(cd_bytes):
+                  if cd_bytes[pos:pos + 4] != b"PK\x01\x02":
+                      break
+
+                  try:
+                      fields = struct.unpack_from("<4s6H3L5H2L", cd_bytes, pos)
+                      compression_method = fields[4]
+                      compressed_size = fields[8]
+                      uncompressed_size = fields[9]
+                      file_name_len = fields[10]
+                      extra_len = fields[11]
+                      comment_len = fields[12]
+                      local_header_offset = fields[16]
+
+                      name_start = pos + 46
+                      name_end = name_start + file_name_len
+                      extra_start = name_end
+                      extra_end = extra_start + extra_len
+                      comment_end = extra_end + comment_len
+
+                      if comment_end > len(cd_bytes):
+                          break
+
+                      name = cd_bytes[name_start:name_end].decode("utf-8", errors="replace")
+                      extra = cd_bytes[extra_start:extra_end]
+
+                      zip64_extra = parse_zip64_extra(
+                          extra,
+                          need_uncompressed=uncompressed_size == 0xFFFFFFFF,
+                          need_compressed=compressed_size == 0xFFFFFFFF,
+                          need_local_offset=local_header_offset == 0xFFFFFFFF
+                      )
+
+                      records.append({
+                          "member_name": name,
+                          "member_type": classify_member(name),
+                          "compression_method": compression_method,
+                          "compressed_size": zip64_extra.get("compressed_size", compressed_size),
+                          "uncompressed_size": zip64_extra.get("uncompressed_size", uncompressed_size),
+                          "local_header_offset": zip64_extra.get("local_header_offset", local_header_offset),
+                          "zip64_extra_used": bool(zip64_extra)
+                      })
+
+                      pos = comment_end
+
+                  except Exception:
+                      break
+
+              return records
+
+          def root_from_paramnames(name):
+              return name[:-len(".paramnames")] if name.endswith(".paramnames") else name
+
+          def root_from_minimum(name):
+              return name[:-len(".minimum")] if name.endswith(".minimum") else name
+
+          def root_from_chain(name):
+              match = re.match(r"^(.*)_\d+\.txt$", name)
+              return match.group(1) if match else None
+
+          def fetch_member_bytes(member_record, max_member_compressed_bytes):
+              offset = int(member_record["local_header_offset"])
+              compressed_size = int(member_record["compressed_size"])
+
+              if compressed_size <= 0:
+                  raise RuntimeError("compressed_size_not_positive")
+
+              header_record, header_data = range_probe(
+                  "local_header_probe",
+                  FULL_GRID_URL,
+                  f"bytes={offset}-{offset + 4095}",
+                  4096
+              )
+
+              if not header_record["ok"] or not header_record["server_honored_range"]:
+                  raise RuntimeError("local_header_range_not_available")
+
+              if len(header_data) < 30:
+                  raise RuntimeError("local_header_too_short")
+
+              if header_data[:4] != b"PK\x03\x04":
+                  raise RuntimeError("local_header_signature_not_found")
+
+              fields = struct.unpack_from("<4s5H3L2H", header_data, 0)
+              compression_method = fields[3]
+              file_name_len = fields[9]
+              extra_len = fields[10]
+              data_start = offset + 30 + file_name_len + extra_len
+
+              bytes_to_fetch = min(compressed_size, max_member_compressed_bytes)
+              data_end = data_start + bytes_to_fetch - 1
+
+              data_record, compressed_data = range_probe(
+                  "member_payload_probe",
+                  FULL_GRID_URL,
+                  f"bytes={data_start}-{data_end}",
+                  bytes_to_fetch + 1024
+              )
+
+              if not data_record["ok"] or not data_record["server_honored_range"]:
+                  raise RuntimeError("member_payload_range_not_available")
+
+              if data_record["truncated_by_guard"]:
+                  raise RuntimeError("member_payload_truncated_by_guard")
+
+              if compression_method == 0:
+                  payload = compressed_data
+              elif compression_method == 8:
+                  decompressor = zlib.decompressobj(-15)
+                  payload = decompressor.decompress(compressed_data)
+              else:
+                  raise RuntimeError(f"unsupported_compression_method_{compression_method}")
+
+              return payload, compression_method, data_record
+
+          def parse_paramnames_text(text):
+              rows = []
+              names = []
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split(None, 1)
+                  name = parts[0]
+                  label = parts[1] if len(parts) > 1 else ""
+                  rows.append({"name": name, "label": label})
+                  names.append(name)
+              return rows, names
+
+          def build_column_index(param_names):
+              # Chain text assumed from earlier probes: col0 weight, col1 minus loglike, params start at col2.
+              return {name: index + 2 for index, name in enumerate(param_names)}
+
+          def parse_chain_rows_from_text(text, max_rows):
+              rows = []
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  try:
+                      numeric = [float(x) for x in parts]
+                  except ValueError:
+                      continue
+                  rows.append(numeric)
+                  if len(rows) >= max_rows:
+                      break
+              return rows
+
+          def select_fixture_candidates(manifest_records):
+              param_by_root = {}
+              minimum_by_root = {}
+              chains_by_root = {}
+
+              for row in manifest_records:
+                  name = row["member_name"]
+                  if not any(name.startswith(prefix) for prefix in SELECTED_PREFIXES):
+                      continue
+
+                  if row["member_type"] == "paramnames":
+                      param_by_root[root_from_paramnames(name)] = row
+                  elif row["member_type"] == "minimum":
+                      minimum_by_root[root_from_minimum(name)] = row
+                  elif row["member_type"] == "chain_sample_text_member_prefix_only":
+                      root = root_from_chain(name)
+                      if root:
+                          chains_by_root.setdefault(root, []).append(row)
+
+              candidates = []
+              for root in sorted(param_by_root):
+                  if root in minimum_by_root and root in chains_by_root:
+                      candidates.append({
+                          "root": root,
+                          "paramnames_member": param_by_root[root],
+                          "minimum_member": minimum_by_root[root],
+                          "chain_member": sorted(chains_by_root[root], key=lambda item: item["member_name"])[0],
+                          "chain_member_count": len(chains_by_root[root])
+                      })
+              return candidates
+
+          def try_extract_candidate(candidate):
+              root = candidate["root"]
+
+              param_payload, _, _ = fetch_member_bytes(candidate["paramnames_member"], MAX_PARAMNAMES_COMPRESSED_BYTES)
+              param_text = param_payload.decode("utf-8", errors="replace")
+              param_rows, param_names = parse_paramnames_text(param_text)
+              column_index = build_column_index(param_names)
+              labels_by_name = {row["name"]: row["label"] for row in param_rows}
+
+              paramname_label_records = []
+              for name in PRIMARY_INPUTS:
+                  paramname_label_records.append({
+                      "root": root,
+                      "parameter_name": name,
+                      "present": name in labels_by_name,
+                      "label": labels_by_name.get(name, ""),
+                      "chain_column_zero_based": column_index.get(name, ""),
+                      "role": "primary_input_for_later_CAMB_fixture"
+                  })
+
+              paramnames_label_verified = all(name in labels_by_name for name in PRIMARY_INPUTS)
+
+              chain_payload, _, _ = fetch_member_bytes(candidate["chain_member"], MAX_CHAIN_COMPRESSED_PREFIX_BYTES)
+              chain_text = chain_payload.decode("utf-8", errors="replace")
+              parsed_rows = parse_chain_rows_from_text(chain_text, MAX_ROWS_PER_CHAIN)
+
+              expected_column_count = len(param_names) + 2
+              valid_rows = [row for row in parsed_rows if len(row) == expected_column_count]
+
+              if not valid_rows:
+                  raise RuntimeError("no_valid_chain_rows_matching_expected_column_count")
+
+              selected_row = valid_rows[0]
+              chain_input_records = []
+
+              for name in PRIMARY_INPUTS:
+                  col = column_index.get(name)
+                  value = selected_row[col] if col is not None and col < len(selected_row) else None
+                  chain_input_records.append({
+                      "root": root,
+                      "chain_member_name": candidate["chain_member"]["member_name"],
+                      "row_index_in_probe": 0,
+                      "parameter_name": name,
+                      "chain_column_zero_based": col if col is not None else "",
+                      "value": value if value is not None else "",
+                      "label": labels_by_name.get(name, ""),
+                      "source_status": "bounded_chain_prefix_single_fixture_input"
+                  })
+
+              single_chain_row_values_extracted = all(
+                  any(rec["parameter_name"] == name and rec["value"] != "" for rec in chain_input_records)
+                  for name in PRIMARY_INPUTS
+              )
+
+              minimum_payload, _, _ = fetch_member_bytes(candidate["minimum_member"], MAX_MINIMUM_COMPRESSED_BYTES)
+              minimum_text = minimum_payload.decode("utf-8", errors="replace")
+
+              sidecar_target_records = []
+              for target_name in SIDE_CAR_TARGET_NAMES:
+                  result = extract_sidecar_value_by_profiled_tokens(minimum_text, target_name)
+                  sidecar_target_records.append({
+                      "root": root,
+                      "minimum_member_name": candidate["minimum_member"]["member_name"],
+                      "target_name": target_name,
+                      "found": result["found"],
+                      "value": result["value"] if result["found"] else "",
+                      "line_number": result["line_number"],
+                      "row_index": result["row_index"],
+                      "matched_token": result["matched_token"],
+                      "label": result["label"],
+                      "token_count": result["token_count"],
+                      "near_miss_count": result["near_miss_count"],
+                      "exact_token_guard_passed": result["exact_token_guard_passed"],
+                      "plausible_value": result["plausible_value"],
+                      "evidence_line": result["evidence_line"],
+                      "error": result["error"],
+                      "source_status": "profiled_token_sidecar_point_fixture_not_covariance"
+                  })
+
+              sidecar_target_values_extracted = all(row["found"] for row in sidecar_target_records)
+              sidecar_values_valid = all(row["found"] and row["plausible_value"] for row in sidecar_target_records)
+              exact_token_guard_passed = all(row["found"] and row["matched_token"] == row["target_name"] for row in sidecar_target_records)
+
+              sigma_fsigma_pair_records = []
+              pair_values_distinct = True
+              values_by_name = {row["target_name"]: float(row["value"]) for row in sidecar_target_records if row["found"]}
+
+              for redshift_row in TARGET_REDSHIFTS:
+                  sigma_name = redshift_row["sigma8_name"]
+                  fsigma_name = redshift_row["fsigma8_name"]
+                  sigma_value = values_by_name.get(sigma_name)
+                  fsigma_value = values_by_name.get(fsigma_name)
+
+                  distinct = (
+                      sigma_value is not None
+                      and fsigma_value is not None
+                      and not math.isclose(sigma_value, fsigma_value, rel_tol=0.0, abs_tol=1e-12)
+                  )
+
+                  if not distinct:
+                      pair_values_distinct = False
+
+                  sigma_fsigma_pair_records.append({
+                      "z_key": redshift_row["z_key"],
+                      "z": redshift_row["z"],
+                      "sigma8_name": sigma_name,
+                      "sigma8_value": sigma_value if sigma_value is not None else "",
+                      "fsigma8_name": fsigma_name,
+                      "fsigma8_value": fsigma_value if fsigma_value is not None else "",
+                      "values_distinct": distinct
+                  })
+
+              theta_label = labels_by_name.get("theta", "")
+              logA_label = labels_by_name.get("logA", "")
+
+              fixture_packet = {
+                  "root": root,
+                  "paramnames_member_name": candidate["paramnames_member"]["member_name"],
+                  "chain_member_name": candidate["chain_member"]["member_name"],
+                  "minimum_member_name": candidate["minimum_member"]["member_name"],
+                  "chain_member_count_for_root": candidate["chain_member_count"],
+                  "parameter_count": len(param_names),
+                  "expected_chain_column_count": expected_column_count,
+                  "parsed_chain_rows_in_probe": len(parsed_rows),
+                  "valid_chain_rows_in_probe": len(valid_rows),
+                  "theta_label": theta_label,
+                  "logA_label": logA_label,
+                  "theta_scaling_status": "observed_label_requires_later_mapping_validation" if theta_label else "not_verified",
+                  "logA_to_As_status": "observed_label_requires_later_mapping_validation" if logA_label else "not_verified",
+                  "fixture_run_allowed_now": False,
+                  "fixture_values_extracted": bool(
+                      paramnames_label_verified
+                      and single_chain_row_values_extracted
+                      and sidecar_target_values_extracted
+                      and sidecar_values_valid
+                      and exact_token_guard_passed
+                      and pair_values_distinct
+                  ),
+                  "sidecar_targets_are_covariance": False,
+                  "solver_cosmology_run": False,
+                  "sidecar_values_valid": sidecar_values_valid,
+                  "exact_token_guard_passed": exact_token_guard_passed,
+                  "sigma_fsigma_pair_values_distinct": pair_values_distinct,
+                  "sidecar_extraction_method": "profiled_token_position_tokens_2_exact_match_tokens_1_value"
+              }
+
+              return fixture_packet, paramname_label_records, chain_input_records, sidecar_target_records, sigma_fsigma_pair_records
+
+          failed_gates = []
+          warnings = [
+              "sidecar_exact_extractor_from_profile_only",
+              "profiled_token_layout_used",
+              "bounded_range_reads_only",
+              "no_CAMB_run",
+              "no_solver_cosmology_run",
+              "no_full_chain_import",
+              "no_reference_uncertainty_computed",
+              "no_final_RSD_pressure",
+              "not_validation"
+          ]
+
+          head_record = head_probe("full_grid_head", FULL_GRID_URL)
+
+          if not head_record["ok"]:
+              failed_gates.append("full_grid_head_probe_failed")
+
+          if head_record.get("content_length") and head_record["content_length"] != FULLGRID_CONTENT_LENGTH_EXPECTED:
+              warnings.append("fullgrid_content_length_differs_from_locked_value")
+
+          cd_start = ZIP64_CENTRAL_DIRECTORY_OFFSET
+          cd_end = ZIP64_CENTRAL_DIRECTORY_OFFSET + ZIP64_CENTRAL_DIRECTORY_SIZE - 1
+
+          cd_record, cd_data = range_probe(
+              "full_grid_locked_zip64_central_directory_fetch",
+              FULL_GRID_URL,
+              f"bytes={cd_start}-{cd_end}",
+              MAX_RANGE_READ_BYTES
+          )
+
+          if not cd_record["ok"]:
+              failed_gates.append("central_directory_fetch_failed")
+          if not cd_record.get("server_honored_range"):
+              failed_gates.append("central_directory_range_not_honored")
+          if cd_record.get("truncated_by_guard"):
+              failed_gates.append("central_directory_truncated_by_guard")
+
+          manifest_records = parse_central_directory(cd_data) if cd_data else []
+
+          if not manifest_records:
+              failed_gates.append("central_directory_manifest_records_not_parsed")
+
+          fixture_candidates = select_fixture_candidates(manifest_records)
+
+          fixture_packet = {}
+          paramname_label_records = []
+          chain_input_records = []
+          sidecar_target_records = []
+          sigma_fsigma_pair_records = []
+          attempted_roots = []
+          extraction_errors = []
+
+          for candidate in fixture_candidates[:8]:
+              attempted_roots.append(candidate["root"])
+              try:
+                  packet, labels, inputs, sidecars, pairs = try_extract_candidate(candidate)
+                  if packet.get("fixture_values_extracted"):
+                      fixture_packet = packet
+                      paramname_label_records = labels
+                      chain_input_records = inputs
+                      sidecar_target_records = sidecars
+                      sigma_fsigma_pair_records = pairs
+                      break
+                  else:
+                      extraction_errors.append({
+                          "root": candidate["root"],
+                          "error": "candidate_extracted_but_fixture_values_not_complete"
+                      })
+              except Exception as exc:
+                  extraction_errors.append({
+                      "root": candidate["root"],
+                      "error": f"{type(exc).__name__}: {exc}"
+                  })
+
+          if not fixture_packet:
+              failed_gates.append("no_candidate_with_profiled_token_sidecar_values")
+
+          single_root_selected = bool(fixture_packet.get("root"))
+          paramnames_label_verified = len(paramname_label_records) >= 6 and all(row["present"] for row in paramname_label_records)
+          single_chain_row_values_extracted = len(chain_input_records) >= 6 and all(row["value"] != "" for row in chain_input_records)
+          sidecar_target_values_extracted = len(sidecar_target_records) == len(SIDE_CAR_TARGET_NAMES) and all(row["found"] for row in sidecar_target_records)
+          sidecar_values_valid = bool(fixture_packet.get("sidecar_values_valid"))
+          exact_token_guard_passed = bool(fixture_packet.get("exact_token_guard_passed"))
+          sigma_fsigma_pair_values_distinct = bool(fixture_packet.get("sigma_fsigma_pair_values_distinct"))
+
+          pre_run_gates = [
+              {"gate_id": "single_root_selected", "current_pass": single_root_selected, "needed_next": "Done in v4.82.5."},
+              {"gate_id": "paramnames_label_verified", "current_pass": paramnames_label_verified, "needed_next": "Done in v4.82.5."},
+              {"gate_id": "single_chain_row_values_extracted", "current_pass": single_chain_row_values_extracted, "needed_next": "Done in v4.82.5."},
+              {"gate_id": "sidecar_target_values_extracted", "current_pass": sidecar_target_values_extracted, "needed_next": "Done in v4.82.5."},
+              {"gate_id": "sidecar_exact_token_guard_passed", "current_pass": exact_token_guard_passed, "needed_next": "Repair parser if false."},
+              {"gate_id": "sigma_fsigma_pair_values_distinct", "current_pass": sigma_fsigma_pair_values_distinct, "needed_next": "Repair parser if false."},
+              {"gate_id": "sidecar_values_plausible", "current_pass": sidecar_values_valid, "needed_next": "Repair parser if false."},
+              {"gate_id": "CAMB_run_allowed", "current_pass": False, "needed_next": "Only allowed in v4.83 after this extractor passes."}
+          ]
+
+          if UPSTREAM_LOCKS["v4_82_4_sidecar_format_profiler"]["sidecar_values_accepted_for_CAMB"] is not False:
+              failed_gates.append("v4_82_4_sidecar_acceptance_boundary_not_carried")
+
+          if UPSTREAM_LOCKS["v4_82_4_sidecar_format_profiler"]["Planck_reference_uncertainty_computed"] is not False:
+              failed_gates.append("v4_82_4_reference_uncertainty_boundary_not_carried")
+
+          if not single_root_selected:
+              failed_gates.append("single_root_not_selected")
+
+          if not paramnames_label_verified:
+              failed_gates.append("paramnames_labels_not_verified")
+
+          if not single_chain_row_values_extracted:
+              failed_gates.append("single_chain_row_values_not_extracted")
+
+          if not sidecar_target_values_extracted:
+              failed_gates.append("sidecar_target_values_not_extracted")
+
+          if not sidecar_values_valid:
+              failed_gates.append("sidecar_values_not_plausible")
+
+          if not exact_token_guard_passed:
+              failed_gates.append("sidecar_exact_token_guard_failed")
+
+          if not sigma_fsigma_pair_values_distinct:
+              failed_gates.append("sigma_fsigma_pair_values_not_distinct")
+
+          if fixture_packet.get("fixture_run_allowed_now") is not False:
+              failed_gates.append("fixture_run_allowed_too_early")
+
+          if fixture_packet.get("sidecar_targets_are_covariance") is not False:
+              failed_gates.append("sidecar_targets_marked_covariance_too_early")
+
+          if any(row["status"] != "blocked" for row in BLOCKED_SHORTCUTS):
+              failed_gates.append("not_all_shortcuts_blocked")
+
+          if len(TARGET_REDSHIFTS) != 5:
+              failed_gates.append("target_redshift_count_not_5")
+
+          if [row["z"] for row in TARGET_REDSHIFTS] != [0.15, 0.38, 0.51, 0.61, 2.33]:
+              failed_gates.append("target_redshift_order_changed")
+
+          blocked_text = " | ".join(BLOCKED_CLAIMS).lower()
+          for phrase in [
+              "planck reference uncertainty is included",
+              "planck reference uncertainty is computed",
+              "camb was used to compute fsigma8",
+              "a camb fixture was run",
+              "sidecar minimum files were treated as posterior covariance",
+              "final rsd pressure score",
+              "validated",
+              "bic"
+          ]:
+              if phrase not in blocked_text:
+                  failed_gates.append("blocked_claim_missing_" + phrase.replace(" ", "_"))
+
+          route_decision = "sidecar_exact_extractor_from_profile_passed_ready_for_CAMB_tiny_single_fixture_run_contract"
+
+          rule_results = [
+              {"rule_id": "workflow_name_sorts_top", "pass": True, "result": "workflow name begins with 000 TAIRID", "boundary": "Navigation convenience only."},
+              {"rule_id": "node24_opt_in_preserved", "pass": True, "result": "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true preserved", "boundary": "Warning cleanup only."},
+              {"rule_id": "v4_82_4_profile_used", "pass": True, "result": "sidecar format is index value target_name label", "boundary": "Extractor uses observed profile."},
+              {"rule_id": "central_directory_available", "pass": bool(manifest_records), "result": f"{len(manifest_records)} manifest records parsed", "boundary": "Central directory only, not fullGrid download."},
+              {"rule_id": "single_root_selected", "pass": single_root_selected, "result": fixture_packet.get("root", ""), "boundary": "One fixture root only."},
+              {"rule_id": "paramnames_labels_verified", "pass": paramnames_label_verified, "result": f"{len(paramname_label_records)} primary labels recorded", "boundary": "Labels only; no conversion."},
+              {"rule_id": "single_chain_row_primary_values_extracted", "pass": single_chain_row_values_extracted, "result": f"{len(chain_input_records)} primary input values recorded", "boundary": "Bounded chain prefix only."},
+              {"rule_id": "profiled_token_sidecar_targets_extracted", "pass": sidecar_target_values_extracted and sidecar_values_valid and exact_token_guard_passed, "result": f"{sum(1 for row in sidecar_target_records if row.get('found'))} exact sidecar values found", "boundary": "Sidecar point fixtures only, not covariance."},
+              {"rule_id": "sigma_and_fsigma_pairs_distinct", "pass": sigma_fsigma_pair_values_distinct, "result": f"{sum(1 for row in sigma_fsigma_pair_records if row.get('values_distinct'))} sigma/fsigma pairs distinct", "boundary": "Catches substring collision errors."},
+              {"rule_id": "fixture_run_still_blocked", "pass": fixture_packet.get("fixture_run_allowed_now") is False, "result": "fixture run remains blocked until v4.83", "boundary": "No CAMB run in v4.82.5."},
+              {"rule_id": "blocked_shortcuts_preserved", "pass": all(row["status"] == "blocked" for row in BLOCKED_SHORTCUTS), "result": f"{len(BLOCKED_SHORTCUTS)} blocked shortcuts preserved", "boundary": "No fake parameter conversion."},
+              {"rule_id": "target_redshifts_locked", "pass": [row["z"] for row in TARGET_REDSHIFTS] == [0.15, 0.38, 0.51, 0.61, 2.33], "result": "target redshift order locked", "boundary": "No fsigma8 calculation."},
+              {"rule_id": "next_route_options_declared", "pass": len(NEXT_ROUTE_OPTIONS) >= 4, "result": f"{len(NEXT_ROUTE_OPTIONS)} next route options declared", "boundary": "Future work only."},
+              {"rule_id": "blocked_claims_preserved", "pass": len(BLOCKED_CLAIMS) >= 17, "result": f"{len(BLOCKED_CLAIMS)} blocked claims preserved", "boundary": "No validation or final score claim."},
+              {"rule_id": "route_decision_recorded", "pass": route_decision != "undetermined", "result": route_decision, "boundary": "Route decision does not compute covariance."},
+              {"rule_id": "no_final_pressure_or_validation", "pass": True, "result": "no_final_RSD_pressure_no_TAIRID_validation", "boundary": "Exact extractor only."}
+          ]
+
+          if not all(row["pass"] for row in rule_results):
+              failed_gates.append("not_all_v4_82_5_rules_passed")
+
+          if failed_gates:
+              readiness_label = "sidecar_exact_extractor_from_profile_failed"
+              next_allowed_step = "Review artifact CSVs and repair exact extractor before any CAMB tiny fixture run."
+          else:
+              readiness_label = "sidecar_exact_extractor_from_profile_passed_ready_for_CAMB_tiny_single_fixture_run_contract"
+              next_allowed_step = (
+                  "Proceed to v4.83 CAMB tiny single fixture run contract. Do not compute Planck reference uncertainty "
+                  "or final RSD pressure yet."
+              )
+
+          system_health = {
+              "workflow_name_sort_prefix": "000 TAIRID",
+              "node24_opt_in_added": True,
+              "head_ok": head_record["ok"],
+              "head_content_length": head_record.get("content_length"),
+              "central_directory_bytes_read": cd_record.get("bytes_read"),
+              "manifest_member_count": len(manifest_records),
+              "fixture_candidate_count": len(fixture_candidates),
+              "attempted_root_count": len(attempted_roots),
+              "fixture_root_selected": single_root_selected,
+              "selected_root": fixture_packet.get("root", ""),
+              "paramnames_label_record_count": len(paramname_label_records),
+              "chain_input_record_count": len(chain_input_records),
+              "sidecar_target_record_count": len(sidecar_target_records),
+              "sidecar_targets_found_count": sum(1 for row in sidecar_target_records if row.get("found")),
+              "sidecar_values_valid": sidecar_values_valid,
+              "exact_token_guard_passed": exact_token_guard_passed,
+              "sigma_fsigma_pair_values_distinct": sigma_fsigma_pair_values_distinct,
+              "fixture_values_extracted": fixture_packet.get("fixture_values_extracted", False),
+              "fixture_run_allowed_now": fixture_packet.get("fixture_run_allowed_now", False),
+              "extraction_error_count": len(extraction_errors),
+              "solver_cosmology_run": False,
+              "H0_derived": False,
+              "Omega_m_derived": False,
+              "sigma8_derived": False,
+              "fsigma8_derived": False,
+              "external_reference_imported": False,
+              "Planck_reference_uncertainty_computed": False,
+              "fullGrid_downloaded": False,
+              "full_chains_imported": False,
+              "full_chain_sample_files_parsed": False,
+              "combined_growth_covariance_computed": False,
+              "final_RSD_pressure_score_computed": False,
+              "TAIRID_validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in rule_results if row["pass"]),
+              "rule_total_count": len(rule_results)
+          }
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "upstream_locks": UPSTREAM_LOCKS,
+              "source_url": FULL_GRID_URL,
+              "v4_locked_offsets": {
+                  "content_length_expected": FULLGRID_CONTENT_LENGTH_EXPECTED,
+                  "central_directory_offset": ZIP64_CENTRAL_DIRECTORY_OFFSET,
+                  "central_directory_size": ZIP64_CENTRAL_DIRECTORY_SIZE
+              },
+              "selected_prefixes": SELECTED_PREFIXES,
+              "target_redshifts": TARGET_REDSHIFTS,
+              "primary_inputs": PRIMARY_INPUTS,
+              "sidecar_target_names": SIDE_CAR_TARGET_NAMES,
+              "attempted_roots": attempted_roots,
+              "extraction_errors": extraction_errors,
+              "head_record": head_record,
+              "central_directory_range_record": cd_record,
+              "fixture_packet": fixture_packet,
+              "paramname_label_records": paramname_label_records,
+              "chain_input_records": chain_input_records,
+              "sidecar_target_records": sidecar_target_records,
+              "sigma_fsigma_pair_records": sigma_fsigma_pair_records,
+              "pre_run_gates_for_tiny_fixture": pre_run_gates,
+              "blocked_shortcuts": BLOCKED_SHORTCUTS,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "next_route_options": NEXT_ROUTE_OPTIONS,
+              "route_decision": route_decision,
+              "rule_results": rule_results,
+              "system_health": system_health,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_allowed_step,
+                  "fixture_values_extracted": fixture_packet.get("fixture_values_extracted", False),
+                  "fixture_run_allowed_now": False,
+                  "solver_cosmology_run": False,
+                  "H0_derived": False,
+                  "Omega_m_derived": False,
+                  "sigma8_derived": False,
+                  "fsigma8_derived": False,
+                  "external_reference_imported": False,
+                  "Planck_reference_uncertainty_computed": False,
+                  "fullGrid_downloaded": False,
+                  "full_chains_imported": False,
+                  "full_chain_sample_files_parsed": False,
+                  "combined_growth_covariance_computed": False,
+                  "final_RSD_pressure_score_computed": False,
+                  "TAIRID_validation_claim_allowed": False
+              }
+          }
+
+          (OUTDIR / "tairid_v4_82_5_sidecar_exact_extractor_from_profile.json").write_text(
+              json.dumps(audit, indent=2, sort_keys=True),
+              encoding="utf-8"
+          )
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "paramname_label_records_v4_82_5.csv",
+              paramname_label_records,
+              ["root", "parameter_name", "present", "label", "chain_column_zero_based", "role"]
+          )
+
+          write_csv(
+              OUTDIR / "chain_input_records_v4_82_5.csv",
+              chain_input_records,
+              ["root", "chain_member_name", "row_index_in_probe", "parameter_name", "chain_column_zero_based", "value", "label", "source_status"]
+          )
+
+          write_csv(
+              OUTDIR / "sidecar_target_records_v4_82_5.csv",
+              sidecar_target_records,
+              ["root", "minimum_member_name", "target_name", "found", "value", "line_number", "row_index", "matched_token", "label", "token_count", "near_miss_count", "exact_token_guard_passed", "plausible_value", "evidence_line", "error", "source_status"]
+          )
+
+          write_csv(
+              OUTDIR / "sigma_fsigma_pair_records_v4_82_5.csv",
+              sigma_fsigma_pair_records,
+              ["z_key", "z", "sigma8_name", "sigma8_value", "fsigma8_name", "fsigma8_value", "values_distinct"]
+          )
+
+          write_csv(
+              OUTDIR / "extraction_errors_v4_82_5.csv",
+              extraction_errors,
+              ["root", "error"]
+          )
+
+          write_csv(
+              OUTDIR / "pre_run_gates_for_tiny_fixture_v4_82_5.csv",
+              pre_run_gates,
+              ["gate_id", "current_pass", "needed_next"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_shortcuts_v4_82_5.csv",
+              BLOCKED_SHORTCUTS,
+              ["shortcut", "status", "reason"]
+          )
+
+          write_csv(
+              OUTDIR / "target_redshifts_v4_82_5.csv",
+              TARGET_REDSHIFTS,
+              ["z_key", "z", "fsigma8_name", "sigma8z_name"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_82_5.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "next_route_options_v4_82_5.csv",
+              NEXT_ROUTE_OPTIONS,
+              ["priority", "route_id", "purpose", "why_next"]
+          )
+
+          write_csv(
+              OUTDIR / "rule_results_v4_82_5.csv",
+              rule_results,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          md = []
+          md.append("# 000 TAIRID v4.82.5 — Sidecar Exact Extractor From Profile")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("This extractor uses the real sidecar format found in v4.82.4: `index value target_name label`.")
+          md.append("")
+          md.append("It accepts a sidecar target only when the third token exactly equals the requested target name. That prevents `sigma8z015` from matching inside `fsigma8z015`.")
+          md.append("")
+          md.append("It still does not run CAMB, compute Planck reference uncertainty, compute final RSD pressure, or validate TAIRID.")
+          md.append("")
+          md.append("## Fixture packet")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key in ["root", "paramnames_member_name", "chain_member_name", "minimum_member_name", "theta_label", "logA_label", "fixture_values_extracted", "sidecar_values_valid", "exact_token_guard_passed", "sigma_fsigma_pair_values_distinct", "fixture_run_allowed_now"]:
+              md.append(f"| `{key}` | `{fixture_packet.get(key, '')}` |")
+          md.append("")
+          md.append("## Extracted sidecar values")
+          md.append("")
+          md.append("| Target | Matched token | Value |")
+          md.append("|---|---|---:|")
+          for row in sidecar_target_records:
+              md.append(f"| `{row['target_name']}` | `{row['matched_token']}` | `{row['value']}` |")
+          md.append("")
+          md.append("## Sigma / fsigma pair check")
+          md.append("")
+          md.append("| z | sigma8 value | fsigma8 value | distinct |")
+          md.append("|---:|---:|---:|---|")
+          for row in sigma_fsigma_pair_records:
+              md.append(f"| `{row['z']}` | `{row['sigma8_value']}` | `{row['fsigma8_value']}` | `{row['values_distinct']}` |")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Route decision")
+          md.append("")
+          md.append(f"`{route_decision}`")
+          md.append("")
+          md.append("## Key boundary")
+          md.append("")
+          md.append("- Sidecar extraction uses profiled token position, not substring search.")
+          md.append("- Third token must exactly match the target name.")
+          md.append("- Extracted sidecar outputs are point targets, not covariance.")
+          md.append("- No CAMB calculation is run in v4.82.5.")
+          md.append("- No Planck reference uncertainty is computed.")
+          md.append("- No final RSD pressure score yet.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_allowed_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_v4_82_5_sidecar_exact_extractor_from_profile.json`")
+          md.append("- `tairid_v4_82_5_sidecar_exact_extractor_from_profile.md`")
+          md.append("- `paramname_label_records_v4_82_5.csv`")
+          md.append("- `chain_input_records_v4_82_5.csv`")
+          md.append("- `sidecar_target_records_v4_82_5.csv`")
+          md.append("- `sigma_fsigma_pair_records_v4_82_5.csv`")
+          md.append("- `extraction_errors_v4_82_5.csv`")
+          md.append("- `pre_run_gates_for_tiny_fixture_v4_82_5.csv`")
+          md.append("- `blocked_shortcuts_v4_82_5.csv`")
+          md.append("- `target_redshifts_v4_82_5.csv`")
+          md.append("- `blocked_claims_v4_82_5.csv`")
+          md.append("- `next_route_options_v4_82_5.csv`")
+          md.append("- `rule_results_v4_82_5.csv`")
+          md.append("")
+
+          (OUTDIR / "tairid_v4_82_5_sidecar_exact_extractor_from_profile.md").write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.82.5 sidecar exact extractor from profile artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-82-5-sidecar-exact-extractor-from-profile
+          path: artifacts/tairid_v4_82_5_sidecar_exact_extractor_from_profile/
