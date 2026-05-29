@@ -1,0 +1,563 @@
+name: 000 TAIRID v4.68 Solver Feasibility Audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-68-solver-feasibility-audit.yml"
+
+jobs:
+  tairid-v4-68-solver-feasibility-audit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.68 solver feasibility audit
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_68_solver_feasibility_audit
+
+          python - <<'PY'
+          import csv
+          import json
+          import importlib.util
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_68_solver_feasibility_audit")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_68_solver_feasibility_audit"
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove new physics.",
+              "This does not solve H0.",
+              "This does not disprove standard cosmology.",
+              "This does not compute final RSD pressure.",
+              "This does not download the full Planck fullGrid zip.",
+              "This does not import full Planck chains.",
+              "This does not parse full chain sample files.",
+              "This does not compute Planck reference uncertainty.",
+              "This does not install CAMB, CLASS, or any solver.",
+              "This only audits whether a solver route is feasible and what would be required.",
+              "The audit must not fake H0 from theta or sigma8 from logA.",
+              "A pass means the solver boundary is documented, not that the solver route is implemented."
+          ]
+
+          UPSTREAM_LOCKS = {
+              "v4_65_1": {
+                  "direct_omegam_sigma8_route_available": False,
+                  "primary_density_route_available": True,
+                  "omegabh2_omegach2_found_roots": 44,
+                  "theta_found_roots": 44,
+                  "direct_fsigma8_columns_found": 0
+              },
+              "v4_66": {
+                  "selected_roots": 12,
+                  "paramnames_ok": 12,
+                  "chain_prefix_probe_ok": 12,
+                  "row_shape_pass": 12,
+                  "primary_tracked_values_available": 12
+              },
+              "v4_67": {
+                  "readiness_label": "primary_density_background_contract_design_passed_ready_for_solver_feasibility_or_external_reference_source_packet",
+                  "simple_omegam_sigma8_route_available": False,
+                  "primary_density_route_available": True,
+                  "solver_implemented": False,
+                  "external_reference_imported": False,
+                  "reference_uncertainty_computed": False,
+                  "final_RSD_pressure_score_allowed_now": False
+              }
+          }
+
+          REQUIRED_SOLVER_CAPABILITIES = [
+              {
+                  "capability_id": "theta_to_H0_background_closure",
+                  "needed_for": "Convert sampled theta plus physical densities into H0/h and Omega_m0.",
+                  "can_be_done_with_simple_algebra": False,
+                  "requires_solver_or_verified_conversion": True,
+                  "blocked_shortcut": "H0 = theta"
+              },
+              {
+                  "capability_id": "primary_density_to_Omega_m0",
+                  "needed_for": "Convert omegabh2 and omegach2 into Omega_m0 after h is known.",
+                  "can_be_done_with_simple_algebra": True,
+                  "requires_solver_or_verified_conversion": True,
+                  "blocked_shortcut": "omegam = omegabh2 + omegach2"
+              },
+              {
+                  "capability_id": "logA_to_sigma8",
+                  "needed_for": "Convert primordial amplitude and transfer shape into sigma8.",
+                  "can_be_done_with_simple_algebra": False,
+                  "requires_solver_or_verified_conversion": True,
+                  "blocked_shortcut": "sigma8 = logA"
+              },
+              {
+                  "capability_id": "growth_to_fsigma8_targets",
+                  "needed_for": "Derive f(z), D(z), sigma8z, and fsigma8z at target redshifts.",
+                  "can_be_done_with_simple_algebra": False,
+                  "requires_solver_or_verified_conversion": True,
+                  "blocked_shortcut": "use sidecar minimum values as covariance"
+              }
+          ]
+
+          LOCAL_SOLVER_PACKAGE_CHECKS = [
+              {
+                  "package": "camb",
+                  "purpose": "Boltzmann/background and matter power solver candidate",
+                  "required_for_full_solver_route": True
+              },
+              {
+                  "package": "classy",
+                  "purpose": "CLASS Python wrapper candidate",
+                  "required_for_full_solver_route": True
+              },
+              {
+                  "package": "scipy",
+                  "purpose": "Numerical integration and interpolation support",
+                  "required_for_full_solver_route": False
+              },
+              {
+                  "package": "numpy",
+                  "purpose": "Array and weighted covariance support",
+                  "required_for_full_solver_route": False
+              }
+          ]
+
+          BLOCKED_SHORTCUTS = [
+              {
+                  "shortcut": "H0 = theta",
+                  "status": "blocked",
+                  "reason": "Theta is an acoustic/angular scale parameter. It is not H0 without background/acoustic-scale solving."
+              },
+              {
+                  "shortcut": "omegam = omegabh2 + omegach2",
+                  "status": "blocked",
+                  "reason": "Physical densities must be divided by h^2 after h is solved or verified."
+              },
+              {
+                  "shortcut": "sigma8 = logA",
+                  "status": "blocked",
+                  "reason": "logA is primordial amplitude, not late-time sigma8; transfer/growth calculation is required."
+              },
+              {
+                  "shortcut": "fsigma8z from minimum sidecars = posterior uncertainty",
+                  "status": "blocked",
+                  "reason": "Minimum sidecars are point fixtures, not posterior samples or covariance."
+              },
+              {
+                  "shortcut": "direct fsigma8z chain columns exist",
+                  "status": "blocked",
+                  "reason": "Earlier target-location audits found fsigma8z as sidecar-derived output, not direct chain columns."
+              }
+          ]
+
+          ROUTE_OPTIONS_AFTER_AUDIT = [
+              {
+                  "route_id": "A_external_verified_reference_packet",
+                  "status": "recommended_next_if_no_solver_available",
+                  "description": "Find a trustworthy external Planck posterior-derived fsigma8 reference or source packet with uncertainty/covariance.",
+                  "advantage": "Avoids building a full Boltzmann/power-spectrum solver inside the GitHub workflow immediately.",
+                  "risk": "Requires careful provenance and covariance definition.",
+                  "allowed_next_test": "v4.69_external_verified_reference_source_packet"
+              },
+              {
+                  "route_id": "B_solver_install_feasibility_branch",
+                  "status": "possible_but_heavier",
+                  "description": "Create a separate branch/workflow that attempts solver installation or uses a pinned solver container.",
+                  "advantage": "Could eventually derive fsigma8 posterior samples directly.",
+                  "risk": "Slower, more fragile, and must be validated against Planck sidecar fixtures.",
+                  "allowed_next_test": "v4.69_solver_install_or_container_feasibility"
+              },
+              {
+                  "route_id": "C_no_solver_shortcut",
+                  "status": "blocked",
+                  "description": "Try to fake H0, Omega_m0, sigma8, or fsigma8 directly from primary columns without a verified solver.",
+                  "advantage": "None.",
+                  "risk": "Would create false precision and corrupt the RSD reference uncertainty lane.",
+                  "allowed_next_test": "none"
+              }
+          ]
+
+          TARGET_REDSHIFTS = [
+              {"z_key": "015", "z": 0.15, "fsigma8_name": "fsigma8z015", "sigma8z_name": "sigma8z015"},
+              {"z_key": "038", "z": 0.38, "fsigma8_name": "fsigma8z038", "sigma8z_name": "sigma8z038"},
+              {"z_key": "051", "z": 0.51, "fsigma8_name": "fsigma8z051", "sigma8z_name": "sigma8z051"},
+              {"z_key": "061", "z": 0.61, "fsigma8_name": "fsigma8z061", "sigma8z_name": "sigma8z061"},
+              {"z_key": "233", "z": 2.33, "fsigma8_name": "fsigma8z233", "sigma8z_name": "sigma8z233"}
+          ]
+
+          BLOCKED_CLAIMS = [
+              "A solver was implemented.",
+              "CAMB or CLASS was installed.",
+              "Planck reference uncertainty is included.",
+              "Full Planck chains were imported.",
+              "Full chain sample files were parsed.",
+              "A final RSD pressure score was computed.",
+              "TAIRID cosmology is validated.",
+              "H0 was derived from theta.",
+              "sigma8 was derived from logA.",
+              "omegam was derived by adding omegabh2 and omegach2.",
+              "Minimum sidecars were treated as posterior covariance.",
+              "A likelihood, BIC, or posterior model comparison was run."
+          ]
+
+          failed_gates = []
+          warnings = [
+              "solver_feasibility_audit_only",
+              "no_solver_installed",
+              "no_chain_import",
+              "no_reference_uncertainty_computed",
+              "no_final_RSD_pressure",
+              "not_validation"
+          ]
+
+          package_records = []
+          for check in LOCAL_SOLVER_PACKAGE_CHECKS:
+              spec = importlib.util.find_spec(check["package"])
+              package_records.append({
+                  "package": check["package"],
+                  "available": spec is not None,
+                  "purpose": check["purpose"],
+                  "required_for_full_solver_route": check["required_for_full_solver_route"]
+              })
+
+          package_available = {row["package"]: row["available"] for row in package_records}
+          camb_available = package_available.get("camb", False)
+          classy_available = package_available.get("classy", False)
+          scipy_available = package_available.get("scipy", False)
+          numpy_available = package_available.get("numpy", False)
+
+          boltzmann_solver_available = camb_available or classy_available
+          numerical_support_available = scipy_available or numpy_available
+
+          if UPSTREAM_LOCKS["v4_67"]["primary_density_route_available"] is not True:
+              failed_gates.append("primary_density_route_not_carried_from_v4_67")
+
+          if UPSTREAM_LOCKS["v4_67"]["simple_omegam_sigma8_route_available"] is not False:
+              failed_gates.append("simple_route_boundary_not_carried_from_v4_67")
+
+          if UPSTREAM_LOCKS["v4_67"]["solver_implemented"] is not False:
+              failed_gates.append("solver_already_marked_implemented_unexpected")
+
+          if len(TARGET_REDSHIFTS) != 5:
+              failed_gates.append("target_redshift_count_not_5")
+
+          if [row["z"] for row in TARGET_REDSHIFTS] != [0.15, 0.38, 0.51, 0.61, 2.33]:
+              failed_gates.append("target_redshift_order_changed")
+
+          if any(row["status"] != "blocked" for row in BLOCKED_SHORTCUTS):
+              failed_gates.append("not_all_shortcuts_blocked")
+
+          route_ids = {row["route_id"] for row in ROUTE_OPTIONS_AFTER_AUDIT}
+          if "A_external_verified_reference_packet" not in route_ids:
+              failed_gates.append("external_reference_route_missing")
+
+          if "B_solver_install_feasibility_branch" not in route_ids:
+              failed_gates.append("solver_install_route_missing")
+
+          if "C_no_solver_shortcut" not in route_ids:
+              failed_gates.append("blocked_shortcut_route_missing")
+
+          blocked_text = " | ".join(BLOCKED_CLAIMS).lower()
+          for phrase in [
+              "solver was implemented",
+              "reference uncertainty is included",
+              "final rsd pressure",
+              "validated",
+              "h0 was derived from theta",
+              "sigma8 was derived from loga",
+              "minimum sidecars were treated as posterior covariance",
+              "bic"
+          ]:
+              if phrase not in blocked_text:
+                  failed_gates.append("blocked_claim_missing_" + phrase.replace(" ", "_"))
+
+          if boltzmann_solver_available:
+              route_decision = "solver_package_available_but_still_requires_pinned_validation_before_reference_uncertainty"
+              next_route_recommendation = "v4.69_solver_install_or_container_feasibility"
+          else:
+              route_decision = "no_local_boltzmann_solver_available_external_reference_packet_recommended_before_heavy_solver_branch"
+              next_route_recommendation = "v4.69_external_verified_reference_source_packet"
+
+          RULE_RESULTS = [
+              {
+                  "rule_id": "workflow_name_sorts_top",
+                  "pass": True,
+                  "result": "workflow name begins with 000 TAIRID",
+                  "boundary": "Navigation convenience only."
+              },
+              {
+                  "rule_id": "upstream_primary_density_route_carried",
+                  "pass": UPSTREAM_LOCKS["v4_67"]["primary_density_route_available"] is True,
+                  "result": "primary density route available from v4.67",
+                  "boundary": "Carry-forward only."
+              },
+              {
+                  "rule_id": "simple_route_remains_blocked",
+                  "pass": UPSTREAM_LOCKS["v4_67"]["simple_omegam_sigma8_route_available"] is False,
+                  "result": "simple direct omegam plus sigma8 route remains blocked",
+                  "boundary": "Do not force simple parser."
+              },
+              {
+                  "rule_id": "solver_package_status_recorded",
+                  "pass": True,
+                  "result": f"camb_available={camb_available}; classy_available={classy_available}",
+                  "boundary": "Availability check only; no solver is run."
+              },
+              {
+                  "rule_id": "blocked_shortcuts_preserved",
+                  "pass": all(row["status"] == "blocked" for row in BLOCKED_SHORTCUTS),
+                  "result": f"{len(BLOCKED_SHORTCUTS)} blocked shortcuts preserved",
+                  "boundary": "No fake parameter conversion."
+              },
+              {
+                  "rule_id": "required_solver_capabilities_declared",
+                  "pass": len(REQUIRED_SOLVER_CAPABILITIES) >= 4,
+                  "result": f"{len(REQUIRED_SOLVER_CAPABILITIES)} required solver capabilities declared",
+                  "boundary": "Design only."
+              },
+              {
+                  "rule_id": "route_options_declared",
+                  "pass": len(ROUTE_OPTIONS_AFTER_AUDIT) == 3,
+                  "result": "external reference, solver branch, and blocked shortcut route declared",
+                  "boundary": "No uncertainty computed."
+              },
+              {
+                  "rule_id": "target_redshifts_locked",
+                  "pass": [row["z"] for row in TARGET_REDSHIFTS] == [0.15, 0.38, 0.51, 0.61, 2.33],
+                  "result": "target redshift order locked",
+                  "boundary": "Design only."
+              },
+              {
+                  "rule_id": "blocked_claims_preserved",
+                  "pass": len(BLOCKED_CLAIMS) >= 12,
+                  "result": f"{len(BLOCKED_CLAIMS)} blocked claims preserved",
+                  "boundary": "No validation or final pressure claim."
+              },
+              {
+                  "rule_id": "route_decision_recorded",
+                  "pass": route_decision != "undetermined",
+                  "result": route_decision,
+                  "boundary": "Route decision does not compute uncertainty."
+              },
+              {
+                  "rule_id": "no_reference_uncertainty_or_final_pressure",
+                  "pass": True,
+                  "result": "no_reference_uncertainty_no_final_RSD_pressure",
+                  "boundary": "Feasibility audit only."
+              }
+          ]
+
+          if not all(row["pass"] for row in RULE_RESULTS):
+              failed_gates.append("not_all_v4_68_rules_passed")
+
+          if failed_gates:
+              readiness_label = "solver_feasibility_audit_failed"
+              next_allowed_step = "Repair solver feasibility audit before choosing external reference or solver branch."
+          else:
+              readiness_label = "solver_feasibility_audit_passed_ready_for_external_reference_packet_or_solver_install_branch"
+              next_allowed_step = (
+                  f"Proceed to {next_route_recommendation}. "
+                  "Do not compute reference uncertainty or final RSD pressure yet."
+              )
+
+          system_health = {
+              "workflow_name_sort_prefix": "000 TAIRID",
+              "python_version": sys.version.split()[0],
+              "camb_available": camb_available,
+              "classy_available": classy_available,
+              "scipy_available": scipy_available,
+              "numpy_available": numpy_available,
+              "boltzmann_solver_available": boltzmann_solver_available,
+              "numerical_support_available": numerical_support_available,
+              "required_solver_capability_count": len(REQUIRED_SOLVER_CAPABILITIES),
+              "blocked_shortcut_count": len(BLOCKED_SHORTCUTS),
+              "route_option_count": len(ROUTE_OPTIONS_AFTER_AUDIT),
+              "target_redshift_count": len(TARGET_REDSHIFTS),
+              "blocked_claim_count": len(BLOCKED_CLAIMS),
+              "route_decision": route_decision,
+              "recommended_next_route": next_route_recommendation,
+              "fullGrid_downloaded": False,
+              "full_chains_imported": False,
+              "full_chain_sample_files_parsed": False,
+              "solver_installed": False,
+              "solver_run": False,
+              "external_reference_imported": False,
+              "reference_uncertainty_computed": False,
+              "final_RSD_pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "rule_pass_count": sum(1 for row in RULE_RESULTS if row["pass"]),
+              "rule_total_count": len(RULE_RESULTS)
+          }
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "upstream_locks": UPSTREAM_LOCKS,
+              "required_solver_capabilities": REQUIRED_SOLVER_CAPABILITIES,
+              "local_solver_package_checks": package_records,
+              "blocked_shortcuts": BLOCKED_SHORTCUTS,
+              "route_options_after_audit": ROUTE_OPTIONS_AFTER_AUDIT,
+              "target_redshifts": TARGET_REDSHIFTS,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "route_decision": route_decision,
+              "recommended_next_route": next_route_recommendation,
+              "rule_results": RULE_RESULTS,
+              "system_health": system_health,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_allowed_step,
+                  "fullGrid_downloaded": False,
+                  "full_chains_imported": False,
+                  "full_chain_sample_files_parsed": False,
+                  "solver_installed": False,
+                  "solver_run": False,
+                  "external_reference_imported": False,
+                  "reference_uncertainty_computed": False,
+                  "final_RSD_pressure_computed": False,
+                  "validation_claim_allowed": False
+              }
+          }
+
+          json_path = OUTDIR / "tairid_v4_68_solver_feasibility_audit.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "solver_package_checks_v4_68.csv",
+              package_records,
+              ["package", "available", "purpose", "required_for_full_solver_route"]
+          )
+
+          write_csv(
+              OUTDIR / "required_solver_capabilities_v4_68.csv",
+              REQUIRED_SOLVER_CAPABILITIES,
+              ["capability_id", "needed_for", "can_be_done_with_simple_algebra", "requires_solver_or_verified_conversion", "blocked_shortcut"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_shortcuts_v4_68.csv",
+              BLOCKED_SHORTCUTS,
+              ["shortcut", "status", "reason"]
+          )
+
+          write_csv(
+              OUTDIR / "route_options_after_audit_v4_68.csv",
+              ROUTE_OPTIONS_AFTER_AUDIT,
+              ["route_id", "status", "description", "advantage", "risk", "allowed_next_test"]
+          )
+
+          write_csv(
+              OUTDIR / "blocked_claims_v4_68.csv",
+              [{"blocked_claim": claim} for claim in BLOCKED_CLAIMS],
+              ["blocked_claim"]
+          )
+
+          write_csv(
+              OUTDIR / "rule_results_v4_68.csv",
+              RULE_RESULTS,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          md = []
+          md.append("# 000 TAIRID v4.68 — Solver Feasibility Audit")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("This audit checks whether the Planck primary-density route can honestly move forward inside the current GitHub environment.")
+          md.append("")
+          md.append("It does not install or run CAMB/CLASS. It only records whether those tools are available and locks the conversion boundary.")
+          md.append("")
+          md.append("The key rule is: do not fake `H0` from `theta`, do not fake `sigma8` from `logA`, and do not fake `omegam` by adding physical densities.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Route decision")
+          md.append("")
+          md.append(f"`{route_decision}`")
+          md.append("")
+          md.append("## Recommended next route")
+          md.append("")
+          md.append(f"`{next_route_recommendation}`")
+          md.append("")
+          md.append("## Key boundary")
+          md.append("")
+          md.append("- `theta` is not `H0` without solver/background conversion.")
+          md.append("- `omegabh2 + omegach2` is not `omegam` without `h`.")
+          md.append("- `logA` is not `sigma8` without transfer/growth calculation.")
+          md.append("- `.minimum` sidecars remain point fixtures, not posterior covariance.")
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_allowed_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_v4_68_solver_feasibility_audit.json`")
+          md.append("- `tairid_v4_68_solver_feasibility_audit.md`")
+          md.append("- `solver_package_checks_v4_68.csv`")
+          md.append("- `required_solver_capabilities_v4_68.csv`")
+          md.append("- `blocked_shortcuts_v4_68.csv`")
+          md.append("- `route_options_after_audit_v4_68.csv`")
+          md.append("- `blocked_claims_v4_68.csv`")
+          md.append("- `rule_results_v4_68.csv`")
+          md.append("")
+
+          (OUTDIR / "tairid_v4_68_solver_feasibility_audit.md").write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.68 solver feasibility audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-68-solver-feasibility-audit
+          path: artifacts/tairid_v4_68_solver_feasibility_audit/
