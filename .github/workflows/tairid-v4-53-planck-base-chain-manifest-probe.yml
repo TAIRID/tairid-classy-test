@@ -1,0 +1,537 @@
+name: TAIRID v4.53 Planck Base Chain Manifest Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/tairid-v4-53-planck-base-chain-manifest-probe.yml"
+
+jobs:
+  tairid-v4-53-planck-base-chain-manifest-probe:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run TAIRID v4.53 Planck base chain manifest probe
+        shell: bash
+        run: |
+          mkdir -p artifacts/tairid_v4_53_planck_base_chain_manifest_probe
+
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          import zipfile
+          import urllib.request
+          import hashlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          OUTDIR = Path("artifacts/tairid_v4_53_planck_base_chain_manifest_probe")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          RUN_ID = "tairid_v4_53_planck_base_chain_manifest_probe"
+
+          BASE_ZIP_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM_R3.01.zip"
+          FULL_GRID_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_fullGrid_R3.01.zip"
+
+          LOCAL_ZIP = Path("/tmp/COM_CosmoParams_base-plikHM_R3.01.zip")
+
+          TARGET_PARAMS = [
+              "fsigma8z015",
+              "fsigma8z038",
+              "fsigma8z051",
+              "fsigma8z061",
+              "fsigma8z233",
+              "sigma8z015",
+              "sigma8z038",
+              "sigma8z051",
+              "sigma8z061",
+              "sigma8z233",
+              "sigma8",
+              "S8",
+              "omegam",
+              "H0"
+          ]
+
+          TRUTH_BOUNDARY = [
+              "This is not a TAIRID validation test.",
+              "This does not prove new physics.",
+              "This does not solve H0.",
+              "This does not disprove standard cosmology.",
+              "This does not compute final RSD pressure.",
+              "This does not download the full Planck full-grid zip.",
+              "This does not import Planck chains.",
+              "This does not parse chain sample rows.",
+              "This does not compute Planck reference uncertainty.",
+              "This only downloads the smaller Planck base-plikHM zip to inspect its manifest and small paramnames files.",
+              "A pass means internal base-package chain roots are verified for later parser work, not that reference uncertainty is computed."
+          ]
+
+          def head_probe(label, url):
+              record = {
+                  "label": label,
+                  "url": url,
+                  "ok": False,
+                  "status": None,
+                  "content_type": None,
+                  "content_length": None,
+                  "error": None
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      method="HEAD",
+                      headers={
+                          "User-Agent": "TAIRID-v4.53-manifest-probe/1.0",
+                          "Accept": "*/*"
+                      }
+                  )
+
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      record["ok"] = True
+                      record["status"] = getattr(response, "status", None)
+                      record["content_type"] = response.headers.get("Content-Type")
+                      content_length = response.headers.get("Content-Length")
+                      record["content_length"] = int(content_length) if content_length and content_length.isdigit() else None
+
+              except Exception as exc:
+                  record["error"] = f"{type(exc).__name__}: {exc}"
+
+              return record
+
+          def download_file(url, path):
+              hasher = hashlib.sha256()
+              total_bytes = 0
+
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v4.53-manifest-probe/1.0",
+                      "Accept": "application/zip,*/*"
+                  }
+              )
+
+              with urllib.request.urlopen(req, timeout=120) as response:
+                  with path.open("wb") as f:
+                      while True:
+                          chunk = response.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          f.write(chunk)
+                          hasher.update(chunk)
+                          total_bytes += len(chunk)
+
+              return {
+                  "downloaded": True,
+                  "bytes": total_bytes,
+                  "sha256_16": hasher.hexdigest()[:16]
+              }
+
+          def classify_manifest_member(name):
+              if name.endswith(".paramnames"):
+                  return "paramnames"
+              if re.search(r"_\d+\.txt$", name):
+                  return "chain_sample_text_member_not_read"
+              if name.endswith(".minimum"):
+                  return "minimum"
+              if name.endswith(".bestfit"):
+                  return "bestfit"
+              if name.endswith(".likestats"):
+                  return "likestats"
+              if name.endswith(".ranges"):
+                  return "ranges"
+              if name.endswith(".converge"):
+                  return "converge"
+              if name.endswith("/"):
+                  return "directory"
+              return "other"
+
+          def root_from_chain_member(name):
+              match = re.match(r"^(.*)_\d+\.txt$", name)
+              return match.group(1) if match else None
+
+          def root_from_paramnames(name):
+              if name.endswith(".paramnames"):
+                  return name[:-len(".paramnames")]
+              return None
+
+          def parse_paramnames_text(text):
+              names = []
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  first = line.split()[0]
+                  if first:
+                      names.append(first)
+              return names
+
+          failed_gates = []
+          warnings = [
+              "base_package_manifest_probe_only",
+              "paramnames_read_only",
+              "chain_sample_rows_not_read",
+              "reference_uncertainty_not_computed",
+              "final_RSD_pressure_not_computed",
+              "not_validation"
+          ]
+
+          full_grid_head = head_probe("full_grid_head_probe_only", FULL_GRID_URL)
+          base_head = head_probe("base_plikHM_head_probe", BASE_ZIP_URL)
+
+          if not full_grid_head["ok"]:
+              failed_gates.append("full_grid_head_probe_failed")
+
+          if not base_head["ok"]:
+              failed_gates.append("base_plikHM_head_probe_failed")
+
+          if base_head.get("content_length") is None:
+              failed_gates.append("base_plikHM_content_length_missing")
+          else:
+              if base_head["content_length"] <= 0:
+                  failed_gates.append("base_plikHM_content_length_not_positive")
+              if base_head["content_length"] > 750_000_000:
+                  failed_gates.append("base_plikHM_zip_too_large_for_guarded_manifest_probe")
+
+          download_record = {
+              "downloaded": False,
+              "bytes": 0,
+              "sha256_16": None
+          }
+
+          manifest_records = []
+          chain_roots = {}
+          paramnames_roots = {}
+          verified_roots = []
+          paramnames_summaries = []
+
+          try:
+              if not failed_gates:
+                  download_record = download_file(BASE_ZIP_URL, LOCAL_ZIP)
+
+                  if not LOCAL_ZIP.exists():
+                      failed_gates.append("base_zip_download_missing_after_download")
+                  elif LOCAL_ZIP.stat().st_size <= 0:
+                      failed_gates.append("base_zip_download_empty")
+                  else:
+                      with zipfile.ZipFile(LOCAL_ZIP, "r") as z:
+                          names = z.namelist()
+
+                          for name in names:
+                              kind = classify_manifest_member(name)
+                              manifest_records.append({
+                                  "member_name": name,
+                                  "member_type": kind
+                              })
+
+                              chain_root = root_from_chain_member(name)
+                              if chain_root:
+                                  chain_roots.setdefault(chain_root, []).append(name)
+
+                              param_root = root_from_paramnames(name)
+                              if param_root:
+                                  paramnames_roots[param_root] = name
+
+                          for root, param_member in sorted(paramnames_roots.items()):
+                              chain_members = sorted(chain_roots.get(root, []))
+
+                              param_text = z.read(param_member).decode("utf-8", errors="replace")
+                              parsed_names = parse_paramnames_text(param_text)
+
+                              detected_targets = [name for name in TARGET_PARAMS if name in parsed_names]
+                              detected_fsigma8_targets = [name for name in detected_targets if name.startswith("fsigma8z")]
+
+                              summary = {
+                                  "root": root,
+                                  "paramnames_member": param_member,
+                                  "chain_member_count": len(chain_members),
+                                  "chain_members": chain_members,
+                                  "parameter_count": len(parsed_names),
+                                  "detected_targets": detected_targets,
+                                  "detected_fsigma8_targets": detected_fsigma8_targets,
+                                  "status": "verified_root_with_paramnames_and_chain_members" if chain_members else "paramnames_without_matching_chain_members"
+                              }
+
+                              paramnames_summaries.append(summary)
+
+                              if chain_members:
+                                  verified_roots.append(summary)
+
+              if LOCAL_ZIP.exists():
+                  LOCAL_ZIP.unlink()
+
+          except zipfile.BadZipFile as exc:
+              failed_gates.append("downloaded_base_zip_not_valid_zip")
+              warnings.append(f"zip_error_{type(exc).__name__}")
+
+              if LOCAL_ZIP.exists():
+                  LOCAL_ZIP.unlink()
+
+          except Exception as exc:
+              failed_gates.append("base_manifest_probe_exception")
+              warnings.append(f"exception_{type(exc).__name__}_{exc}")
+
+              if LOCAL_ZIP.exists():
+                  LOCAL_ZIP.unlink()
+
+          if not manifest_records:
+              failed_gates.append("base_zip_manifest_not_read")
+
+          if not verified_roots:
+              failed_gates.append("no_verified_roots_with_paramnames_and_chain_members")
+
+          if not any(row["detected_fsigma8_targets"] for row in verified_roots):
+              failed_gates.append("no_verified_root_contains_fsigma8_targets")
+
+          if LOCAL_ZIP.exists():
+              failed_gates.append("local_zip_not_deleted_after_manifest_probe")
+
+          RULE_RESULTS = [
+              {
+                  "rule_id": "full_grid_not_downloaded",
+                  "pass": True,
+                  "result": "full_grid_used_for_HEAD_probe_only",
+                  "boundary": "No fullGrid download."
+              },
+              {
+                  "rule_id": "base_zip_size_guarded",
+                  "pass": base_head.get("content_length") is not None and 0 < base_head["content_length"] <= 750_000_000,
+                  "result": f"base_plikHM_content_length_{base_head.get('content_length')}",
+                  "boundary": "Base package only, not fullGrid."
+              },
+              {
+                  "rule_id": "base_manifest_read",
+                  "pass": bool(manifest_records),
+                  "result": f"{len(manifest_records)} manifest members detected",
+                  "boundary": "Manifest names only."
+              },
+              {
+                  "rule_id": "chain_roots_verified",
+                  "pass": bool(verified_roots),
+                  "result": f"{len(verified_roots)} roots with paramnames and chain members",
+                  "boundary": "Chain sample rows not read."
+              },
+              {
+                  "rule_id": "fsigma8_targets_visible_in_paramnames",
+                  "pass": any(row["detected_fsigma8_targets"] for row in verified_roots),
+                  "result": "at_least_one_verified_root_contains_fsigma8_targets",
+                  "boundary": "Parameter presence only, not reference uncertainty."
+              },
+              {
+                  "rule_id": "paramnames_only_read_policy",
+                  "pass": True,
+                  "result": "only small paramnames files read from zip",
+                  "boundary": "No sample rows parsed."
+              },
+              {
+                  "rule_id": "local_zip_deleted",
+                  "pass": not LOCAL_ZIP.exists(),
+                  "result": "local_zip_deleted_after_manifest_probe",
+                  "boundary": "Do not upload or persist Planck zip."
+              },
+              {
+                  "rule_id": "no_final_pressure_or_validation",
+                  "pass": True,
+                  "result": "no_final_RSD_pressure_no_TAIRID_validation",
+                  "boundary": "Source packet only."
+              }
+          ]
+
+          if not all(row["pass"] for row in RULE_RESULTS):
+              failed_gates.append("not_all_v4_53_rules_passed")
+
+          if failed_gates:
+              readiness_label = "planck_base_chain_manifest_probe_failed"
+              next_allowed_step = "Repair base package manifest probe before any parser implementation."
+          else:
+              readiness_label = "planck_base_chain_manifest_probe_passed_ready_for_paramnames_mapping_or_guarded_parser_skeleton"
+              next_allowed_step = (
+                  "Proceed to v4.54 paramnames mapping audit or guarded parser skeleton. "
+                  "Do not import chain samples, compute reference uncertainty, or compute final RSD pressure yet."
+              )
+
+          system_health = {
+              "full_grid_head_ok": full_grid_head["ok"],
+              "full_grid_downloaded": False,
+              "base_head_ok": base_head["ok"],
+              "base_content_length": base_head.get("content_length"),
+              "base_zip_downloaded_for_manifest_only": download_record["downloaded"],
+              "base_zip_download_bytes": download_record["bytes"],
+              "base_zip_sha256_16": download_record["sha256_16"],
+              "manifest_member_count": len(manifest_records),
+              "chain_root_count": len(chain_roots),
+              "paramnames_root_count": len(paramnames_roots),
+              "verified_root_count": len(verified_roots),
+              "verified_root_with_fsigma8_count": sum(1 for row in verified_roots if row["detected_fsigma8_targets"]),
+              "Planck_chains_imported": False,
+              "chain_sample_rows_read": False,
+              "Planck_full_grid_downloaded": False,
+              "reference_uncertainty_computed": False,
+              "final_RSD_pressure_score_allowed_now": False,
+              "validation_claim_allowed": False,
+              "local_zip_deleted": not LOCAL_ZIP.exists(),
+              "rule_pass_count": sum(1 for row in RULE_RESULTS if row["pass"]),
+              "rule_total_count": len(RULE_RESULTS)
+          }
+
+          audit = {
+              "run_id": RUN_ID,
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "truth_boundary": TRUTH_BOUNDARY,
+              "source_urls": {
+                  "base_plikHM_zip": BASE_ZIP_URL,
+                  "full_grid_head_probe_only": FULL_GRID_URL
+              },
+              "head_records": {
+                  "full_grid": full_grid_head,
+                  "base_plikHM": base_head
+              },
+              "download_record": download_record,
+              "manifest_records": manifest_records,
+              "paramnames_summaries": paramnames_summaries,
+              "verified_roots": verified_roots,
+              "rule_results": RULE_RESULTS,
+              "system_health": system_health,
+              "gate_result": {
+                  "failed_gates": sorted(set(failed_gates)),
+                  "warnings": sorted(set(warnings)),
+                  "readiness_label": readiness_label,
+                  "next_allowed_step": next_allowed_step,
+                  "full_grid_downloaded": False,
+                  "Planck_chains_imported": False,
+                  "chain_sample_rows_read": False,
+                  "reference_uncertainty_computed": False,
+                  "final_RSD_pressure_computed": False,
+                  "validation_claim_allowed": False
+              }
+          }
+
+          json_path = OUTDIR / "tairid_v4_53_planck_base_chain_manifest_probe.json"
+          json_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(path, rows, fieldnames):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+          write_csv(
+              OUTDIR / "manifest_members_v4_53.csv",
+              manifest_records,
+              ["member_name", "member_type"]
+          )
+
+          write_csv(
+              OUTDIR / "verified_chain_roots_v4_53.csv",
+              [
+                  {
+                      "root": row["root"],
+                      "paramnames_member": row["paramnames_member"],
+                      "chain_member_count": row["chain_member_count"],
+                      "parameter_count": row["parameter_count"],
+                      "detected_targets": ", ".join(row["detected_targets"]),
+                      "detected_fsigma8_targets": ", ".join(row["detected_fsigma8_targets"]),
+                      "status": row["status"]
+                  }
+                  for row in verified_roots
+              ],
+              [
+                  "root",
+                  "paramnames_member",
+                  "chain_member_count",
+                  "parameter_count",
+                  "detected_targets",
+                  "detected_fsigma8_targets",
+                  "status"
+              ]
+          )
+
+          write_csv(
+              OUTDIR / "rule_results_v4_53.csv",
+              RULE_RESULTS,
+              ["rule_id", "pass", "result", "boundary"]
+          )
+
+          md = []
+          md.append("# TAIRID v4.53 — Planck Base Chain Manifest Probe")
+          md.append("")
+          md.append(f"Created UTC: `{audit['created_at_utc']}`")
+          md.append("")
+          md.append("## Status")
+          md.append("")
+          md.append(f"Readiness label: `{readiness_label}`")
+          md.append("")
+          md.append(f"Failed gates: `{', '.join(sorted(set(failed_gates))) if failed_gates else 'none'}`")
+          md.append("")
+          md.append(f"Warnings: `{', '.join(sorted(set(warnings))) if warnings else 'none'}`")
+          md.append("")
+          md.append("## Plain-language result")
+          md.append("")
+          md.append("This test downloads the smaller Planck base-plikHM zip only to inspect its internal manifest and read small `.paramnames` files.")
+          md.append("")
+          md.append("It does not download the fullGrid zip, import chains, read chain sample rows, compute Planck reference uncertainty, compute final RSD pressure, or validate TAIRID.")
+          md.append("")
+          md.append("## System health")
+          md.append("")
+          md.append("| Check | Value |")
+          md.append("|---|---|")
+          for key, value in system_health.items():
+              md.append(f"| `{key}` | `{value}` |")
+          md.append("")
+          md.append("## Verified roots")
+          md.append("")
+          md.append("| Root | Chain members | fsigma8 targets visible? |")
+          md.append("|---|---:|---|")
+          for row in verified_roots:
+              md.append(
+                  f"| `{row['root']}` | `{row['chain_member_count']}` | `{', '.join(row['detected_fsigma8_targets']) if row['detected_fsigma8_targets'] else 'none'}` |"
+              )
+          md.append("")
+          md.append("## Next allowed step")
+          md.append("")
+          md.append(next_allowed_step)
+          md.append("")
+          md.append("## Files produced")
+          md.append("")
+          md.append("- `tairid_v4_53_planck_base_chain_manifest_probe.json`")
+          md.append("- `tairid_v4_53_planck_base_chain_manifest_probe.md`")
+          md.append("- `manifest_members_v4_53.csv`")
+          md.append("- `verified_chain_roots_v4_53.csv`")
+          md.append("- `rule_results_v4_53.csv`")
+          md.append("")
+
+          (OUTDIR / "tairid_v4_53_planck_base_chain_manifest_probe.md").write_text(
+              "\n".join(md),
+              encoding="utf-8"
+          )
+
+          print("Gate result:")
+          print(json.dumps(audit["gate_result"], indent=2))
+          print()
+          print("System health:")
+          print(json.dumps(system_health, indent=2))
+          print()
+          print("Wrote artifacts into:")
+          print(f"  {OUTDIR}")
+
+          if failed_gates:
+              raise SystemExit(2)
+
+          raise SystemExit(0)
+          PY
+
+      - name: Upload TAIRID v4.53 Planck base chain manifest probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-53-planck-base-chain-manifest-probe
+          path: artifacts/tairid_v4_53_planck_base_chain_manifest_probe/
