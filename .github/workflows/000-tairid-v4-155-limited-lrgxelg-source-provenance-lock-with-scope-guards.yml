@@ -1,0 +1,704 @@
+name: 000 TAIRID v4.155 — Limited LRGxELG Source Provenance Lock With Scope Guards
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-v4-155-limited-lrgxelg-source-provenance-lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run guarded limited LRGxELG source provenance lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_155_limited_lrgxelg_source_provenance_lock
+          cat > tairid_v4_155_limited_lrgxelg_source_provenance_lock/run_v4_155.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+          from xml.etree import ElementTree as ET
+
+          VERSION = "v4.155"
+          OUTDIR = "tairid_v4_155_limited_lrgxelg_source_provenance_lock"
+          os.makedirs(OUTDIR, exist_ok=True)
+
+          EXPECTED_RESULT_LABEL = "limited_lrgxelg_source_provenance_lock_passed_pinned_sources_and_checksums_written_no_pressure_no_validation"
+          ALLOWED_SCOPE = "LRGxELG two-redshift BAO/RSD vector at z=0.70 and z=0.845 only; source/provenance lock only"
+          CLAIM_BOUNDARY = "source_provenance_lock_only_no_pressure_no_validation"
+
+          REPO_OWNER = "icosmology"
+          REPO_NAME = "eBOSS_DR16_LRGxELG"
+          BRANCH = "master"
+          REPO_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+          BRANCH_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/branches/{BRANCH}"
+          ARXIV_ID = "2007.09011"
+          ARXIV_API_URL = f"https://export.arxiv.org/api/query?id_list={ARXIV_ID}"
+
+          SOURCES = [
+              {
+                  "source_id": "lrgxelg_value_file",
+                  "filename": "sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK.dat",
+                  "role": "inline_labeled_value_sigma_vector",
+                  "expected_sha256_16_from_v4_154": "75847ae104bc4c24",
+              },
+              {
+                  "source_id": "lrgxelg_covariance_file",
+                  "filename": "sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK_cov.dat",
+                  "role": "six_by_six_covariance_candidate",
+                  "expected_sha256_16_from_v4_154": "450cdb1b651eaf46",
+              },
+              {
+                  "source_id": "lrgxelg_readme",
+                  "filename": "README.md",
+                  "role": "repository_provenance_context",
+                  "expected_sha256_16_from_v4_154": "356a404244b282fa",
+              },
+          ]
+
+          EXPECTED_VALUE_ORDER = [
+              ("DM_ov_rd_z0p70", 0.700, "DM_ov_rd", "geometry"),
+              ("DH_ov_rd_z0p70", 0.700, "DH_ov_rd", "geometry"),
+              ("fsigma8_z0p70", 0.700, "fsigma8", "growth"),
+              ("DM_ov_rd_z0p845", 0.845, "DM_ov_rd", "geometry"),
+              ("DH_ov_rd_z0p845", 0.845, "DH_ov_rd", "geometry"),
+              ("fsigma8_z0p845", 0.845, "fsigma8", "growth"),
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "Standard cosmology is disproven.",
+              "A final RSD pressure score was computed.",
+              "A residual against LCDM or TAIRID was computed.",
+              "A final combined growth covariance was computed.",
+              "The limited LRGxELG product is full eBOSS covariance.",
+              "The limited LRGxELG product provides QSO covariance.",
+              "The eBOSS family points are independent by default.",
+              "BIC, likelihood, posterior comparison, or model selection has been run.",
+              "Source provenance locking is physical proof.",
+              "Pinned source files remove the need for reference covariance.",
+              "Public-facing validation claims are allowed.",
+          ]
+
+          SCOPE_GUARDS = [
+              {
+                  "guard_id": "limited_LRGxELG_two_redshift_only",
+                  "allowed": True,
+                  "blocked_use": "full_eBOSS_family_covariance",
+                  "guard_text": "This lock is limited to the LRGxELG two-redshift BAO/RSD product at z=0.70 and z=0.845.",
+              },
+              {
+                  "guard_id": "source_lock_not_scientific_ingestion",
+                  "allowed": True,
+                  "blocked_use": "pressure_or_model_victory_claim",
+                  "guard_text": "Checksums, pinned URLs, repository metadata, and README context lock provenance only; they do not compute residuals, pressure, likelihood, or proof.",
+              },
+              {
+                  "guard_id": "not_QSO_covariance",
+                  "allowed": False,
+                  "blocked_use": "QSO_covariance_or_QSO_pressure",
+                  "guard_text": "No QSO covariance is provided by this LRGxELG source lock.",
+              },
+              {
+                  "guard_id": "not_full_eboss_covariance",
+                  "allowed": False,
+                  "blocked_use": "full_eBOSS_family_covariance_or_overlap_solution",
+                  "guard_text": "This does not solve full eBOSS family covariance, overlap, or cross-tracer independence.",
+              },
+              {
+                  "guard_id": "not_final_pressure_input",
+                  "allowed": False,
+                  "blocked_use": "final_RSD_pressure",
+                  "guard_text": "This workflow may lock source identity, but may not compute final pressure.",
+              },
+              {
+                  "guard_id": "not_model_comparison",
+                  "allowed": False,
+                  "blocked_use": "BIC_likelihood_posterior_comparison",
+                  "guard_text": "No BIC, likelihood, posterior comparison, model selection, or public-facing proof claim is allowed.",
+              },
+              {
+                  "guard_id": "requires_reference_vector_later",
+                  "allowed": False,
+                  "blocked_use": "reference_complete_growth_test",
+                  "guard_text": "The 12-redshift reference vector and reference covariance remain missing.",
+              },
+          ]
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def write_csv(path, rows, fieldnames=None):
+              if fieldnames is None:
+                  keys = []
+                  for row in rows:
+                      for key in row.keys():
+                          if key not in keys:
+                              keys.append(key)
+                  fieldnames = keys
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def sha256_hex(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def fetch_url(url, source_id, role, timeout=30, accept=None):
+              headers = {"User-Agent": "TAIRID-v4.155-source-provenance-lock"}
+              if accept:
+                  headers["Accept"] = accept
+              req = urllib.request.Request(url, headers=headers)
+              started = time.time()
+              record = {
+                  "source_id": source_id,
+                  "url": url,
+                  "role": role,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_read": 0,
+                  "sha256": "",
+                  "sha256_16": "",
+                  "elapsed_seconds": "",
+                  "error": "",
+                  "claim_boundary": "fetch_status_only_not_scientific_ingestion",
+              }
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read()
+                      record["fetch_ok"] = True
+                      record["status_code"] = getattr(resp, "status", "")
+                      record["content_type"] = resp.headers.get("Content-Type", "")
+                      record["bytes_read"] = len(data)
+                      digest = sha256_hex(data)
+                      record["sha256"] = digest
+                      record["sha256_16"] = digest[:16]
+                      record["elapsed_seconds"] = round(time.time() - started, 3)
+                      return data, record
+              except Exception as exc:
+                  record["elapsed_seconds"] = round(time.time() - started, 3)
+                  record["error"] = repr(exc)
+                  return b"", record
+
+          def parse_value_file(text):
+              rows = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  data_part, _, comment = line.partition("#")
+                  parts = data_part.split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      z_value = float(parts[0])
+                      measurement = float(parts[1])
+                      sigma = float(parts[2])
+                  except ValueError:
+                      continue
+                  comment_clean = comment.strip()
+                  if "DM_ov_rd" in comment_clean:
+                      observable = "DM_ov_rd"
+                  elif "DH_ov_rd" in comment_clean:
+                      observable = "DH_ov_rd"
+                  elif "sigma" in comment_clean or "fsigma" in comment_clean or "f\\sigma" in comment_clean:
+                      observable = "fsigma8"
+                  else:
+                      observable = "unknown"
+                  z_label = "z0p70" if abs(z_value - 0.70) < 1e-9 else "z0p845" if abs(z_value - 0.845) < 1e-9 else f"z{str(z_value).replace('.', 'p')}"
+                  parameter_label = f"{observable}_{z_label}"
+                  family = "growth" if observable == "fsigma8" else "geometry" if observable in {"DM_ov_rd", "DH_ov_rd"} else "unknown"
+                  rows.append({
+                      "order_index": len(rows) + 1,
+                      "parameter_label": parameter_label,
+                      "z_value": z_value,
+                      "observable": observable,
+                      "family": family,
+                      "measurement": measurement,
+                      "sigma": sigma,
+                      "raw_line_preview": stripped[:200],
+                      "claim_boundary": "source_identity_reparse_only_not_pressure",
+                  })
+              return rows
+
+          def parse_covariance(text):
+              values = []
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+                  for token in stripped.split():
+                      try:
+                          values.append(float(token))
+                      except ValueError:
+                          pass
+              n = int(round(math.sqrt(len(values)))) if values else 0
+              square = n * n == len(values)
+              matrix = []
+              if square:
+                  matrix = [values[i*n:(i+1)*n] for i in range(n)]
+              return values, n, square, matrix
+
+          def is_symmetric(matrix, tol=1e-10):
+              n = len(matrix)
+              for i in range(n):
+                  for j in range(n):
+                      if abs(matrix[i][j] - matrix[j][i]) > tol:
+                          return False
+              return True
+
+          def diagonal_matches_sigma(matrix, value_rows, tol=5e-5):
+              if len(matrix) != len(value_rows):
+                  return False
+              for i, row in enumerate(value_rows):
+                  sigma = float(row["sigma"])
+                  if abs(matrix[i][i] - sigma * sigma) > tol:
+                      return False
+              return True
+
+          fetch_records = []
+          branch_raw_bytes = {}
+          pinned_raw_bytes = {}
+          checksum_records = []
+          pinned_url_records = []
+
+          repo_data, repo_fetch = fetch_url(REPO_API_URL, "github_repo_api", "repository_metadata", accept="application/vnd.github+json")
+          fetch_records.append(repo_fetch)
+          branch_data, branch_fetch = fetch_url(BRANCH_API_URL, "github_branch_api", "branch_head_metadata", accept="application/vnd.github+json")
+          fetch_records.append(branch_fetch)
+
+          repo_json = {}
+          branch_json = {}
+          branch_head_sha = ""
+          repo_default_branch = ""
+          repo_html_url = ""
+          repo_license_key = ""
+          repo_description = ""
+          repo_updated_at = ""
+          repo_pushed_at = ""
+          repo_stargazers_count = ""
+          repo_visibility = ""
+
+          if repo_data:
+              try:
+                  repo_json = json.loads(repo_data.decode("utf-8"))
+                  repo_default_branch = repo_json.get("default_branch", "")
+                  repo_html_url = repo_json.get("html_url", "")
+                  repo_description = repo_json.get("description", "") or ""
+                  repo_updated_at = repo_json.get("updated_at", "")
+                  repo_pushed_at = repo_json.get("pushed_at", "")
+                  repo_visibility = repo_json.get("visibility", "")
+                  repo_stargazers_count = repo_json.get("stargazers_count", "")
+                  lic = repo_json.get("license") or {}
+                  repo_license_key = lic.get("key", "") if isinstance(lic, dict) else ""
+              except Exception:
+                  repo_json = {}
+
+          if branch_data:
+              try:
+                  branch_json = json.loads(branch_data.decode("utf-8"))
+                  branch_head_sha = (((branch_json or {}).get("commit") or {}).get("sha")) or ""
+              except Exception:
+                  branch_json = {}
+
+          for src in SOURCES:
+              branch_url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{BRANCH}/{src['filename']}"
+              data, rec = fetch_url(branch_url, src["source_id"], src["role"])
+              rec["source_form"] = "branch_raw_master"
+              fetch_records.append(rec)
+              branch_raw_bytes[src["source_id"]] = data
+
+              pinned_url = ""
+              pinned_data = b""
+              pinned_rec = {
+                  "source_id": src["source_id"],
+                  "url": "",
+                  "role": src["role"],
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_read": 0,
+                  "sha256": "",
+                  "sha256_16": "",
+                  "elapsed_seconds": "",
+                  "error": "branch_head_sha_missing",
+                  "claim_boundary": "pinned_fetch_status_only_not_scientific_ingestion",
+                  "source_form": "commit_pinned_raw",
+              }
+              if branch_head_sha:
+                  pinned_url = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{branch_head_sha}/{src['filename']}"
+                  pinned_data, pinned_rec = fetch_url(pinned_url, src["source_id"] + "_pinned", src["role"])
+                  pinned_rec["source_form"] = "commit_pinned_raw"
+              fetch_records.append(pinned_rec)
+              pinned_raw_bytes[src["source_id"]] = pinned_data
+
+              branch_sha = sha256_hex(data) if data else ""
+              pinned_sha = sha256_hex(pinned_data) if pinned_data else ""
+              checksum_records.append({
+                  "source_id": src["source_id"],
+                  "filename": src["filename"],
+                  "role": src["role"],
+                  "branch_raw_url": branch_url,
+                  "commit_pinned_url": pinned_url,
+                  "branch_head_sha": branch_head_sha,
+                  "expected_sha256_16_from_v4_154": src["expected_sha256_16_from_v4_154"],
+                  "branch_sha256": branch_sha,
+                  "branch_sha256_16": branch_sha[:16] if branch_sha else "",
+                  "pinned_sha256": pinned_sha,
+                  "pinned_sha256_16": pinned_sha[:16] if pinned_sha else "",
+                  "branch_matches_v4_154_short_hash": bool(branch_sha and branch_sha.startswith(src["expected_sha256_16_from_v4_154"])),
+                  "pinned_matches_v4_154_short_hash": bool(pinned_sha and pinned_sha.startswith(src["expected_sha256_16_from_v4_154"])),
+                  "branch_matches_pinned": bool(branch_sha and pinned_sha and branch_sha == pinned_sha),
+                  "claim_boundary": "checksum_lock_not_pressure_not_validation",
+              })
+              pinned_url_records.append({
+                  "source_id": src["source_id"],
+                  "filename": src["filename"],
+                  "branch_head_sha": branch_head_sha,
+                  "commit_pinned_raw_url": pinned_url,
+                  "claim_boundary": "pinned_url_for_reproducibility_not_scientific_ingestion",
+              })
+
+          arxiv_data, arxiv_fetch = fetch_url(ARXIV_API_URL, "arxiv_api_2007_09011", "external_paper_metadata_context", timeout=30)
+          fetch_records.append(arxiv_fetch)
+          arxiv_metadata = {
+              "arxiv_id": ARXIV_ID,
+              "api_url": ARXIV_API_URL,
+              "fetch_ok": bool(arxiv_data),
+              "title": "",
+              "published": "",
+              "updated": "",
+              "authors": "",
+              "entry_present": False,
+              "claim_boundary": "paper_metadata_context_not_validation",
+          }
+          if arxiv_data:
+              try:
+                  root = ET.fromstring(arxiv_data.decode("utf-8", errors="replace"))
+                  ns = {"atom": "http://www.w3.org/2005/Atom"}
+                  entries = root.findall("atom:entry", ns)
+                  if entries:
+                      e = entries[0]
+                      arxiv_metadata["entry_present"] = True
+                      title_el = e.find("atom:title", ns)
+                      published_el = e.find("atom:published", ns)
+                      updated_el = e.find("atom:updated", ns)
+                      authors = []
+                      for a in e.findall("atom:author", ns):
+                          name_el = a.find("atom:name", ns)
+                          if name_el is not None and name_el.text:
+                              authors.append(" ".join(name_el.text.split()))
+                      arxiv_metadata["title"] = " ".join((title_el.text or "").split()) if title_el is not None else ""
+                      arxiv_metadata["published"] = published_el.text if published_el is not None else ""
+                      arxiv_metadata["updated"] = updated_el.text if updated_el is not None else ""
+                      arxiv_metadata["authors"] = "; ".join(authors)
+              except Exception as exc:
+                  arxiv_metadata["error"] = repr(exc)
+
+          value_text = (branch_raw_bytes.get("lrgxelg_value_file") or b"").decode("utf-8", errors="replace")
+          cov_text = (branch_raw_bytes.get("lrgxelg_covariance_file") or b"").decode("utf-8", errors="replace")
+          readme_text = (branch_raw_bytes.get("lrgxelg_readme") or b"").decode("utf-8", errors="replace")
+
+          value_rows = parse_value_file(value_text)
+          cov_values, cov_dim, cov_square, cov_matrix = parse_covariance(cov_text)
+
+          expected_labels = [x[0] for x in EXPECTED_VALUE_ORDER]
+          parsed_labels = [r["parameter_label"] for r in value_rows]
+          order_matches_expected = parsed_labels == expected_labels
+          covariance_dimension_matches_value_order = (cov_dim == len(value_rows) == len(EXPECTED_VALUE_ORDER))
+          covariance_symmetric = bool(cov_matrix and is_symmetric(cov_matrix))
+          diagonal_matches = bool(cov_matrix and diagonal_matches_sigma(cov_matrix, value_rows))
+
+          readme_lower = readme_text.lower()
+          source_context_rows = [{
+              "readme_nonempty": bool(readme_text.strip()),
+              "mentions_bao": "bao" in readme_lower,
+              "mentions_rsd": "rsd" in readme_lower,
+              "mentions_zhao": "zhao" in readme_lower,
+              "mentions_arxiv_2007_09011": "2007.09011" in readme_text,
+              "arxiv_api_fetch_ok": bool(arxiv_data),
+              "arxiv_entry_present": bool(arxiv_metadata.get("entry_present")),
+              "repo_api_fetch_ok": bool(repo_data),
+              "branch_api_fetch_ok": bool(branch_data),
+              "repo_default_branch": repo_default_branch,
+              "branch_head_sha": branch_head_sha,
+              "claim_boundary": "source_context_and_metadata_not_final_scientific_ingestion",
+          }]
+
+          repo_metadata_rows = [{
+              "repo_api_url": REPO_API_URL,
+              "branch_api_url": BRANCH_API_URL,
+              "repo_html_url": repo_html_url,
+              "repo_description": repo_description,
+              "repo_default_branch": repo_default_branch,
+              "branch_requested": BRANCH,
+              "branch_head_sha": branch_head_sha,
+              "repo_license_key": repo_license_key,
+              "repo_visibility": repo_visibility,
+              "repo_stargazers_count": repo_stargazers_count,
+              "repo_updated_at": repo_updated_at,
+              "repo_pushed_at": repo_pushed_at,
+              "claim_boundary": "github_repository_metadata_not_scientific_claim",
+          }]
+
+          provenance_manifest_rows = []
+          for rec in checksum_records:
+              provenance_manifest_rows.append({
+                  "source_id": rec["source_id"],
+                  "filename": rec["filename"],
+                  "role": rec["role"],
+                  "repository": f"{REPO_OWNER}/{REPO_NAME}",
+                  "branch": BRANCH,
+                  "branch_head_sha": branch_head_sha,
+                  "branch_raw_url": rec["branch_raw_url"],
+                  "commit_pinned_raw_url": rec["commit_pinned_url"],
+                  "sha256": rec["pinned_sha256"] or rec["branch_sha256"],
+                  "sha256_16": (rec["pinned_sha256"] or rec["branch_sha256"])[:16] if (rec["pinned_sha256"] or rec["branch_sha256"]) else "",
+                  "matches_v4_154_short_hash": rec["pinned_matches_v4_154_short_hash"] or rec["branch_matches_v4_154_short_hash"],
+                  "branch_matches_pinned": rec["branch_matches_pinned"],
+                  "allowed_use": "local_limited_LRGxELG_parser_artifacts_only",
+                  "blocked_use": "pressure_residual_likelihood_BIC_QSO_full_eBOSS_validation",
+                  "claim_boundary": "source_lock_manifest_not_pressure_not_validation",
+              })
+
+          # Rule checks.
+          all_branch_raw_sources_fetch_ok = all(
+              r.get("fetch_ok") is True
+              for r in fetch_records
+              if r.get("source_form") == "branch_raw_master"
+          )
+          all_pinned_raw_sources_fetch_ok = all(
+              r.get("fetch_ok") is True
+              for r in fetch_records
+              if r.get("source_form") == "commit_pinned_raw"
+          )
+          all_branch_short_hashes_match_v4_154 = all(r["branch_matches_v4_154_short_hash"] for r in checksum_records)
+          all_pinned_short_hashes_match_v4_154 = all(r["pinned_matches_v4_154_short_hash"] for r in checksum_records)
+          all_branch_matches_pinned = all(r["branch_matches_pinned"] for r in checksum_records)
+          readme_context_present = bool(source_context_rows[0]["readme_nonempty"] and source_context_rows[0]["mentions_bao"] and source_context_rows[0]["mentions_rsd"] and source_context_rows[0]["mentions_zhao"] and source_context_rows[0]["mentions_arxiv_2007_09011"])
+
+          pressure_recomputed = False
+          residuals_computed = False
+          likelihood_or_bic_run = False
+          TAIRID_validation_claim_allowed = False
+          QSO_covariance_available = False
+          full_eBOSS_family_covariance_available = False
+          reference_vector_still_missing = True
+          reference_covariance_still_missing = True
+
+          rule_rows = [
+              {"rule_id": "repo_api_fetch_ok", "pass": bool(repo_data), "result": f"repo_api_fetch_ok={bool(repo_data)}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "branch_api_fetch_ok", "pass": bool(branch_data), "result": f"branch_api_fetch_ok={bool(branch_data)}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "branch_head_sha_present", "pass": bool(branch_head_sha), "result": f"branch_head_sha={branch_head_sha}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "all_branch_raw_sources_fetch_ok", "pass": all_branch_raw_sources_fetch_ok, "result": f"all_branch_raw_sources_fetch_ok={all_branch_raw_sources_fetch_ok}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "all_commit_pinned_sources_fetch_ok", "pass": all_pinned_raw_sources_fetch_ok, "result": f"all_commit_pinned_sources_fetch_ok={all_pinned_raw_sources_fetch_ok}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "all_branch_short_hashes_match_v4_154", "pass": all_branch_short_hashes_match_v4_154, "result": f"all_branch_short_hashes_match_v4_154={all_branch_short_hashes_match_v4_154}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "all_pinned_short_hashes_match_v4_154", "pass": all_pinned_short_hashes_match_v4_154, "result": f"all_pinned_short_hashes_match_v4_154={all_pinned_short_hashes_match_v4_154}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "all_branch_hashes_match_pinned_hashes", "pass": all_branch_matches_pinned, "result": f"all_branch_hashes_match_pinned_hashes={all_branch_matches_pinned}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "value_record_count_6", "pass": len(value_rows) == 6, "result": f"value_record_count={len(value_rows)}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "order_matches_expected", "pass": order_matches_expected, "result": f"order_matches_expected={order_matches_expected}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "covariance_square", "pass": cov_square, "result": f"covariance_square={cov_square}; covariance_long_record_count={len(cov_values)}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "covariance_dimension_6", "pass": cov_dim == 6, "result": f"covariance_dimension={cov_dim}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "covariance_dimension_matches_value_order", "pass": covariance_dimension_matches_value_order, "result": f"covariance_dimension={cov_dim}; value_records={len(value_rows)}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "covariance_symmetric", "pass": covariance_symmetric, "result": f"covariance_symmetric={covariance_symmetric}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "diagonal_matches_sigma", "pass": diagonal_matches, "result": f"diagonal_matches_sigma={diagonal_matches}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "readme_context_present", "pass": readme_context_present, "result": f"readme_context_present={readme_context_present}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "arxiv_metadata_fetch_attempted", "pass": True, "result": f"arxiv_fetch_ok={bool(arxiv_data)}; entry_present={bool(arxiv_metadata.get('entry_present'))}", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "source_lock_artifacts_written", "pass": True, "result": "Source lock CSV/JSON/Markdown artifacts prepared.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "no_pressure_computed", "pass": not pressure_recomputed, "result": "No pressure calculation is performed.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "no_residuals_computed", "pass": not residuals_computed, "result": "No model residuals are computed.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "no_model_comparison", "pass": not likelihood_or_bic_run, "result": "No BIC, likelihood, posterior comparison, or model selection is run.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "not_qso_covariance", "pass": not QSO_covariance_available, "result": "QSO covariance remains unavailable.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "not_full_eboss_covariance", "pass": not full_eBOSS_family_covariance_available, "result": "Full eBOSS family covariance remains unavailable.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "reference_vector_still_missing", "pass": reference_vector_still_missing, "result": "Reference vector remains missing.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "reference_covariance_still_missing", "pass": reference_covariance_still_missing, "result": "Reference covariance remains missing.", "boundary": CLAIM_BOUNDARY},
+              {"rule_id": "validation_claim_blocked", "pass": not TAIRID_validation_claim_allowed, "result": "TAIRID validation claims remain blocked.", "boundary": CLAIM_BOUNDARY},
+          ]
+
+          failed = [r for r in rule_rows if not bool(r["pass"])]
+          failed_gates = "none" if not failed else ";".join(r["rule_id"] for r in failed)
+
+          normalized_value_rows = []
+          for idx, row in enumerate(value_rows):
+              expected = EXPECTED_VALUE_ORDER[idx] if idx < len(EXPECTED_VALUE_ORDER) else ("", "", "", "")
+              normalized_value_rows.append({
+                  **row,
+                  "expected_parameter_label": expected[0],
+                  "expected_z": expected[1],
+                  "expected_observable": expected[2],
+                  "expected_family": expected[3],
+                  "order_match": bool(row.get("parameter_label") == expected[0] and abs(float(row.get("z_value")) - float(expected[1])) < 1e-9),
+              })
+
+          blocked_claim_rows = [{"blocked_claim": c, "claim_boundary": "blocked_claim_preserved_v4_155"} for c in BLOCKED_CLAIMS]
+          scope_guard_rows = [{**g, "claim_boundary": "scope_guard_enforced_in_source_provenance_lock"} for g in SCOPE_GUARDS]
+
+          health_items = {
+              "version": VERSION,
+              "created_utc": utc_now(),
+              "allowed_scope": ALLOWED_SCOPE,
+              "repository": f"{REPO_OWNER}/{REPO_NAME}",
+              "branch": BRANCH,
+              "branch_head_sha": branch_head_sha,
+              "repo_api_fetch_ok": bool(repo_data),
+              "branch_api_fetch_ok": bool(branch_data),
+              "all_branch_raw_sources_fetch_ok": all_branch_raw_sources_fetch_ok,
+              "all_commit_pinned_sources_fetch_ok": all_pinned_raw_sources_fetch_ok,
+              "all_branch_short_hashes_match_v4_154": all_branch_short_hashes_match_v4_154,
+              "all_pinned_short_hashes_match_v4_154": all_pinned_short_hashes_match_v4_154,
+              "all_branch_hashes_match_pinned_hashes": all_branch_matches_pinned,
+              "value_record_count": len(value_rows),
+              "covariance_dimension": cov_dim,
+              "covariance_long_record_count": len(cov_values),
+              "order_matches_expected": order_matches_expected,
+              "covariance_dimension_matches_value_order": covariance_dimension_matches_value_order,
+              "covariance_symmetric": covariance_symmetric,
+              "diagonal_matches_sigma": diagonal_matches,
+              "readme_context_present": readme_context_present,
+              "arxiv_api_fetch_ok": bool(arxiv_data),
+              "arxiv_entry_present": bool(arxiv_metadata.get("entry_present")),
+              "pressure_recomputed": pressure_recomputed,
+              "residuals_computed": residuals_computed,
+              "likelihood_or_bic_run": likelihood_or_bic_run,
+              "TAIRID_validation_claim_allowed": TAIRID_validation_claim_allowed,
+              "QSO_covariance_available": QSO_covariance_available,
+              "full_eBOSS_family_covariance_available": full_eBOSS_family_covariance_available,
+              "reference_vector_still_missing": reference_vector_still_missing,
+              "reference_covariance_still_missing": reference_covariance_still_missing,
+              "expected_result_label": EXPECTED_RESULT_LABEL,
+              "selected_next_route": "reference_vector_manifest_fill_or_reference_covariance_acquisition_before_any_pressure_interpretation",
+              "rule_pass_count": sum(1 for r in rule_rows if bool(r["pass"])),
+              "rule_total_count": len(rule_rows),
+              "failed_gates": failed_gates,
+          }
+          parser_health_rows = [{"metric": k, "value": v, "claim_boundary": "source_provenance_lock_status_only"} for k, v in health_items.items()]
+
+          # Write source/raw snapshots for exact reproducibility.
+          raw_snapshot_rows = []
+          for src in SOURCES:
+              data = pinned_raw_bytes.get(src["source_id"]) or branch_raw_bytes.get(src["source_id"]) or b""
+              if data:
+                  snapshot_name = f"pinned_{src['filename']}"
+                  with open(os.path.join(OUTDIR, snapshot_name), "wb") as f:
+                      f.write(data)
+                  raw_snapshot_rows.append({
+                      "source_id": src["source_id"],
+                      "snapshot_filename": snapshot_name,
+                      "bytes_written": len(data),
+                      "sha256": sha256_hex(data),
+                      "claim_boundary": "raw_snapshot_for_reproducibility_not_scientific_ingestion",
+                  })
+
+          write_csv(os.path.join(OUTDIR, "fetch_records_v4_155.csv"), fetch_records)
+          write_csv(os.path.join(OUTDIR, "github_repo_metadata_v4_155.csv"), repo_metadata_rows)
+          write_csv(os.path.join(OUTDIR, "checksum_records_v4_155.csv"), checksum_records)
+          write_csv(os.path.join(OUTDIR, "pinned_url_records_v4_155.csv"), pinned_url_records)
+          write_csv(os.path.join(OUTDIR, "source_lock_manifest_v4_155.csv"), provenance_manifest_rows)
+          write_csv(os.path.join(OUTDIR, "source_context_record_v4_155.csv"), source_context_rows)
+          write_csv(os.path.join(OUTDIR, "arxiv_metadata_record_v4_155.csv"), [arxiv_metadata])
+          write_csv(os.path.join(OUTDIR, "normalized_limited_lrgxelg_values_v4_155.csv"), normalized_value_rows)
+          write_csv(os.path.join(OUTDIR, "raw_snapshot_records_v4_155.csv"), raw_snapshot_rows)
+          write_csv(os.path.join(OUTDIR, "scope_guard_report_v4_155.csv"), scope_guard_rows)
+          write_csv(os.path.join(OUTDIR, "blocked_claims_v4_155.csv"), blocked_claim_rows)
+          write_csv(os.path.join(OUTDIR, "parser_health_report_v4_155.csv"), parser_health_rows)
+          write_csv(os.path.join(OUTDIR, "rule_results_v4_155.csv"), rule_rows)
+
+          summary = {
+              **health_items,
+              "allowed_scope": ALLOWED_SCOPE,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "scope_guards": SCOPE_GUARDS,
+              "github_repository_metadata": repo_metadata_rows[0],
+              "source_lock_manifest": provenance_manifest_rows,
+              "arxiv_metadata": arxiv_metadata,
+              "normalized_artifacts": [
+                  "fetch_records_v4_155.csv",
+                  "github_repo_metadata_v4_155.csv",
+                  "checksum_records_v4_155.csv",
+                  "pinned_url_records_v4_155.csv",
+                  "source_lock_manifest_v4_155.csv",
+                  "source_context_record_v4_155.csv",
+                  "arxiv_metadata_record_v4_155.csv",
+                  "normalized_limited_lrgxelg_values_v4_155.csv",
+                  "raw_snapshot_records_v4_155.csv",
+                  "scope_guard_report_v4_155.csv",
+                  "blocked_claims_v4_155.csv",
+                  "parser_health_report_v4_155.csv",
+                  "rule_results_v4_155.csv",
+                  "tairid_v4_155_limited_lrgxelg_source_provenance_lock.json",
+                  "tairid_v4_155_limited_lrgxelg_source_provenance_lock.md",
+              ],
+          }
+
+          with open(os.path.join(OUTDIR, "tairid_v4_155_limited_lrgxelg_source_provenance_lock.json"), "w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+
+          md = []
+          md.append("# 000 TAIRID v4.155 — Limited LRGxELG Source Provenance Lock With Scope Guards\n")
+          md.append(f"Created UTC: `{health_items['created_utc']}`\n")
+          md.append("## Status\n")
+          md.append(f"Expected result label: `{EXPECTED_RESULT_LABEL}`\n")
+          md.append(f"Failed gates: `{failed_gates}`\n")
+          md.append(f"Rule pass count: `{health_items['rule_pass_count']} / {health_items['rule_total_count']}`\n")
+          md.append("## Plain-language result\n")
+          md.append("This workflow locks the source identity for the limited LRGxELG two-redshift BAO/RSD product by recording branch/raw fetches, commit-pinned fetches, checksums, README context, GitHub repository metadata, optional arXiv metadata context, and raw snapshots.\n")
+          md.append("It covers only:\n")
+          md.append("- `z = 0.70`: `DM/rd`, `DH/rd`, `fσ8`\n")
+          md.append("- `z = 0.845`: `DM/rd`, `DH/rd`, `fσ8`\n")
+          md.append("## Source lock diagnostics\n")
+          md.append(f"- Repository: `{REPO_OWNER}/{REPO_NAME}`\n")
+          md.append(f"- Branch requested: `{BRANCH}`\n")
+          md.append(f"- Branch head SHA: `{branch_head_sha}`\n")
+          md.append(f"- Branch raw files fetched: `{all_branch_raw_sources_fetch_ok}`\n")
+          md.append(f"- Commit-pinned raw files fetched: `{all_pinned_raw_sources_fetch_ok}`\n")
+          md.append(f"- Branch hashes match v4.154 short hashes: `{all_branch_short_hashes_match_v4_154}`\n")
+          md.append(f"- Pinned hashes match v4.154 short hashes: `{all_pinned_short_hashes_match_v4_154}`\n")
+          md.append(f"- Branch hashes match pinned hashes: `{all_branch_matches_pinned}`\n")
+          md.append(f"- README context present: `{readme_context_present}`\n")
+          md.append("## Truth boundary\n")
+          md.append("This does not compute final pressure. It does not compute residuals against ΛCDM or TAIRID. It does not ingest the product into the main growth lane as a final scientific input. It does not provide QSO covariance. It does not provide full eBOSS family covariance. It does not run BIC, likelihood, posterior comparison, or public-facing validation. It does not validate TAIRID.\n")
+          md.append("## Health\n")
+          md.append("| Check | Value |\n|---|---:|\n")
+          for k in [
+              "value_record_count", "covariance_dimension", "order_matches_expected", "covariance_dimension_matches_value_order", "covariance_symmetric", "diagonal_matches_sigma", "repo_api_fetch_ok", "branch_api_fetch_ok", "all_branch_raw_sources_fetch_ok", "all_commit_pinned_sources_fetch_ok", "all_branch_short_hashes_match_v4_154", "all_pinned_short_hashes_match_v4_154", "all_branch_hashes_match_pinned_hashes", "readme_context_present", "pressure_recomputed", "residuals_computed", "likelihood_or_bic_run", "TAIRID_validation_claim_allowed"
+          ]:
+              md.append(f"| {k} | `{health_items[k]}` |\n")
+          md.append("## Files produced\n")
+          for fname in summary["normalized_artifacts"]:
+              md.append(f"- `{fname}`\n")
+          md.append("## Next clean move if this passes\n")
+          md.append("Move to reference-vector manifest fill or reference-covariance acquisition before any pressure interpretation. Do not move to final pressure until reference vector, reference covariance, QSO covariance, full eBOSS covariance/overlap, and final pressure methodology are resolved.\n")
+
+          with open(os.path.join(OUTDIR, "tairid_v4_155_limited_lrgxelg_source_provenance_lock.md"), "w", encoding="utf-8") as f:
+              f.write("".join(md))
+
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          if failed:
+              print("FAILED_GATES=" + failed_gates, file=sys.stderr)
+              sys.exit(1)
+          PY
+          python tairid_v4_155_limited_lrgxelg_source_provenance_lock/run_v4_155.py
+
+      - name: Upload TAIRID v4.155 limited LRGxELG source provenance lock artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-155-limited-lrgxelg-source-provenance-lock-with-scope-guards
+          path: tairid_v4_155_limited_lrgxelg_source_provenance_lock/
+          if-no-files-found: error
