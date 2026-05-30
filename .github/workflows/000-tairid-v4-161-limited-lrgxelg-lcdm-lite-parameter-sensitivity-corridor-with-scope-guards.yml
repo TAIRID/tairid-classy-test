@@ -1,0 +1,453 @@
+name: 000 TAIRID v4.161 - Limited LRGxELG LCDM Lite Parameter Sensitivity Corridor With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/000-tairid-v4-161-limited-lrgxelg-lcdm-lite-parameter-sensitivity-corridor-with-scope-guards.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  limited-lrgxelg-lcdm-lite-parameter-sensitivity-corridor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run v4.161 LCDM-lite parameter sensitivity corridor with scope guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > run_tairid_v4_161.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          import platform
+          import zipfile
+          from datetime import datetime, timezone
+
+          VERSION = 'v4.161'
+          TITLE = '000 TAIRID v4.161 - Limited LRGxELG LCDM Lite Parameter Sensitivity Corridor With Scope Guards'
+          EXPECTED_LABEL = 'limited_lrgxelg_lcdm_lite_parameter_sensitivity_corridor_passed_sensitivity_artifacts_written_no_covariance_no_pressure_no_validation'
+          OUTDIR = 'tairid_v4_161_limited_lrgxelg_lcdm_lite_parameter_sensitivity_corridor_outputs'
+          os.makedirs(OUTDIR, exist_ok=True)
+
+          CLAIM_BOUNDARY = 'diagnostic_parameter_sensitivity_only_no_covariance_no_pressure_no_validation'
+
+          BASE_PARAMS = {
+              'H0_km_s_Mpc': 67.36,
+              'Omega_m': 0.3153,
+              'Omega_lambda_flat': 1.0 - 0.3153,
+              'sigma8_z0': 0.8111,
+              'rd_Mpc': 147.09,
+              'growth_index_gamma': 0.55,
+              'c_km_s': 299792.458,
+              'parameter_label': 'Planck_like_LCDM_lite_fixed_parameters_not_posterior_not_covariance',
+          }
+
+          ROWS = [
+              (0, 'DM_ov_rd_z0p70', 0.700, 'DM_over_rd', 'geometry_transverse', 'dimensionless_ratio_to_rd'),
+              (1, 'DH_ov_rd_z0p70', 0.700, 'DH_over_rd', 'geometry_radial', 'dimensionless_ratio_to_rd'),
+              (2, 'fsigma8_z0p70', 0.700, 'fsigma8', 'growth', 'dimensionless'),
+              (3, 'DM_ov_rd_z0p845', 0.845, 'DM_over_rd', 'geometry_transverse', 'dimensionless_ratio_to_rd'),
+              (4, 'DH_ov_rd_z0p845', 0.845, 'DH_over_rd', 'geometry_radial', 'dimensionless_ratio_to_rd'),
+              (5, 'fsigma8_z0p845', 0.845, 'fsigma8', 'growth', 'dimensionless'),
+          ]
+
+          # One-at-a-time diagnostic parameter corridor.
+          # These ranges are not posterior uncertainties and are not converted into covariance.
+          PARAMETER_STEPS = [
+              {'parameter': 'Omega_m', 'minus': -0.0100, 'plus': 0.0100, 'units': 'absolute', 'reason': 'matter-density sensitivity probe'},
+              {'parameter': 'H0_km_s_Mpc', 'minus': -1.0000, 'plus': 1.0000, 'units': 'km/s/Mpc absolute', 'reason': 'distance-scale sensitivity probe'},
+              {'parameter': 'rd_Mpc', 'minus': -1.0000, 'plus': 1.0000, 'units': 'Mpc absolute', 'reason': 'sound-horizon ratio sensitivity probe'},
+              {'parameter': 'sigma8_z0', 'minus': -0.0200, 'plus': 0.0200, 'units': 'absolute', 'reason': 'growth-amplitude sensitivity probe'},
+              {'parameter': 'growth_index_gamma', 'minus': -0.0200, 'plus': 0.0200, 'units': 'absolute', 'reason': 'growth-index sensitivity probe'},
+          ]
+
+          def with_flat_lambda(params):
+              p = dict(params)
+              p['Omega_lambda_flat'] = 1.0 - p['Omega_m']
+              return p
+
+          def e_of_z(z, p):
+              return math.sqrt(p['Omega_m'] * (1.0 + z) ** 3 + p['Omega_lambda_flat'])
+
+          def omega_m_of_z(z, p):
+              ez2 = e_of_z(z, p) ** 2
+              return p['Omega_m'] * (1.0 + z) ** 3 / ez2
+
+          def simpson_integral(func, a, b, n=4000):
+              if n % 2:
+                  n += 1
+              h = (b - a) / n
+              s = func(a) + func(b)
+              for i in range(1, n):
+                  coeff = 4 if i % 2 else 2
+                  s += coeff * func(a + i * h)
+              return s * h / 3.0
+
+          def comoving_distance_mpc(z, p):
+              integral = simpson_integral(lambda zz: 1.0 / e_of_z(zz, p), 0.0, z, n=4000)
+              return (p['c_km_s'] / p['H0_km_s_Mpc']) * integral
+
+          def hubble_distance_mpc(z, p):
+              return p['c_km_s'] / (p['H0_km_s_Mpc'] * e_of_z(z, p))
+
+          def e_of_a(a, p):
+              return math.sqrt(p['Omega_m'] / (a ** 3) + p['Omega_lambda_flat'])
+
+          def growth_integral_raw(a, p):
+              lower = 1.0e-5
+              upper = a
+              if upper <= lower:
+                  return 0.0
+              def integrand(ap):
+                  return 1.0 / ((ap ** 3) * (e_of_a(ap, p) ** 3))
+              return (5.0 * p['Omega_m'] * e_of_a(a, p) / 2.0) * simpson_integral(integrand, lower, upper, n=4000)
+
+          def growth_D_norm(z, p):
+              a = 1.0 / (1.0 + z)
+              norm = growth_integral_raw(1.0, p)
+              return growth_integral_raw(a, p) / norm
+
+          def fsigma8_lite(z, p):
+              f = omega_m_of_z(z, p) ** p['growth_index_gamma']
+              return f * p['sigma8_z0'] * growth_D_norm(z, p)
+
+          def reference_value(z, observable, p):
+              if observable == 'DM_over_rd':
+                  return comoving_distance_mpc(z, p) / p['rd_Mpc']
+              if observable == 'DH_over_rd':
+                  return hubble_distance_mpc(z, p) / p['rd_Mpc']
+              if observable == 'fsigma8':
+                  return fsigma8_lite(z, p)
+              raise ValueError('Unknown observable: ' + observable)
+
+          def full_vector(params):
+              p = with_flat_lambda(params)
+              out = {}
+              for slot_index, row_id, z, observable, role, units in ROWS:
+                  out[row_id] = reference_value(z, observable, p)
+              return out
+
+          def write_csv(path, fieldnames, rows):
+              with open(path, 'w', newline='', encoding='utf-8') as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          base_vector = full_vector(BASE_PARAMS)
+
+          central_rows = []
+          for slot_index, row_id, z, observable, role, units in ROWS:
+              central_rows.append({
+                  'slot_index': slot_index,
+                  'row_id': row_id,
+                  'z': f'{z:.3f}',
+                  'observable': observable,
+                  'reference_product_role': role,
+                  'units': units,
+                  'central_reference_value': f'{base_vector[row_id]:.10f}',
+                  'reference_model': 'LCDM_lite_flat_fixed_parameter_diagnostic',
+                  'claim_boundary': CLAIM_BOUNDARY,
+              })
+          write_csv(os.path.join(OUTDIR, 'central_reference_vector_v4_161.csv'), list(central_rows[0].keys()), central_rows)
+
+          scenario_rows = []
+          sensitivity_rows = []
+          scenario_vectors = {'central': base_vector}
+
+          for step in PARAMETER_STEPS:
+              param = step['parameter']
+              for direction, delta_key in [('minus', 'minus'), ('plus', 'plus')]:
+                  scenario_id = f'{param}_{direction}'
+                  p = dict(BASE_PARAMS)
+                  p[param] = p[param] + step[delta_key]
+                  p = with_flat_lambda(p)
+                  vector = full_vector(p)
+                  scenario_vectors[scenario_id] = vector
+                  for slot_index, row_id, z, observable, role, units in ROWS:
+                      central = base_vector[row_id]
+                      varied = vector[row_id]
+                      shift = varied - central
+                      frac = shift / central if central != 0 else float('nan')
+                      scenario_rows.append({
+                          'scenario_id': scenario_id,
+                          'parameter': param,
+                          'direction': direction,
+                          'delta': f'{step[delta_key]:.10g}',
+                          'parameter_value': f'{p[param]:.10g}',
+                          'row_id': row_id,
+                          'z': f'{z:.3f}',
+                          'observable': observable,
+                          'role': role,
+                          'central_value': f'{central:.10f}',
+                          'varied_value': f'{varied:.10f}',
+                          'absolute_shift': f'{shift:.10f}',
+                          'fractional_shift': f'{frac:.10e}',
+                          'claim_boundary': CLAIM_BOUNDARY,
+                      })
+                      denom = abs(step[delta_key]) if step[delta_key] != 0 else float('nan')
+                      sensitivity_rows.append({
+                          'parameter': param,
+                          'direction': direction,
+                          'row_id': row_id,
+                          'observable': observable,
+                          'role': role,
+                          'delta': f'{step[delta_key]:.10g}',
+                          'absolute_sensitivity_per_unit': f'{shift / denom:.10f}',
+                          'fractional_sensitivity_per_unit': f'{frac / denom:.10e}',
+                          'claim_boundary': CLAIM_BOUNDARY,
+                      })
+
+          write_csv(os.path.join(OUTDIR, 'parameter_scenario_values_long_v4_161.csv'), list(scenario_rows[0].keys()), scenario_rows)
+          write_csv(os.path.join(OUTDIR, 'finite_difference_sensitivity_long_v4_161.csv'), list(sensitivity_rows[0].keys()), sensitivity_rows)
+
+          corridor_rows = []
+          for slot_index, row_id, z, observable, role, units in ROWS:
+              vals = [vec[row_id] for sid, vec in scenario_vectors.items()]
+              central = base_vector[row_id]
+              min_val = min(vals)
+              max_val = max(vals)
+              half_width = max(abs(max_val - central), abs(central - min_val))
+              frac_half_width = half_width / abs(central) if central != 0 else float('nan')
+              shifts = []
+              for sid, vec in scenario_vectors.items():
+                  if sid == 'central':
+                      continue
+                  shifts.append((abs(vec[row_id] - central), sid, vec[row_id] - central))
+              shifts.sort(reverse=True)
+              largest_abs_shift, largest_scenario, signed_shift = shifts[0]
+              corridor_rows.append({
+                  'row_id': row_id,
+                  'z': f'{z:.3f}',
+                  'observable': observable,
+                  'role': role,
+                  'central_value': f'{central:.10f}',
+                  'min_over_one_at_a_time_scenarios': f'{min_val:.10f}',
+                  'max_over_one_at_a_time_scenarios': f'{max_val:.10f}',
+                  'absolute_half_width': f'{half_width:.10f}',
+                  'fractional_half_width': f'{frac_half_width:.10e}',
+                  'largest_abs_shift_scenario': largest_scenario,
+                  'largest_signed_shift': f'{signed_shift:.10f}',
+                  'claim_boundary': 'diagnostic_corridor_not_covariance_not_posterior_uncertainty',
+              })
+          write_csv(os.path.join(OUTDIR, 'reference_vector_sensitivity_corridor_summary_v4_161.csv'), list(corridor_rows[0].keys()), corridor_rows)
+
+          role_groups = {}
+          for r in corridor_rows:
+              role_groups.setdefault(r['role'], []).append(float(r['fractional_half_width']))
+          role_summary = []
+          for role, vals in sorted(role_groups.items()):
+              role_summary.append({
+                  'role': role,
+                  'slot_count': len(vals),
+                  'mean_fractional_half_width': f'{sum(vals)/len(vals):.10e}',
+                  'max_fractional_half_width': f'{max(vals):.10e}',
+                  'claim_boundary': 'diagnostic_role_sensitivity_only_not_pressure',
+              })
+          write_csv(os.path.join(OUTDIR, 'role_level_sensitivity_summary_v4_161.csv'), list(role_summary[0].keys()), role_summary)
+
+          parameter_rows = []
+          for k, v in BASE_PARAMS.items():
+              parameter_rows.append({'parameter': k, 'central_value': v, 'claim_boundary': 'fixed_diagnostic_input_not_posterior_sample'})
+          write_csv(os.path.join(OUTDIR, 'central_parameter_ledger_v4_161.csv'), ['parameter', 'central_value', 'claim_boundary'], parameter_rows)
+          write_csv(os.path.join(OUTDIR, 'parameter_step_ledger_v4_161.csv'), ['parameter', 'minus', 'plus', 'units', 'reason'], PARAMETER_STEPS)
+
+          route_decision = [
+              {
+                  'route_id': 'R1',
+                  'route_name': 'external_planck_or_reference_chain_package',
+                  'status_after_v4_161': 'still_preferred_for_final_reference_but_missing',
+                  'usable_for_pressure_now': False,
+                  'next_action': 'continue_to_seek_downloadable_chain_or_parameter_sample_package',
+                  'claim_boundary': 'required_for_stronger_reference_uncertainty_not_present',
+              },
+              {
+                  'route_id': 'R2',
+                  'route_name': 'CAMB_or_CLASS_background_growth_generation',
+                  'status_after_v4_161': 'still_blocked_by_v4_158b_runner_result',
+                  'usable_for_pressure_now': False,
+                  'next_action': 'only_reopen_if_dependency_install_route_changes',
+                  'claim_boundary': 'software_route_unavailable_here',
+              },
+              {
+                  'route_id': 'R3',
+                  'route_name': 'lcdm_lite_parameter_sensitivity_corridor',
+                  'status_after_v4_161': 'diagnostic_corridor_written',
+                  'usable_for_pressure_now': False,
+                  'next_action': 'review_corridor_then_build_visual_shape_packet_or_continue_reference_source_search',
+                  'claim_boundary': 'diagnostic_sensitivity_only_not_planck_posterior_not_covariance',
+              },
+              {
+                  'route_id': 'R4',
+                  'route_name': 'diagonal_only_reference_uncertainty_guess',
+                  'status_after_v4_161': 'still_blocked_for_pressure',
+                  'usable_for_pressure_now': False,
+                  'next_action': 'do_not_use_for_pressure_claims',
+                  'claim_boundary': 'would_create_false_precision',
+              },
+          ]
+          write_csv(os.path.join(OUTDIR, 'route_status_after_sensitivity_corridor_v4_161.csv'), list(route_decision[0].keys()), route_decision)
+
+          dependency_status = [
+              {'dependency': 'limited_lrgxelg_reference_mean_vector_6', 'status_after_v4_161': 'prototype_generated_and_sensitivity_corridor_written', 'usable_for_pressure': False, 'claim_boundary': 'not_final_reference_vector'},
+              {'dependency': 'limited_lrgxelg_reference_covariance_or_samples', 'status_after_v4_161': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'required_before_covariance_weighted_pressure'},
+              {'dependency': 'expanded_12_redshift_growth_reference_vector', 'status_after_v4_161': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'outside_limited_product'},
+              {'dependency': 'expanded_12_redshift_reference_covariance_or_samples', 'status_after_v4_161': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'outside_limited_product'},
+              {'dependency': 'qso_covariance_or_likelihood', 'status_after_v4_161': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'not_supplied_by_limited_lrgxelg_product'},
+              {'dependency': 'full_eboss_family_covariance_or_overlap_model', 'status_after_v4_161': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'not_supplied_by_limited_lrgxelg_product'},
+              {'dependency': 'final_pressure_methodology_spec', 'status_after_v4_161': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'must_be_locked_before_pressure'},
+          ]
+          write_csv(os.path.join(OUTDIR, 'reference_dependency_status_after_v4_161.csv'), list(dependency_status[0].keys()), dependency_status)
+
+          scope_guards = [
+              {'guard': 'no_observed_values_ingested', 'status': 'enforced', 'detail': 'v4.161 uses only the LCDM-lite reference prototype formulas and parameter variations'},
+              {'guard': 'no_reference_covariance_generated', 'status': 'enforced', 'detail': 'finite-difference corridor is not covariance and not posterior uncertainty'},
+              {'guard': 'no_residuals_or_pressure', 'status': 'enforced', 'detail': 'no comparison against observed values is performed'},
+              {'guard': 'no_qso_or_full_eboss_claim', 'status': 'enforced', 'detail': 'limited LRGxELG scope only'},
+              {'guard': 'no_validation_claim', 'status': 'enforced', 'detail': 'diagnostic scaffolding only'},
+          ]
+          write_csv(os.path.join(OUTDIR, 'scope_guard_report_v4_161.csv'), list(scope_guards[0].keys()), scope_guards)
+
+          blocked_claims = [
+              {'claim': 'TAIRID is validated by v4.161', 'blocked': True, 'reason': 'no observed values, residuals, pressure, covariance, likelihood, or posterior comparison'},
+              {'claim': 'v4.161 supplies reference covariance', 'blocked': True, 'reason': 'finite-difference corridor is not covariance'},
+              {'claim': 'LCDM-lite parameter corridor is a Planck posterior', 'blocked': True, 'reason': 'one-at-a-time parameter steps are diagnostic only'},
+              {'claim': 'v4.161 resolves QSO or full eBOSS covariance', 'blocked': True, 'reason': 'limited LRGxELG scope only'},
+              {'claim': 'v4.161 computes pressure', 'blocked': True, 'reason': 'pressure and residual computation are intentionally absent'},
+          ]
+          write_csv(os.path.join(OUTDIR, 'blocked_claims_report_v4_161.csv'), list(blocked_claims[0].keys()), blocked_claims)
+
+          all_values = []
+          for vec in scenario_vectors.values():
+              all_values.extend(vec.values())
+          row_order_ok = [r['row_id'] for r in central_rows] == [r[1] for r in ROWS]
+          finite = all(math.isfinite(v) for v in all_values)
+          positive = all(v > 0 for v in all_values)
+          corridor_written = len(corridor_rows) == 6
+          scenario_count = len(scenario_vectors)
+          selected_next_route = 'limited_lrgxelg_parameter_sensitivity_corridor_review_then_visual_shape_packet_with_scope_guards'
+
+          rules = [
+              ('R01', 'six_central_reference_values_written', len(central_rows) == 6),
+              ('R02', 'row_order_matches_limited_lrgxelg_order', row_order_ok),
+              ('R03', 'all_scenario_values_finite', finite),
+              ('R04', 'all_scenario_values_positive', positive),
+              ('R05', 'one_at_a_time_parameter_steps_written', len(PARAMETER_STEPS) == 5),
+              ('R06', 'eleven_scenarios_written_central_plus_ten_variations', scenario_count == 11),
+              ('R07', 'scenario_values_long_written', len(scenario_rows) == 60),
+              ('R08', 'sensitivity_long_written', len(sensitivity_rows) == 60),
+              ('R09', 'six_slot_corridor_summary_written', corridor_written),
+              ('R10', 'role_level_summary_written', len(role_summary) >= 2),
+              ('R11', 'route_status_written', len(route_decision) == 4),
+              ('R12', 'dependency_status_written', len(dependency_status) == 7),
+              ('R13', 'no_observed_values_ingested', True),
+              ('R14', 'no_reference_covariance_generated', True),
+              ('R15', 'no_residuals_computed', True),
+              ('R16', 'no_pressure_computed', True),
+              ('R17', 'no_qso_or_full_eboss_covariance_supplied', True),
+              ('R18', 'no_likelihood_bic_or_posterior_comparison', True),
+              ('R19', 'no_validation_claim_allowed', True),
+              ('R20', 'next_route_selected', bool(selected_next_route)),
+          ]
+          write_csv(os.path.join(OUTDIR, 'rule_audit_v4_161.csv'), ['rule_id', 'rule', 'pass'], [{'rule_id': a, 'rule': b, 'pass': c} for a, b, c in rules])
+          failed = [rule_id for rule_id, _, passed in rules if not passed]
+
+          parser_health = [
+              {'metric': 'workflow_version', 'value': VERSION, 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'expected_result_label', 'value': EXPECTED_LABEL, 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'failed_gates', 'value': json.dumps(failed), 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'rule_pass_count', 'value': f'{sum(1 for _, _, p in rules if p)} / {len(rules)}', 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'central_reference_value_slots', 'value': len(central_rows), 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'scenario_count', 'value': scenario_count, 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'reference_covariance_generated', 'value': False, 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'observed_values_ingested', 'value': False, 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'residuals_computed', 'value': False, 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'pressure_computed', 'value': False, 'claim_boundary': CLAIM_BOUNDARY},
+              {'metric': 'selected_next_route', 'value': selected_next_route, 'claim_boundary': CLAIM_BOUNDARY},
+          ]
+          write_csv(os.path.join(OUTDIR, 'parser_health_report_v4_161.csv'), list(parser_health[0].keys()), parser_health)
+
+          summary = {
+              'title': TITLE,
+              'version': VERSION,
+              'created_utc': datetime.now(timezone.utc).isoformat(),
+              'platform': platform.platform(),
+              'python_version': platform.python_version(),
+              'expected_result_label': EXPECTED_LABEL,
+              'failed_gates': failed,
+              'rule_pass_count': f'{sum(1 for _, _, p in rules if p)} / {len(rules)}',
+              'central_reference_value_slots': len(central_rows),
+              'scenario_count': scenario_count,
+              'parameter_steps': len(PARAMETER_STEPS),
+              'corridor_rows': len(corridor_rows),
+              'reference_covariance_generated': False,
+              'observed_values_ingested': False,
+              'residuals_computed': False,
+              'pressure_computed': False,
+              'qso_covariance_supplied': False,
+              'full_eboss_covariance_supplied': False,
+              'likelihood_bic_or_posterior_comparison_run': False,
+              'validation_claim_allowed': False,
+              'selected_next_route': selected_next_route,
+          }
+          with open(os.path.join(OUTDIR, 'summary_v4_161.json'), 'w', encoding='utf-8') as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+
+          md_lines = [
+              '# TAIRID v4.161 - Limited LRGxELG LCDM-lite Parameter Sensitivity Corridor',
+              '',
+              '## Clean result',
+              '',
+              'Expected result label: `' + EXPECTED_LABEL + '`',
+              '',
+              'Rule pass count: `' + summary['rule_pass_count'] + '`',
+              '',
+              'Failed gates: `' + json.dumps(failed) + '`',
+              '',
+              '## What this did',
+              '',
+              'This workflow generated a one-at-a-time diagnostic sensitivity corridor around the six-slot LCDM-lite reference vector.',
+              '',
+              '## What this did not do',
+              '',
+              'It did not ingest observed values. It did not generate reference covariance. It did not compute residuals or pressure. It did not provide QSO covariance or full eBOSS covariance. It did not validate TAIRID.',
+              '',
+              '## Selected next route',
+              '',
+              '`' + selected_next_route + '`',
+              '',
+              'The corridor is useful for seeing which prototype reference slots are parameter-sensitive, but it is not uncertainty, covariance, likelihood, or proof.',
+          ]
+          with open(os.path.join(OUTDIR, 'methodology_and_scope_summary_v4_161.md'), 'w', encoding='utf-8') as f:
+              f.write('\n'.join(md_lines) + '\n')
+
+          zip_name = 'tairid-v4-161-limited-lrgxelg-lcdm-lite-parameter-sensitivity-corridor-output.zip'
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk(OUTDIR):
+                  for file in files:
+                      path = os.path.join(root, file)
+                      zf.write(path, arcname=os.path.relpath(path, OUTDIR))
+
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          if failed:
+              raise SystemExit('v4.161 failed gates: ' + ','.join(failed))
+          PY
+          python run_tairid_v4_161.py
+
+      - name: Upload v4.161 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-161-limited-lrgxelg-lcdm-lite-parameter-sensitivity-corridor-output
+          path: |
+            tairid_v4_161_limited_lrgxelg_lcdm_lite_parameter_sensitivity_corridor_outputs
+            tairid-v4-161-limited-lrgxelg-lcdm-lite-parameter-sensitivity-corridor-output.zip
