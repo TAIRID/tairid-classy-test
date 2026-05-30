@@ -1,0 +1,322 @@
+name: 000 TAIRID v4.159 - Limited LRGxELG LCDM Lite Reference Vector Prototype With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/000-tairid-v4-159-limited-lrgxelg-lcdm-lite-reference-vector-prototype-with-scope-guards.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  limited-lrgxelg-lcdm-lite-reference-vector-prototype:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run v4.159 limited LCDM-lite reference vector prototype with guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > run_tairid_v4_159.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          import platform
+          import zipfile
+          from datetime import datetime, timezone
+
+          VERSION = 'v4.159'
+          TITLE = '000 TAIRID v4.159 - Limited LRGxELG LCDM Lite Reference Vector Prototype With Scope Guards'
+          EXPECTED_LABEL = 'limited_lrgxelg_lcdm_lite_reference_vector_prototype_passed_reference_values_written_no_covariance_no_pressure_no_validation'
+          OUTDIR = 'tairid_v4_159_limited_lrgxelg_lcdm_lite_reference_vector_prototype_outputs'
+          os.makedirs(OUTDIR, exist_ok=True)
+
+          # This is a diagnostic LCDM-lite reference prototype only.
+          # It is not a Planck posterior, not a full Boltzmann calculation,
+          # not a reference covariance, and not a final cosmology baseline.
+          PARAMS = {
+              'H0_km_s_Mpc': 67.36,
+              'Omega_m': 0.3153,
+              'Omega_lambda_flat': 1.0 - 0.3153,
+              'sigma8_z0': 0.8111,
+              'rd_Mpc': 147.09,
+              'growth_index_gamma': 0.55,
+              'c_km_s': 299792.458,
+              'parameter_label': 'Planck_like_LCDM_lite_fixed_parameters_not_posterior_not_covariance',
+          }
+
+          ROWS = [
+              (0, 'DM_ov_rd_z0p70', 0.700, 'DM_over_rd', 'geometry_transverse', 'dimensionless_ratio_to_rd'),
+              (1, 'DH_ov_rd_z0p70', 0.700, 'DH_over_rd', 'geometry_radial', 'dimensionless_ratio_to_rd'),
+              (2, 'fsigma8_z0p70', 0.700, 'fsigma8', 'growth', 'dimensionless'),
+              (3, 'DM_ov_rd_z0p845', 0.845, 'DM_over_rd', 'geometry_transverse', 'dimensionless_ratio_to_rd'),
+              (4, 'DH_ov_rd_z0p845', 0.845, 'DH_over_rd', 'geometry_radial', 'dimensionless_ratio_to_rd'),
+              (5, 'fsigma8_z0p845', 0.845, 'fsigma8', 'growth', 'dimensionless'),
+          ]
+
+          def e_of_z(z):
+              return math.sqrt(PARAMS['Omega_m'] * (1.0 + z) ** 3 + PARAMS['Omega_lambda_flat'])
+
+          def omega_m_of_z(z):
+              ez2 = e_of_z(z) ** 2
+              return PARAMS['Omega_m'] * (1.0 + z) ** 3 / ez2
+
+          def simpson_integral(func, a, b, n=4000):
+              if n % 2:
+                  n += 1
+              h = (b - a) / n
+              s = func(a) + func(b)
+              for i in range(1, n):
+                  coeff = 4 if i % 2 else 2
+                  s += coeff * func(a + i * h)
+              return s * h / 3.0
+
+          def comoving_distance_mpc(z):
+              integral = simpson_integral(lambda zz: 1.0 / e_of_z(zz), 0.0, z, n=4000)
+              return (PARAMS['c_km_s'] / PARAMS['H0_km_s_Mpc']) * integral
+
+          def hubble_distance_mpc(z):
+              return PARAMS['c_km_s'] / (PARAMS['H0_km_s_Mpc'] * e_of_z(z))
+
+          def e_of_a(a):
+              return math.sqrt(PARAMS['Omega_m'] / (a ** 3) + PARAMS['Omega_lambda_flat'])
+
+          def growth_integral_raw(a):
+              lower = 1.0e-5
+              upper = a
+              if upper <= lower:
+                  return 0.0
+              def integrand(ap):
+                  return 1.0 / ((ap ** 3) * (e_of_a(ap) ** 3))
+              return (5.0 * PARAMS['Omega_m'] * e_of_a(a) / 2.0) * simpson_integral(integrand, lower, upper, n=4000)
+
+          GROWTH_NORM = growth_integral_raw(1.0)
+
+          def growth_D_norm(z):
+              a = 1.0 / (1.0 + z)
+              return growth_integral_raw(a) / GROWTH_NORM
+
+          def fsigma8_lite(z):
+              f = omega_m_of_z(z) ** PARAMS['growth_index_gamma']
+              return f * PARAMS['sigma8_z0'] * growth_D_norm(z)
+
+          def reference_value(z, observable):
+              if observable == 'DM_over_rd':
+                  return comoving_distance_mpc(z) / PARAMS['rd_Mpc']
+              if observable == 'DH_over_rd':
+                  return hubble_distance_mpc(z) / PARAMS['rd_Mpc']
+              if observable == 'fsigma8':
+                  return fsigma8_lite(z)
+              raise ValueError(f'Unknown observable: {observable}')
+
+          generated_rows = []
+          for slot_index, row_id, z, observable, role, units in ROWS:
+              val = reference_value(z, observable)
+              generated_rows.append({
+                  'slot_index': slot_index,
+                  'row_id': row_id,
+                  'z': f'{z:.3f}',
+                  'observable': observable,
+                  'reference_product_role': role,
+                  'units': units,
+                  'reference_mean_value': f'{val:.10f}',
+                  'reference_model': 'LCDM_lite_flat_fixed_parameter_diagnostic',
+                  'parameter_set': PARAMS['parameter_label'],
+                  'method': 'self_contained_background_distance_plus_growth_index_approximation',
+                  'claim_boundary': 'prototype_reference_vector_only_no_covariance_no_pressure_no_validation',
+              })
+
+          def write_csv(path, fieldnames, rows):
+              with open(path, 'w', newline='', encoding='utf-8') as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          reference_vector_path = os.path.join(OUTDIR, 'limited_lrgxelg_lcdm_lite_reference_mean_vector_prototype_v4_159.csv')
+          write_csv(reference_vector_path, list(generated_rows[0].keys()), generated_rows)
+
+          parameter_rows = [{'parameter': k, 'value': v, 'claim_boundary': 'fixed_diagnostic_input_not_posterior_sample'} for k, v in PARAMS.items()]
+          write_csv(os.path.join(OUTDIR, 'lcdm_lite_parameter_ledger_v4_159.csv'), ['parameter', 'value', 'claim_boundary'], parameter_rows)
+
+          formulas = [
+              {'formula_id': 'E_z_flat_lcdm', 'formula': 'E(z)=sqrt(Omega_m*(1+z)^3+Omega_Lambda)', 'used_for': 'DH and DM distance terms', 'claim_boundary': 'diagnostic_formula_only'},
+              {'formula_id': 'DH_over_rd', 'formula': 'DH/rd=(c/H0)/(E(z)*rd)', 'used_for': 'radial geometry reference slot', 'claim_boundary': 'diagnostic_formula_only'},
+              {'formula_id': 'DM_over_rd', 'formula': 'DM/rd=(c/H0)*integral_0^z dzprime/E(zprime)/rd', 'used_for': 'transverse geometry reference slot in flat model', 'claim_boundary': 'diagnostic_formula_only'},
+              {'formula_id': 'growth_integral', 'formula': 'D(a) proportional to E(a)*integral_0^a da/(a^3*E(a)^3), normalized at a=1', 'used_for': 'growth amplitude approximation', 'claim_boundary': 'diagnostic_formula_only'},
+              {'formula_id': 'fsigma8_lite', 'formula': 'f_sigma8(z)=Omega_m(z)^gamma*sigma8_0*D(z)', 'used_for': 'growth reference slot', 'claim_boundary': 'growth_index_approximation_not_full_boltzmann_result'},
+          ]
+          write_csv(os.path.join(OUTDIR, 'formula_ledger_v4_159.csv'), ['formula_id', 'formula', 'used_for', 'claim_boundary'], formulas)
+
+          dependency_status = [
+              {'dependency': 'limited_lrgxelg_reference_mean_vector_6', 'status_after_v4_159': 'prototype_generated_lcdm_lite_only', 'usable_for_pressure': False, 'claim_boundary': 'not_final_reference_vector'},
+              {'dependency': 'limited_lrgxelg_reference_covariance_or_samples', 'status_after_v4_159': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'required_before_covariance_weighted_pressure'},
+              {'dependency': 'expanded_12_redshift_growth_reference_vector', 'status_after_v4_159': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'outside_limited_product'},
+              {'dependency': 'expanded_12_redshift_reference_covariance_or_samples', 'status_after_v4_159': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'outside_limited_product'},
+              {'dependency': 'qso_covariance_or_likelihood', 'status_after_v4_159': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'not_supplied_by_limited_lrgxelg_product'},
+              {'dependency': 'full_eboss_family_covariance_or_overlap_model', 'status_after_v4_159': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'not_supplied_by_limited_lrgxelg_product'},
+              {'dependency': 'final_pressure_methodology_spec', 'status_after_v4_159': 'missing', 'usable_for_pressure': False, 'claim_boundary': 'must_be_locked_before_pressure'},
+          ]
+          write_csv(os.path.join(OUTDIR, 'reference_dependency_status_after_v4_159.csv'), ['dependency', 'status_after_v4_159', 'usable_for_pressure', 'claim_boundary'], dependency_status)
+
+          scope_guards = [
+              {'guard': 'observed_values_ingested', 'status': False, 'required_status': False, 'pass': True, 'notes': 'No observed LRGxELG measured values are ingested in this prototype.'},
+              {'guard': 'reference_vector_generated', 'status': True, 'required_status': True, 'pass': True, 'notes': 'A diagnostic LCDM-lite reference mean vector is generated.'},
+              {'guard': 'reference_covariance_generated', 'status': False, 'required_status': False, 'pass': True, 'notes': 'No reference covariance is generated.'},
+              {'guard': 'residuals_computed', 'status': False, 'required_status': False, 'pass': True, 'notes': 'No residuals are computed.'},
+              {'guard': 'pressure_computed', 'status': False, 'required_status': False, 'pass': True, 'notes': 'No pressure score is computed.'},
+              {'guard': 'qso_covariance_supplied', 'status': False, 'required_status': False, 'pass': True, 'notes': 'No QSO covariance is supplied.'},
+              {'guard': 'full_eboss_covariance_supplied', 'status': False, 'required_status': False, 'pass': True, 'notes': 'No full eBOSS covariance is supplied.'},
+              {'guard': 'validation_claim_allowed', 'status': False, 'required_status': False, 'pass': True, 'notes': 'No validation claim is allowed.'},
+          ]
+          write_csv(os.path.join(OUTDIR, 'scope_guard_report_v4_159.csv'), ['guard', 'status', 'required_status', 'pass', 'notes'], scope_guards)
+
+          blocked_claims = [
+              'TAIRID cosmology is validated.',
+              'Standard cosmology is disproven.',
+              'The LCDM-lite vector is a final Planck posterior reference.',
+              'The LCDM-lite vector supplies reference covariance.',
+              'A final RSD pressure score was computed.',
+              'Observed-minus-reference residuals were computed.',
+              'A likelihood, BIC, posterior comparison, or model selection has been run.',
+              'The limited LRGxELG product is full eBOSS covariance.',
+              'This workflow provides QSO covariance.',
+              'The eBOSS family points are independent by default.',
+              'Public-facing validation claims are allowed.',
+          ]
+          write_csv(os.path.join(OUTDIR, 'blocked_claims_report_v4_159.csv'), ['blocked_claim', 'blocked', 'claim_boundary'], [{'blocked_claim': c, 'blocked': True, 'claim_boundary': 'explicitly_forbidden_in_v4_159'} for c in blocked_claims])
+
+          values_are_finite = all(math.isfinite(float(r['reference_mean_value'])) for r in generated_rows)
+          row_order_ok = [r['row_id'] for r in generated_rows] == [r[1] for r in ROWS]
+          dm_positive = all(float(r['reference_mean_value']) > 0 for r in generated_rows if r['observable'] == 'DM_over_rd')
+          dh_positive = all(float(r['reference_mean_value']) > 0 for r in generated_rows if r['observable'] == 'DH_over_rd')
+          fs8_positive = all(float(r['reference_mean_value']) > 0 for r in generated_rows if r['observable'] == 'fsigma8')
+          rules = [
+              ('R01', 'six_reference_values_generated', len(generated_rows) == 6),
+              ('R02', 'row_order_matches_limited_lrgxelg_order', row_order_ok),
+              ('R03', 'reference_values_are_finite_numeric', values_are_finite),
+              ('R04', 'dm_reference_values_positive', dm_positive),
+              ('R05', 'dh_reference_values_positive', dh_positive),
+              ('R06', 'fsigma8_reference_values_positive', fs8_positive),
+              ('R07', 'parameter_ledger_written', True),
+              ('R08', 'formula_ledger_written', True),
+              ('R09', 'no_observed_values_ingested', True),
+              ('R10', 'no_reference_covariance_generated', True),
+              ('R11', 'no_residuals_computed', True),
+              ('R12', 'no_pressure_computed', True),
+              ('R13', 'no_qso_covariance_supplied', True),
+              ('R14', 'no_full_eboss_covariance_supplied', True),
+              ('R15', 'no_likelihood_bic_or_posterior_comparison', True),
+              ('R16', 'no_validation_claim_allowed', True),
+          ]
+          write_csv(os.path.join(OUTDIR, 'rule_audit_v4_159.csv'), ['rule_id', 'rule', 'pass'], [{'rule_id': a, 'rule': b, 'pass': c} for a, b, c in rules])
+          failed = [rule_id for rule_id, _, passed in rules if not passed]
+
+          parser_health = [
+              {'metric': 'workflow_version', 'value': VERSION, 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'expected_result_label', 'value': EXPECTED_LABEL, 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'failed_gates', 'value': json.dumps(failed), 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'rule_pass_count', 'value': f'{sum(1 for _, _, p in rules if p)} / {len(rules)}', 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'reference_value_slots_generated', 'value': len(generated_rows), 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'reference_covariance_generated', 'value': False, 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'observed_values_ingested', 'value': False, 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'residuals_computed', 'value': False, 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'pressure_computed', 'value': False, 'claim_boundary': 'prototype_reference_vector_only'},
+              {'metric': 'selected_next_route', 'value': 'limited_reference_vector_prototype_review_then_reference_covariance_route_decision_with_scope_guards', 'claim_boundary': 'prototype_reference_vector_only'},
+          ]
+          write_csv(os.path.join(OUTDIR, 'parser_health_report_v4_159.csv'), ['metric', 'value', 'claim_boundary'], parser_health)
+
+          summary = {
+              'title': TITLE,
+              'version': VERSION,
+              'created_utc': datetime.now(timezone.utc).isoformat(),
+              'platform': platform.platform(),
+              'python_version': platform.python_version(),
+              'expected_result_label': EXPECTED_LABEL,
+              'failed_gates': failed,
+              'rule_pass_count': f'{sum(1 for _, _, p in rules if p)} / {len(rules)}',
+              'reference_value_slots_generated': len(generated_rows),
+              'reference_vector_generated': True,
+              'reference_model': 'LCDM_lite_flat_fixed_parameter_diagnostic',
+              'reference_covariance_generated': False,
+              'observed_values_ingested': False,
+              'residuals_computed': False,
+              'pressure_computed': False,
+              'qso_covariance_supplied': False,
+              'full_eboss_covariance_supplied': False,
+              'validation_claim_allowed': False,
+              'selected_next_route': 'limited_reference_vector_prototype_review_then_reference_covariance_route_decision_with_scope_guards',
+          }
+          with open(os.path.join(OUTDIR, 'summary_v4_159.json'), 'w', encoding='utf-8') as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+
+          md_lines = [
+              f'# {TITLE}',
+              '',
+              f"Created UTC: `{summary['created_utc']}`",
+              '',
+              '## Status',
+              f'Expected result label: `{EXPECTED_LABEL}`',
+              f'Failed gates: `{failed}`',
+              f"Rule pass count: `{summary['rule_pass_count']}`",
+              '',
+              '## Plain-language result',
+              'This workflow generates a diagnostic LCDM-lite six-slot reference mean vector for the limited LRGxELG two-redshift product. It uses a flat fixed-parameter background-distance calculation and a growth-index approximation for f sigma 8. This is a prototype reference vector only.',
+              '',
+              '## Required limited reference order',
+              '1. `DM_ov_rd_z0p70`',
+              '2. `DH_ov_rd_z0p70`',
+              '3. `fsigma8_z0p70`',
+              '4. `DM_ov_rd_z0p845`',
+              '5. `DH_ov_rd_z0p845`',
+              '6. `fsigma8_z0p845`',
+              '',
+              '## Outputs written',
+              '- `limited_lrgxelg_lcdm_lite_reference_mean_vector_prototype_v4_159.csv`',
+              '- `lcdm_lite_parameter_ledger_v4_159.csv`',
+              '- `formula_ledger_v4_159.csv`',
+              '- `reference_dependency_status_after_v4_159.csv`',
+              '- `scope_guard_report_v4_159.csv`',
+              '- `blocked_claims_report_v4_159.csv`',
+              '- `rule_audit_v4_159.csv`',
+              '- `parser_health_report_v4_159.csv`',
+              '- `summary_v4_159.json`',
+              '',
+              '## Truth boundary',
+              'This is progress in reference scaffolding, not proof. The vector is not a Planck posterior product, not a CLASS/CAMB Boltzmann run, not a covariance matrix, and not a final scientific baseline. This workflow does not ingest observed values, does not compute residuals, does not compute pressure, does not compare models, does not supply QSO covariance, does not supply full eBOSS covariance, and does not validate TAIRID.',
+              '',
+              '## Selected next route',
+              '`limited_reference_vector_prototype_review_then_reference_covariance_route_decision_with_scope_guards`',
+              '',
+          ]
+          md = '\n'.join(md_lines)
+          with open(os.path.join(OUTDIR, 'methodology_and_scope_summary_v4_159.md'), 'w', encoding='utf-8') as f:
+              f.write(md)
+
+          zip_name = 'tairid-v4-159-limited-lrgxelg-lcdm-lite-reference-vector-prototype-output.zip'
+          with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+              for root, _, files in os.walk(OUTDIR):
+                  for name in files:
+                      path = os.path.join(root, name)
+                      zf.write(path, path)
+
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          print(f'Wrote {zip_name}')
+          PY
+          python run_tairid_v4_159.py
+
+      - name: Upload v4.159 output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-159-limited-lrgxelg-lcdm-lite-reference-vector-prototype-output
+          path: |
+            tairid_v4_159_limited_lrgxelg_lcdm_lite_reference_vector_prototype_outputs/**
+            tairid-v4-159-limited-lrgxelg-lcdm-lite-reference-vector-prototype-output.zip
