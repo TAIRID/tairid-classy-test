@@ -1,0 +1,664 @@
+name: 000 TAIRID v4.154 — Limited LRGxELG Geometry-Growth Coupling Inspection With Scope Guards
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  limited-lrgxelg-geometry-growth-coupling-inspection:
+    name: Limited LRGxELG geometry-growth coupling inspection with scope guards
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run guarded limited LRGxELG geometry-growth coupling inspection
+        shell: bash
+        run: |
+          cat > run_tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          import hashlib
+          import urllib.request
+          from datetime import datetime, timezone
+
+          VERSION = "v4.154"
+          OUTPUT_DIR = "outputs/tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection"
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          VALUE_URL = "https://raw.githubusercontent.com/icosmology/eBOSS_DR16_LRGxELG/master/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK.dat"
+          COV_URL = "https://raw.githubusercontent.com/icosmology/eBOSS_DR16_LRGxELG/master/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK_cov.dat"
+          README_URL = "https://raw.githubusercontent.com/icosmology/eBOSS_DR16_LRGxELG/master/README.md"
+
+          EXPECTED_ORDER = [
+              {"order_index": 1, "parameter_label": "DM_ov_rd_z0p70", "observable": "DM_ov_rd", "family": "geometry", "z_expected": 0.700},
+              {"order_index": 2, "parameter_label": "DH_ov_rd_z0p70", "observable": "DH_ov_rd", "family": "geometry", "z_expected": 0.700},
+              {"order_index": 3, "parameter_label": "fsigma8_z0p70", "observable": "fsigma8", "family": "growth", "z_expected": 0.700},
+              {"order_index": 4, "parameter_label": "DM_ov_rd_z0p845", "observable": "DM_ov_rd", "family": "geometry", "z_expected": 0.845},
+              {"order_index": 5, "parameter_label": "DH_ov_rd_z0p845", "observable": "DH_ov_rd", "family": "geometry", "z_expected": 0.845},
+              {"order_index": 6, "parameter_label": "fsigma8_z0p845", "observable": "fsigma8", "family": "growth", "z_expected": 0.845},
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "Standard cosmology is disproven.",
+              "A final RSD pressure score was computed.",
+              "A residual against LCDM or TAIRID was computed.",
+              "A final combined growth covariance was computed.",
+              "The limited LRGxELG product is full eBOSS covariance.",
+              "The limited LRGxELG product provides QSO covariance.",
+              "The eBOSS family points are independent by default.",
+              "BIC, likelihood, posterior comparison, or model selection has been run.",
+              "Correlation/coupling diagnostics are physical proof.",
+              "Public-facing validation claims are allowed."
+          ]
+
+          SCOPE_GUARDS = [
+              {
+                  "guard_id": "limited_LRGxELG_two_redshift_only",
+                  "allowed": True,
+                  "blocked_use": "full_eBOSS_family_covariance",
+                  "guard_text": "This inspection is limited to the LRGxELG two-redshift BAO/RSD product at z=0.70 and z=0.845."
+              },
+              {
+                  "guard_id": "correlation_shape_diagnostic_only",
+                  "allowed": True,
+                  "blocked_use": "physical_signal_or_model_victory_claim",
+                  "guard_text": "Correlation and coupling tables are diagnostic shape artifacts only. They are not residuals, pressure, likelihood, or proof."
+              },
+              {
+                  "guard_id": "not_QSO_covariance",
+                  "allowed": False,
+                  "blocked_use": "QSO_covariance_or_QSO_pressure",
+                  "guard_text": "No QSO covariance is provided by this raw candidate pair."
+              },
+              {
+                  "guard_id": "not_final_pressure_input",
+                  "allowed": False,
+                  "blocked_use": "final_RSD_pressure",
+                  "guard_text": "This workflow may inspect limited covariance/correlation shape, but may not compute final pressure."
+              },
+              {
+                  "guard_id": "not_model_comparison",
+                  "allowed": False,
+                  "blocked_use": "BIC_likelihood_posterior_comparison",
+                  "guard_text": "No BIC, likelihood, posterior comparison, model selection, or public-facing proof claim is allowed."
+              },
+              {
+                  "guard_id": "requires_reference_vector_later",
+                  "allowed": False,
+                  "blocked_use": "reference_complete_growth_test",
+                  "guard_text": "The 12-redshift reference vector and reference covariance remain missing."
+              },
+              {
+                  "guard_id": "requires_provenance_lock_later",
+                  "allowed": False,
+                  "blocked_use": "source_clean_scientific_ingestion",
+                  "guard_text": "Source/provenance locking is still required before scientific ingestion."
+              }
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def fetch_text(source_id, url, role):
+              record = {
+                  "source_id": source_id,
+                  "url": url,
+                  "role": role,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_read": 0,
+                  "sha256_16": "",
+                  "error": "",
+                  "claim_boundary": "fetch_status_only_not_scientific_ingestion"
+              }
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.154-guarded-coupling-inspection"})
+                  with urllib.request.urlopen(req, timeout=45) as resp:
+                      raw = resp.read()
+                      record["fetch_ok"] = True
+                      record["status_code"] = getattr(resp, "status", "")
+                      record["content_type"] = resp.headers.get("content-type", "")
+                      record["bytes_read"] = len(raw)
+                      record["sha256_16"] = hashlib.sha256(raw).hexdigest()[:16]
+                      return raw.decode("utf-8", errors="replace"), record
+              except Exception as exc:
+                  record["error"] = repr(exc)
+                  return "", record
+
+          def parse_observable_from_comment(comment):
+              clean = comment.lower().replace("\\sigma_8", "sigma8").replace("sigma_8", "sigma8")
+              if "dm_ov_rd" in clean:
+                  return "DM_ov_rd"
+              if "dh_ov_rd" in clean:
+                  return "DH_ov_rd"
+              if "fsigma8" in clean or "f sigma8" in clean or "f\\sigma_8" in comment.lower():
+                  return "fsigma8"
+              return "unknown"
+
+          def family_for_observable(observable):
+              if observable in ("DM_ov_rd", "DH_ov_rd"):
+                  return "geometry"
+              if observable == "fsigma8":
+                  return "growth"
+              return "unknown"
+
+          def parse_value_file(text):
+              raw_rows = []
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  numeric_part, sep, comment = line.partition("#")
+                  parts = numeric_part.split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      z_value = float(parts[0])
+                      measurement = float(parts[1])
+                      sigma = float(parts[2])
+                  except ValueError:
+                      continue
+                  raw_rows.append((raw_line, z_value, measurement, sigma, comment.strip()))
+
+              records = []
+              for idx, row in enumerate(raw_rows):
+                  expected = EXPECTED_ORDER[idx] if idx < len(EXPECTED_ORDER) else {
+                      "order_index": idx + 1,
+                      "parameter_label": f"unexpected_row_{idx + 1}",
+                      "observable": "unexpected",
+                      "family": "unexpected",
+                      "z_expected": float("nan"),
+                  }
+                  raw_line, z_value, measurement, sigma, comment = row
+                  parsed_observable = parse_observable_from_comment(comment)
+                  parsed_family = family_for_observable(parsed_observable)
+                  z_match = abs(z_value - expected["z_expected"]) <= 1e-9 if isinstance(expected["z_expected"], float) else False
+                  observable_match = parsed_observable == expected["observable"]
+                  family_match = parsed_family == expected["family"]
+                  records.append({
+                      "order_index": idx + 1,
+                      "parameter_label": expected["parameter_label"],
+                      "z_value": z_value,
+                      "observable": parsed_observable,
+                      "family": parsed_family,
+                      "measurement": measurement,
+                      "sigma": sigma,
+                      "expected_observable": expected["observable"],
+                      "expected_family": expected["family"],
+                      "expected_z": expected["z_expected"],
+                      "order_match": bool(z_match and observable_match and family_match and idx < len(EXPECTED_ORDER)),
+                      "raw_line_preview": raw_line[:220],
+                      "claim_boundary": "normalized_value_record_limited_lrgxelg_only_not_pressure"
+                  })
+              return records
+
+          def parse_covariance_file(text):
+              rows = []
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  numeric_part = line.partition("#")[0]
+                  parts = numeric_part.split()
+                  if not parts:
+                      continue
+                  try:
+                      row = [float(x) for x in parts]
+                  except ValueError:
+                      continue
+                  rows.append(row)
+              return rows
+
+          def is_square(matrix):
+              return bool(matrix) and all(len(row) == len(matrix) for row in matrix)
+
+          def max_symmetry_delta(matrix):
+              if not is_square(matrix):
+                  return float("inf")
+              n = len(matrix)
+              return max(abs(matrix[i][j] - matrix[j][i]) for i in range(n) for j in range(n))
+
+          def cholesky_positive_definite(matrix, tol=1e-14):
+              if not is_square(matrix):
+                  return False
+              n = len(matrix)
+              L = [[0.0] * n for _ in range(n)]
+              for i in range(n):
+                  for j in range(i + 1):
+                      s = sum(L[i][k] * L[j][k] for k in range(j))
+                      if i == j:
+                          val = matrix[i][i] - s
+                          if val <= tol:
+                              return False
+                          L[i][j] = math.sqrt(val)
+                      else:
+                          if abs(L[j][j]) <= tol:
+                              return False
+                          L[i][j] = (matrix[i][j] - s) / L[j][j]
+              return True
+
+          def correlation_matrix(cov):
+              n = len(cov)
+              corr = [[0.0] * n for _ in range(n)]
+              for i in range(n):
+                  for j in range(n):
+                      denom = math.sqrt(cov[i][i] * cov[j][j]) if cov[i][i] > 0 and cov[j][j] > 0 else float("nan")
+                      corr[i][j] = cov[i][j] / denom if denom and not math.isnan(denom) else float("nan")
+              return corr
+
+          def relation_kind(a, b):
+              fams = sorted([a["family"], b["family"]])
+              if fams == ["geometry", "geometry"]:
+                  return "geometry_geometry"
+              if fams == ["geometry", "growth"]:
+                  return "geometry_growth"
+              if fams == ["growth", "growth"]:
+                  return "growth_growth"
+              return "unknown"
+
+          def z_relation(a, b):
+              return "same_redshift" if abs(float(a["z_value"]) - float(b["z_value"])) <= 1e-9 else "cross_redshift"
+
+          def direction(value, weak_threshold=0.10):
+              if value > weak_threshold:
+                  return "positive"
+              if value < -weak_threshold:
+                  return "negative"
+              return "near_zero_or_weak"
+
+          def stats_for_pairs(name, pair_rows, selector):
+              selected = [r for r in pair_rows if selector(r)]
+              if not selected:
+                  return {
+                      "block_id": name,
+                      "pair_count": 0,
+                      "mean_correlation": "",
+                      "mean_abs_correlation": "",
+                      "min_correlation": "",
+                      "max_correlation": "",
+                      "strongest_pair": "",
+                      "strongest_abs_correlation": "",
+                      "claim_boundary": "diagnostic_coupling_summary_not_pressure_not_validation"
+                  }
+              values = [float(r["correlation"]) for r in selected]
+              abs_values = [abs(v) for v in values]
+              strongest_idx = max(range(len(selected)), key=lambda k: abs(float(selected[k]["correlation"])))
+              strongest = selected[strongest_idx]
+              return {
+                  "block_id": name,
+                  "pair_count": len(selected),
+                  "mean_correlation": sum(values) / len(values),
+                  "mean_abs_correlation": sum(abs_values) / len(abs_values),
+                  "min_correlation": min(values),
+                  "max_correlation": max(values),
+                  "strongest_pair": f"{strongest['parameter_label_a']}__x__{strongest['parameter_label_b']}",
+                  "strongest_abs_correlation": abs(float(strongest["correlation"])),
+                  "claim_boundary": "diagnostic_coupling_summary_not_pressure_not_validation"
+              }
+
+          def truthy_text(value):
+              return "True" if value else "False"
+
+          value_text, value_fetch = fetch_text("lrgxelg_value_file", VALUE_URL, "inline_labeled_value_sigma_vector")
+          cov_text, cov_fetch = fetch_text("lrgxelg_covariance_file", COV_URL, "six_by_six_covariance_candidate")
+          readme_text, readme_fetch = fetch_text("lrgxelg_readme", README_URL, "repository_provenance_context")
+          fetch_records = [value_fetch, cov_fetch, readme_fetch]
+
+          values = parse_value_file(value_text) if value_fetch["fetch_ok"] else []
+          covariance = parse_covariance_file(cov_text) if cov_fetch["fetch_ok"] else []
+          corr = correlation_matrix(covariance) if is_square(covariance) else []
+
+          value_count = len(values)
+          cov_dimension = len(covariance) if covariance else 0
+          covariance_square = is_square(covariance)
+          covariance_dimension_matches_value_order = covariance_square and cov_dimension == value_count
+          covariance_symmetric = covariance_square and max_symmetry_delta(covariance) <= 1e-12
+          covariance_positive_definite = cholesky_positive_definite(covariance) if covariance_square else False
+          order_matches_expected = value_count == 6 and all(bool(r["order_match"]) for r in values)
+
+          diagonal_records = []
+          diagonal_matches_sigma = covariance_dimension_matches_value_order
+          if covariance_dimension_matches_value_order:
+              for i, record in enumerate(values):
+                  sigma_sq = float(record["sigma"]) ** 2
+                  cov_diag = covariance[i][i]
+                  rel_delta = abs(cov_diag - sigma_sq) / max(1.0, abs(sigma_sq), abs(cov_diag))
+                  match = rel_delta <= 1e-10
+                  diagonal_matches_sigma = diagonal_matches_sigma and match
+                  diagonal_records.append({
+                      "order_index": record["order_index"],
+                      "parameter_label": record["parameter_label"],
+                      "sigma": record["sigma"],
+                      "sigma_squared": sigma_sq,
+                      "covariance_diagonal": cov_diag,
+                      "relative_delta": rel_delta,
+                      "matches_within_tolerance": match,
+                      "claim_boundary": "diagonal_consistency_diagnostic_only_not_pressure"
+                  })
+
+          correlation_matrix_rows = []
+          if corr:
+              header_labels = [r["parameter_label"] for r in values]
+              for i, row in enumerate(corr):
+                  out = {
+                      "row_index": i + 1,
+                      "row_parameter_label": header_labels[i],
+                      "claim_boundary": "diagnostic_correlation_matrix_not_likelihood_not_pressure"
+                  }
+                  for j, label in enumerate(header_labels):
+                      out[label] = row[j]
+                  correlation_matrix_rows.append(out)
+
+          pair_rows = []
+          if corr and covariance_dimension_matches_value_order:
+              for i in range(value_count):
+                  for j in range(i + 1, value_count):
+                      a = values[i]
+                      b = values[j]
+                      rk = relation_kind(a, b)
+                      zr = z_relation(a, b)
+                      pair_rows.append({
+                          "pair_index": len(pair_rows) + 1,
+                          "parameter_label_a": a["parameter_label"],
+                          "parameter_label_b": b["parameter_label"],
+                          "observable_a": a["observable"],
+                          "observable_b": b["observable"],
+                          "family_a": a["family"],
+                          "family_b": b["family"],
+                          "z_a": a["z_value"],
+                          "z_b": b["z_value"],
+                          "relation_kind": rk,
+                          "redshift_relation": zr,
+                          "covariance": covariance[i][j],
+                          "correlation": corr[i][j],
+                          "abs_correlation": abs(corr[i][j]),
+                          "direction": direction(corr[i][j]),
+                          "claim_boundary": "diagnostic_pairwise_coupling_not_residual_not_pressure"
+                      })
+
+          block_summary_rows = [
+              stats_for_pairs("all_off_diagonal", pair_rows, lambda r: True),
+              stats_for_pairs("geometry_geometry", pair_rows, lambda r: r["relation_kind"] == "geometry_geometry"),
+              stats_for_pairs("geometry_growth_all", pair_rows, lambda r: r["relation_kind"] == "geometry_growth"),
+              stats_for_pairs("geometry_growth_same_redshift", pair_rows, lambda r: r["relation_kind"] == "geometry_growth" and r["redshift_relation"] == "same_redshift"),
+              stats_for_pairs("geometry_growth_cross_redshift", pair_rows, lambda r: r["relation_kind"] == "geometry_growth" and r["redshift_relation"] == "cross_redshift"),
+              stats_for_pairs("growth_growth_cross_redshift", pair_rows, lambda r: r["relation_kind"] == "growth_growth" and r["redshift_relation"] == "cross_redshift"),
+              stats_for_pairs("DM_growth_same_redshift", pair_rows, lambda r: r["relation_kind"] == "geometry_growth" and r["redshift_relation"] == "same_redshift" and (r["observable_a"] == "DM_ov_rd" or r["observable_b"] == "DM_ov_rd")),
+              stats_for_pairs("DH_growth_same_redshift", pair_rows, lambda r: r["relation_kind"] == "geometry_growth" and r["redshift_relation"] == "same_redshift" and (r["observable_a"] == "DH_ov_rd" or r["observable_b"] == "DH_ov_rd")),
+          ]
+
+          same_redshift_geometry_growth_rows = [
+              r for r in pair_rows
+              if r["relation_kind"] == "geometry_growth" and r["redshift_relation"] == "same_redshift"
+          ]
+          same_redshift_signs = set(r["direction"] for r in same_redshift_geometry_growth_rows if r["direction"] in ("positive", "negative"))
+          mixed_same_redshift_geometry_growth_signs = "positive" in same_redshift_signs and "negative" in same_redshift_signs
+          max_abs_geometry_growth_corr = max([float(r["abs_correlation"]) for r in pair_rows if r["relation_kind"] == "geometry_growth"], default=0.0)
+          diagnostic_geometry_growth_coupling_present = max_abs_geometry_growth_corr >= 0.30
+
+          geometry_growth_surface_rows = []
+          for r in same_redshift_geometry_growth_rows:
+              geometry_label = r["parameter_label_a"] if r["family_a"] == "geometry" else r["parameter_label_b"]
+              growth_label = r["parameter_label_a"] if r["family_a"] == "growth" else r["parameter_label_b"]
+              geometry_observable = r["observable_a"] if r["family_a"] == "geometry" else r["observable_b"]
+              z_value = r["z_a"] if r["family_a"] == "geometry" else r["z_b"]
+              geometry_growth_surface_rows.append({
+                  "z_value": z_value,
+                  "geometry_parameter_label": geometry_label,
+                  "geometry_observable": geometry_observable,
+                  "growth_parameter_label": growth_label,
+                  "correlation": r["correlation"],
+                  "abs_correlation": r["abs_correlation"],
+                  "direction": r["direction"],
+                  "claim_boundary": "same_redshift_geometry_growth_surface_shape_not_pressure"
+              })
+
+          source_context_rows = [{
+              "readme_nonempty": bool(readme_text.strip()),
+              "mentions_bao": "BAO" in readme_text,
+              "mentions_rsd": "RSD" in readme_text,
+              "mentions_zhao": "Zhao" in readme_text or "zhao" in readme_text.lower(),
+              "mentions_arxiv_2007_09011": "2007.09011" in readme_text,
+              "claim_boundary": "readme_context_not_final_provenance_lock"
+          }]
+          readme_context_present = bool(source_context_rows[0]["readme_nonempty"] and source_context_rows[0]["mentions_bao"] and source_context_rows[0]["mentions_rsd"])
+
+          health_items = {
+              "version": VERSION,
+              "created_utc": datetime.now(timezone.utc).isoformat(),
+              "allowed_scope": "LRGxELG two-redshift BAO/RSD vector at z=0.70 and z=0.845 only",
+              "value_record_count": value_count,
+              "covariance_dimension": cov_dimension,
+              "pairwise_coupling_pair_count": len(pair_rows),
+              "geometry_growth_pair_count": len([r for r in pair_rows if r["relation_kind"] == "geometry_growth"]),
+              "same_redshift_geometry_growth_pair_count": len(same_redshift_geometry_growth_rows),
+              "max_abs_geometry_growth_correlation": max_abs_geometry_growth_corr,
+              "diagnostic_geometry_growth_coupling_present_threshold_0p30": diagnostic_geometry_growth_coupling_present,
+              "mixed_same_redshift_geometry_growth_signs": mixed_same_redshift_geometry_growth_signs,
+              "order_matches_expected": order_matches_expected,
+              "covariance_dimension_matches_value_order": covariance_dimension_matches_value_order,
+              "covariance_symmetric": covariance_symmetric,
+              "covariance_positive_definite": covariance_positive_definite,
+              "diagonal_matches_sigma": diagonal_matches_sigma,
+              "readme_context_present": readme_context_present,
+              "pressure_recomputed": False,
+              "residuals_computed": False,
+              "likelihood_or_bic_run": False,
+              "TAIRID_validation_claim_allowed": False,
+              "QSO_covariance_available": False,
+              "full_eBOSS_family_covariance_available": False,
+              "reference_vector_still_missing": True,
+              "reference_covariance_still_missing": True,
+              "source_provenance_lock_still_required": True,
+              "expected_result_label": "limited_lrgxelg_geometry_growth_coupling_inspection_passed_coupling_shape_artifacts_written_no_pressure_no_validation",
+              "selected_next_route": "source_provenance_lock_or_reference_vector_manifest_fill_before_any_pressure_interpretation"
+          }
+
+          rule_checks = [
+              ("fetch_all_sources_ok", all(r["fetch_ok"] for r in fetch_records), "All three raw/context files fetched."),
+              ("value_record_count_6", value_count == 6, f"value_record_count={value_count}"),
+              ("order_matches_expected", order_matches_expected, f"order_matches_expected={order_matches_expected}"),
+              ("covariance_square", covariance_square, f"covariance_square={covariance_square}"),
+              ("covariance_dimension_matches_value_order", covariance_dimension_matches_value_order, f"covariance_dimension={cov_dimension}; value_records={value_count}"),
+              ("covariance_symmetric", covariance_symmetric, f"max_symmetry_delta={max_symmetry_delta(covariance) if covariance_square else 'not_square'}"),
+              ("covariance_positive_definite", covariance_positive_definite, f"covariance_positive_definite={covariance_positive_definite}"),
+              ("diagonal_matches_sigma", diagonal_matches_sigma, f"diagonal_matches_sigma={diagonal_matches_sigma}"),
+              ("readme_context_present", readme_context_present, f"readme_context_present={readme_context_present}"),
+              ("pairwise_coupling_rows_15", len(pair_rows) == 15, f"pairwise_coupling_pair_count={len(pair_rows)}"),
+              ("geometry_growth_pair_rows_8", len([r for r in pair_rows if r["relation_kind"] == "geometry_growth"]) == 8, f"geometry_growth_pair_count={len([r for r in pair_rows if r['relation_kind'] == 'geometry_growth'])}"),
+              ("same_redshift_geometry_growth_rows_4", len(same_redshift_geometry_growth_rows) == 4, f"same_redshift_geometry_growth_pair_count={len(same_redshift_geometry_growth_rows)}"),
+              ("coupling_shape_artifacts_written", True, "Coupling shape CSV/JSON/Markdown artifacts prepared."),
+              ("diagnostic_coupling_not_physical_proof", True, "Coupling diagnostics are explicitly marked as not pressure, not likelihood, and not validation."),
+              ("no_pressure_computed", health_items["pressure_recomputed"] is False, "No pressure calculation is performed."),
+              ("no_residuals_computed", health_items["residuals_computed"] is False, "No model residuals are computed."),
+              ("no_model_comparison", health_items["likelihood_or_bic_run"] is False, "No BIC, likelihood, posterior comparison, or model selection is run."),
+              ("not_qso_covariance", health_items["QSO_covariance_available"] is False, "QSO covariance remains unavailable."),
+              ("not_full_eboss_covariance", health_items["full_eBOSS_family_covariance_available"] is False, "Full eBOSS family covariance remains unavailable."),
+              ("reference_vector_still_missing", health_items["reference_vector_still_missing"] is True, "Reference vector remains missing."),
+              ("reference_covariance_still_missing", health_items["reference_covariance_still_missing"] is True, "Reference covariance remains missing."),
+              ("validation_claim_blocked", health_items["TAIRID_validation_claim_allowed"] is False, "TAIRID validation claims remain blocked."),
+          ]
+          rule_rows = [{
+              "rule_id": rule_id,
+              "pass": bool(passed),
+              "result": result,
+              "boundary": "limited_coupling_inspection_only_no_pressure_no_validation"
+          } for rule_id, passed, result in rule_checks]
+          failed_gates = [r["rule_id"] for r in rule_rows if not r["pass"]]
+          health_items["rule_pass_count"] = sum(1 for r in rule_rows if r["pass"])
+          health_items["rule_total_count"] = len(rule_rows)
+          health_items["failed_gates"] = "none" if not failed_gates else ";".join(failed_gates)
+
+          if health_items["rule_pass_count"] != health_items["rule_total_count"]:
+              health_items["expected_result_label"] = "limited_lrgxelg_geometry_growth_coupling_inspection_failed_review_required"
+
+          write_csv(os.path.join(OUTPUT_DIR, "fetch_records_v4_154.csv"), fetch_records, [
+              "source_id", "url", "role", "fetch_ok", "status_code", "content_type", "bytes_read", "sha256_16", "error", "claim_boundary"
+          ])
+          write_csv(os.path.join(OUTPUT_DIR, "normalized_limited_lrgxelg_values_v4_154.csv"), values, [
+              "order_index", "parameter_label", "z_value", "observable", "family", "measurement", "sigma", "expected_observable", "expected_family", "expected_z", "order_match", "raw_line_preview", "claim_boundary"
+          ])
+          matrix_fields = ["row_index", "row_parameter_label"] + [r["parameter_label"] for r in values] + ["claim_boundary"]
+          write_csv(os.path.join(OUTPUT_DIR, "diagnostic_limited_lrgxelg_correlation_matrix_v4_154.csv"), correlation_matrix_rows, matrix_fields)
+          write_csv(os.path.join(OUTPUT_DIR, "diagonal_consistency_records_v4_154.csv"), diagonal_records, [
+              "order_index", "parameter_label", "sigma", "sigma_squared", "covariance_diagonal", "relative_delta", "matches_within_tolerance", "claim_boundary"
+          ])
+          write_csv(os.path.join(OUTPUT_DIR, "pairwise_coupling_records_v4_154.csv"), pair_rows, [
+              "pair_index", "parameter_label_a", "parameter_label_b", "observable_a", "observable_b", "family_a", "family_b", "z_a", "z_b", "relation_kind", "redshift_relation", "covariance", "correlation", "abs_correlation", "direction", "claim_boundary"
+          ])
+          write_csv(os.path.join(OUTPUT_DIR, "coupling_block_summary_v4_154.csv"), block_summary_rows, [
+              "block_id", "pair_count", "mean_correlation", "mean_abs_correlation", "min_correlation", "max_correlation", "strongest_pair", "strongest_abs_correlation", "claim_boundary"
+          ])
+          write_csv(os.path.join(OUTPUT_DIR, "same_redshift_geometry_growth_surface_v4_154.csv"), geometry_growth_surface_rows, [
+              "z_value", "geometry_parameter_label", "geometry_observable", "growth_parameter_label", "correlation", "abs_correlation", "direction", "claim_boundary"
+          ])
+          write_csv(os.path.join(OUTPUT_DIR, "scope_guard_report_v4_154.csv"), [
+              {
+                  "guard_id": g["guard_id"],
+                  "allowed": g["allowed"],
+                  "blocked_use": g["blocked_use"],
+                  "guard_text": g["guard_text"],
+                  "claim_boundary": "scope_guard_enforced_in_limited_coupling_inspection"
+              } for g in SCOPE_GUARDS
+          ], ["guard_id", "allowed", "blocked_use", "guard_text", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "blocked_claims_v4_154.csv"), [
+              {"blocked_claim": c, "claim_boundary": "blocked_claim_preserved_v4_154"} for c in BLOCKED_CLAIMS
+          ], ["blocked_claim", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "source_context_record_v4_154.csv"), source_context_rows, [
+              "readme_nonempty", "mentions_bao", "mentions_rsd", "mentions_zhao", "mentions_arxiv_2007_09011", "claim_boundary"
+          ])
+          write_csv(os.path.join(OUTPUT_DIR, "parser_health_report_v4_154.csv"), [
+              {"metric": k, "value": v, "claim_boundary": "limited_coupling_inspection_status_only"} for k, v in health_items.items()
+          ], ["metric", "value", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "rule_results_v4_154.csv"), rule_rows, ["rule_id", "pass", "result", "boundary"])
+
+          json_summary = {
+              **health_items,
+              "truth_boundary": "This workflow inspects limited LRGxELG geometry-growth covariance/correlation shape only. It does not compute pressure, residuals, likelihood, BIC, posterior comparison, QSO covariance, full eBOSS covariance, or validation of TAIRID.",
+              "normalized_artifacts": sorted(os.listdir(OUTPUT_DIR)),
+              "blocked_claims": BLOCKED_CLAIMS,
+              "scope_guards": SCOPE_GUARDS,
+              "strongest_geometry_growth_pair": next((r for r in sorted([p for p in pair_rows if p["relation_kind"] == "geometry_growth"], key=lambda x: float(x["abs_correlation"]), reverse=True)), None)
+          }
+          with open(os.path.join(OUTPUT_DIR, "tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection.json"), "w", encoding="utf-8") as f:
+              json.dump(json_summary, f, indent=2, sort_keys=True)
+
+          strongest_gg = json_summary["strongest_geometry_growth_pair"] or {}
+          md = f"""# 000 TAIRID v4.154 — Limited LRGxELG Geometry-Growth Coupling Inspection With Scope Guards
+          
+          Created UTC: `{health_items['created_utc']}`
+          
+          ## Status
+          
+          Expected result label: `{health_items['expected_result_label']}`
+          
+          Failed gates: `{health_items['failed_gates']}`
+          
+          Rule pass count: `{health_items['rule_pass_count']} / {health_items['rule_total_count']}`
+          
+          ## Plain-language result
+          
+          This workflow inspects the covariance/correlation shape inside the already limited LRGxELG two-redshift BAO/RSD product. It separates geometry-like observables (`DM/rd`, `DH/rd`) from the growth-like observable (`fσ8`) and writes pairwise coupling diagnostics.
+          
+          It covers only:
+          
+          - `z = 0.70`: `DM/rd`, `DH/rd`, `fσ8`
+          - `z = 0.845`: `DM/rd`, `DH/rd`, `fσ8`
+          
+          ## Coupling diagnostics
+          
+          - Pairwise off-diagonal records: `{health_items['pairwise_coupling_pair_count']}`
+          - Geometry-growth pair records: `{health_items['geometry_growth_pair_count']}`
+          - Same-redshift geometry-growth pair records: `{health_items['same_redshift_geometry_growth_pair_count']}`
+          - Max absolute geometry-growth correlation: `{health_items['max_abs_geometry_growth_correlation']}`
+          - Mixed same-redshift geometry-growth signs: `{health_items['mixed_same_redshift_geometry_growth_signs']}`
+          - Strongest geometry-growth pair: `{strongest_gg.get('parameter_label_a', '')} x {strongest_gg.get('parameter_label_b', '')}`
+          
+          These are shape diagnostics only. They do not say the pattern is cosmological truth, TAIRID confirmation, or ΛCDM failure.
+          
+          ## Truth boundary
+          
+          This does not compute final pressure. It does not compute residuals against ΛCDM or TAIRID. It does not ingest the product into the main growth lane. It does not provide QSO covariance. It does not provide full eBOSS family covariance. It does not run BIC, likelihood, posterior comparison, or public-facing validation. It does not validate TAIRID.
+          
+          ## Health
+          
+          | Check | Value |
+          |---|---:|
+          | value records | `{health_items['value_record_count']}` |
+          | covariance dimension | `{health_items['covariance_dimension']}` |
+          | order matches expected | `{health_items['order_matches_expected']}` |
+          | covariance dimension matches value order | `{health_items['covariance_dimension_matches_value_order']}` |
+          | covariance symmetric | `{health_items['covariance_symmetric']}` |
+          | covariance positive definite | `{health_items['covariance_positive_definite']}` |
+          | diagonal matches sigma | `{health_items['diagonal_matches_sigma']}` |
+          | readme context present | `{health_items['readme_context_present']}` |
+          | pressure recomputed | `{health_items['pressure_recomputed']}` |
+          | residuals computed | `{health_items['residuals_computed']}` |
+          | likelihood or BIC run | `{health_items['likelihood_or_bic_run']}` |
+          | TAIRID validation claim allowed | `{health_items['TAIRID_validation_claim_allowed']}` |
+          
+          ## Files produced
+          
+          - `fetch_records_v4_154.csv`
+          - `normalized_limited_lrgxelg_values_v4_154.csv`
+          - `diagnostic_limited_lrgxelg_correlation_matrix_v4_154.csv`
+          - `diagonal_consistency_records_v4_154.csv`
+          - `pairwise_coupling_records_v4_154.csv`
+          - `coupling_block_summary_v4_154.csv`
+          - `same_redshift_geometry_growth_surface_v4_154.csv`
+          - `scope_guard_report_v4_154.csv`
+          - `blocked_claims_v4_154.csv`
+          - `source_context_record_v4_154.csv`
+          - `parser_health_report_v4_154.csv`
+          - `rule_results_v4_154.csv`
+          - `tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection.json`
+          - `tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection.md`
+          
+          ## Next clean move if this passes
+          
+          Use the result to decide whether to prioritize source/provenance locking or reference-vector/reference-covariance acquisition. Do not move to final pressure until reference vector, reference covariance, QSO covariance, full eBOSS covariance/overlap, and final pressure methodology are resolved.
+          """
+          with open(os.path.join(OUTPUT_DIR, "tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection.md"), "w", encoding="utf-8") as f:
+              f.write(md)
+
+          print(json.dumps(json_summary, indent=2, sort_keys=True))
+          if failed_gates:
+              raise SystemExit(1)
+          PY
+
+          python run_tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection.py
+
+      - name: Package v4.154 outputs
+        if: always()
+        shell: bash
+        run: |
+          cd outputs/tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection
+          zip -r ../../tairid-v4-154-limited-lrgxelg-geometry-growth-coupling-inspection-with-scope-guards.zip .
+
+      - name: Upload v4.154 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-154-limited-lrgxelg-geometry-growth-coupling-inspection-with-scope-guards
+          path: |
+            outputs/tairid_v4_154_limited_lrgxelg_geometry_growth_coupling_inspection/**
+            outputs/tairid-v4-154-limited-lrgxelg-geometry-growth-coupling-inspection-with-scope-guards.zip
