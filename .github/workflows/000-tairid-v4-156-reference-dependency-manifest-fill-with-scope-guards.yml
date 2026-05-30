@@ -1,0 +1,610 @@
+name: 000 TAIRID v4.156 — Reference Dependency Manifest Fill With Scope Guards
+
+on:
+  workflow_dispatch:
+
+jobs:
+  reference-dependency-manifest-fill:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build v4.156 reference dependency manifest fill
+        shell: bash
+        run: |
+          cat > run_v4_156.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          VERSION = "v4.156"
+          OUTDIR = "tairid_v4_156_reference_dependency_manifest_fill"
+          os.makedirs(OUTDIR, exist_ok=True)
+
+          EXPECTED_RESULT_LABEL = "reference_dependency_manifest_fill_passed_reference_inputs_status_recorded_no_pressure_no_validation"
+          CLAIM_BOUNDARY = "manifest_fill_only_no_pressure_no_validation"
+          ALLOWED_SCOPE = (
+              "Reference dependency manifest fill and repository candidate scan only. "
+              "No pressure, residuals, likelihood, BIC, posterior comparison, or validation claim."
+          )
+
+          PINNED_LRGXELG_COMMIT = "fd34ffbd2281543c97579f93fa1adc39d37fa46a"
+          LRGXELG_REPO = "icosmology/eBOSS_DR16_LRGxELG"
+          PINNED_LRGXELG_SOURCES = [
+              {
+                  "source_id": "lrgxelg_value_file_pinned_v4_155_bridge",
+                  "role": "prior_observed_limited_value_vector_bridge",
+                  "url": f"https://raw.githubusercontent.com/{LRGXELG_REPO}/{PINNED_LRGXELG_COMMIT}/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK.dat",
+                  "expected_sha256_16": "75847ae104bc4c24",
+                  "allowed_use": "prior_limited_LRGxELG_observed_source_bridge_only",
+              },
+              {
+                  "source_id": "lrgxelg_covariance_file_pinned_v4_155_bridge",
+                  "role": "prior_observed_limited_covariance_bridge",
+                  "url": f"https://raw.githubusercontent.com/{LRGXELG_REPO}/{PINNED_LRGXELG_COMMIT}/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK_cov.dat",
+                  "expected_sha256_16": "450cdb1b651eaf46",
+                  "allowed_use": "prior_limited_LRGxELG_observed_source_bridge_only",
+              },
+              {
+                  "source_id": "lrgxelg_readme_pinned_v4_155_bridge",
+                  "role": "prior_observed_limited_readme_bridge",
+                  "url": f"https://raw.githubusercontent.com/{LRGXELG_REPO}/{PINNED_LRGXELG_COMMIT}/README.md",
+                  "expected_sha256_16": "356a404244b282fa",
+                  "allowed_use": "prior_limited_LRGxELG_observed_source_bridge_only",
+              },
+          ]
+
+          LIMITED_LRGXELG_REFERENCE_SLOTS = [
+              {"slot_id": "ref_DM_ov_rd_z0p70", "z": 0.700, "quantity": "DM_ov_rd", "family": "geometry"},
+              {"slot_id": "ref_DH_ov_rd_z0p70", "z": 0.700, "quantity": "DH_ov_rd", "family": "geometry"},
+              {"slot_id": "ref_fsigma8_z0p70", "z": 0.700, "quantity": "fsigma8", "family": "growth"},
+              {"slot_id": "ref_DM_ov_rd_z0p845", "z": 0.845, "quantity": "DM_ov_rd", "family": "geometry"},
+              {"slot_id": "ref_DH_ov_rd_z0p845", "z": 0.845, "quantity": "DH_ov_rd", "family": "geometry"},
+              {"slot_id": "ref_fsigma8_z0p845", "z": 0.845, "quantity": "fsigma8", "family": "growth"},
+          ]
+
+          REQUIRED_DEPENDENCIES = [
+              {
+                  "dependency_id": "limited_lrgxelg_reference_mean_vector_6",
+                  "scope": "limited_LRGxELG_two_redshift",
+                  "needed_for": "future limited coupled residual or pressure attempt",
+                  "required_content": "model/reference means for DM/rd, DH/rd, and fσ8 at z=0.70 and z=0.845 in the same order as the observed six-row vector",
+                  "acceptable_forms": "CAMB/CLASS calculation with frozen cosmology; parameter-chain-derived predictions; or documented published reference vector",
+                  "status_from_this_workflow": "required_not_supplied_by_v4_156",
+                  "blocking_if_missing": True,
+              },
+              {
+                  "dependency_id": "limited_lrgxelg_reference_covariance_or_samples",
+                  "scope": "limited_LRGxELG_two_redshift",
+                  "needed_for": "honest coupled residual uncertainty and reference sensitivity",
+                  "required_content": "reference covariance for the six predicted quantities, or parameter samples allowing it to be generated",
+                  "acceptable_forms": "Planck posterior samples; CLASS/CAMB sample propagation; documented covariance matrix",
+                  "status_from_this_workflow": "required_not_supplied_by_v4_156",
+                  "blocking_if_missing": True,
+              },
+              {
+                  "dependency_id": "expanded_12_redshift_growth_reference_vector",
+                  "scope": "expanded_growth_lane",
+                  "needed_for": "full growth/RSD pressure interpretation across the prior 12 redshift targets",
+                  "required_content": "reference fσ8-like values at all expanded growth redshift targets used in the previous lane",
+                  "acceptable_forms": "stored reference vector; reproducible CAMB/CLASS calculation; parameter-chain-derived vector",
+                  "status_from_this_workflow": "required_not_supplied_by_v4_156",
+                  "blocking_if_missing": True,
+              },
+              {
+                  "dependency_id": "expanded_12_redshift_reference_covariance_or_samples",
+                  "scope": "expanded_growth_lane",
+                  "needed_for": "pressure magnitude, correlated uncertainty, and final interpretation guard",
+                  "required_content": "reference covariance or parameter samples spanning the expanded redshift vector",
+                  "acceptable_forms": "Planck posterior samples; documented covariance; reproducible propagation from samples",
+                  "status_from_this_workflow": "required_not_supplied_by_v4_156",
+                  "blocking_if_missing": True,
+              },
+              {
+                  "dependency_id": "qso_covariance_or_likelihood",
+                  "scope": "eBOSS_family",
+                  "needed_for": "QSO counter-component covariance handling",
+                  "required_content": "QSO value source plus covariance/likelihood and overlap notes with LRG/ELG products",
+                  "acceptable_forms": "official SDSS/eBOSS source files; likelihood package; documented covariance table",
+                  "status_from_this_workflow": "required_not_supplied_by_v4_156",
+                  "blocking_if_missing": True,
+              },
+              {
+                  "dependency_id": "full_eboss_family_covariance_or_overlap_model",
+                  "scope": "eBOSS_family",
+                  "needed_for": "full LRG/ELG/QSO covariance/overlap interpretation",
+                  "required_content": "cross-tracer covariance/overlap treatment or documented independence/combination rule",
+                  "acceptable_forms": "official multi-tracer covariance; paper/language-supported overlap model; likelihood package",
+                  "status_from_this_workflow": "required_not_supplied_by_v4_156",
+                  "blocking_if_missing": True,
+              },
+              {
+                  "dependency_id": "final_pressure_methodology_spec",
+                  "scope": "final_interpretation_guard",
+                  "needed_for": "any future claim about pressure magnitude",
+                  "required_content": "predeclared method for residuals, covariance combination, reference uncertainty, thresholds, and forbidden claims",
+                  "acceptable_forms": "locked markdown/JSON methodology file with formulas and scope limits",
+                  "status_from_this_workflow": "required_not_supplied_by_v4_156",
+                  "blocking_if_missing": True,
+              },
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "Standard cosmology is disproven.",
+              "A final RSD pressure score was computed.",
+              "A residual against LCDM or TAIRID was computed.",
+              "A final combined growth covariance was computed.",
+              "The limited LRGxELG product is full eBOSS covariance.",
+              "The limited LRGxELG product provides QSO covariance.",
+              "The eBOSS family points are independent by default.",
+              "BIC, likelihood, posterior comparison, or model selection has been run.",
+              "Reference dependency manifest fill supplies the missing reference vector.",
+              "Repository candidate names are accepted as scientific data without triage.",
+              "Public-facing validation claims are allowed.",
+          ]
+
+          SCOPE_GUARDS = [
+              {
+                  "guard_id": "manifest_fill_only",
+                  "allowed": True,
+                  "blocked_use": "pressure_or_model_victory_claim",
+                  "guard_text": "This workflow fills and scans dependency manifests only; it does not compute pressure or residuals.",
+              },
+              {
+                  "guard_id": "reference_inputs_still_required",
+                  "allowed": False,
+                  "blocked_use": "final_RSD_pressure",
+                  "guard_text": "Reference mean vector and reference covariance/parameter samples remain required before pressure interpretation.",
+              },
+              {
+                  "guard_id": "not_QSO_covariance",
+                  "allowed": False,
+                  "blocked_use": "QSO_covariance_or_QSO_pressure",
+                  "guard_text": "No QSO covariance is produced or inferred by this workflow.",
+              },
+              {
+                  "guard_id": "not_full_eboss_covariance",
+                  "allowed": False,
+                  "blocked_use": "full_eBOSS_family_covariance_or_overlap_solution",
+                  "guard_text": "This workflow does not solve full eBOSS family covariance or cross-tracer overlap.",
+              },
+              {
+                  "guard_id": "candidate_names_not_data",
+                  "allowed": False,
+                  "blocked_use": "accepting_filename_matches_as_scientific_input",
+                  "guard_text": "Repository filename matches are only candidates and require later source/provenance triage.",
+              },
+              {
+                  "guard_id": "not_model_comparison",
+                  "allowed": False,
+                  "blocked_use": "BIC_likelihood_posterior_comparison",
+                  "guard_text": "No BIC, likelihood, posterior comparison, model selection, or validation claim is allowed.",
+              },
+          ]
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def write_csv(path, rows, fieldnames=None):
+              if fieldnames is None:
+                  keys = []
+                  for row in rows:
+                      for key in row.keys():
+                          if key not in keys:
+                              keys.append(key)
+                  fieldnames = keys
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def sha256_bytes(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def fetch_url(url, timeout=20):
+              start = time.time()
+              record = {
+                  "url": url,
+                  "fetch_ok": False,
+                  "status_code": None,
+                  "content_type": None,
+                  "bytes_read": 0,
+                  "sha256": None,
+                  "sha256_16": None,
+                  "elapsed_seconds": None,
+                  "error": "",
+              }
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.156-manifest-fill"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read()
+                      record["fetch_ok"] = True
+                      record["status_code"] = getattr(resp, "status", None)
+                      record["content_type"] = resp.headers.get("Content-Type")
+                      record["bytes_read"] = len(data)
+                      record["sha256"] = sha256_bytes(data)
+                      record["sha256_16"] = record["sha256"][:16]
+                      record["elapsed_seconds"] = round(time.time() - start, 3)
+                      return record, data
+              except Exception as e:
+                  record["elapsed_seconds"] = round(time.time() - start, 3)
+                  record["error"] = repr(e)
+                  return record, None
+
+          def classify_candidate(path):
+              s = str(path).replace("\\", "/")
+              lower = s.lower()
+              name = os.path.basename(lower)
+              ext = os.path.splitext(name)[1]
+              is_workflow = ".github/workflows/" in lower or ext in [".yml", ".yaml"]
+              is_artifact_output = "tairid_v4_" in lower and (
+                  "output" in lower or "artifact" in lower or "workflow-files" in lower
+              )
+              keyword_hits = []
+              for kw in [
+                  "reference", "ref", "planck", "lcdm", "lambda", "camb", "class", "chain",
+                  "cov", "covariance", "fsigma", "fsigma8", "growth", "bao", "rsd",
+                  "qso", "lrg", "elg", "eboss", "dr16", "pantheon", "desi", "boss",
+              ]:
+                  if kw in lower:
+                      keyword_hits.append(kw)
+              data_like_exts = {".csv", ".tsv", ".txt", ".dat", ".json", ".fits", ".fit", ".npy", ".npz", ".pkl", ".h5", ".hdf5"}
+              if not keyword_hits:
+                  category = "not_reference_candidate"
+              elif is_workflow:
+                  category = "workflow_or_protocol_false_positive"
+              elif is_artifact_output:
+                  category = "prior_artifact_or_output_candidate_needs_triage"
+              elif ext in data_like_exts:
+                  category = "data_like_reference_candidate_needs_triage"
+              else:
+                  category = "nondata_context_candidate_needs_triage"
+              return category, keyword_hits
+
+          def scan_repo():
+              rows = []
+              root = Path(".").resolve()
+              skip_dirs = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", OUTDIR}
+              for p in Path(".").rglob("*"):
+                  try:
+                      if any(part in skip_dirs for part in p.parts):
+                          continue
+                      if p.is_dir():
+                          continue
+                      size = p.stat().st_size
+                      category, hits = classify_candidate(p)
+                      if category == "not_reference_candidate":
+                          continue
+                      rows.append({
+                          "path": str(p),
+                          "size_bytes": size,
+                          "extension": p.suffix.lower(),
+                          "candidate_category": category,
+                          "keyword_hits": ";".join(hits),
+                          "parser_ready": category == "data_like_reference_candidate_needs_triage",
+                          "claim_boundary": "filename_scan_only_not_scientific_ingestion",
+                      })
+                  except Exception as e:
+                      rows.append({
+                          "path": str(p),
+                          "size_bytes": "",
+                          "extension": "",
+                          "candidate_category": "scan_error",
+                          "keyword_hits": "",
+                          "parser_ready": False,
+                          "error": repr(e),
+                          "claim_boundary": "filename_scan_only_not_scientific_ingestion",
+                      })
+              rows.sort(key=lambda r: (not r.get("parser_ready", False), r["candidate_category"], r["path"]))
+              return rows
+
+          created = utc_now()
+
+          # Bridge recheck of v4.155 pinned observed sources. This is not required for pressure.
+          fetch_rows = []
+          for src in PINNED_LRGXELG_SOURCES:
+              rec, data = fetch_url(src["url"])
+              rec.update({
+                  "source_id": src["source_id"],
+                  "role": src["role"],
+                  "expected_sha256_16_from_v4_155": src["expected_sha256_16"],
+                  "sha256_16_matches_expected_v4_155": bool(rec.get("sha256_16") == src["expected_sha256_16"]),
+                  "allowed_use": src["allowed_use"],
+                  "claim_boundary": "prior_source_bridge_only_not_reference_not_pressure",
+              })
+              fetch_rows.append(rec)
+
+          candidate_rows = scan_repo()
+          candidate_counts = Counter(r["candidate_category"] for r in candidate_rows)
+          parser_ready_candidates = [r for r in candidate_rows if str(r.get("parser_ready")) == "True" or r.get("parser_ready") is True]
+
+          dependency_rows = []
+          for dep in REQUIRED_DEPENDENCIES:
+              row = dict(dep)
+              row["candidate_count_found_by_filename_scan"] = len(candidate_rows)
+              row["parser_ready_candidate_count_found_by_filename_scan"] = len(parser_ready_candidates)
+              row["claim_boundary"] = "dependency_manifest_not_scientific_ingestion"
+              dependency_rows.append(row)
+
+          slot_rows = []
+          for slot in LIMITED_LRGXELG_REFERENCE_SLOTS:
+              row = dict(slot)
+              row["reference_mean_required"] = True
+              row["reference_uncertainty_required"] = True
+              row["reference_covariance_or_samples_required"] = True
+              row["status_from_this_workflow"] = "slot_defined_no_value_supplied"
+              row["claim_boundary"] = "reference_slot_definition_only_no_residual_no_pressure"
+              slot_rows.append(row)
+
+          summary_rows = []
+          for category, count in sorted(candidate_counts.items()):
+              summary_rows.append({
+                  "candidate_category": category,
+                  "file_count": count,
+                  "parser_ready_category": category == "data_like_reference_candidate_needs_triage",
+                  "claim_boundary": "candidate_count_only_not_scientific_ingestion",
+              })
+          if not summary_rows:
+              summary_rows.append({
+                  "candidate_category": "no_reference_candidates_found_by_filename_scan",
+                  "file_count": 0,
+                  "parser_ready_category": False,
+                  "claim_boundary": "candidate_count_only_not_scientific_ingestion",
+              })
+
+          manifest_status = {
+              "version": VERSION,
+              "created_utc": created,
+              "expected_result_label": EXPECTED_RESULT_LABEL,
+              "allowed_scope": ALLOWED_SCOPE,
+              "failed_gates": "none",
+              "prior_v4_155_source_bridge_attempted": True,
+              "prior_v4_155_all_pinned_fetches_ok": all(bool(r["fetch_ok"]) for r in fetch_rows),
+              "prior_v4_155_all_pinned_hashes_match": all(bool(r["sha256_16_matches_expected_v4_155"]) for r in fetch_rows),
+              "limited_lrgxelg_reference_slots_defined": len(slot_rows),
+              "required_dependency_count": len(dependency_rows),
+              "repository_candidate_count": len(candidate_rows),
+              "parser_ready_candidate_count": len(parser_ready_candidates),
+              "reference_mean_vector_supplied": False,
+              "reference_covariance_or_samples_supplied": False,
+              "qso_covariance_supplied": False,
+              "full_eboss_covariance_or_overlap_supplied": False,
+              "pressure_computed": False,
+              "residuals_computed": False,
+              "likelihood_or_bic_run": False,
+              "posterior_comparison_run": False,
+              "TAIRID_validation_claim_allowed": False,
+              "selected_next_route_if_no_parser_ready_candidates": "external_reference_source_locator_or_reference_package_upload_request",
+              "selected_next_route_if_parser_ready_candidates_exist": "reference_candidate_triage_with_scope_guards",
+              "selected_next_route": "reference_candidate_triage_with_scope_guards" if parser_ready_candidates else "external_reference_source_locator_or_reference_package_upload_request",
+          }
+
+          health_rows = [
+              {"metric": k, "value": v, "claim_boundary": "manifest_status_only_no_pressure_no_validation"}
+              for k, v in manifest_status.items()
+          ]
+
+          scope_rows = [{**g, "claim_boundary": CLAIM_BOUNDARY} for g in SCOPE_GUARDS]
+          blocked_rows = [{"blocked_claim": c, "claim_boundary": "blocked_claim_preserved_v4_156"} for c in BLOCKED_CLAIMS]
+
+          rule_rows = [
+              {
+                  "rule": "manifest_artifacts_written",
+                  "pass": True,
+                  "detail": "Reference dependency manifest, slot table, candidate scan, guards, and reports are prepared.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "limited_lrgxelg_reference_slots_defined",
+                  "pass": len(slot_rows) == 6,
+                  "detail": f"slot_count={len(slot_rows)}",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "required_dependencies_defined",
+                  "pass": len(dependency_rows) >= 7,
+                  "detail": f"required_dependency_count={len(dependency_rows)}",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "reference_mean_vector_still_marked_missing",
+                  "pass": manifest_status["reference_mean_vector_supplied"] is False,
+                  "detail": "Reference mean vector is required but not supplied by this manifest workflow.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "reference_covariance_still_marked_missing",
+                  "pass": manifest_status["reference_covariance_or_samples_supplied"] is False,
+                  "detail": "Reference covariance or samples are required but not supplied by this manifest workflow.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "qso_covariance_still_marked_missing",
+                  "pass": manifest_status["qso_covariance_supplied"] is False,
+                  "detail": "QSO covariance remains a separate blocker.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "full_eboss_covariance_still_marked_missing",
+                  "pass": manifest_status["full_eboss_covariance_or_overlap_supplied"] is False,
+                  "detail": "Full eBOSS covariance/overlap remains a separate blocker.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "repo_candidate_scan_completed",
+                  "pass": isinstance(candidate_rows, list),
+                  "detail": f"candidate_count={len(candidate_rows)}; parser_ready_candidate_count={len(parser_ready_candidates)}",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "prior_v4_155_source_bridge_recorded",
+                  "pass": len(fetch_rows) == 3,
+                  "detail": f"pinned_fetches_ok={manifest_status['prior_v4_155_all_pinned_fetches_ok']}; hashes_match={manifest_status['prior_v4_155_all_pinned_hashes_match']}",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "no_pressure_computed",
+                  "pass": manifest_status["pressure_computed"] is False,
+                  "detail": "No pressure calculation is performed.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "no_residuals_computed",
+                  "pass": manifest_status["residuals_computed"] is False,
+                  "detail": "No residuals are computed.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "no_likelihood_or_bic_run",
+                  "pass": manifest_status["likelihood_or_bic_run"] is False,
+                  "detail": "No likelihood, BIC, or model comparison is run.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "no_posterior_comparison_run",
+                  "pass": manifest_status["posterior_comparison_run"] is False,
+                  "detail": "No posterior comparison is run.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "no_validation_claim_allowed",
+                  "pass": manifest_status["TAIRID_validation_claim_allowed"] is False,
+                  "detail": "Public-facing validation claims remain blocked.",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "rule": "selected_next_route_is_guarded",
+                  "pass": manifest_status["selected_next_route"] in [
+                      "reference_candidate_triage_with_scope_guards",
+                      "external_reference_source_locator_or_reference_package_upload_request",
+                  ],
+                  "detail": f"selected_next_route={manifest_status['selected_next_route']}",
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+          ]
+
+          failed_rules = [r for r in rule_rows if not bool(r["pass"])]
+          if failed_rules:
+              manifest_status["failed_gates"] = ";".join(r["rule"] for r in failed_rules)
+          else:
+              manifest_status["failed_gates"] = "none"
+
+          # Write files.
+          write_csv(os.path.join(OUTDIR, "prior_v4_155_pinned_source_bridge_fetch_records_v4_156.csv"), fetch_rows)
+          write_csv(os.path.join(OUTDIR, "limited_lrgxelg_reference_slots_v4_156.csv"), slot_rows)
+          write_csv(os.path.join(OUTDIR, "required_reference_dependencies_v4_156.csv"), dependency_rows)
+          write_csv(os.path.join(OUTDIR, "repository_reference_candidate_scan_v4_156.csv"), candidate_rows)
+          write_csv(os.path.join(OUTDIR, "repository_reference_candidate_summary_v4_156.csv"), summary_rows)
+          write_csv(os.path.join(OUTDIR, "scope_guard_report_v4_156.csv"), scope_rows)
+          write_csv(os.path.join(OUTDIR, "blocked_claims_v4_156.csv"), blocked_rows)
+          write_csv(os.path.join(OUTDIR, "parser_health_report_v4_156.csv"), health_rows)
+          write_csv(os.path.join(OUTDIR, "rule_results_v4_156.csv"), rule_rows)
+
+          json_path = os.path.join(OUTDIR, "tairid_v4_156_reference_dependency_manifest_fill.json")
+          with open(json_path, "w", encoding="utf-8") as f:
+              json.dump(
+                  {
+                      "manifest_status": manifest_status,
+                      "limited_lrgxelg_reference_slots": slot_rows,
+                      "required_dependencies": dependency_rows,
+                      "candidate_summary": summary_rows,
+                      "scope_guards": scope_rows,
+                      "blocked_claims": blocked_rows,
+                      "rules": rule_rows,
+                  },
+                  f,
+                  indent=2,
+                  sort_keys=True,
+              )
+
+          md_path = os.path.join(OUTDIR, "tairid_v4_156_reference_dependency_manifest_fill.md")
+          with open(md_path, "w", encoding="utf-8") as f:
+              f.write("# 000 TAIRID v4.156 — Reference Dependency Manifest Fill With Scope Guards\n")
+              f.write(f"Created UTC: `{created}`\n\n")
+              f.write("## Status\n")
+              f.write(f"Expected result label: `{EXPECTED_RESULT_LABEL}`\n\n")
+              f.write(f"Failed gates: `{manifest_status['failed_gates']}`\n\n")
+              f.write(f"Rule pass count: `{sum(1 for r in rule_rows if r['pass'])} / {len(rule_rows)}`\n\n")
+              f.write("## Plain-language result\n")
+              f.write(
+                  "This workflow does not try to win the cosmology lane. It fills the missing-reference dependency ledger, "
+                  "defines the six limited LRGxELG reference slots that would be needed later, scans the repository for possible "
+                  "reference/covariance candidate files, and keeps all pressure/model-comparison claims blocked.\n\n"
+              )
+              f.write("## Current dependency boundary\n")
+              f.write("- Reference mean vector supplied: `False`\n")
+              f.write("- Reference covariance or parameter samples supplied: `False`\n")
+              f.write("- QSO covariance supplied: `False`\n")
+              f.write("- Full eBOSS covariance/overlap supplied: `False`\n")
+              f.write("- Pressure computed: `False`\n")
+              f.write("- Residuals computed: `False`\n")
+              f.write("- Validation claim allowed: `False`\n\n")
+              f.write("## Candidate scan\n")
+              f.write(f"- Repository candidate count: `{len(candidate_rows)}`\n")
+              f.write(f"- Parser-ready candidate count by filename scan: `{len(parser_ready_candidates)}`\n")
+              f.write(f"- Selected next route: `{manifest_status['selected_next_route']}`\n\n")
+              f.write("Filename matches are not accepted as data. Any candidate file requires source/provenance triage before use.\n\n")
+              f.write("## Limited LRGxELG reference slots defined\n")
+              f.write("| Slot | z | Quantity | Family |\n")
+              f.write("|---|---:|---|---|\n")
+              for row in slot_rows:
+                  f.write(f"| `{row['slot_id']}` | `{row['z']}` | `{row['quantity']}` | `{row['family']}` |\n")
+              f.write("\n## Truth boundary\n")
+              f.write(
+                  "This does not compute final pressure. It does not compute residuals against ΛCDM or TAIRID. "
+                  "It does not ingest any repository candidate as a scientific input. It does not provide QSO covariance. "
+                  "It does not provide full eBOSS family covariance. It does not run BIC, likelihood, posterior comparison, "
+                  "or public-facing validation. It does not validate TAIRID.\n\n"
+              )
+              f.write("## Files produced\n")
+              for filename in [
+                  "prior_v4_155_pinned_source_bridge_fetch_records_v4_156.csv",
+                  "limited_lrgxelg_reference_slots_v4_156.csv",
+                  "required_reference_dependencies_v4_156.csv",
+                  "repository_reference_candidate_scan_v4_156.csv",
+                  "repository_reference_candidate_summary_v4_156.csv",
+                  "scope_guard_report_v4_156.csv",
+                  "blocked_claims_v4_156.csv",
+                  "parser_health_report_v4_156.csv",
+                  "rule_results_v4_156.csv",
+                  "tairid_v4_156_reference_dependency_manifest_fill.json",
+                  "tairid_v4_156_reference_dependency_manifest_fill.md",
+              ]:
+                  f.write(f"- `{filename}`\n")
+              f.write("\n## Next clean move if this passes\n")
+              f.write(
+                  "If parser-ready reference candidates are found, triage them under source/provenance guards. "
+                  "If none are found, move to an external reference-source locator or explicit reference-package upload request. "
+                  "Do not compute pressure until reference vector, reference covariance/parameter samples, QSO covariance, "
+                  "full eBOSS covariance/overlap, and final pressure methodology are resolved.\n"
+              )
+
+          print(json.dumps(manifest_status, indent=2, sort_keys=True))
+
+          if failed_rules:
+              print("FAILED_RULES:", [r["rule"] for r in failed_rules], file=sys.stderr)
+              sys.exit(1)
+          PY
+
+          python run_v4_156.py
+
+      - name: Upload v4.156 reference dependency manifest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-156-reference-dependency-manifest-fill-with-scope-guards
+          path: tairid_v4_156_reference_dependency_manifest_fill/
