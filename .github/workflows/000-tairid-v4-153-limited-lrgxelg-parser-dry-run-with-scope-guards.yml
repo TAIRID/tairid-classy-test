@@ -1,0 +1,547 @@
+name: 000 TAIRID v4.153 — Limited LRGxELG Parser Dry Run With Scope Guards
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  limited-lrgxelg-parser-dry-run:
+    name: Limited LRGxELG parser dry run with scope guards
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run guarded limited LRGxELG parser dry run
+        shell: bash
+        run: |
+          cat > run_tairid_v4_153_limited_lrgxelg_parser_dry_run.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          import re
+          import sys
+          import hashlib
+          import urllib.request
+          from datetime import datetime, timezone
+
+          VERSION = "v4.153"
+          OUTPUT_DIR = "outputs/tairid_v4_153_limited_lrgxelg_parser_dry_run"
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          VALUE_URL = "https://raw.githubusercontent.com/icosmology/eBOSS_DR16_LRGxELG/master/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK.dat"
+          COV_URL = "https://raw.githubusercontent.com/icosmology/eBOSS_DR16_LRGxELG/master/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK_cov.dat"
+          README_URL = "https://raw.githubusercontent.com/icosmology/eBOSS_DR16_LRGxELG/master/README.md"
+
+          EXPECTED_ORDER = [
+              {"order_index": 1, "parameter_label": "DM_ov_rd_z0p70", "observable": "DM_ov_rd", "z_expected": 0.700},
+              {"order_index": 2, "parameter_label": "DH_ov_rd_z0p70", "observable": "DH_ov_rd", "z_expected": 0.700},
+              {"order_index": 3, "parameter_label": "fsigma8_z0p70", "observable": "fsigma8", "z_expected": 0.700},
+              {"order_index": 4, "parameter_label": "DM_ov_rd_z0p845", "observable": "DM_ov_rd", "z_expected": 0.845},
+              {"order_index": 5, "parameter_label": "DH_ov_rd_z0p845", "observable": "DH_ov_rd", "z_expected": 0.845},
+              {"order_index": 6, "parameter_label": "fsigma8_z0p845", "observable": "fsigma8", "z_expected": 0.845},
+          ]
+
+          BLOCKED_CLAIMS = [
+              "TAIRID cosmology is validated.",
+              "Standard cosmology is disproven.",
+              "A final RSD pressure score was computed.",
+              "A final combined growth covariance was computed.",
+              "The limited LRGxELG parser is full eBOSS covariance.",
+              "The limited LRGxELG parser provides QSO covariance.",
+              "The eBOSS family points are independent by default.",
+              "BIC, likelihood, or posterior comparison has been run.",
+              "Pressure magnitude can be interpreted before reference covariance is source-locked.",
+              "Public-facing validation claims are allowed."
+          ]
+
+          SCOPE_GUARDS = [
+              {
+                  "guard_id": "limited_LRGxELG_two_redshift_only",
+                  "allowed": True,
+                  "blocked_use": "full_eBOSS_family_covariance",
+                  "guard_text": "This dry run is limited to the LRGxELG two-redshift BAO/RSD product at z=0.70 and z=0.845."
+              },
+              {
+                  "guard_id": "not_QSO_covariance",
+                  "allowed": False,
+                  "blocked_use": "QSO_covariance_or_QSO_pressure",
+                  "guard_text": "No QSO covariance is provided by this raw candidate pair."
+              },
+              {
+                  "guard_id": "not_final_pressure_input",
+                  "allowed": False,
+                  "blocked_use": "final_RSD_pressure",
+                  "guard_text": "This dry run may write normalized parser artifacts, but may not compute final pressure."
+              },
+              {
+                  "guard_id": "not_model_comparison",
+                  "allowed": False,
+                  "blocked_use": "BIC_likelihood_posterior_comparison",
+                  "guard_text": "No BIC, likelihood, posterior comparison, or model-selection claim is allowed."
+              },
+              {
+                  "guard_id": "requires_reference_vector_later",
+                  "allowed": False,
+                  "blocked_use": "reference_complete_growth_test",
+                  "guard_text": "The 12-redshift reference vector and reference covariance remain missing."
+              },
+              {
+                  "guard_id": "requires_provenance_lock_later",
+                  "allowed": False,
+                  "blocked_use": "source_clean_scientific_ingestion",
+                  "guard_text": "Source/provenance locking is still required before scientific ingestion."
+              }
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def fetch_text(source_id, url, role):
+              record = {
+                  "source_id": source_id,
+                  "url": url,
+                  "role": role,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_read": 0,
+                  "sha256_16": "",
+                  "error": "",
+                  "claim_boundary": "fetch_status_only_not_scientific_ingestion"
+              }
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.153-guarded-parser-dry-run"})
+                  with urllib.request.urlopen(req, timeout=45) as resp:
+                      raw = resp.read()
+                      record["fetch_ok"] = True
+                      record["status_code"] = getattr(resp, "status", "")
+                      record["content_type"] = resp.headers.get("content-type", "")
+                      record["bytes_read"] = len(raw)
+                      record["sha256_16"] = hashlib.sha256(raw).hexdigest()[:16]
+                      return raw.decode("utf-8", errors="replace"), record
+              except Exception as exc:
+                  record["error"] = repr(exc)
+                  return "", record
+
+          def parse_observable_from_comment(comment):
+              clean = comment.lower().replace("\\sigma_8", "sigma8").replace("sigma_8", "sigma8")
+              if "dm_ov_rd" in clean:
+                  return "DM_ov_rd"
+              if "dh_ov_rd" in clean:
+                  return "DH_ov_rd"
+              if "fsigma8" in clean or "f sigma8" in clean or "f\\sigma_8" in comment.lower():
+                  return "fsigma8"
+              return "unknown"
+
+          def parse_value_file(text):
+              records = []
+              raw_rows = []
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  numeric_part, sep, comment = line.partition("#")
+                  parts = numeric_part.split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      z_value = float(parts[0])
+                      measurement = float(parts[1])
+                      sigma = float(parts[2])
+                  except ValueError:
+                      continue
+                  raw_rows.append((raw_line, z_value, measurement, sigma, comment.strip()))
+
+              for idx, row in enumerate(raw_rows):
+                  expected = EXPECTED_ORDER[idx] if idx < len(EXPECTED_ORDER) else {
+                      "order_index": idx + 1,
+                      "parameter_label": f"unexpected_row_{idx + 1}",
+                      "observable": "unexpected",
+                      "z_expected": float("nan"),
+                  }
+                  raw_line, z_value, measurement, sigma, comment = row
+                  parsed_observable = parse_observable_from_comment(comment)
+                  z_match = abs(z_value - expected["z_expected"]) <= 1e-9 if isinstance(expected["z_expected"], float) else False
+                  observable_match = parsed_observable == expected["observable"]
+                  records.append({
+                      "order_index": idx + 1,
+                      "parameter_label": expected["parameter_label"],
+                      "z_value": z_value,
+                      "observable": parsed_observable,
+                      "measurement": measurement,
+                      "sigma": sigma,
+                      "expected_observable": expected["observable"],
+                      "expected_z": expected["z_expected"],
+                      "order_match": bool(z_match and observable_match and idx < len(EXPECTED_ORDER)),
+                      "raw_line_preview": raw_line[:220],
+                      "claim_boundary": "normalized_value_record_limited_lrgxelg_only_not_pressure"
+                  })
+              return records
+
+          def parse_covariance_file(text):
+              rows = []
+              for raw_line in text.splitlines():
+                  line = raw_line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  numeric_part = line.partition("#")[0]
+                  parts = numeric_part.split()
+                  if not parts:
+                      continue
+                  try:
+                      row = [float(x) for x in parts]
+                  except ValueError:
+                      continue
+                  rows.append(row)
+              return rows
+
+          def is_square(matrix):
+              return bool(matrix) and all(len(row) == len(matrix) for row in matrix)
+
+          def max_symmetry_delta(matrix):
+              if not is_square(matrix):
+                  return float("inf")
+              n = len(matrix)
+              return max(abs(matrix[i][j] - matrix[j][i]) for i in range(n) for j in range(n))
+
+          def cholesky_positive_definite(matrix, tol=1e-14):
+              if not is_square(matrix):
+                  return False
+              n = len(matrix)
+              L = [[0.0] * n for _ in range(n)]
+              for i in range(n):
+                  for j in range(i + 1):
+                      s = sum(L[i][k] * L[j][k] for k in range(j))
+                      if i == j:
+                          val = matrix[i][i] - s
+                          if val <= tol:
+                              return False
+                          L[i][j] = math.sqrt(val)
+                      else:
+                          if abs(L[j][j]) <= tol:
+                              return False
+                          L[i][j] = (matrix[i][j] - s) / L[j][j]
+              return True
+
+          def covariance_matrix_records(matrix, labels):
+              records = []
+              for i, row in enumerate(matrix):
+                  rec = {"row_index": i + 1, "row_parameter_label": labels[i]}
+                  for j, value in enumerate(row):
+                      rec[labels[j]] = value
+                  rec["claim_boundary"] = "normalized_covariance_matrix_limited_lrgxelg_only_not_full_family"
+                  records.append(rec)
+              return records
+
+          def covariance_long_records(matrix, labels):
+              records = []
+              for i, row in enumerate(matrix):
+                  for j, value in enumerate(row):
+                      records.append({
+                          "row_index": i + 1,
+                          "column_index": j + 1,
+                          "row_parameter_label": labels[i],
+                          "column_parameter_label": labels[j],
+                          "covariance_value": value,
+                          "claim_boundary": "normalized_covariance_long_limited_lrgxelg_only_not_ingested_for_pressure"
+                      })
+              return records
+
+          def correlation_matrix_records(matrix, labels):
+              records = []
+              diag = [matrix[i][i] for i in range(len(matrix))]
+              for i, row in enumerate(matrix):
+                  rec = {"row_index": i + 1, "row_parameter_label": labels[i]}
+                  for j, value in enumerate(row):
+                      denom = math.sqrt(diag[i] * diag[j]) if diag[i] > 0 and diag[j] > 0 else float("nan")
+                      rec[labels[j]] = value / denom if denom and not math.isnan(denom) else float("nan")
+                  rec["claim_boundary"] = "diagnostic_correlation_matrix_not_likelihood_not_pressure"
+                  records.append(rec)
+              return records
+
+          def diagonal_consistency_records(values, matrix):
+              records = []
+              for i, val in enumerate(values):
+                  sigma = float(val["sigma"])
+                  sigma_sq = sigma * sigma
+                  diag = matrix[i][i] if i < len(matrix) and i < len(matrix[i]) else float("nan")
+                  rel_delta = abs(diag - sigma_sq) / max(abs(sigma_sq), 1e-30)
+                  records.append({
+                      "order_index": i + 1,
+                      "parameter_label": val["parameter_label"],
+                      "sigma": sigma,
+                      "sigma_squared": sigma_sq,
+                      "covariance_diagonal": diag,
+                      "relative_delta": rel_delta,
+                      "matches_within_tolerance": bool(rel_delta <= 1e-10),
+                      "claim_boundary": "diagonal_consistency_dry_run_only"
+                  })
+              return records
+
+          created_utc = datetime.now(timezone.utc).isoformat()
+
+          value_text, value_fetch = fetch_text("lrgxelg_value_file", VALUE_URL, "inline_labeled_value_sigma_vector")
+          cov_text, cov_fetch = fetch_text("lrgxelg_covariance_file", COV_URL, "six_by_six_covariance_candidate")
+          readme_text, readme_fetch = fetch_text("lrgxelg_readme", README_URL, "repository_provenance_context")
+          fetch_records = [value_fetch, cov_fetch, readme_fetch]
+
+          value_records = parse_value_file(value_text)
+          labels = [r["parameter_label"] for r in value_records]
+          covariance = parse_covariance_file(cov_text)
+
+          readme_lower = readme_text.lower()
+          readme_context = {
+              "readme_nonempty": bool(readme_text.strip()),
+              "mentions_bao": "bao" in readme_lower,
+              "mentions_rsd": "rsd" in readme_lower,
+              "mentions_zhao": "zhao" in readme_lower,
+              "mentions_arxiv_2007_09011": "2007.09011" in readme_lower,
+              "claim_boundary": "readme_context_not_final_provenance_lock"
+          }
+
+          covariance_square = is_square(covariance)
+          covariance_dimension = len(covariance) if covariance_square else 0
+          symmetry_delta = max_symmetry_delta(covariance)
+          covariance_symmetric = symmetry_delta <= 1e-12
+          covariance_pd = cholesky_positive_definite(covariance)
+
+          diag_records = diagonal_consistency_records(value_records, covariance) if covariance_square and len(value_records) == len(covariance) else []
+          diagonal_matches_sigma = bool(diag_records) and all(r["matches_within_tolerance"] for r in diag_records)
+
+          order_matches_expected = (
+              len(value_records) == len(EXPECTED_ORDER)
+              and all(r["order_match"] for r in value_records)
+          )
+
+          covariance_dimension_matches_value_order = covariance_square and covariance_dimension == len(value_records) == len(EXPECTED_ORDER)
+
+          covariance_long = covariance_long_records(covariance, labels) if covariance_dimension_matches_value_order else []
+          covariance_matrix = covariance_matrix_records(covariance, labels) if covariance_dimension_matches_value_order else []
+          correlation_matrix = correlation_matrix_records(covariance, labels) if covariance_dimension_matches_value_order else []
+
+          scope_guard_report = []
+          for guard in SCOPE_GUARDS:
+              row = dict(guard)
+              row["claim_boundary"] = "scope_guard_enforced_in_dry_run"
+              scope_guard_report.append(row)
+
+          blocked_claim_rows = [{"blocked_claim": claim, "claim_boundary": "blocked_claim_preserved_v4_153"} for claim in BLOCKED_CLAIMS]
+
+          rules = [
+              ("fetch_all_sources_ok", all(r["fetch_ok"] for r in fetch_records), "All three raw/context files fetched."),
+              ("value_record_count_6", len(value_records) == 6, f"value_record_count={len(value_records)}"),
+              ("order_matches_expected", order_matches_expected, f"order_matches_expected={order_matches_expected}"),
+              ("covariance_square", covariance_square, f"covariance_square={covariance_square}"),
+              ("covariance_dimension_matches_value_order", covariance_dimension_matches_value_order, f"covariance_dimension={covariance_dimension}; value_records={len(value_records)}"),
+              ("covariance_symmetric", covariance_symmetric, f"max_symmetry_delta={symmetry_delta}"),
+              ("covariance_positive_definite", covariance_pd, f"covariance_positive_definite={covariance_pd}"),
+              ("covariance_long_records_36", len(covariance_long) == 36, f"covariance_long_records={len(covariance_long)}"),
+              ("diagonal_matches_sigma", diagonal_matches_sigma, f"diagonal_matches_sigma={diagonal_matches_sigma}"),
+              ("readme_context_present", bool(readme_context["readme_nonempty"]), f"readme_context_present={bool(readme_context['readme_nonempty'])}"),
+              ("normalized_values_written", True, "normalized values artifact prepared"),
+              ("normalized_covariance_matrix_written", bool(covariance_matrix), "normalized covariance matrix artifact prepared"),
+              ("normalized_covariance_long_written", bool(covariance_long), "normalized long covariance artifact prepared"),
+              ("correlation_matrix_written", bool(correlation_matrix), "diagnostic correlation artifact prepared"),
+              ("scope_guards_preserved", len(scope_guard_report) == 6, f"scope_guard_count={len(scope_guard_report)}"),
+              ("no_pressure_computed", True, "No pressure, residual, chi-square, BIC, likelihood, or posterior calculation is performed."),
+              ("no_model_comparison", True, "No model comparison is performed."),
+              ("no_validation_claim", True, "No TAIRID validation claim is allowed."),
+              ("qso_and_full_family_blocked", True, "QSO covariance and full eBOSS family covariance remain blocked."),
+              ("reference_blockers_preserved", True, "Reference vector and reference covariance remain missing.")
+          ]
+
+          rule_rows = [
+              {
+                  "rule_id": rule_id,
+                  "pass": bool(passed),
+                  "result": result,
+                  "boundary": "dry_run_parser_artifact_only_no_pressure_no_validation"
+              }
+              for rule_id, passed, result in rules
+          ]
+
+          failed_gates = [r["rule_id"] for r in rule_rows if not r["pass"]]
+          rule_pass_count = sum(1 for r in rule_rows if r["pass"])
+          rule_total_count = len(rule_rows)
+
+          if not failed_gates:
+              expected_result_label = "limited_lrgxelg_parser_dry_run_with_scope_guards_passed_normalized_artifacts_written_no_pressure_no_validation"
+          else:
+              expected_result_label = "limited_lrgxelg_parser_dry_run_with_scope_guards_failed_repair_required_no_pressure_no_validation"
+
+          health_rows = [
+              {"metric": "version", "value": VERSION, "claim_boundary": "parser_dry_run_status_only"},
+              {"metric": "created_utc", "value": created_utc, "claim_boundary": "parser_dry_run_status_only"},
+              {"metric": "value_record_count", "value": len(value_records), "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "covariance_dimension", "value": covariance_dimension, "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "covariance_long_record_count", "value": len(covariance_long), "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "order_matches_expected", "value": order_matches_expected, "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "covariance_dimension_matches_value_order", "value": covariance_dimension_matches_value_order, "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "covariance_symmetric", "value": covariance_symmetric, "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "covariance_positive_definite", "value": covariance_pd, "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "diagonal_matches_sigma", "value": diagonal_matches_sigma, "claim_boundary": "limited_lrgxelg_only"},
+              {"metric": "readme_context_present", "value": bool(readme_context["readme_nonempty"]), "claim_boundary": "context_only_not_final_provenance"},
+              {"metric": "pressure_recomputed", "value": False, "claim_boundary": "hard_block"},
+              {"metric": "likelihood_or_bic_run", "value": False, "claim_boundary": "hard_block"},
+              {"metric": "TAIRID_validation_claim_allowed", "value": False, "claim_boundary": "hard_block"},
+              {"metric": "QSO_covariance_available", "value": False, "claim_boundary": "hard_block"},
+              {"metric": "full_eBOSS_family_covariance_available", "value": False, "claim_boundary": "hard_block"},
+              {"metric": "reference_vector_still_missing", "value": True, "claim_boundary": "hard_block"},
+              {"metric": "reference_covariance_still_missing", "value": True, "claim_boundary": "hard_block"},
+              {"metric": "rule_pass_count", "value": rule_pass_count, "claim_boundary": "parser_dry_run_status_only"},
+              {"metric": "rule_total_count", "value": rule_total_count, "claim_boundary": "parser_dry_run_status_only"},
+              {"metric": "failed_gates", "value": ";".join(failed_gates) if failed_gates else "none", "claim_boundary": "parser_dry_run_status_only"},
+              {"metric": "expected_result_label", "value": expected_result_label, "claim_boundary": "parser_dry_run_status_only"}
+          ]
+
+          write_csv(os.path.join(OUTPUT_DIR, "fetch_records_v4_153.csv"), fetch_records, ["source_id", "url", "role", "fetch_ok", "status_code", "content_type", "bytes_read", "sha256_16", "error", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "normalized_limited_lrgxelg_values_v4_153.csv"), value_records, ["order_index", "parameter_label", "z_value", "observable", "measurement", "sigma", "expected_observable", "expected_z", "order_match", "raw_line_preview", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "normalized_limited_lrgxelg_covariance_matrix_v4_153.csv"), covariance_matrix, ["row_index", "row_parameter_label"] + labels + ["claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "normalized_limited_lrgxelg_covariance_long_v4_153.csv"), covariance_long, ["row_index", "column_index", "row_parameter_label", "column_parameter_label", "covariance_value", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "normalized_limited_lrgxelg_correlation_matrix_v4_153.csv"), correlation_matrix, ["row_index", "row_parameter_label"] + labels + ["claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "diagonal_consistency_records_v4_153.csv"), diag_records, ["order_index", "parameter_label", "sigma", "sigma_squared", "covariance_diagonal", "relative_delta", "matches_within_tolerance", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "scope_guard_report_v4_153.csv"), scope_guard_report, ["guard_id", "allowed", "blocked_use", "guard_text", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "blocked_claims_v4_153.csv"), blocked_claim_rows, ["blocked_claim", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "parser_health_report_v4_153.csv"), health_rows, ["metric", "value", "claim_boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "rule_results_v4_153.csv"), rule_rows, ["rule_id", "pass", "result", "boundary"])
+          write_csv(os.path.join(OUTPUT_DIR, "readme_context_record_v4_153.csv"), [readme_context], ["readme_nonempty", "mentions_bao", "mentions_rsd", "mentions_zhao", "mentions_arxiv_2007_09011", "claim_boundary"])
+
+          summary = {
+              "version": VERSION,
+              "created_utc": created_utc,
+              "expected_result_label": expected_result_label,
+              "failed_gates": failed_gates,
+              "rule_pass_count": rule_pass_count,
+              "rule_total_count": rule_total_count,
+              "allowed_scope": "LRGxELG two-redshift BAO/RSD vector at z=0.70 and z=0.845 only",
+              "value_record_count": len(value_records),
+              "covariance_dimension": covariance_dimension,
+              "covariance_long_record_count": len(covariance_long),
+              "order_matches_expected": order_matches_expected,
+              "covariance_dimension_matches_value_order": covariance_dimension_matches_value_order,
+              "covariance_symmetric": covariance_symmetric,
+              "covariance_positive_definite": covariance_pd,
+              "diagonal_matches_sigma": diagonal_matches_sigma,
+              "readme_context_present": bool(readme_context["readme_nonempty"]),
+              "pressure_recomputed": False,
+              "likelihood_or_bic_run": False,
+              "TAIRID_validation_claim_allowed": False,
+              "QSO_covariance_available": False,
+              "full_eBOSS_family_covariance_available": False,
+              "reference_vector_still_missing": True,
+              "reference_covariance_still_missing": True,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "scope_guards": SCOPE_GUARDS,
+              "normalized_artifacts": [
+                  "fetch_records_v4_153.csv",
+                  "normalized_limited_lrgxelg_values_v4_153.csv",
+                  "normalized_limited_lrgxelg_covariance_matrix_v4_153.csv",
+                  "normalized_limited_lrgxelg_covariance_long_v4_153.csv",
+                  "normalized_limited_lrgxelg_correlation_matrix_v4_153.csv",
+                  "diagonal_consistency_records_v4_153.csv",
+                  "scope_guard_report_v4_153.csv",
+                  "blocked_claims_v4_153.csv",
+                  "parser_health_report_v4_153.csv",
+                  "rule_results_v4_153.csv",
+                  "readme_context_record_v4_153.csv"
+              ],
+              "truth_boundary": "This writes normalized limited-parser artifacts only. It is not a final pressure test, not QSO covariance, not full eBOSS covariance, not model comparison, and not validation of TAIRID."
+          }
+
+          with open(os.path.join(OUTPUT_DIR, "tairid_v4_153_limited_lrgxelg_parser_dry_run_with_scope_guards.json"), "w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+
+          md = f"""# 000 TAIRID v4.153 — Limited LRGxELG Parser Dry Run With Scope Guards
+
+          Created UTC: `{created_utc}`
+
+          ## Status
+
+          Expected result label: `{expected_result_label}`
+
+          Failed gates: `{'; '.join(failed_gates) if failed_gates else 'none'}`
+
+          Rule pass count: `{rule_pass_count} / {rule_total_count}`
+
+          ## Plain-language result
+
+          This dry run fetches the limited LRGxELG two-redshift BAO/RSD value file, covariance file, and README context, then writes normalized parser artifacts.
+
+          It covers only:
+
+          - `z = 0.70`: `DM/rd`, `DH/rd`, `fσ8`
+          - `z = 0.845`: `DM/rd`, `DH/rd`, `fσ8`
+
+          ## Truth boundary
+
+          This does not compute final pressure. It does not ingest the product into the main growth lane. It does not provide QSO covariance. It does not provide full eBOSS family covariance. It does not run BIC, likelihood, posterior comparison, or public-facing validation. It does not validate TAIRID.
+
+          ## Health
+
+          | Check | Value |
+          |---|---:|
+          | value records | `{len(value_records)}` |
+          | covariance dimension | `{covariance_dimension}` |
+          | covariance long records | `{len(covariance_long)}` |
+          | order matches expected | `{order_matches_expected}` |
+          | covariance dimension matches value order | `{covariance_dimension_matches_value_order}` |
+          | covariance symmetric | `{covariance_symmetric}` |
+          | covariance positive definite | `{covariance_pd}` |
+          | diagonal matches sigma | `{diagonal_matches_sigma}` |
+          | readme context present | `{bool(readme_context['readme_nonempty'])}` |
+          | pressure recomputed | `False` |
+          | likelihood or BIC run | `False` |
+          | TAIRID validation claim allowed | `False` |
+
+          ## Files produced
+
+          - `fetch_records_v4_153.csv`
+          - `normalized_limited_lrgxelg_values_v4_153.csv`
+          - `normalized_limited_lrgxelg_covariance_matrix_v4_153.csv`
+          - `normalized_limited_lrgxelg_covariance_long_v4_153.csv`
+          - `normalized_limited_lrgxelg_correlation_matrix_v4_153.csv`
+          - `diagonal_consistency_records_v4_153.csv`
+          - `scope_guard_report_v4_153.csv`
+          - `blocked_claims_v4_153.csv`
+          - `parser_health_report_v4_153.csv`
+          - `rule_results_v4_153.csv`
+          - `readme_context_record_v4_153.csv`
+          - `tairid_v4_153_limited_lrgxelg_parser_dry_run_with_scope_guards.json`
+          - `tairid_v4_153_limited_lrgxelg_parser_dry_run_with_scope_guards.md`
+
+          ## Next clean move if this passes
+
+          Source/provenance lock or limited geometry-growth coupling inspection. Do not move to final pressure until reference vector, reference covariance, QSO covariance, full eBOSS covariance/overlap, and methodology boundaries are resolved.
+          """
+          with open(os.path.join(OUTPUT_DIR, "tairid_v4_153_limited_lrgxelg_parser_dry_run_with_scope_guards.md"), "w", encoding="utf-8") as f:
+              f.write("\n".join(line.strip() for line in md.splitlines()) + "\n")
+
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          if failed_gates:
+              sys.exit(1)
+          PY
+
+          python run_tairid_v4_153_limited_lrgxelg_parser_dry_run.py
+
+      - name: Upload v4.153 parser dry-run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-153-limited-lrgxelg-parser-dry-run-with-scope-guards
+          path: outputs/tairid_v4_153_limited_lrgxelg_parser_dry_run
