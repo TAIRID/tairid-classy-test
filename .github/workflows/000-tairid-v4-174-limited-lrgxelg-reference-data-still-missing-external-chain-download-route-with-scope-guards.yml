@@ -1,0 +1,507 @@
+name: 000 TAIRID v4.174 - Limited LRGxELG Reference Data Still Missing External Chain Download Route With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-174-limited-lrgxelg-reference-data-still-missing-external-chain-download-route-with-scope-guards.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-174-reference-data-still-missing-external-chain-route:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.174 external chain download route locator
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_174_outputs
+          cat > tairid_v4_174_outputs/run_v4_174.py <<'PY'
+          import csv
+          import json
+          import math
+          import re
+          import urllib.request
+          from urllib.parse import urljoin
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_174_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_reference_data_still_missing_external_chain_download_route_passed_download_targets_written_no_ingestion_no_pressure_no_validation"
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          BLOCKED_CLAIMS = [
+              "no external chain downloaded",
+              "no Planck chain ingested",
+              "no reference covariance ingested",
+              "no reference covariance computed",
+              "no residuals computed",
+              "no pressure computed",
+              "no final chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          SOURCE_TARGETS = [
+              {
+                  "target_id": "planck_legacy_archive_base",
+                  "source_family": "official_planck_archive",
+                  "url": "https://pla.esac.esa.int/pla/",
+                  "purpose": "Official Planck Legacy Archive route for cosmology products.",
+              },
+              {
+                  "target_id": "planck_cosmological_parameters_wiki",
+                  "source_family": "official_planck_documentation",
+                  "url": "https://wiki.cosmos.esa.int/planck-legacy-archive/index.php/Cosmological_Parameters",
+                  "purpose": "Planck cosmological-parameter product documentation and possible chain naming context.",
+              },
+              {
+                  "target_id": "planck_irsa_release3",
+                  "source_family": "official_planck_mirror_context",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/",
+                  "purpose": "Official mirror context for Planck release 3 products.",
+              },
+              {
+                  "target_id": "planck_irsa_release3_ancillary",
+                  "source_family": "official_planck_mirror_context",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/",
+                  "purpose": "Potential product subdirectory context; locator only.",
+              },
+              {
+                  "target_id": "sdss_dr16_context",
+                  "source_family": "official_sdss_context",
+                  "url": "https://www.sdss4.org/science/final-bao-and-rsd-measurements/",
+                  "purpose": "Keeps eBOSS/DR16 context visible while reference side is acquired.",
+              },
+          ]
+
+          KEYWORDS = [
+              "base_plik",
+              "TTTEEE",
+              "lowE",
+              "lensing",
+              "chain",
+              "chains",
+              "CosmoMC",
+              "cosmological",
+              "CosmoParams",
+              "COM_CosmoParams",
+              "paramnames",
+              ".zip",
+              ".tar",
+              ".tgz",
+              ".gz",
+              ".txt",
+              ".dat",
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def fetch_text(url, max_bytes=300000, timeout=14):
+              record = {
+                  "url": url,
+                  "reachable": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_read": 0,
+                  "error": "",
+                  "text": "",
+              }
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "TAIRID-v4.174-external-chain-route-locator/1.0"},
+                  )
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      record["reachable"] = True
+                      record["status_code"] = getattr(resp, "status", "")
+                      record["content_type"] = resp.headers.get("Content-Type", "")
+                      record["bytes_read"] = len(data)
+                      record["text"] = data.decode("utf-8", errors="replace")
+              except Exception as exc:
+                  record["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+              return record
+
+          def extract_links(base_url, text):
+              links = set()
+              href_pattern = r"(?:href|src)\s*=\s*[\"']([^\"']+)[\"']"
+              loose_pattern = r"https?://[^\s\"'<>]+"
+              for match in re.finditer(href_pattern, text, re.IGNORECASE):
+                  links.add(urljoin(base_url, match.group(1)))
+              for match in re.finditer(loose_pattern, text):
+                  links.add(match.group(0).rstrip(").,;"))
+              return sorted(links)
+
+          reachability_rows = []
+          candidate_rows = []
+          keyword_hit_rows = []
+
+          for target in SOURCE_TARGETS:
+              fetched = fetch_text(target["url"])
+              reachability_rows.append({
+                  "target_id": target["target_id"],
+                  "source_family": target["source_family"],
+                  "purpose": target["purpose"],
+                  "url": target["url"],
+                  "reachable": fetched["reachable"],
+                  "status_code": fetched["status_code"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": fetched["error"],
+              })
+
+              text = fetched["text"]
+              lowered = text.lower()
+              for keyword in KEYWORDS:
+                  if keyword.lower() in lowered:
+                      keyword_hit_rows.append({
+                          "target_id": target["target_id"],
+                          "source_url": target["url"],
+                          "keyword": keyword,
+                          "hit": True,
+                      })
+
+              if fetched["reachable"] and text:
+                  for link in extract_links(target["url"], text):
+                      score = 0
+                      reasons = []
+                      lower_link = link.lower()
+                      for keyword in KEYWORDS:
+                          if keyword.lower() in lower_link:
+                              score += 1
+                              reasons.append(keyword)
+                      if score > 0:
+                          candidate_rows.append({
+                              "target_id": target["target_id"],
+                              "source_family": target["source_family"],
+                              "source_url": target["url"],
+                              "candidate_url": link,
+                              "score": score,
+                              "reason_keywords": ";".join(reasons),
+                              "candidate_status": "link_candidate_only_not_downloaded_not_ingested",
+                          })
+
+          dedup = {}
+          for row in candidate_rows:
+              key = row["candidate_url"]
+              if key not in dedup or int(row["score"]) > int(dedup[key]["score"]):
+                  dedup[key] = row
+          candidate_rows = sorted(dedup.values(), key=lambda r: (-int(r["score"]), r["candidate_url"]))
+
+          write_csv(
+              OUT / "v4_174_source_reachability.csv",
+              reachability_rows,
+              [
+                  "target_id",
+                  "source_family",
+                  "purpose",
+                  "url",
+                  "reachable",
+                  "status_code",
+                  "content_type",
+                  "bytes_read",
+                  "error",
+              ],
+          )
+
+          write_csv(
+              OUT / "v4_174_keyword_hits.csv",
+              keyword_hit_rows,
+              ["target_id", "source_url", "keyword", "hit"],
+          )
+
+          write_csv(
+              OUT / "v4_174_discovered_chain_candidate_links.csv",
+              candidate_rows,
+              [
+                  "target_id",
+                  "source_family",
+                  "source_url",
+                  "candidate_url",
+                  "score",
+                  "reason_keywords",
+                  "candidate_status",
+              ],
+          )
+
+          manual_targets = [
+              {
+                  "manual_target_id": "M1",
+                  "name": "Planck posterior chain or compressed chain package",
+                  "what_to_find": "A downloadable Planck posterior chain package or exported chain table with Omega_m, H0, rd or sound-horizon equivalent, sigma8, and weights if available.",
+                  "why_needed": "This is the best route for building a six-slot reference ensemble and empirical reference covariance.",
+                  "put_result_here": "data/reference/planck_chain_manifest.json plus the referenced chain file",
+                  "status": "manual_acquisition_needed",
+              },
+              {
+                  "manual_target_id": "M2",
+                  "name": "Precomputed six-slot reference ensemble",
+                  "what_to_find": "A CSV where each row is one reference sample already transformed into the exact six LRGxELG labels.",
+                  "why_needed": "This avoids needing CAMB/CLASS in GitHub and can still build a reference covariance later.",
+                  "put_result_here": "data/reference/lrgxelg_reference_ensemble.csv",
+                  "status": "manual_acquisition_or_generation_needed",
+              },
+              {
+                  "manual_target_id": "M3",
+                  "name": "Documented six-by-six reference covariance",
+                  "what_to_find": "A documented 6x6 covariance matrix for the exact limited LRGxELG reference labels.",
+                  "why_needed": "This could support a later covariance matrix reader, but only if provenance is clean.",
+                  "put_result_here": "data/reference/lrgxelg_reference_covariance.csv",
+                  "status": "manual_acquisition_needed_if_available",
+              },
+              {
+                  "manual_target_id": "M4",
+                  "name": "Package provenance manifest",
+                  "what_to_find": "A metadata file describing source family, provenance URL or note, license/use note, and package type.",
+                  "why_needed": "Prevents data from becoming an undocumented magic file.",
+                  "put_result_here": "data/reference/lrgxelg_reference_package_manifest.json",
+                  "status": "manual_fill_needed_with_any_package",
+              },
+          ]
+
+          write_csv(
+              OUT / "v4_174_manual_download_targets.csv",
+              manual_targets,
+              ["manual_target_id", "name", "what_to_find", "why_needed", "put_result_here", "status"],
+          )
+
+          chain_manifest_template = {
+              "chain_file": "data/reference/replace_with_chain_file_name.csv",
+              "parameter_fields": [
+                  "Omega_m",
+                  "H0_km_s_Mpc",
+                  "rd_Mpc",
+                  "sigma8_z0"
+              ],
+              "optional_fields": [
+                  "weight",
+                  "growth_index_gamma",
+                  "omegam",
+                  "H0",
+                  "theta_MC",
+                  "sigma8"
+              ],
+              "source_family": "replace_with_planck_or_reference_chain_source",
+              "provenance_url_or_note": "replace_with_source_url_or_download_note",
+              "license_or_use_note": "replace_with_license_or_use_note",
+              "six_slot_target_order": LABELS,
+              "blocked_claims": BLOCKED_CLAIMS,
+              "notes": [
+                  "This manifest does not ingest a chain by itself.",
+                  "A later workflow must validate the referenced file.",
+                  "Do not treat this as reference covariance until a chain-to-ensemble or covariance-builder workflow passes."
+              ]
+          }
+
+          (OUT / "v4_174_template_planck_chain_manifest.json").write_text(
+              json.dumps(chain_manifest_template, indent=2),
+              encoding="utf-8",
+          )
+
+          ensemble_columns = [
+              "sample_id",
+              *LABELS,
+              "Omega_m",
+              "H0_km_s_Mpc",
+              "rd_Mpc",
+              "sigma8_z0",
+              "growth_index_gamma",
+              "source_family",
+              "provenance_url_or_note",
+              "license_or_use_note",
+          ]
+          write_csv(
+              OUT / "v4_174_reference_ensemble_empty_template.csv",
+              [
+                  {col: ("replace_with_sample_1" if col == "sample_id" else "") for col in ensemble_columns},
+                  {col: ("replace_with_sample_2" if col == "sample_id" else "") for col in ensemble_columns},
+              ],
+              ensemble_columns,
+          )
+
+          instructions = []
+          instructions.append("# TAIRID v4.174 External Chain / Reference Data Acquisition Route")
+          instructions.append("")
+          instructions.append("v4.173 confirmed that no valid reference package exists in the repository.")
+          instructions.append("This workflow does not download or ingest a chain. It only locates candidate routes and writes manual acquisition targets.")
+          instructions.append("")
+          instructions.append("## Clean next action")
+          instructions.append("")
+          instructions.append("Find or create one of these packages and commit it to the repository:")
+          instructions.append("")
+          for row in manual_targets:
+              instructions.append(f"- `{row['put_result_here']}` — {row['name']}")
+          instructions.append("")
+          instructions.append("## Best practical path")
+          instructions.append("")
+          instructions.append("The safest path is a precomputed six-slot reference ensemble:")
+          instructions.append("")
+          instructions.append("`data/reference/lrgxelg_reference_ensemble.csv`")
+          instructions.append("")
+          instructions.append("Each row should contain the exact six target labels:")
+          instructions.append("")
+          for label in LABELS:
+              instructions.append(f"- `{label}`")
+          instructions.append("")
+          instructions.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              instructions.append(f"- {item}")
+          instructions.append("")
+          instructions.append("## After adding a package")
+          instructions.append("")
+          instructions.append("Run the schema recheck again before building covariance.")
+          (OUT / "v4_174_manual_chain_download_instructions.md").write_text(
+              "\n".join(instructions),
+              encoding="utf-8",
+          )
+
+          candidate_count = len(candidate_rows)
+          reachable_count = sum(1 for r in reachability_rows if r["reachable"])
+          selected_next_route = "limited_lrgxelg_external_chain_candidate_review_or_manual_reference_package_acquisition_with_scope_guards"
+
+          route_decision = {
+              "version": "v4.174",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Reference data is still missing. Candidate source routes and manual acquisition targets were written. No chain or covariance was ingested.",
+              "reachable_source_count": reachable_count,
+              "source_target_count": len(SOURCE_TARGETS),
+              "candidate_link_count": candidate_count,
+              "selected_next_route": selected_next_route,
+              "truth_boundary": "download route locator only; no scientific reference data ingested",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+
+          (OUT / "v4_174_route_decision.json").write_text(
+              json.dumps(route_decision, indent=2),
+              encoding="utf-8",
+          )
+
+          (OUT / "v4_174_scope_guards.json").write_text(
+              json.dumps(
+                  {
+                      "scope": "external chain/reference-data route locator only",
+                      "downloads_external_chain": False,
+                      "ingests_reference_covariance": False,
+                      "ingests_planck_chain": False,
+                      "computes_reference_covariance": False,
+                      "computes_residuals": False,
+                      "computes_pressure": False,
+                      "computes_likelihood": False,
+                      "computes_bic": False,
+                      "computes_posterior_comparison": False,
+                      "validates_tairid": False,
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          (OUT / "v4_174_blocked_claims.json").write_text(
+              json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2),
+              encoding="utf-8",
+          )
+
+          summary = []
+          summary.append("# TAIRID v4.174 - External Chain Download Route")
+          summary.append("")
+          summary.append(f"Expected result: `{RESULT_LABEL}`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("The workflow writes candidate source routes and manual acquisition templates.")
+          summary.append("It does not ingest Planck chains or reference covariance.")
+          summary.append("")
+          summary.append(f"Reachable sources: `{reachable_count} / {len(SOURCE_TARGETS)}`")
+          summary.append(f"Candidate links found: `{candidate_count}`")
+          summary.append("")
+          summary.append("## Selected next route")
+          summary.append("")
+          summary.append(f"`{selected_next_route}`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_174_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_174": True,
+              "result_label_present": RESULT_LABEL.endswith("no_ingestion_no_pressure_no_validation"),
+              "source_targets_present": len(SOURCE_TARGETS) >= 5,
+              "source_reachability_written": (OUT / "v4_174_source_reachability.csv").exists(),
+              "keyword_hits_written": (OUT / "v4_174_keyword_hits.csv").exists(),
+              "candidate_links_written": (OUT / "v4_174_discovered_chain_candidate_links.csv").exists(),
+              "manual_targets_written": (OUT / "v4_174_manual_download_targets.csv").exists(),
+              "chain_manifest_template_written": (OUT / "v4_174_template_planck_chain_manifest.json").exists(),
+              "ensemble_template_written": (OUT / "v4_174_reference_ensemble_empty_template.csv").exists(),
+              "instructions_written": (OUT / "v4_174_manual_chain_download_instructions.md").exists(),
+              "route_decision_written": (OUT / "v4_174_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_174_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_174_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_174_summary.md").exists(),
+              "next_route_selected": selected_next_route == "limited_lrgxelg_external_chain_candidate_review_or_manual_reference_package_acquisition_with_scope_guards",
+              "no_chain_downloaded": True,
+              "no_reference_covariance_ingested": True,
+              "no_pressure_computed": True,
+              "no_likelihood_computed": True,
+              "no_validation_claimed": True,
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.174",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "reachable_source_count": reachable_count,
+              "source_target_count": len(SOURCE_TARGETS),
+              "candidate_link_count": candidate_count,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "external_route_locator_only_no_ingestion_no_pressure_no_validation",
+          }
+          (OUT / "v4_174_parser_health_report.json").write_text(
+              json.dumps(health, indent=2),
+              encoding="utf-8",
+          )
+
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.174 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_174_outputs/run_v4_174.py
+
+      - name: Upload v4.174 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-174-limited-lrgxelg-reference-data-still-missing-external-chain-download-route-output
+          path: tairid_v4_174_outputs/
