@@ -1,0 +1,682 @@
+name: 000 TAIRID v4.184 - eBOSS QSO BAO Plus Parser And Planck Chain Reference Preview No Validation
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-184-eboss-qso-baoplus-parser-and-planck-chain-reference-preview-no-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-184-qso-baoplus-parser-planck-chain-reference-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.184 QSO BAO-plus parser and Planck-chain reference preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_184_outputs
+          cat > tairid_v4_184_outputs/run_v4_184.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import os
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_184_outputs")
+          TMP = OUT / "tmp_downloads"
+          TMP.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "eboss_qso_baoplus_parser_and_planck_chain_reference_preview_passed_qso_covariance_artifacts_written_no_validation"
+
+          QSO_VALUE_URL = "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_QSO_FSBAO_DMDHfs8.txt"
+          QSO_COV_URL = "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt"
+          QSO_README_URL = "https://svn.sdss.org/public/data/eboss/DR16cosmo/tags/v1_0_1/likelihoods/BAO-plus/README.txt"
+
+          PLANCK_PACKAGE_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          BASE_PREFIX = "base/plikHM_TTTEEE_lowl_lowE"
+          PARAMNAMES_MEMBER = BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE.paramnames"
+          CHAIN_MEMBERS = [
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_1.txt",
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_2.txt",
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_3.txt",
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_4.txt",
+          ]
+
+          LABELS = ["DM_ov_rd_z1p48", "DH_ov_rd_z1p48", "fsigma8_z1p48"]
+          ROLES = {
+              "DM_ov_rd_z1p48": "transverse_geometry_reach",
+              "DH_ov_rd_z1p48": "radial_geometry_pacing_access",
+              "fsigma8_z1p48": "growth_consolidation",
+          }
+          Z_QSO = 1.48
+
+          PARAM_ALIASES = {
+              "Omega_m": ["omegam", "Omega_m"],
+              "H0_km_s_Mpc": ["H0", "h0"],
+              "sigma8_z0": ["sigma8"],
+              "rdragh_Mpc_times_h": ["rdragh", "rdrag_h"],
+          }
+
+          BLOCKED_CLAIMS = [
+              "no TAIRID validation",
+              "no LCDM ruled-out claim",
+              "no final cosmology claim",
+              "no full eBOSS covariance",
+              "no full tracer-family covariance",
+              "no QSO-plus-LRGxELG cross-covariance",
+              "no likelihood computed",
+              "no BIC",
+              "no posterior model comparison",
+              "no publication-grade pressure claim",
+              "QSO BAO-plus single-tracer preview only",
+          ]
+
+          MAX_DOWNLOAD_BYTES = int(os.environ.get("TAIRID_MAX_DOWNLOAD_BYTES", str(350 * 1024 * 1024)))
+          MAX_EXPORT_ROWS = int(os.environ.get("TAIRID_MAX_EXPORT_ROWS", "5000"))
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fetch_text(url, timeout=45, max_bytes=5_000_000):
+              rec = {"url": url, "ok": False, "status_code": "", "content_type": "", "bytes_read": 0, "error": "", "text": ""}
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.184/1.0"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      rec["ok"] = True
+                      rec["status_code"] = getattr(resp, "status", "")
+                      rec["content_type"] = resp.headers.get("Content-Type", "")
+                      rec["bytes_read"] = len(data)
+                      rec["text"] = data.decode("utf-8", errors="replace")
+              except Exception as exc:
+                  rec["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+              return rec
+
+          def download_with_cap(url, out_path, cap_bytes):
+              rec = {"url": url, "download_attempted": True, "download_ok": False, "downloaded_bytes": 0, "sha256": "", "error": "", "skipped_reason": ""}
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.184/1.0"})
+                  with urllib.request.urlopen(req, timeout=90) as resp, open(out_path, "wb") as f:
+                      total = 0
+                      while True:
+                          chunk = resp.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          total += len(chunk)
+                          if total > cap_bytes:
+                              rec["downloaded_bytes"] = total
+                              rec["skipped_reason"] = "download exceeded cap " + str(cap_bytes)
+                              try:
+                                  f.close()
+                                  out_path.unlink(missing_ok=True)
+                              except Exception:
+                                  pass
+                              return rec
+                          f.write(chunk)
+                      rec["downloaded_bytes"] = out_path.stat().st_size
+                  rec["sha256"] = sha256_file(out_path)
+                  rec["download_ok"] = True
+              except Exception as exc:
+                  rec["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+                  try:
+                      out_path.unlink(missing_ok=True)
+                  except Exception:
+                      pass
+              return rec
+
+          def parse_qso_values(text):
+              rows = []
+              label_map = {
+                  "DM_over_rs": "DM_ov_rd_z1p48",
+                  "DH_over_rs": "DH_ov_rd_z1p48",
+                  "f_sigma8": "fsigma8_z1p48",
+              }
+              for raw in text.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  if len(parts) < 3:
+                      continue
+                  try:
+                      z = float(parts[0])
+                      value = float(parts[1])
+                  except Exception:
+                      continue
+                  quantity = parts[2].strip()
+                  label = label_map.get(quantity, quantity)
+                  rows.append({
+                      "label": label,
+                      "z": z,
+                      "quantity": quantity,
+                      "observed": value,
+                      "role": ROLES.get(label, ""),
+                      "source_url": QSO_VALUE_URL,
+                  })
+              rows_by_label = {r["label"]: r for r in rows}
+              return [rows_by_label[label] for label in LABELS if label in rows_by_label]
+
+          def parse_matrix(text):
+              matrix = []
+              for raw in text.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  vals = []
+                  ok = True
+                  for p in line.split():
+                      try:
+                          vals.append(float(p))
+                      except Exception:
+                          ok = False
+                          break
+                  if ok and vals:
+                      matrix.append(vals)
+              return matrix
+
+          def corr_from_cov(C):
+              corr = []
+              for i in range(len(C)):
+                  row = []
+                  for j in range(len(C)):
+                      denom = math.sqrt(C[i][i] * C[j][j]) if C[i][i] > 0 and C[j][j] > 0 else 0.0
+                      row.append(C[i][j] / denom if denom else "")
+                  corr.append(row)
+              return corr
+
+          def mat_to_rows(matrix, row_names, col_names):
+              rows = []
+              for i, rname in enumerate(row_names):
+                  row = {"row_label": rname}
+                  for j, cname in enumerate(col_names):
+                      row[cname] = matrix[i][j] if i < len(matrix) and j < len(matrix[i]) else ""
+                  rows.append(row)
+              return rows
+
+          def mat_add(A, B):
+              return [[A[i][j] + B[i][j] for j in range(len(A[0]))] for i in range(len(A))]
+
+          def gaussian_solve(A, b):
+              n = len(A)
+              M = [list(A[i]) + [b[i]] for i in range(n)]
+              for col in range(n):
+                  pivot = max(range(col, n), key=lambda r: abs(M[r][col]))
+                  if abs(M[pivot][col]) < 1e-15:
+                      raise ValueError("singular matrix")
+                  if pivot != col:
+                      M[col], M[pivot] = M[pivot], M[col]
+                  piv = M[col][col]
+                  for j in range(col, n + 1):
+                      M[col][j] /= piv
+                  for r in range(n):
+                      if r == col:
+                          continue
+                      factor = M[r][col]
+                      if factor:
+                          for j in range(col, n + 1):
+                              M[r][j] -= factor * M[col][j]
+              return [M[i][n] for i in range(n)]
+
+          def quadratic_form_with_inverse(C, r):
+              x = gaussian_solve(C, r)
+              return sum(r[i] * x[i] for i in range(len(r)))
+
+          def parse_paramnames(text):
+              rows = []
+              for raw in text.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split(None, 1)
+                  parameter = parts[0].strip()
+                  rows.append({
+                      "parameter": parameter,
+                      "clean_parameter": parameter.rstrip("*"),
+                      "derived_flag": parameter.endswith("*"),
+                      "display_label": parts[1].strip() if len(parts) > 1 else "",
+                  })
+              return rows
+
+          def find_param_index(paramnames_rows, aliases):
+              clean_lookup = {}
+              full_lookup = {}
+              for idx, row in enumerate(paramnames_rows):
+                  clean_lookup[row["clean_parameter"].lower()] = idx
+                  full_lookup[row["parameter"].lower()] = idx
+              for alias in aliases:
+                  a = alias.lower().rstrip("*")
+                  if a in clean_lookup:
+                      return clean_lookup[a]
+                  if alias.lower() in full_lookup:
+                      return full_lookup[alias.lower()]
+              return None
+
+          def e_z(z, omega_m):
+              return math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+          def simpson_integral_inverse_e(z, omega_m, n=1200):
+              if n % 2:
+                  n += 1
+              h = z / n
+              total = 1.0 / e_z(0.0, omega_m) + 1.0 / e_z(z, omega_m)
+              for i in range(1, n):
+                  total += (4 if i % 2 else 2) / e_z(i * h, omega_m)
+              return h * total / 3.0
+
+          def growth_factor_cpt(z, omega_m):
+              ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+              omz = omega_m * (1.0 + z) ** 3 / ez2
+              olz = (1.0 - omega_m) / ez2
+              gz = 5.0 * omz / (2.0 * (omz ** (4.0 / 7.0) - olz + (1.0 + omz / 2.0) * (1.0 + olz / 70.0)))
+              om0 = omega_m
+              ol0 = 1.0 - omega_m
+              g0 = 5.0 * om0 / (2.0 * (om0 ** (4.0 / 7.0) - ol0 + (1.0 + om0 / 2.0) * (1.0 + ol0 / 70.0)))
+              return gz / (g0 * (1.0 + z))
+
+          def qso_vector(omega_m, h0, rdragh, sigma8):
+              h = h0 / 100.0
+              rd = rdragh / h
+              c_km_s = 299792.458
+              gamma = 0.55
+              z = Z_QSO
+              ez = e_z(z, omega_m)
+              dm_rd = (c_km_s / h0) * simpson_integral_inverse_e(z, omega_m) / rd
+              dh_rd = c_km_s / (h0 * ez) / rd
+              ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+              omz = omega_m * (1.0 + z) ** 3 / ez2
+              fs8 = (omz ** gamma) * sigma8 * growth_factor_cpt(z, omega_m)
+              return [dm_rd, dh_rd, fs8], rd
+
+          def weighted_cov_matrix(matrix_rows, weights):
+              n = len(matrix_rows)
+              m = len(matrix_rows[0]) if n else 0
+              sw = sum(weights)
+              if n == 0 or sw == 0:
+                  return [], []
+              means = [sum(matrix_rows[i][j] * weights[i] for i in range(n)) / sw for j in range(m)]
+              sw2 = sum(w*w for w in weights)
+              denom = sw - (sw2 / sw) if sw else 0.0
+              if denom <= 0:
+                  denom = sw
+              cov = []
+              for a in range(m):
+                  row = []
+                  for b in range(m):
+                      num = sum(weights[i] * (matrix_rows[i][a] - means[a]) * (matrix_rows[i][b] - means[b]) for i in range(n))
+                      row.append(num / denom)
+                  cov.append(row)
+              return means, cov
+
+          qso_value_fetch = fetch_text(QSO_VALUE_URL)
+          qso_cov_fetch = fetch_text(QSO_COV_URL)
+          qso_readme_fetch = fetch_text(QSO_README_URL, max_bytes=200000)
+
+          qso_value_rows = parse_qso_values(qso_value_fetch["text"]) if qso_value_fetch["ok"] else []
+          qso_cov = parse_matrix(qso_cov_fetch["text"]) if qso_cov_fetch["ok"] else []
+
+          qso_fetch_rows = [
+              {"artifact": "qso_value", **{k: v for k, v in qso_value_fetch.items() if k != "text"}},
+              {"artifact": "qso_covariance", **{k: v for k, v in qso_cov_fetch.items() if k != "text"}},
+              {"artifact": "qso_readme", **{k: v for k, v in qso_readme_fetch.items() if k != "text"}},
+          ]
+
+          observed_values = [next((r["observed"] for r in qso_value_rows if r["label"] == label), float("nan")) for label in LABELS]
+          observed_ok = len(qso_value_rows) == 3 and len(qso_cov) == 3 and all(len(row) == 3 for row in qso_cov)
+
+          planck_download_path = TMP / "planck_candidate.zip"
+          planck_download = download_with_cap(PLANCK_PACKAGE_URL, planck_download_path, MAX_DOWNLOAD_BYTES)
+
+          paramnames_rows = []
+          mapping_rows = []
+          chain_member_rows = []
+          sample_export_rows = []
+          reference_matrix = []
+          parameter_matrix = []
+          weights = []
+          total_chain_rows = 0
+          skipped_chain_rows = 0
+          planck_mapping_ok = False
+
+          if planck_download["download_ok"]:
+              try:
+                  with zipfile.ZipFile(planck_download_path, "r") as zf:
+                      names = set(zf.namelist())
+                      if PARAMNAMES_MEMBER in names:
+                          paramnames_rows = parse_paramnames(zf.read(PARAMNAMES_MEMBER).decode("utf-8", errors="replace"))
+                      index_map = {}
+                      for field, aliases in PARAM_ALIASES.items():
+                          idx = find_param_index(paramnames_rows, aliases)
+                          index_map[field] = idx
+                          mapping_rows.append({
+                              "field": field,
+                              "aliases": ";".join(aliases),
+                              "paramnames_index_zero_based": idx if idx is not None else "",
+                              "chain_column_index_with_two_column_offset": idx + 2 if idx is not None else "",
+                              "mapping_ok": idx is not None,
+                          })
+                      planck_mapping_ok = all(index_map[field] is not None for field in PARAM_ALIASES)
+                      if planck_mapping_ok:
+                          needed = {field: index_map[field] + 2 for field in PARAM_ALIASES}
+                          max_col = max(needed.values())
+                          for member in CHAIN_MEMBERS:
+                              present = member in names
+                              seen = used = skipped = 0
+                              if present:
+                                  with zf.open(member, "r") as f:
+                                      for raw in f:
+                                          line = raw.decode("utf-8", errors="replace").strip()
+                                          if not line or line.startswith("#"):
+                                              continue
+                                          parts = line.split()
+                                          seen += 1
+                                          total_chain_rows += 1
+                                          if len(parts) <= max_col:
+                                              skipped += 1
+                                              skipped_chain_rows += 1
+                                              continue
+                                          try:
+                                              weight = float(parts[0])
+                                              minus_loglike = float(parts[1])
+                                              omega_m = float(parts[needed["Omega_m"]])
+                                              h0 = float(parts[needed["H0_km_s_Mpc"]])
+                                              sigma8 = float(parts[needed["sigma8_z0"]])
+                                              rdragh = float(parts[needed["rdragh_Mpc_times_h"]])
+                                              vector, rd = qso_vector(omega_m, h0, rdragh, sigma8)
+                                          except Exception:
+                                              skipped += 1
+                                              skipped_chain_rows += 1
+                                              continue
+                                          weights.append(weight)
+                                          parameter_matrix.append([omega_m, h0, rdragh, rd, sigma8])
+                                          reference_matrix.append(vector)
+                                          used += 1
+                                          if len(sample_export_rows) < MAX_EXPORT_ROWS:
+                                              row = {
+                                                  "sample_id": f"{member}:{seen}",
+                                                  "weight": weight,
+                                                  "minus_loglike": minus_loglike,
+                                                  "Omega_m": omega_m,
+                                                  "H0_km_s_Mpc": h0,
+                                                  "rdragh_Mpc_times_h": rdragh,
+                                                  "rd_Mpc": rd,
+                                                  "sigma8_z0": sigma8,
+                                              }
+                                              for label, val in zip(LABELS, vector):
+                                                  row[label] = val
+                                              sample_export_rows.append(row)
+                              chain_member_rows.append({
+                                  "chain_member": member,
+                                  "present": present,
+                                  "member_rows_seen": seen,
+                                  "member_rows_used": used,
+                                  "member_rows_skipped": skipped,
+                              })
+              except Exception as exc:
+                  chain_member_rows.append({
+                      "chain_member": "exception",
+                      "present": False,
+                      "member_rows_seen": 0,
+                      "member_rows_used": 0,
+                      "member_rows_skipped": 0,
+                      "error": type(exc).__name__ + ": " + str(exc)[:240],
+                  })
+
+          ref_means, ref_cov = weighted_cov_matrix(reference_matrix, weights) if reference_matrix else ([], [])
+          param_means, param_cov = weighted_cov_matrix(parameter_matrix, weights) if parameter_matrix else ([], [])
+
+          if observed_ok and ref_cov:
+              combined_cov = mat_add(qso_cov, ref_cov)
+              residual = [observed_values[i] - ref_means[i] for i in range(3)]
+              observed_norm = quadratic_form_with_inverse(qso_cov, residual)
+              combined_norm = quadratic_form_with_inverse(combined_cov, residual)
+              observed_radius = math.sqrt(observed_norm) if observed_norm >= 0 else float("nan")
+              combined_radius = math.sqrt(combined_norm) if combined_norm >= 0 else float("nan")
+          else:
+              combined_cov = []
+              residual = []
+              observed_norm = combined_norm = observed_radius = combined_radius = float("nan")
+
+          qso_normalized_rows = []
+          for i, label in enumerate(LABELS):
+              if observed_ok:
+                  qso_normalized_rows.append({
+                      "label": label,
+                      "z": Z_QSO,
+                      "role": ROLES[label],
+                      "observed": observed_values[i],
+                      "observed_sigma": math.sqrt(qso_cov[i][i]) if qso_cov[i][i] > 0 else "",
+                      "source_url": QSO_VALUE_URL,
+                  })
+
+          ref_vector_rows = []
+          for i, label in enumerate(LABELS):
+              if ref_means:
+                  ref_vector_rows.append({
+                      "label": label,
+                      "z": Z_QSO,
+                      "role": ROLES[label],
+                      "planck_chain_reference_mean": ref_means[i],
+                      "planck_chain_reference_sigma": math.sqrt(ref_cov[i][i]) if ref_cov and ref_cov[i][i] > 0 else "",
+                      "status": "chain_derived_qso_reference_no_validation",
+                  })
+
+          residual_rows = []
+          for i, label in enumerate(LABELS):
+              if observed_ok and ref_means:
+                  obs_sig = math.sqrt(qso_cov[i][i])
+                  ref_sig = math.sqrt(ref_cov[i][i])
+                  comb_sig = math.sqrt(combined_cov[i][i])
+                  residual_rows.append({
+                      "label": label,
+                      "z": Z_QSO,
+                      "role": ROLES[label],
+                      "observed": observed_values[i],
+                      "planck_chain_reference_mean": ref_means[i],
+                      "residual_observed_minus_reference": residual[i],
+                      "percent_residual": 100.0 * residual[i] / ref_means[i],
+                      "observed_sigma": obs_sig,
+                      "reference_sigma": ref_sig,
+                      "combined_sigma_diagonal": comb_sig,
+                      "observed_sigma_units_preview_not_validation": residual[i] / obs_sig,
+                      "combined_sigma_units_preview_not_validation": residual[i] / comb_sig,
+                  })
+
+          param_names = ["Omega_m", "H0_km_s_Mpc", "rdragh_Mpc_times_h", "rd_Mpc", "sigma8_z0"]
+          param_summary_rows = []
+          if param_means:
+              for i, name in enumerate(param_names):
+                  param_summary_rows.append({
+                      "parameter": name,
+                      "weighted_mean": param_means[i],
+                      "weighted_sigma": math.sqrt(param_cov[i][i]) if param_cov and param_cov[i][i] > 0 else "",
+                      "status": "Planck_chain_derived_parameter_summary_for_QSO_reference",
+                  })
+
+          total_weight = sum(weights)
+          eff_n = (total_weight * total_weight / sum(w*w for w in weights)) if weights and sum(w*w for w in weights) > 0 else 0
+
+          if observed_ok and ref_cov:
+              package_status = "qso_observed_and_planck_chain_reference_preview_built"
+              selected_next_route = "qso_plus_limited_lrgxelg_consistency_bridge_no_full_overlap_with_scope_guards"
+          elif observed_ok:
+              package_status = "qso_observed_parser_passed_planck_reference_missing"
+              selected_next_route = "qso_planck_chain_reference_builder_repair_with_scope_guards"
+          else:
+              package_status = "qso_observed_parser_failed_or_source_unreachable"
+              selected_next_route = "qso_baoplus_source_parser_repair_with_scope_guards"
+
+          write_csv(OUT / "v4_184_source_fetch_status.csv", qso_fetch_rows, ["artifact", "url", "ok", "status_code", "content_type", "bytes_read", "error"])
+          write_csv(OUT / "v4_184_qso_baoplus_values.csv", qso_normalized_rows, ["label", "z", "role", "observed", "observed_sigma", "source_url"])
+          write_csv(OUT / "v4_184_qso_baoplus_observed_covariance.csv", mat_to_rows(qso_cov, LABELS, LABELS), ["row_label"] + LABELS)
+          write_csv(OUT / "v4_184_qso_baoplus_observed_correlation.csv", mat_to_rows(corr_from_cov(qso_cov), LABELS, LABELS) if observed_ok else [], ["row_label"] + LABELS)
+          write_csv(OUT / "v4_184_planck_download_status.csv", [planck_download], ["url", "download_attempted", "download_ok", "downloaded_bytes", "sha256", "error", "skipped_reason"])
+          write_csv(OUT / "v4_184_planck_paramnames_table.csv", paramnames_rows, ["parameter", "clean_parameter", "derived_flag", "display_label"])
+          write_csv(OUT / "v4_184_planck_chain_column_mapping.csv", mapping_rows, ["field", "aliases", "paramnames_index_zero_based", "chain_column_index_with_two_column_offset", "mapping_ok"])
+          write_csv(OUT / "v4_184_planck_chain_member_status.csv", chain_member_rows, ["chain_member", "present", "member_rows_seen", "member_rows_used", "member_rows_skipped"])
+          write_csv(OUT / "v4_184_planck_chain_parameter_summary.csv", param_summary_rows, ["parameter", "weighted_mean", "weighted_sigma", "status"])
+          write_csv(OUT / "v4_184_planck_chain_parameter_covariance.csv", mat_to_rows(param_cov, param_names, param_names), ["row_label"] + param_names)
+          write_csv(OUT / "v4_184_qso_planck_chain_reference_vector.csv", ref_vector_rows, ["label", "z", "role", "planck_chain_reference_mean", "planck_chain_reference_sigma", "status"])
+          write_csv(OUT / "v4_184_qso_planck_chain_reference_covariance.csv", mat_to_rows(ref_cov, LABELS, LABELS), ["row_label"] + LABELS)
+          write_csv(OUT / "v4_184_qso_planck_chain_reference_correlation.csv", mat_to_rows(corr_from_cov(ref_cov), LABELS, LABELS) if ref_cov else [], ["row_label"] + LABELS)
+          write_csv(OUT / "v4_184_qso_observed_plus_reference_combined_covariance.csv", mat_to_rows(combined_cov, LABELS, LABELS), ["row_label"] + LABELS)
+          write_csv(OUT / "v4_184_qso_observed_vs_planck_chain_residuals.csv", residual_rows, ["label", "z", "role", "observed", "planck_chain_reference_mean", "residual_observed_minus_reference", "percent_residual", "observed_sigma", "reference_sigma", "combined_sigma_diagonal", "observed_sigma_units_preview_not_validation", "combined_sigma_units_preview_not_validation"])
+          write_csv(OUT / "v4_184_qso_reference_ensemble_sample_export.csv", sample_export_rows, ["sample_id", "weight", "minus_loglike", "Omega_m", "H0_km_s_Mpc", "rdragh_Mpc_times_h", "rd_Mpc", "sigma8_z0"] + LABELS)
+
+          pattern = {}
+          if residual_rows:
+              pattern = {
+                  "growth_relative_to_reference": "above" if residual_rows[2]["residual_observed_minus_reference"] > 0 else "below",
+                  "DM_relative_to_reference": "above" if residual_rows[0]["residual_observed_minus_reference"] > 0 else "below",
+                  "DH_relative_to_reference": "above" if residual_rows[1]["residual_observed_minus_reference"] > 0 else "below",
+                  "largest_percent_residual_label": max(residual_rows, key=lambda r: abs(r["percent_residual"]))["label"],
+                  "largest_percent_residual": max(residual_rows, key=lambda r: abs(r["percent_residual"]))["percent_residual"],
+                  "largest_combined_sigma_units_label": max(residual_rows, key=lambda r: abs(r["combined_sigma_units_preview_not_validation"]))["label"],
+                  "largest_combined_sigma_units": max(residual_rows, key=lambda r: abs(r["combined_sigma_units_preview_not_validation"]))["combined_sigma_units_preview_not_validation"],
+              }
+
+          readiness = {
+              "version": "v4.184",
+              "result_label": RESULT_LABEL,
+              "package_status": package_status,
+              "qso_observed_parser_ok": observed_ok,
+              "planck_chain_rows_used": len(reference_matrix),
+              "effective_sample_size_preview": eff_n,
+              "qso_planck_reference_built": len(ref_means) == 3,
+              "qso_planck_reference_covariance_built": len(ref_cov) == 3,
+              "observed_plus_reference_combined_covariance_built": len(combined_cov) == 3,
+              "observed_norm_preview_not_validation": observed_norm,
+              "observed_radius_preview_not_validation": observed_radius,
+              "combined_norm_preview_not_validation": combined_norm,
+              "combined_radius_preview_not_validation": combined_radius,
+              "pattern_summary": pattern,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "QSO BAO-plus observed plus Planck-chain reference preview only; no validation",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+          (OUT / "v4_184_readiness_report.json").write_text(json.dumps(readiness, indent=2), encoding="utf-8")
+
+          (OUT / "v4_184_route_decision.json").write_text(json.dumps({
+              "version": "v4.184",
+              "result_label": RESULT_LABEL,
+              "clean_result": "QSO BAO-plus data/covariance were parsed and compared to a Planck-chain-derived QSO reference preview if source fetches succeeded. No validation or full eBOSS covariance was computed.",
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "blocked_claims": BLOCKED_CLAIMS,
+          }, indent=2), encoding="utf-8")
+
+          (OUT / "v4_184_scope_guards.json").write_text(json.dumps({
+              "scope": "QSO BAO-plus single-tracer parser and Planck-chain reference preview only",
+              "QSO_observed_covariance_used": observed_ok,
+              "Planck_chain_reference_covariance_used": len(ref_cov) == 3,
+              "full_eBOSS_covariance_used": False,
+              "QSO_plus_LRGxELG_cross_covariance_used": False,
+              "likelihood_computed": False,
+              "BIC_computed": False,
+              "posterior_model_comparison_computed": False,
+              "TAIRID_validated": False,
+          }, indent=2), encoding="utf-8")
+
+          (OUT / "v4_184_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = []
+          summary.append("# TAIRID v4.184 - eBOSS QSO BAO-plus Parser And Planck Chain Reference Preview")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("This workflow parses the official eBOSS QSO BAO-plus D_M/D_H/fσ8 data vector and covariance, then builds a Planck-chain-derived QSO reference preview.")
+          summary.append("")
+          summary.append("Package status: `" + package_status + "`")
+          summary.append("")
+          summary.append("Planck chain rows used: `" + str(len(reference_matrix)) + "`")
+          summary.append("")
+          summary.append("Combined radius preview, not validation: `" + (f"{combined_radius:.6f}" if math.isfinite(combined_radius) else "not built") + "`")
+          summary.append("")
+          summary.append("Selected next route: `" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for claim in BLOCKED_CLAIMS:
+              summary.append("- " + claim)
+          (OUT / "v4_184_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_184": True,
+              "result_label_present": RESULT_LABEL.endswith("no_validation"),
+              "source_fetch_status_written": (OUT / "v4_184_source_fetch_status.csv").exists(),
+              "qso_values_written": (OUT / "v4_184_qso_baoplus_values.csv").exists(),
+              "qso_covariance_written": (OUT / "v4_184_qso_baoplus_observed_covariance.csv").exists(),
+              "qso_correlation_written": (OUT / "v4_184_qso_baoplus_observed_correlation.csv").exists(),
+              "planck_download_status_written": (OUT / "v4_184_planck_download_status.csv").exists(),
+              "planck_mapping_written": (OUT / "v4_184_planck_chain_column_mapping.csv").exists(),
+              "planck_chain_status_written": (OUT / "v4_184_planck_chain_member_status.csv").exists(),
+              "planck_parameter_summary_written": (OUT / "v4_184_planck_chain_parameter_summary.csv").exists(),
+              "qso_reference_vector_written": (OUT / "v4_184_qso_planck_chain_reference_vector.csv").exists(),
+              "qso_reference_covariance_written": (OUT / "v4_184_qso_planck_chain_reference_covariance.csv").exists(),
+              "combined_covariance_written": (OUT / "v4_184_qso_observed_plus_reference_combined_covariance.csv").exists(),
+              "residuals_written": (OUT / "v4_184_qso_observed_vs_planck_chain_residuals.csv").exists(),
+              "sample_export_written": (OUT / "v4_184_qso_reference_ensemble_sample_export.csv").exists(),
+              "readiness_report_written": (OUT / "v4_184_readiness_report.json").exists(),
+              "route_decision_written": (OUT / "v4_184_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_184_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_184_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_184_summary.md").exists(),
+              "no_full_eBOSS_covariance_used": True,
+              "no_likelihood_claim": True,
+              "no_validation_claim": True,
+              "next_route_selected": bool(selected_next_route),
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.184",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "package_status": package_status,
+              "qso_observed_parser_ok": observed_ok,
+              "qso_planck_reference_covariance_built": len(ref_cov) == 3,
+              "combined_radius_preview_not_validation": combined_radius,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "QSO_BAO_plus_single_tracer_preview_only_no_validation",
+          }
+
+          (OUT / "v4_184_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.184 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_184_outputs/run_v4_184.py
+
+      - name: Upload v4.184 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-184-eboss-qso-baoplus-parser-and-planck-chain-reference-preview-output
+          path: tairid_v4_184_outputs/
