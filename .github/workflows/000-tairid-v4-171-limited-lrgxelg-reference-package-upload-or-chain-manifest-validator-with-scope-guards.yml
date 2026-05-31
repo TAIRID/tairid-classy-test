@@ -1,0 +1,546 @@
+name: 000 TAIRID v4.171 - Limited LRGxELG Reference Package Upload Or Chain Manifest Validator With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-171-limited-lrgxelg-reference-package-upload-or-chain-manifest-validator-with-scope-guards.yml"
+      - "data/reference/**"
+      - "reference/**"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-171-reference-package-validator:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.171 reference package or chain manifest validator
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_171_outputs
+          cat > tairid_v4_171_outputs/run_v4_171.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_171_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_reference_package_upload_or_chain_manifest_validator_passed_package_status_written_no_pressure_no_validation"
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          REQUIRED_META_COLUMNS = [
+              "source_family",
+              "provenance_url_or_note",
+              "license_or_use_note",
+          ]
+
+          OPTIONAL_PARAMETER_COLUMNS = [
+              "Omega_m",
+              "H0_km_s_Mpc",
+              "rd_Mpc",
+              "sigma8_z0",
+              "growth_index_gamma",
+          ]
+
+          BLOCKED_CLAIMS = [
+              "no pressure",
+              "no final chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          EXPECTED_FILES = {
+              "reference_ensemble_csv": [
+                  "data/reference/lrgxelg_reference_ensemble.csv",
+                  "data/reference/limited_lrgxelg_reference_ensemble.csv",
+                  "reference/lrgxelg_reference_ensemble.csv",
+                  "reference/limited_lrgxelg_reference_ensemble.csv",
+              ],
+              "reference_covariance_csv": [
+                  "data/reference/lrgxelg_reference_covariance.csv",
+                  "data/reference/limited_lrgxelg_reference_covariance.csv",
+                  "reference/lrgxelg_reference_covariance.csv",
+                  "reference/limited_lrgxelg_reference_covariance.csv",
+              ],
+              "chain_manifest_json": [
+                  "data/reference/planck_chain_manifest.json",
+                  "data/reference/lrgxelg_planck_chain_manifest.json",
+                  "reference/planck_chain_manifest.json",
+                  "reference/lrgxelg_planck_chain_manifest.json",
+              ],
+              "package_manifest_json": [
+                  "data/reference/lrgxelg_reference_package_manifest.json",
+                  "data/reference/limited_lrgxelg_reference_package_manifest.json",
+                  "reference/lrgxelg_reference_package_manifest.json",
+                  "reference/limited_lrgxelg_reference_package_manifest.json",
+              ],
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def finite_float(value):
+              try:
+                  x = float(value)
+                  return math.isfinite(x), x
+              except Exception:
+                  return False, None
+
+          def read_csv_rows(path):
+              with open(path, "r", newline="", encoding="utf-8") as f:
+                  return list(csv.DictReader(f))
+
+          def validate_reference_ensemble(path):
+              result = {
+                  "package_type": "reference_ensemble_csv",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": 0,
+                  "missing_columns": "",
+                  "nonfinite_cells": "",
+                  "notes": "",
+              }
+              if not path.exists():
+                  result["notes"] = "file not present"
+                  return result
+
+              rows = read_csv_rows(path)
+              result["row_count"] = len(rows)
+              fieldnames = rows[0].keys() if rows else []
+              required = ["sample_id"] + LABELS + REQUIRED_META_COLUMNS
+              missing = [c for c in required if c not in fieldnames]
+              result["missing_columns"] = ";".join(missing)
+              nonfinite = []
+              for ridx, row in enumerate(rows, start=1):
+                  for label in LABELS:
+                      ok, _ = finite_float(row.get(label, ""))
+                      if not ok:
+                          nonfinite.append(f"row{ridx}:{label}")
+              result["nonfinite_cells"] = ";".join(nonfinite[:50])
+              if missing:
+                  result["notes"] = "missing required columns"
+              elif len(rows) < 2:
+                  result["notes"] = "needs at least two rows to support covariance-building later"
+              elif nonfinite:
+                  result["notes"] = "non-finite six-slot values found"
+              else:
+                  result["valid"] = True
+                  result["notes"] = "schema-valid reference ensemble; ready for later covariance builder, not used for pressure here"
+              return result
+
+          def validate_reference_covariance(path):
+              result = {
+                  "package_type": "reference_covariance_csv",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": 0,
+                  "missing_columns": "",
+                  "nonfinite_cells": "",
+                  "notes": "",
+              }
+              if not path.exists():
+                  result["notes"] = "file not present"
+                  return result
+
+              rows = read_csv_rows(path)
+              result["row_count"] = len(rows)
+              required = ["row_label"] + LABELS
+              fieldnames = rows[0].keys() if rows else []
+              missing = [c for c in required if c not in fieldnames]
+              result["missing_columns"] = ";".join(missing)
+
+              if missing:
+                  result["notes"] = "missing required columns"
+                  return result
+              if len(rows) != 6:
+                  result["notes"] = "covariance file must have exactly six rows"
+                  return result
+
+              row_labels = [r.get("row_label", "") for r in rows]
+              if row_labels != LABELS:
+                  result["notes"] = "row_label order does not match expected six-label order"
+                  return result
+
+              matrix = []
+              nonfinite = []
+              for ridx, row in enumerate(rows):
+                  vals = []
+                  for cidx, label in enumerate(LABELS):
+                      ok, val = finite_float(row.get(label, ""))
+                      if not ok:
+                          nonfinite.append(f"row{ridx+1}:{label}")
+                          val = 0.0
+                      vals.append(val)
+                  matrix.append(vals)
+
+              result["nonfinite_cells"] = ";".join(nonfinite[:50])
+              if nonfinite:
+                  result["notes"] = "non-finite covariance cells found"
+                  return result
+
+              max_asym = 0.0
+              min_diag = None
+              for i in range(6):
+                  if min_diag is None or matrix[i][i] < min_diag:
+                      min_diag = matrix[i][i]
+                  for j in range(6):
+                      max_asym = max(max_asym, abs(matrix[i][j] - matrix[j][i]))
+
+              if max_asym > 1e-8:
+                  result["notes"] = f"covariance matrix is not symmetric; max_asym={max_asym}"
+              elif min_diag is None or min_diag <= 0:
+                  result["notes"] = f"covariance diagonal must be positive; min_diag={min_diag}"
+              else:
+                  result["valid"] = True
+                  result["notes"] = "schema-valid covariance matrix; ready for later matrix reader, not used for pressure here"
+              return result
+
+          def validate_chain_manifest(path):
+              result = {
+                  "package_type": "chain_manifest_json",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": "",
+                  "missing_columns": "",
+                  "nonfinite_cells": "",
+                  "notes": "",
+              }
+              if not path.exists():
+                  result["notes"] = "file not present"
+                  return result
+
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  result["notes"] = "invalid JSON: " + str(exc)[:160]
+                  return result
+
+              required_keys = [
+                  "chain_file",
+                  "parameter_fields",
+                  "source_family",
+                  "provenance_url_or_note",
+                  "license_or_use_note",
+              ]
+              missing = [k for k in required_keys if k not in data]
+              result["missing_columns"] = ";".join(missing)
+              if missing:
+                  result["notes"] = "missing required manifest keys"
+                  return result
+
+              parameter_fields = data.get("parameter_fields", [])
+              if not isinstance(parameter_fields, list) or len(parameter_fields) < 3:
+                  result["notes"] = "parameter_fields must be a list with enough fields to identify a usable chain"
+                  return result
+
+              chain_file = Path(str(data.get("chain_file", "")))
+              if not chain_file.exists():
+                  result["notes"] = "manifest schema valid, but referenced chain_file is not present in repository"
+                  return result
+
+              result["valid"] = True
+              result["notes"] = "manifest and referenced chain file found; ready for later chain route, not ingested here"
+              return result
+
+          def validate_package_manifest(path):
+              result = {
+                  "package_type": "package_manifest_json",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": "",
+                  "missing_columns": "",
+                  "nonfinite_cells": "",
+                  "notes": "",
+              }
+              if not path.exists():
+                  result["notes"] = "file not present"
+                  return result
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  result["notes"] = "invalid JSON: " + str(exc)[:160]
+                  return result
+
+              required_keys = [
+                  "package_type",
+                  "source_family",
+                  "provenance_url_or_note",
+                  "license_or_use_note",
+              ]
+              missing = [k for k in required_keys if k not in data]
+              result["missing_columns"] = ";".join(missing)
+              if missing:
+                  result["notes"] = "missing required package manifest keys"
+              else:
+                  result["valid"] = True
+                  result["notes"] = "package manifest valid; use with ensemble/covariance/chain file validator"
+              return result
+
+          # Inventory targeted expected files and nearby candidate files.
+          candidate_rows = []
+          for package_type, paths in EXPECTED_FILES.items():
+              for raw_path in paths:
+                  p = Path(raw_path)
+                  candidate_rows.append({
+                      "package_type": package_type,
+                      "path": raw_path,
+                      "present": p.exists(),
+                      "size_bytes": p.stat().st_size if p.exists() else "",
+                      "reason": "expected_path",
+                  })
+
+          for root in [Path("data/reference"), Path("reference")]:
+              if root.exists():
+                  for p in root.rglob("*"):
+                      if p.is_file() and p.suffix.lower() in [".csv", ".json", ".txt"]:
+                          if not any(row["path"] == str(p) for row in candidate_rows):
+                              candidate_rows.append({
+                                  "package_type": "nearby_candidate",
+                                  "path": str(p),
+                                  "present": True,
+                                  "size_bytes": p.stat().st_size,
+                                  "reason": "nearby_reference_folder_candidate",
+                              })
+
+          write_csv(
+              OUT / "v4_171_candidate_file_inventory.csv",
+              candidate_rows,
+              ["package_type", "path", "present", "size_bytes", "reason"],
+          )
+
+          validation_rows = []
+          for raw_path in EXPECTED_FILES["reference_ensemble_csv"]:
+              validation_rows.append(validate_reference_ensemble(Path(raw_path)))
+          for raw_path in EXPECTED_FILES["reference_covariance_csv"]:
+              validation_rows.append(validate_reference_covariance(Path(raw_path)))
+          for raw_path in EXPECTED_FILES["chain_manifest_json"]:
+              validation_rows.append(validate_chain_manifest(Path(raw_path)))
+          for raw_path in EXPECTED_FILES["package_manifest_json"]:
+              validation_rows.append(validate_package_manifest(Path(raw_path)))
+
+          write_csv(
+              OUT / "v4_171_package_validation_report.csv",
+              validation_rows,
+              [
+                  "package_type",
+                  "path",
+                  "present",
+                  "valid",
+                  "row_count",
+                  "missing_columns",
+                  "nonfinite_cells",
+                  "notes",
+              ],
+          )
+
+          valid_ensembles = [r for r in validation_rows if r["package_type"] == "reference_ensemble_csv" and r["valid"]]
+          valid_covariances = [r for r in validation_rows if r["package_type"] == "reference_covariance_csv" and r["valid"]]
+          valid_chain_manifests = [r for r in validation_rows if r["package_type"] == "chain_manifest_json" and r["valid"]]
+          valid_package_manifests = [r for r in validation_rows if r["package_type"] == "package_manifest_json" and r["valid"]]
+
+          if valid_ensembles:
+              selected_next_route = "limited_lrgxelg_reference_ensemble_covariance_builder_no_pressure_with_scope_guards"
+              package_status = "reference_ensemble_validated"
+          elif valid_covariances:
+              selected_next_route = "limited_lrgxelg_reference_covariance_matrix_reader_no_pressure_with_scope_guards"
+              package_status = "reference_covariance_matrix_validated"
+          elif valid_chain_manifests:
+              selected_next_route = "planck_chain_manifest_prepare_reference_ensemble_with_scope_guards"
+              package_status = "chain_manifest_validated"
+          else:
+              selected_next_route = "limited_lrgxelg_reference_package_manual_fill_request_with_scope_guards"
+              package_status = "no_valid_reference_package_found"
+
+          accepted_status = {
+              "version": "v4.171",
+              "result_label": RESULT_LABEL,
+              "package_status": package_status,
+              "valid_reference_ensemble_count": len(valid_ensembles),
+              "valid_reference_covariance_count": len(valid_covariances),
+              "valid_chain_manifest_count": len(valid_chain_manifests),
+              "valid_package_manifest_count": len(valid_package_manifests),
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "package_schema_validation_only_no_pressure_no_validation",
+          }
+
+          with open(OUT / "v4_171_accepted_reference_package_status.json", "w", encoding="utf-8") as f:
+              json.dump(accepted_status, f, indent=2)
+
+          request_lines = []
+          request_lines.append("# v4.171 Reference Package Request")
+          request_lines.append("")
+          request_lines.append("This file tells the user what to add if no valid package was found.")
+          request_lines.append("")
+          request_lines.append("## Best manual upload path")
+          request_lines.append("")
+          request_lines.append("Create this CSV in the repository:")
+          request_lines.append("")
+          request_lines.append("`data/reference/lrgxelg_reference_ensemble.csv`")
+          request_lines.append("")
+          request_lines.append("Required columns:")
+          request_lines.append("")
+          request_lines.append("`sample_id," + ",".join(LABELS + REQUIRED_META_COLUMNS) + "`")
+          request_lines.append("")
+          request_lines.append("Each row should be one reference sample or precomputed six-slot reference vector.")
+          request_lines.append("At least two rows are needed to support a covariance builder later; more rows are better.")
+          request_lines.append("")
+          request_lines.append("## Alternative covariance path")
+          request_lines.append("")
+          request_lines.append("Create this CSV:")
+          request_lines.append("")
+          request_lines.append("`data/reference/lrgxelg_reference_covariance.csv`")
+          request_lines.append("")
+          request_lines.append("Columns must be:")
+          request_lines.append("")
+          request_lines.append("`row_label," + ",".join(LABELS) + "`")
+          request_lines.append("")
+          request_lines.append("Rows must appear in the exact six-label order.")
+          request_lines.append("")
+          request_lines.append("## Chain manifest path")
+          request_lines.append("")
+          request_lines.append("Create this JSON:")
+          request_lines.append("")
+          request_lines.append("`data/reference/planck_chain_manifest.json`")
+          request_lines.append("")
+          request_lines.append("Required keys: `chain_file`, `parameter_fields`, `source_family`, `provenance_url_or_note`, `license_or_use_note`.")
+          request_lines.append("")
+          request_lines.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              request_lines.append("- " + item)
+
+          (OUT / "v4_171_reference_package_request.md").write_text("\n".join(request_lines), encoding="utf-8")
+
+          with open(OUT / "v4_171_scope_guards.json", "w", encoding="utf-8") as f:
+              json.dump({
+                  "scope": "limited LRGxELG reference package or chain manifest validator only",
+                  "validates_schema": True,
+                  "computes_reference_covariance": False,
+                  "computes_residuals": False,
+                  "computes_pressure": False,
+                  "computes_likelihood": False,
+                  "computes_bic": False,
+                  "computes_posterior_comparison": False,
+                  "validates_tairid": False,
+              }, f, indent=2)
+
+          with open(OUT / "v4_171_blocked_claims.json", "w", encoding="utf-8") as f:
+              json.dump({"blocked_claims": BLOCKED_CLAIMS}, f, indent=2)
+
+          route_decision = {
+              "version": "v4.171",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Reference package status was checked. No pressure or validation was computed.",
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "truth_boundary": "schema/package validation only",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+          with open(OUT / "v4_171_route_decision.json", "w", encoding="utf-8") as f:
+              json.dump(route_decision, f, indent=2)
+
+          summary = []
+          summary.append("# TAIRID v4.171 - Reference Package Or Chain Manifest Validator")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("The workflow checked whether a reference ensemble, reference covariance matrix, chain manifest, or package manifest exists in the repository.")
+          summary.append("")
+          summary.append("Package status: `" + package_status + "`")
+          summary.append("")
+          summary.append("Selected next route: `" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_171_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_171": True,
+              "result_label_present": RESULT_LABEL.endswith("no_pressure_no_validation"),
+              "candidate_inventory_written": (OUT / "v4_171_candidate_file_inventory.csv").exists(),
+              "validation_report_written": (OUT / "v4_171_package_validation_report.csv").exists(),
+              "accepted_status_written": (OUT / "v4_171_accepted_reference_package_status.json").exists(),
+              "package_request_written": (OUT / "v4_171_reference_package_request.md").exists(),
+              "route_decision_written": (OUT / "v4_171_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_171_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_171_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_171_summary.md").exists(),
+              "label_count_is_six": len(LABELS) == 6,
+              "expected_file_paths_scanned": sum(1 for row in candidate_rows if row["reason"] == "expected_path") >= 10,
+              "validation_rows_written": len(validation_rows) >= 10,
+              "package_status_selected": package_status in [
+                  "reference_ensemble_validated",
+                  "reference_covariance_matrix_validated",
+                  "chain_manifest_validated",
+                  "no_valid_reference_package_found",
+              ],
+              "next_route_selected": bool(selected_next_route),
+              "pressure_not_computed": True,
+              "likelihood_not_computed": True,
+              "bic_not_computed": True,
+              "posterior_not_computed": True,
+              "validation_not_claimed": True,
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.171",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "package_validation_only_no_pressure_no_validation",
+          }
+
+          with open(OUT / "v4_171_parser_health_report.json", "w", encoding="utf-8") as f:
+              json.dump(health, f, indent=2)
+
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.171 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_171_outputs/run_v4_171.py
+
+      - name: Upload v4.171 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-171-limited-lrgxelg-reference-package-validator-output
+          path: tairid_v4_171_outputs/
