@@ -1,0 +1,441 @@
+name: 000 TAIRID v4.178 - Limited LRGxELG Planck Summary Reference Vs Observed Preview No Pressure
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-178-limited-lrgxelg-planck-summary-reference-vs-observed-preview-no-pressure.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-178-planck-summary-reference-vs-observed-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.178 Planck summary reference vs observed preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_178_outputs
+          cat > tairid_v4_178_outputs/run_v4_178.py <<'PY'
+          import csv
+          import json
+          import math
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_178_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_planck_summary_reference_vs_observed_preview_passed_residual_artifacts_written_no_pressure_no_validation"
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          OBSERVED = {
+              "DM_ov_rd_z0p70": 17.954174,
+              "DH_ov_rd_z0p70": 21.221161,
+              "fsigma8_z0p70": 0.433572,
+              "DM_ov_rd_z0p845": 18.896851,
+              "DH_ov_rd_z0p845": 20.910056,
+              "fsigma8_z0p845": 0.296822,
+          }
+
+          OBSERVED_SIGMA = {
+              "DM_ov_rd_z0p70": 0.508712,
+              "DH_ov_rd_z0p70": 1.197674,
+              "fsigma8_z0p70": 0.050037,
+              "DM_ov_rd_z0p845": 0.776274,
+              "DH_ov_rd_z0p845": 2.861697,
+              "fsigma8_z0p845": 0.081385,
+          }
+
+          # Carried forward from v4.177 Planck CosmoParams extraction.
+          PLANCK_PARAMS = {
+              "Omega_m": {"mean": 0.3165504, "sddev": 0.0084223128, "source_parameter": "omegam*"},
+              "H0_km_s_Mpc": {"mean": 67.273386, "sddev": 0.60408851, "source_parameter": "H0*"},
+              "sigma8_z0": {"mean": 0.81197768, "sddev": 0.0073327667, "source_parameter": "sigma8*"},
+              "rdragh_Mpc_times_h": {"mean": 98.927975, "sddev": 1.0498631, "source_parameter": "rdragh*"},
+          }
+
+          h = PLANCK_PARAMS["H0_km_s_Mpc"]["mean"] / 100.0
+          rd = PLANCK_PARAMS["rdragh_Mpc_times_h"]["mean"] / h
+          rd_sd_diag = abs(rd) * math.sqrt(
+              (PLANCK_PARAMS["rdragh_Mpc_times_h"]["sddev"] / PLANCK_PARAMS["rdragh_Mpc_times_h"]["mean"]) ** 2
+              + (PLANCK_PARAMS["H0_km_s_Mpc"]["sddev"] / PLANCK_PARAMS["H0_km_s_Mpc"]["mean"]) ** 2
+          )
+
+          PLANCK_PARAMS["rd_Mpc"] = {
+              "mean": rd,
+              "sddev": rd_sd_diag,
+              "source_parameter": "derived_from_rdragh_and_H0",
+          }
+
+          Z_AND_ROLE = {
+              "DM_ov_rd_z0p70": (0.700, "transverse_geometry_reach"),
+              "DH_ov_rd_z0p70": (0.700, "radial_geometry_pacing_access"),
+              "fsigma8_z0p70": (0.700, "growth_consolidation"),
+              "DM_ov_rd_z0p845": (0.845, "transverse_geometry_reach"),
+              "DH_ov_rd_z0p845": (0.845, "radial_geometry_pacing_access"),
+              "fsigma8_z0p845": (0.845, "growth_consolidation"),
+          }
+
+          BLOCKED_CLAIMS = [
+              "no final pressure",
+              "no full chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no Planck posterior covariance accepted",
+              "no six-slot reference covariance accepted",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def e_z(z, omega_m):
+              return math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+          def simpson_integral_inverse_e(z, omega_m, n=2000):
+              if n % 2:
+                  n += 1
+              hstep = z / n
+              total = 1.0 / e_z(0.0, omega_m) + 1.0 / e_z(z, omega_m)
+              for i in range(1, n):
+                  total += (4 if i % 2 else 2) / e_z(i * hstep, omega_m)
+              return hstep * total / 3.0
+
+          def growth_factor_cpt(z, omega_m):
+              ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+              omz = omega_m * (1.0 + z) ** 3 / ez2
+              olz = (1.0 - omega_m) / ez2
+              gz = 5.0 * omz / (2.0 * (omz ** (4.0 / 7.0) - olz + (1.0 + omz / 2.0) * (1.0 + olz / 70.0)))
+              om0 = omega_m
+              ol0 = 1.0 - omega_m
+              g0 = 5.0 * om0 / (2.0 * (om0 ** (4.0 / 7.0) - ol0 + (1.0 + om0 / 2.0) * (1.0 + ol0 / 70.0)))
+              return gz / (g0 * (1.0 + z))
+
+          def reference_vector(params, gamma=0.55):
+              c_km_s = 299792.458
+              omega_m = params["Omega_m"]
+              h0 = params["H0_km_s_Mpc"]
+              rd_mpc = params["rd_Mpc"]
+              sigma8 = params["sigma8_z0"]
+              values = {}
+              for suffix, z in [("z0p70", 0.700), ("z0p845", 0.845)]:
+                  ez = e_z(z, omega_m)
+                  dm_rd = (c_km_s / h0) * simpson_integral_inverse_e(z, omega_m) / rd_mpc
+                  dh_rd = c_km_s / (h0 * ez) / rd_mpc
+                  ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+                  omz = omega_m * (1.0 + z) ** 3 / ez2
+                  f_growth = omz ** gamma
+                  fs8 = f_growth * sigma8 * growth_factor_cpt(z, omega_m)
+                  values["DM_ov_rd_" + suffix] = dm_rd
+                  values["DH_ov_rd_" + suffix] = dh_rd
+                  values["fsigma8_" + suffix] = fs8
+              return values
+
+          central_params = {
+              "Omega_m": PLANCK_PARAMS["Omega_m"]["mean"],
+              "H0_km_s_Mpc": PLANCK_PARAMS["H0_km_s_Mpc"]["mean"],
+              "rd_Mpc": PLANCK_PARAMS["rd_Mpc"]["mean"],
+              "sigma8_z0": PLANCK_PARAMS["sigma8_z0"]["mean"],
+          }
+
+          central_ref = reference_vector(central_params)
+
+          param_rows = []
+          for key, item in PLANCK_PARAMS.items():
+              param_rows.append({
+                  "field": key,
+                  "source_parameter": item["source_parameter"],
+                  "mean": item["mean"],
+                  "sddev": item["sddev"],
+                  "source": "v4.177 Planck CosmoParams margestats extraction",
+              })
+
+          write_csv(
+              OUT / "v4_178_planck_parameter_packet_carried_forward.csv",
+              param_rows,
+              ["field", "source_parameter", "mean", "sddev", "source"],
+          )
+
+          ref_rows = []
+          for label in LABELS:
+              z, role = Z_AND_ROLE[label]
+              ref_rows.append({
+                  "label": label,
+                  "z": z,
+                  "role": role,
+                  "planck_summary_reference_value": central_ref[label],
+                  "source": "v4.177 Planck-summary parameter packet + LCDM-lite distance/growth approximation",
+                  "status": "reference_preview_only_no_pressure",
+              })
+
+          write_csv(
+              OUT / "v4_178_planck_summary_reference_vector.csv",
+              ref_rows,
+              ["label", "z", "role", "planck_summary_reference_value", "source", "status"],
+          )
+
+          # Diagonal marginal corridor preview from Planck parameter SDs.
+          driver_steps = {
+              "Omega_m": PLANCK_PARAMS["Omega_m"]["sddev"],
+              "H0_km_s_Mpc": PLANCK_PARAMS["H0_km_s_Mpc"]["sddev"],
+              "rd_Mpc": PLANCK_PARAMS["rd_Mpc"]["sddev"],
+              "sigma8_z0": PLANCK_PARAMS["sigma8_z0"]["sddev"],
+          }
+
+          corridor_rows = []
+          per_label_corridor_squares = {label: 0.0 for label in LABELS}
+          for driver, step in driver_steps.items():
+              if not step or not math.isfinite(step) or step <= 0:
+                  continue
+              plus = dict(central_params)
+              minus = dict(central_params)
+              plus[driver] += step
+              minus[driver] -= step
+              plus_vec = reference_vector(plus)
+              minus_vec = reference_vector(minus)
+              for label in LABELS:
+                  half_width = abs(plus_vec[label] - minus_vec[label]) / 2.0
+                  per_label_corridor_squares[label] += half_width ** 2
+                  corridor_rows.append({
+                      "driver": driver,
+                      "driver_one_sigma_step": step,
+                      "label": label,
+                      "central_reference_value": central_ref[label],
+                      "one_sigma_half_width_preview_not_covariance": half_width,
+                      "fractional_half_width_preview_not_covariance": half_width / abs(central_ref[label]) if central_ref[label] else "",
+                  })
+
+          write_csv(
+              OUT / "v4_178_planck_diagonal_corridor_components.csv",
+              corridor_rows,
+              ["driver", "driver_one_sigma_step", "label", "central_reference_value", "one_sigma_half_width_preview_not_covariance", "fractional_half_width_preview_not_covariance"],
+          )
+
+          residual_rows = []
+          role_summary = {}
+          redshift_summary = {}
+          for label in LABELS:
+              z, role = Z_AND_ROLE[label]
+              obs = OBSERVED[label]
+              obs_sig = OBSERVED_SIGMA[label]
+              ref = central_ref[label]
+              diff = obs - ref
+              pct = 100.0 * diff / ref
+              obs_sigma_units = diff / obs_sig
+              planck_diag_corridor = math.sqrt(per_label_corridor_squares[label])
+              planck_corridor_units = diff / planck_diag_corridor if planck_diag_corridor > 0 else ""
+              quadrature_preview = math.sqrt(obs_sig ** 2 + planck_diag_corridor ** 2)
+              quadrature_units_preview = diff / quadrature_preview if quadrature_preview > 0 else ""
+
+              residual_rows.append({
+                  "label": label,
+                  "z": z,
+                  "role": role,
+                  "observed": obs,
+                  "observed_sigma": obs_sig,
+                  "planck_summary_reference": ref,
+                  "observed_minus_planck_summary_reference": diff,
+                  "percent_residual": pct,
+                  "observed_sigma_units_preview_not_pressure": obs_sigma_units,
+                  "planck_diagonal_corridor_half_width_preview_not_covariance": planck_diag_corridor,
+                  "planck_corridor_units_preview_not_pressure": planck_corridor_units,
+                  "observed_plus_planck_diagonal_quadrature_units_preview_not_pressure": quadrature_units_preview,
+              })
+
+              role_summary.setdefault(role, []).append(diff / abs(ref))
+              redshift_summary.setdefault(str(z), []).append(diff / abs(ref))
+
+          write_csv(
+              OUT / "v4_178_observed_vs_planck_summary_residuals.csv",
+              residual_rows,
+              [
+                  "label", "z", "role", "observed", "observed_sigma", "planck_summary_reference",
+                  "observed_minus_planck_summary_reference", "percent_residual",
+                  "observed_sigma_units_preview_not_pressure",
+                  "planck_diagonal_corridor_half_width_preview_not_covariance",
+                  "planck_corridor_units_preview_not_pressure",
+                  "observed_plus_planck_diagonal_quadrature_units_preview_not_pressure",
+              ],
+          )
+
+          role_rows = []
+          for role, vals in role_summary.items():
+              role_rows.append({
+                  "role": role,
+                  "mean_fractional_residual": sum(vals) / len(vals),
+                  "max_abs_fractional_residual": max(abs(v) for v in vals),
+                  "count": len(vals),
+              })
+
+          write_csv(
+              OUT / "v4_178_role_summary.csv",
+              role_rows,
+              ["role", "mean_fractional_residual", "max_abs_fractional_residual", "count"],
+          )
+
+          redshift_rows = []
+          for z, vals in redshift_summary.items():
+              redshift_rows.append({
+                  "z": z,
+                  "mean_fractional_residual": sum(vals) / len(vals),
+                  "max_abs_fractional_residual": max(abs(v) for v in vals),
+                  "count": len(vals),
+              })
+
+          write_csv(
+              OUT / "v4_178_redshift_summary.csv",
+              redshift_rows,
+              ["z", "mean_fractional_residual", "max_abs_fractional_residual", "count"],
+          )
+
+          pattern = {
+              "growth_below_planck_summary_at_both_redshifts": (
+                  OBSERVED["fsigma8_z0p70"] < central_ref["fsigma8_z0p70"]
+                  and OBSERVED["fsigma8_z0p845"] < central_ref["fsigma8_z0p845"]
+              ),
+              "radial_geometry_above_planck_summary_at_both_redshifts": (
+                  OBSERVED["DH_ov_rd_z0p70"] > central_ref["DH_ov_rd_z0p70"]
+                  and OBSERVED["DH_ov_rd_z0p845"] > central_ref["DH_ov_rd_z0p845"]
+              ),
+              "transverse_geometry_flips_sign": (
+                  (OBSERVED["DM_ov_rd_z0p70"] - central_ref["DM_ov_rd_z0p70"])
+                  * (OBSERVED["DM_ov_rd_z0p845"] - central_ref["DM_ov_rd_z0p845"])
+                  < 0
+              ),
+              "largest_percent_residual_label": max(residual_rows, key=lambda r: abs(r["percent_residual"]))["label"],
+              "largest_percent_residual": max(residual_rows, key=lambda r: abs(r["percent_residual"]))["percent_residual"],
+              "largest_observed_sigma_preview_label": max(residual_rows, key=lambda r: abs(r["observed_sigma_units_preview_not_pressure"]))["label"],
+              "largest_observed_sigma_preview": max(residual_rows, key=lambda r: abs(r["observed_sigma_units_preview_not_pressure"]))["observed_sigma_units_preview_not_pressure"],
+          }
+
+          (OUT / "v4_178_pattern_summary.json").write_text(json.dumps(pattern, indent=2), encoding="utf-8")
+
+          selected_next_route = "limited_lrgxelg_planck_covmat_parameter_order_mapping_and_propagation_attempt_no_pressure_with_scope_guards"
+
+          route_decision = {
+              "version": "v4.178",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Observed limited LRGxELG values were compared to the v4.177 Planck-summary reference vector. No final pressure or validation was computed.",
+              "selected_next_route": selected_next_route,
+              "pattern_summary": pattern,
+              "truth_boundary": "Planck-summary residual preview only; no six-slot reference covariance accepted",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+
+          (OUT / "v4_178_route_decision.json").write_text(json.dumps(route_decision, indent=2), encoding="utf-8")
+
+          (OUT / "v4_178_scope_guards.json").write_text(json.dumps({
+              "scope": "observed vs Planck-summary reference preview only",
+              "observed_values_used": True,
+              "planck_summary_reference_used": True,
+              "planck_diagonal_corridor_preview_used": True,
+              "six_slot_reference_covariance_accepted": False,
+              "pressure_computed": False,
+              "likelihood_computed": False,
+              "bic_computed": False,
+              "posterior_comparison_computed": False,
+              "tairid_validated": False,
+          }, indent=2), encoding="utf-8")
+
+          (OUT / "v4_178_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = []
+          summary.append("# TAIRID v4.178 - Planck Summary Reference Vs Observed Preview")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("This workflow compares the observed limited LRGxELG product to the v4.177 Planck-summary reference vector.")
+          summary.append("")
+          summary.append("## Main pattern")
+          summary.append("")
+          summary.append("- Growth fσ8 below Planck-summary reference at both redshifts: `" + str(pattern["growth_below_planck_summary_at_both_redshifts"]) + "`")
+          summary.append("- Radial geometry DH/rd above Planck-summary reference at both redshifts: `" + str(pattern["radial_geometry_above_planck_summary_at_both_redshifts"]) + "`")
+          summary.append("- Transverse geometry DM/rd flips sign across redshift: `" + str(pattern["transverse_geometry_flips_sign"]) + "`")
+          summary.append("")
+          summary.append("Largest percent residual: `" + str(pattern["largest_percent_residual_label"]) + " = " + str(pattern["largest_percent_residual"]) + "`")
+          summary.append("")
+          summary.append("Largest observed-sigma preview: `" + str(pattern["largest_observed_sigma_preview_label"]) + " = " + str(pattern["largest_observed_sigma_preview"]) + "`")
+          summary.append("")
+          summary.append("## Selected next route")
+          summary.append("")
+          summary.append("`" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_178_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_178": True,
+              "result_label_present": RESULT_LABEL.endswith("no_pressure_no_validation"),
+              "planck_parameter_packet_written": (OUT / "v4_178_planck_parameter_packet_carried_forward.csv").exists(),
+              "planck_reference_vector_written": (OUT / "v4_178_planck_summary_reference_vector.csv").exists(),
+              "corridor_components_written": (OUT / "v4_178_planck_diagonal_corridor_components.csv").exists(),
+              "residuals_written": (OUT / "v4_178_observed_vs_planck_summary_residuals.csv").exists(),
+              "role_summary_written": (OUT / "v4_178_role_summary.csv").exists(),
+              "redshift_summary_written": (OUT / "v4_178_redshift_summary.csv").exists(),
+              "pattern_summary_written": (OUT / "v4_178_pattern_summary.json").exists(),
+              "route_decision_written": (OUT / "v4_178_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_178_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_178_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_178_summary.md").exists(),
+              "six_residual_rows": len(residual_rows) == 6,
+              "growth_below_both_redshifts": pattern["growth_below_planck_summary_at_both_redshifts"],
+              "radial_geometry_above_both_redshifts": pattern["radial_geometry_above_planck_summary_at_both_redshifts"],
+              "transverse_geometry_flips": pattern["transverse_geometry_flips_sign"],
+              "next_route_selected": selected_next_route == "limited_lrgxelg_planck_covmat_parameter_order_mapping_and_propagation_attempt_no_pressure_with_scope_guards",
+              "no_pressure_computed": True,
+              "no_validation_claimed": True,
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.178",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "planck_summary_residual_preview_only_no_pressure_no_validation",
+          }
+
+          (OUT / "v4_178_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.178 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_178_outputs/run_v4_178.py
+
+      - name: Upload v4.178 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-178-limited-lrgxelg-planck-summary-reference-vs-observed-preview-output
+          path: tairid_v4_178_outputs/
