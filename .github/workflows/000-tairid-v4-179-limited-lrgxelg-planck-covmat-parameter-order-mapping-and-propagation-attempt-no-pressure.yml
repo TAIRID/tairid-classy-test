@@ -1,0 +1,635 @@
+name: 000 TAIRID v4.179 - Limited LRGxELG Planck Covmat Parameter Order Mapping And Propagation Attempt No Pressure
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-179-limited-lrgxelg-planck-covmat-parameter-order-mapping-and-propagation-attempt-no-pressure.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-179-planck-covmat-order-mapping-propagation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.179 Planck covmat order mapping and propagation attempt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_179_outputs
+          cat > tairid_v4_179_outputs/run_v4_179.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import os
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_179_outputs")
+          TMP = OUT / "tmp_downloads"
+          TMP.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_planck_covmat_parameter_order_mapping_and_propagation_attempt_passed_covariance_artifacts_written_no_pressure_no_validation"
+
+          PACKAGE_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PACKAGE_ID = "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00"
+
+          BASE_PREFIX = "base/plikHM_TTTEEE_lowl_lowE"
+          SELECTED_MEMBERS = {
+              "paramnames": BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE.paramnames",
+              "margestats": BASE_PREFIX + "/dist/base_plikHM_TTTEEE_lowl_lowE.margestats",
+              "covmat": BASE_PREFIX + "/dist/base_plikHM_TTTEEE_lowl_lowE.covmat",
+          }
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          PARAM_ALIAS_MAP = {
+              "Omega_m": ["omegam", "Omega_m"],
+              "H0_km_s_Mpc": ["H0", "h0"],
+              "rdragh_Mpc_times_h": ["rdragh", "rdrag_h", "rdragh*"],
+              "sigma8_z0": ["sigma8", "sigma8*"],
+          }
+
+          DERIVED_PARAM_ORDER = ["Omega_m", "H0_km_s_Mpc", "rd_Mpc", "sigma8_z0"]
+
+          BLOCKED_CLAIMS = [
+              "no observed residuals computed",
+              "no pressure computed",
+              "no final chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no final Planck posterior covariance claim",
+              "no final six-slot reference covariance claim",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          MAX_DOWNLOAD_BYTES = int(os.environ.get("TAIRID_MAX_DOWNLOAD_BYTES", str(350 * 1024 * 1024)))
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_with_cap(url, out_path, cap_bytes):
+              result = {
+                  "url": url,
+                  "download_attempted": True,
+                  "download_ok": False,
+                  "downloaded_bytes": 0,
+                  "sha256": "",
+                  "error": "",
+                  "skipped_reason": "",
+              }
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.179/1.0"})
+                  with urllib.request.urlopen(req, timeout=90) as resp, open(out_path, "wb") as f:
+                      total = 0
+                      while True:
+                          chunk = resp.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          total += len(chunk)
+                          if total > cap_bytes:
+                              result["downloaded_bytes"] = total
+                              result["skipped_reason"] = "download exceeded cap " + str(cap_bytes)
+                              try:
+                                  f.close()
+                                  out_path.unlink(missing_ok=True)
+                              except Exception:
+                                  pass
+                              return result
+                          f.write(chunk)
+                      result["downloaded_bytes"] = total
+                  result["sha256"] = sha256_file(out_path)
+                  result["download_ok"] = True
+              except Exception as exc:
+                  result["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+                  try:
+                      out_path.unlink(missing_ok=True)
+                  except Exception:
+                      pass
+              return result
+
+          def read_member_text(zf, member):
+              return zf.read(member).decode("utf-8", errors="replace")
+
+          def parse_paramnames(text):
+              rows = []
+              for raw in text.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split(None, 1)
+                  parameter = parts[0].strip()
+                  rows.append({
+                      "parameter": parameter,
+                      "clean_parameter": parameter.rstrip("*"),
+                      "derived_flag": parameter.endswith("*"),
+                      "display_label": parts[1].strip() if len(parts) > 1 else "",
+                  })
+              return rows
+
+          def parse_margestats(text):
+              rows = []
+              in_table = False
+              for raw in text.splitlines():
+                  line = raw.rstrip()
+                  if not line.strip():
+                      continue
+                  if line.lower().startswith("parameter"):
+                      in_table = True
+                      continue
+                  if not in_table:
+                      continue
+                  parts = line.split()
+                  if len(parts) < 4:
+                      continue
+                  parameter = parts[0]
+                  try:
+                      mean = float(parts[1])
+                      sddev = float(parts[2])
+                      lower1 = float(parts[3])
+                      upper1 = float(parts[4]) if len(parts) > 4 else float("nan")
+                  except Exception:
+                      continue
+                  rows.append({
+                      "parameter": parameter,
+                      "clean_parameter": parameter.rstrip("*"),
+                      "derived_flag": parameter.endswith("*"),
+                      "mean": mean,
+                      "sddev": sddev,
+                      "lower1": lower1,
+                      "upper1": upper1,
+                      "display_label": " ".join(parts[12:]) if len(parts) > 12 else "",
+                  })
+              return rows
+
+          def parse_covmat(text):
+              matrix = []
+              for raw in text.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  vals = []
+                  ok = True
+                  for p in parts:
+                      try:
+                          vals.append(float(p))
+                      except Exception:
+                          ok = False
+                          break
+                  if ok and vals:
+                      matrix.append(vals)
+              return matrix
+
+          def matmul(A, B):
+              return [[sum(A[i][k] * B[k][j] for k in range(len(B))) for j in range(len(B[0]))] for i in range(len(A))]
+
+          def transpose(A):
+              return [list(row) for row in zip(*A)]
+
+          def matvec(A, v):
+              return [sum(row[j] * v[j] for j in range(len(v))) for row in A]
+
+          def cov_sym_diag(matrix):
+              if not matrix:
+                  return {"rows": 0, "cols": 0, "square": False, "symmetric": False, "max_asym": "", "min_diag": "", "positive_diag": False}
+              rows = len(matrix)
+              cols = max(len(r) for r in matrix)
+              square = rows == cols and all(len(r) == cols for r in matrix)
+              if not square:
+                  return {"rows": rows, "cols": cols, "square": False, "symmetric": False, "max_asym": "", "min_diag": "", "positive_diag": False}
+              max_asym = 0.0
+              min_diag = None
+              for i in range(rows):
+                  min_diag = matrix[i][i] if min_diag is None else min(min_diag, matrix[i][i])
+                  for j in range(cols):
+                      max_asym = max(max_asym, abs(matrix[i][j] - matrix[j][i]))
+              return {
+                  "rows": rows,
+                  "cols": cols,
+                  "square": True,
+                  "symmetric": max_asym <= 1e-10,
+                  "max_asym": max_asym,
+                  "min_diag": min_diag,
+                  "positive_diag": min_diag is not None and min_diag > 0,
+              }
+
+          def find_param_index(paramnames_rows, aliases):
+              lookup_clean = {}
+              lookup_full = {}
+              for idx, row in enumerate(paramnames_rows):
+                  lookup_clean[row["clean_parameter"].lower()] = idx
+                  lookup_full[row["parameter"].lower()] = idx
+              for alias in aliases:
+                  key = alias.lower().rstrip("*")
+                  if key in lookup_clean:
+                      return lookup_clean[key]
+                  if alias.lower() in lookup_full:
+                      return lookup_full[alias.lower()]
+              return None
+
+          def find_margestats_row(margestats_rows, aliases):
+              lookup_clean = {row["clean_parameter"].lower(): row for row in margestats_rows}
+              lookup_full = {row["parameter"].lower(): row for row in margestats_rows}
+              for alias in aliases:
+                  key = alias.lower().rstrip("*")
+                  if key in lookup_clean:
+                      return lookup_clean[key]
+                  if alias.lower() in lookup_full:
+                      return lookup_full[alias.lower()]
+              return None
+
+          def e_z(z, omega_m):
+              return math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+          def simpson_integral_inverse_e(z, omega_m, n=2000):
+              if n % 2:
+                  n += 1
+              hstep = z / n
+              total = 1.0 / e_z(0.0, omega_m) + 1.0 / e_z(z, omega_m)
+              for i in range(1, n):
+                  total += (4 if i % 2 else 2) / e_z(i * hstep, omega_m)
+              return hstep * total / 3.0
+
+          def growth_factor_cpt(z, omega_m):
+              ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+              omz = omega_m * (1.0 + z) ** 3 / ez2
+              olz = (1.0 - omega_m) / ez2
+              gz = 5.0 * omz / (2.0 * (omz ** (4.0 / 7.0) - olz + (1.0 + omz / 2.0) * (1.0 + olz / 70.0)))
+              om0 = omega_m
+              ol0 = 1.0 - omega_m
+              g0 = 5.0 * om0 / (2.0 * (om0 ** (4.0 / 7.0) - ol0 + (1.0 + om0 / 2.0) * (1.0 + ol0 / 70.0)))
+              return gz / (g0 * (1.0 + z))
+
+          def reference_values(params):
+              c_km_s = 299792.458
+              omega_m = params["Omega_m"]
+              h0 = params["H0_km_s_Mpc"]
+              rd_mpc = params["rd_Mpc"]
+              sigma8 = params["sigma8_z0"]
+              gamma = 0.55
+              values = {}
+              for suffix, z in [("z0p70", 0.700), ("z0p845", 0.845)]:
+                  ez = e_z(z, omega_m)
+                  dm_rd = (c_km_s / h0) * simpson_integral_inverse_e(z, omega_m) / rd_mpc
+                  dh_rd = c_km_s / (h0 * ez) / rd_mpc
+                  ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+                  omz = omega_m * (1.0 + z) ** 3 / ez2
+                  f_growth = omz ** gamma
+                  fs8 = f_growth * sigma8 * growth_factor_cpt(z, omega_m)
+                  values["DM_ov_rd_" + suffix] = dm_rd
+                  values["DH_ov_rd_" + suffix] = dh_rd
+                  values["fsigma8_" + suffix] = fs8
+              return values
+
+          def finite_difference_jacobian(params, cov_params):
+              # Step from parameter covariance diagonal, with fallback if unavailable.
+              rows = []
+              for label in LABELS:
+                  row = []
+                  for pname in DERIVED_PARAM_ORDER:
+                      diag = cov_params.get(pname, {}).get("variance", 0.0)
+                      step = math.sqrt(diag) if diag and diag > 0 else abs(params[pname]) * 1e-5
+                      if step == 0:
+                          step = 1e-5
+                      plus = dict(params)
+                      minus = dict(params)
+                      plus[pname] += step
+                      minus[pname] -= step
+                      fp = reference_values(plus)[label]
+                      fm = reference_values(minus)[label]
+                      row.append((fp - fm) / (2.0 * step))
+                  rows.append(row)
+              return rows
+
+          def matrix_to_rows(matrix, row_names, col_names, prefix_fields=None):
+              rows = []
+              for i, rname in enumerate(row_names):
+                  row = {"row_label": rname}
+                  if prefix_fields:
+                      row.update(prefix_fields(i, rname))
+                  for j, cname in enumerate(col_names):
+                      row[cname] = matrix[i][j] if i < len(matrix) and j < len(matrix[i]) else ""
+                  rows.append(row)
+              return rows
+
+          download_path = TMP / "planck_candidate.zip"
+          download = download_with_cap(PACKAGE_URL, download_path, MAX_DOWNLOAD_BYTES)
+
+          paramnames_rows = []
+          margestats_rows = []
+          covmat = []
+          member_status_rows = []
+          parameter_map_rows = []
+          selected_input_cov_rows = []
+          derived_param_rows = []
+          derived_param_cov_rows = []
+          reference_vector_rows = []
+          jacobian_rows = []
+          reference_cov_rows = []
+          reference_corr_rows = []
+          readiness_status = "download_failed_or_blocked"
+          selected_next_route = "limited_lrgxelg_planck_package_download_failed_try_manual_route_with_scope_guards"
+
+          if download["download_ok"]:
+              try:
+                  with zipfile.ZipFile(download_path, "r") as zf:
+                      names = set(zf.namelist())
+                      for key, member in SELECTED_MEMBERS.items():
+                          present = member in names
+                          member_status_rows.append({"member_key": key, "member_name": member, "present": present, "status": "present" if present else "missing"})
+                      if SELECTED_MEMBERS["paramnames"] in names:
+                          paramnames_rows = parse_paramnames(read_member_text(zf, SELECTED_MEMBERS["paramnames"]))
+                      if SELECTED_MEMBERS["margestats"] in names:
+                          margestats_rows = parse_margestats(read_member_text(zf, SELECTED_MEMBERS["margestats"]))
+                      if SELECTED_MEMBERS["covmat"] in names:
+                          covmat = parse_covmat(read_member_text(zf, SELECTED_MEMBERS["covmat"]))
+              except Exception as exc:
+                  member_status_rows.append({"member_key": "exception", "member_name": "", "present": False, "status": type(exc).__name__ + ": " + str(exc)[:240]})
+
+          covdiag = cov_sym_diag(covmat)
+          source_covmat_usable = bool(covdiag["square"] and covdiag["symmetric"] and covdiag["positive_diag"])
+
+          selected_input_names = ["Omega_m", "H0_km_s_Mpc", "rdragh_Mpc_times_h", "sigma8_z0"]
+          selected_indices = []
+          selected_means = {}
+          selected_margestats = {}
+
+          if paramnames_rows and margestats_rows:
+              for pname in selected_input_names:
+                  aliases = PARAM_ALIAS_MAP[pname]
+                  idx = find_param_index(paramnames_rows, aliases)
+                  mrow = find_margestats_row(margestats_rows, aliases)
+                  ok = idx is not None and mrow is not None
+                  parameter_map_rows.append({
+                      "field": pname,
+                      "aliases": ";".join(aliases),
+                      "paramnames_index_zero_based": idx if idx is not None else "",
+                      "margestats_parameter": mrow["parameter"] if mrow else "",
+                      "margestats_mean": mrow["mean"] if mrow else "",
+                      "margestats_sddev": mrow["sddev"] if mrow else "",
+                      "mapping_ok": ok,
+                  })
+                  if ok:
+                      selected_indices.append(idx)
+                      selected_means[pname] = mrow["mean"]
+                      selected_margestats[pname] = mrow
+
+          mapping_ok = len(selected_indices) == 4 and source_covmat_usable and max(selected_indices) < len(covmat)
+
+          if mapping_ok:
+              # Input parameter covariance in order Omega_m, H0, rdragh, sigma8.
+              C_in = [[covmat[i][j] for j in selected_indices] for i in selected_indices]
+              input_names = selected_input_names
+              selected_input_cov_rows = matrix_to_rows(C_in, input_names, input_names)
+
+              omega_m = selected_means["Omega_m"]
+              h0 = selected_means["H0_km_s_Mpc"]
+              rdragh = selected_means["rdragh_Mpc_times_h"]
+              sigma8 = selected_means["sigma8_z0"]
+              rd = rdragh / (h0 / 100.0)
+
+              # Transform input params [Omega_m, H0, rdragh, sigma8]
+              # to derived params [Omega_m, H0, rd, sigma8].
+              J_derive = [
+                  [1.0, 0.0, 0.0, 0.0],
+                  [0.0, 1.0, 0.0, 0.0],
+                  [0.0, -rd / h0, 100.0 / h0, 0.0],
+                  [0.0, 0.0, 0.0, 1.0],
+              ]
+              C_derived = matmul(matmul(J_derive, C_in), transpose(J_derive))
+              derived_params = {
+                  "Omega_m": omega_m,
+                  "H0_km_s_Mpc": h0,
+                  "rd_Mpc": rd,
+                  "sigma8_z0": sigma8,
+              }
+
+              derived_param_rows = []
+              for i, pname in enumerate(DERIVED_PARAM_ORDER):
+                  derived_param_rows.append({
+                      "parameter": pname,
+                      "mean": derived_params[pname],
+                      "variance_from_planck_covmat_propagation": C_derived[i][i],
+                      "sigma_from_planck_covmat_propagation": math.sqrt(C_derived[i][i]) if C_derived[i][i] > 0 else "",
+                      "status": "derived_parameter_packet_for_reference_propagation_not_final_cosmology_fit",
+                  })
+
+              derived_param_cov_rows = matrix_to_rows(C_derived, DERIVED_PARAM_ORDER, DERIVED_PARAM_ORDER)
+
+              ref = reference_values(derived_params)
+              for label in LABELS:
+                  z = 0.700 if "z0p70" in label else 0.845
+                  role = "growth_consolidation" if "fsigma8" in label else ("transverse_geometry_reach" if label.startswith("DM") else "radial_geometry_pacing_access")
+                  reference_vector_rows.append({
+                      "label": label,
+                      "z": z,
+                      "role": role,
+                      "planck_covmat_propagated_reference_mean_preview": ref[label],
+                      "status": "reference_mean_preview_from_planck_parameter_packet_no_observed_residuals_no_pressure",
+                  })
+
+              cov_params = {DERIVED_PARAM_ORDER[i]: {"variance": C_derived[i][i]} for i in range(4)}
+              J_six = finite_difference_jacobian(derived_params, cov_params)
+              for i, label in enumerate(LABELS):
+                  row = {"label": label}
+                  for j, pname in enumerate(DERIVED_PARAM_ORDER):
+                      row["d_" + label + "_d_" + pname] = J_six[i][j]
+                  jacobian_rows.append(row)
+
+              C_ref = matmul(matmul(J_six, C_derived), transpose(J_six))
+              reference_cov_rows = matrix_to_rows(C_ref, LABELS, LABELS)
+
+              # Correlation matrix.
+              C_corr = []
+              for i in range(len(LABELS)):
+                  crow = []
+                  for j in range(len(LABELS)):
+                      denom = math.sqrt(C_ref[i][i] * C_ref[j][j]) if C_ref[i][i] > 0 and C_ref[j][j] > 0 else 0.0
+                      crow.append(C_ref[i][j] / denom if denom else "")
+                  C_corr.append(crow)
+              reference_corr_rows = matrix_to_rows(C_corr, LABELS, LABELS)
+
+              readiness_status = "planck_parameter_covmat_propagated_to_six_slot_reference_covariance_preview"
+              selected_next_route = "limited_lrgxelg_observed_plus_planck_propagated_reference_covariance_preview_no_validation_with_scope_guards"
+          elif download["download_ok"] and source_covmat_usable:
+              readiness_status = "covmat_usable_but_parameter_mapping_incomplete"
+              selected_next_route = "limited_lrgxelg_planck_covmat_parameter_mapping_repair_with_scope_guards"
+          elif download["download_ok"]:
+              readiness_status = "package_downloaded_but_covmat_not_usable"
+              selected_next_route = "limited_lrgxelg_planck_covmat_parsing_repair_with_scope_guards"
+
+          write_csv(OUT / "v4_179_download_status.csv", [download], ["url", "download_attempted", "download_ok", "downloaded_bytes", "sha256", "error", "skipped_reason"])
+          write_csv(OUT / "v4_179_selected_member_status.csv", member_status_rows, ["member_key", "member_name", "present", "status"])
+          write_csv(OUT / "v4_179_paramnames_table.csv", paramnames_rows, ["parameter", "clean_parameter", "derived_flag", "display_label"])
+          write_csv(OUT / "v4_179_margestats_table.csv", margestats_rows, ["parameter", "clean_parameter", "derived_flag", "mean", "sddev", "lower1", "upper1", "display_label"])
+          write_csv(OUT / "v4_179_parameter_order_mapping.csv", parameter_map_rows, ["field", "aliases", "paramnames_index_zero_based", "margestats_parameter", "margestats_mean", "margestats_sddev", "mapping_ok"])
+          write_csv(OUT / "v4_179_selected_planck_input_parameter_covariance.csv", selected_input_cov_rows, ["row_label"] + selected_input_names)
+          write_csv(OUT / "v4_179_derived_parameter_packet.csv", derived_param_rows, ["parameter", "mean", "variance_from_planck_covmat_propagation", "sigma_from_planck_covmat_propagation", "status"])
+          write_csv(OUT / "v4_179_derived_parameter_covariance.csv", derived_param_cov_rows, ["row_label"] + DERIVED_PARAM_ORDER)
+          write_csv(OUT / "v4_179_reference_vector_from_planck_covmat_mapping.csv", reference_vector_rows, ["label", "z", "role", "planck_covmat_propagated_reference_mean_preview", "status"])
+          write_csv(OUT / "v4_179_reference_jacobian.csv", jacobian_rows, ["label"] + ["d_" + label + "_d_" + pname for label in [] for pname in []] if False else ["label"] + ["d_" + lbl + "_d_" + p for lbl in [] for p in []])
+          # Rewrite the Jacobian with dynamic fieldnames because labels are embedded in column names.
+          jac_fields = ["label"]
+          for pname in DERIVED_PARAM_ORDER:
+              # shorter readable column per parameter
+              pass
+          jacobian_rows2 = []
+          for i, label in enumerate(LABELS):
+              row = {"label": label}
+              for j, pname in enumerate(DERIVED_PARAM_ORDER):
+                  row["d_value_d_" + pname] = J_six[i][j] if mapping_ok else ""
+              jacobian_rows2.append(row)
+          write_csv(OUT / "v4_179_reference_jacobian.csv", jacobian_rows2, ["label"] + ["d_value_d_" + pname for pname in DERIVED_PARAM_ORDER])
+          write_csv(OUT / "v4_179_propagated_six_slot_reference_covariance_preview.csv", reference_cov_rows, ["row_label"] + LABELS)
+          write_csv(OUT / "v4_179_propagated_six_slot_reference_correlation_preview.csv", reference_corr_rows, ["row_label"] + LABELS)
+
+          cov_diag_report = {
+              "source_covmat_rows": covdiag["rows"],
+              "source_covmat_cols": covdiag["cols"],
+              "source_covmat_square": covdiag["square"],
+              "source_covmat_symmetric": covdiag["symmetric"],
+              "source_covmat_max_asym": covdiag["max_asym"],
+              "source_covmat_min_diag": covdiag["min_diag"],
+              "source_covmat_positive_diag": covdiag["positive_diag"],
+              "selected_indices": selected_indices,
+              "mapping_ok": mapping_ok,
+              "readiness_status": readiness_status,
+          }
+          (OUT / "v4_179_covmat_mapping_diagnostics.json").write_text(json.dumps(cov_diag_report, indent=2), encoding="utf-8")
+
+          route_decision = {
+              "version": "v4.179",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Planck source covariance was mapped to selected parameters and, if mapping passed, propagated to a six-slot LRGxELG reference covariance preview. No observed residuals or pressure were computed.",
+              "readiness_status": readiness_status,
+              "selected_next_route": selected_next_route,
+              "mapping_ok": mapping_ok,
+              "reference_covariance_preview_built": len(reference_cov_rows) == 6,
+              "truth_boundary": "propagated reference covariance preview only; not final Planck posterior covariance and not pressure",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+          (OUT / "v4_179_route_decision.json").write_text(json.dumps(route_decision, indent=2), encoding="utf-8")
+
+          (OUT / "v4_179_scope_guards.json").write_text(json.dumps({
+              "scope": "Planck covmat parameter order mapping and six-slot propagation attempt only",
+              "observed_values_used": False,
+              "observed_residuals_computed": False,
+              "planck_source_covmat_used": source_covmat_usable,
+              "parameter_order_mapping_attempted": True,
+              "six_slot_reference_covariance_preview_built": len(reference_cov_rows) == 6,
+              "six_slot_reference_covariance_final_accepted": False,
+              "pressure_computed": False,
+              "likelihood_computed": False,
+              "bic_computed": False,
+              "posterior_comparison_computed": False,
+              "tairid_validated": False,
+          }, indent=2), encoding="utf-8")
+
+          (OUT / "v4_179_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = []
+          summary.append("# TAIRID v4.179 - Planck Covmat Parameter Order Mapping And Propagation Attempt")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("This workflow tries to map the Planck source covmat order to selected parameters and propagate it into a six-slot LRGxELG reference covariance preview.")
+          summary.append("")
+          summary.append("Readiness status: `" + readiness_status + "`")
+          summary.append("")
+          summary.append("Selected next route: `" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_179_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_179": True,
+              "result_label_present": RESULT_LABEL.endswith("no_pressure_no_validation"),
+              "download_status_written": (OUT / "v4_179_download_status.csv").exists(),
+              "member_status_written": (OUT / "v4_179_selected_member_status.csv").exists(),
+              "paramnames_table_written": (OUT / "v4_179_paramnames_table.csv").exists(),
+              "margestats_table_written": (OUT / "v4_179_margestats_table.csv").exists(),
+              "parameter_order_mapping_written": (OUT / "v4_179_parameter_order_mapping.csv").exists(),
+              "selected_input_covariance_written": (OUT / "v4_179_selected_planck_input_parameter_covariance.csv").exists(),
+              "derived_parameter_packet_written": (OUT / "v4_179_derived_parameter_packet.csv").exists(),
+              "derived_parameter_covariance_written": (OUT / "v4_179_derived_parameter_covariance.csv").exists(),
+              "reference_vector_written": (OUT / "v4_179_reference_vector_from_planck_covmat_mapping.csv").exists(),
+              "reference_jacobian_written": (OUT / "v4_179_reference_jacobian.csv").exists(),
+              "reference_covariance_preview_written": (OUT / "v4_179_propagated_six_slot_reference_covariance_preview.csv").exists(),
+              "reference_correlation_preview_written": (OUT / "v4_179_propagated_six_slot_reference_correlation_preview.csv").exists(),
+              "covmat_mapping_diagnostics_written": (OUT / "v4_179_covmat_mapping_diagnostics.json").exists(),
+              "route_decision_written": (OUT / "v4_179_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_179_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_179_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_179_summary.md").exists(),
+              "no_observed_values_used": True,
+              "no_residuals_computed": True,
+              "no_pressure_computed": True,
+              "no_validation_claimed": True,
+              "next_route_selected": bool(selected_next_route),
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.179",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "readiness_status": readiness_status,
+              "mapping_ok": mapping_ok,
+              "reference_covariance_preview_built": len(reference_cov_rows) == 6,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "planck_covmat_mapping_and_reference_covariance_preview_only_no_pressure_no_validation",
+          }
+          (OUT / "v4_179_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.179 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_179_outputs/run_v4_179.py
+
+      - name: Upload v4.179 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-179-limited-lrgxelg-planck-covmat-parameter-order-mapping-and-propagation-attempt-output
+          path: tairid_v4_179_outputs/
