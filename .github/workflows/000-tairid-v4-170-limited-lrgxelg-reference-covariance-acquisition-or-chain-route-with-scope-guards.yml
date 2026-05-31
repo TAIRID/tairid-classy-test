@@ -1,0 +1,480 @@
+name: 000 TAIRID v4.170 - Limited LRGxELG Reference Covariance Acquisition Or Chain Route With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-170-limited-lrgxelg-reference-covariance-acquisition-or-chain-route-with-scope-guards.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-170-reference-covariance-acquisition-or-chain-route:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.170 reference covariance acquisition or chain route
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_170_outputs
+          cat > tairid_v4_170_outputs/run_v4_170.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          import re
+          import sys
+          import time
+          import urllib.request
+          import urllib.error
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_170_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_reference_covariance_acquisition_or_chain_route_passed_routes_and_package_request_written_no_ingestion_no_pressure_no_validation"
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          BLOCKED_CLAIMS = [
+              "no reference covariance ingested",
+              "no Planck posterior ingested",
+              "no parameter chain ingested",
+              "no final pressure",
+              "no full chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no claim that LCDM-lite is ruled out",
+              "no TAIRID validation",
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def fetch_status(url, timeout=12):
+              record = {
+                  "url": url,
+                  "reachable": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_previewed": 0,
+                  "error": "",
+              }
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v4.170-reference-route-locator/1.0"
+                      },
+                  )
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      record["status_code"] = getattr(resp, "status", "")
+                      record["content_type"] = resp.headers.get("Content-Type", "")
+                      data = resp.read(4096)
+                      record["bytes_previewed"] = len(data)
+                      record["reachable"] = True
+              except Exception as exc:
+                  record["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+              return record
+
+          source_targets = [
+              {
+                  "target_id": "planck_legacy_archive_base",
+                  "source_family": "official_planck_archive",
+                  "purpose": "Find official Planck cosmological parameter products or chain access route.",
+                  "url": "https://pla.esac.esa.int/pla/",
+                  "required_for": "reference covariance or parameter samples",
+              },
+              {
+                  "target_id": "planck_cosmological_parameters_wiki",
+                  "source_family": "official_planck_documentation",
+                  "purpose": "Find Planck cosmological parameter product documentation and naming conventions.",
+                  "url": "https://wiki.cosmos.esa.int/planck-legacy-archive/index.php/Cosmological_Parameters",
+                  "required_for": "reference covariance or parameter samples",
+              },
+              {
+                  "target_id": "planck_irsa_release_3_base",
+                  "source_family": "official_planck_mirror_context",
+                  "purpose": "Check alternate official mirror route for Planck release 3 products.",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/",
+                  "required_for": "reference covariance or parameter samples",
+              },
+              {
+                  "target_id": "sdss_dr16_base",
+                  "source_family": "official_sdss_context",
+                  "purpose": "Keep the eBOSS DR16 context route explicit.",
+                  "url": "https://www.sdss4.org/dr16/",
+                  "required_for": "eBOSS provenance context",
+              },
+              {
+                  "target_id": "sdss_dr16_cosmology_results",
+                  "source_family": "official_sdss_context",
+                  "purpose": "Locate DR16/eBOSS cosmology result pages and public tables.",
+                  "url": "https://www.sdss4.org/science/final-bao-and-rsd-measurements/",
+                  "required_for": "observed-side and tracer-family context",
+              },
+              {
+                  "target_id": "limited_lrgxelg_source_repo",
+                  "source_family": "observed_limited_lrgxelg_source",
+                  "purpose": "Keep pinned observed-side source route visible.",
+                  "url": "https://github.com/icosmology/eBOSS_DR16_LRGxELG",
+                  "required_for": "limited LRGxELG observed product provenance",
+              },
+              {
+                  "target_id": "limited_lrgxelg_paper_arxiv",
+                  "source_family": "paper_context",
+                  "purpose": "Keep the limited LRGxELG paper context visible.",
+                  "url": "https://arxiv.org/abs/2007.09011",
+                  "required_for": "limited LRGxELG paper provenance",
+              },
+          ]
+
+          reachability_rows = []
+          for target in source_targets:
+              status = fetch_status(target["url"])
+              row = dict(target)
+              row.update(status)
+              reachability_rows.append(row)
+
+          write_csv(
+              OUT / "v4_170_external_route_reachability.csv",
+              reachability_rows,
+              [
+                  "target_id",
+                  "source_family",
+                  "purpose",
+                  "url",
+                  "required_for",
+                  "reachable",
+                  "status_code",
+                  "content_type",
+                  "bytes_previewed",
+                  "error",
+              ],
+          )
+
+          acquisition_routes = [
+              {
+                  "route_id": "R1",
+                  "route_name": "Planck posterior chain route",
+                  "route_type": "preferred",
+                  "input_needed": "A parameter-sample table or chain package with enough parameters to generate the six-slot LRGxELG reference vector repeatedly.",
+                  "would_close_gap": "reference covariance or parameter-sample covariance for the six-slot vector",
+                  "status_now": "not ingested",
+                  "why_safe": "Samples can be transformed into a six-slot reference ensemble without pretending a single LCDM-lite vector has covariance.",
+                  "next_action": "Locate official Planck chain package or manually upload a small exported chain table.",
+              },
+              {
+                  "route_id": "R2",
+                  "route_name": "Planck covariance matrix route",
+                  "route_type": "acceptable_if_documented",
+                  "input_needed": "A parameter covariance matrix with parameter order, central values, units, provenance, and license notes.",
+                  "would_close_gap": "approximate reference covariance after propagation through the six-slot model",
+                  "status_now": "not ingested",
+                  "why_safe": "A documented covariance can be propagated by finite differences, but it is less direct than samples.",
+                  "next_action": "Find or upload a documented parameter covariance table.",
+              },
+              {
+                  "route_id": "R3",
+                  "route_name": "Precomputed six-slot reference ensemble route",
+                  "route_type": "acceptable_if_reproducible",
+                  "input_needed": "A table with repeated generated rows for the exact six labels and source parameters.",
+                  "would_close_gap": "empirical six-slot reference covariance",
+                  "status_now": "not ingested",
+                  "why_safe": "It avoids installing CAMB/CLASS on GitHub if generated externally from a documented baseline.",
+                  "next_action": "Upload a CSV with the six labels and metadata, then run a schema validator.",
+              },
+              {
+                  "route_id": "R4",
+                  "route_name": "CAMB or CLASS package route",
+                  "route_type": "currently_blocked_in_runner",
+                  "input_needed": "A working cosmology package install plus parameter samples.",
+                  "would_close_gap": "reference mean and covariance if samples are run successfully",
+                  "status_now": "blocked by v4.158b software check",
+                  "why_safe": "Would be strong if the package route becomes reproducible, but current runner did not provide it.",
+                  "next_action": "Do not rely on this unless a future workflow installs and tests it cleanly.",
+              },
+              {
+                  "route_id": "R5",
+                  "route_name": "LCDM-lite sensitivity proxy route",
+                  "route_type": "diagnostic_fallback_only",
+                  "input_needed": "Already produced by v4.161 and v4.167.",
+                  "would_close_gap": "does not close the real covariance gap",
+                  "status_now": "available as proxy only",
+                  "why_safe": "Useful for shape inspection, unsafe for final pressure.",
+                  "next_action": "Keep as diagnostic comparison only.",
+              },
+          ]
+
+          write_csv(
+              OUT / "v4_170_reference_covariance_acquisition_routes.csv",
+              acquisition_routes,
+              [
+                  "route_id",
+                  "route_name",
+                  "route_type",
+                  "input_needed",
+                  "would_close_gap",
+                  "status_now",
+                  "why_safe",
+                  "next_action",
+              ],
+          )
+
+          package_schema_rows = []
+          for label in LABELS:
+              package_schema_rows.append({
+                  "field_name": label,
+                  "required": True,
+                  "meaning": "six-slot limited LRGxELG reference vector field",
+                  "accepted_type": "finite numeric",
+                  "notes": "Must match the exact label order used since v4.151.",
+              })
+
+          extra_fields = [
+              ("sample_id", True, "sample or row identifier", "string or integer", "Needed for parameter-sample or ensemble route."),
+              ("Omega_m", False, "matter density parameter", "finite numeric", "Needed for transparent parameter-sample route if available."),
+              ("H0_km_s_Mpc", False, "Hubble constant", "finite numeric", "Needed if reference generation is repeated from parameters."),
+              ("rd_Mpc", False, "sound horizon scale", "finite numeric", "Needed for DM/rd and DH/rd generation route."),
+              ("sigma8_z0", False, "growth amplitude", "finite numeric", "Needed for fsigma8 generation route."),
+              ("growth_index_gamma", False, "growth index", "finite numeric", "Optional LCDM-lite or approximation route field."),
+              ("source_family", True, "source identity", "string", "Must identify Planck chain, covariance table, precomputed ensemble, or diagnostic proxy."),
+              ("provenance_url_or_note", True, "source URL or provenance note", "string", "Required before any later pressure-like calculation."),
+              ("license_or_use_note", True, "use/license note", "string", "Required for reproducibility and public boundary."),
+          ]
+          for field_name, required, meaning, accepted_type, notes in extra_fields:
+              package_schema_rows.append({
+                  "field_name": field_name,
+                  "required": required,
+                  "meaning": meaning,
+                  "accepted_type": accepted_type,
+                  "notes": notes,
+              })
+
+          write_csv(
+              OUT / "v4_170_reference_package_schema.csv",
+              package_schema_rows,
+              ["field_name", "required", "meaning", "accepted_type", "notes"],
+          )
+
+          # Empty templates for manual filling or later machine-generation.
+          reference_ensemble_template_rows = []
+          for sample_index in range(1, 4):
+              row = {"sample_id": "example_sample_" + str(sample_index)}
+              for label in LABELS:
+                  row[label] = ""
+              row.update({
+                  "Omega_m": "",
+                  "H0_km_s_Mpc": "",
+                  "rd_Mpc": "",
+                  "sigma8_z0": "",
+                  "growth_index_gamma": "",
+                  "source_family": "",
+                  "provenance_url_or_note": "",
+                  "license_or_use_note": "",
+              })
+              reference_ensemble_template_rows.append(row)
+
+          write_csv(
+              OUT / "v4_170_reference_ensemble_template.csv",
+              reference_ensemble_template_rows,
+              ["sample_id"] + LABELS + [
+                  "Omega_m",
+                  "H0_km_s_Mpc",
+                  "rd_Mpc",
+                  "sigma8_z0",
+                  "growth_index_gamma",
+                  "source_family",
+                  "provenance_url_or_note",
+                  "license_or_use_note",
+              ],
+          )
+
+          covariance_template_rows = []
+          for row_label in LABELS:
+              row = {"row_label": row_label}
+              for col_label in LABELS:
+                  row[col_label] = ""
+              covariance_template_rows.append(row)
+
+          write_csv(
+              OUT / "v4_170_reference_covariance_template.csv",
+              covariance_template_rows,
+              ["row_label"] + LABELS,
+          )
+
+          dependency_status_rows = [
+              {
+                  "dependency": "limited LRGxELG observed values",
+                  "status": "closed locally",
+                  "source": "v4.151-v4.155",
+                  "notes": "Observed product parsed and pinned.",
+              },
+              {
+                  "dependency": "limited LRGxELG observed covariance",
+                  "status": "closed locally",
+                  "source": "v4.151-v4.155",
+                  "notes": "Observed 6x6 covariance parsed, symmetric, positive definite.",
+              },
+              {
+                  "dependency": "limited LRGxELG reference mean vector",
+                  "status": "diagnostic prototype only",
+                  "source": "v4.159",
+                  "notes": "LCDM-lite reference vector exists, not final reference.",
+              },
+              {
+                  "dependency": "limited LRGxELG reference covariance",
+                  "status": "open",
+                  "source": "this workflow",
+                  "notes": "Route manifest and package schema written; no scientific covariance ingested.",
+              },
+              {
+                  "dependency": "QSO covariance or likelihood",
+                  "status": "open",
+                  "source": "future workflow",
+                  "notes": "Still separate from limited LRGxELG lane.",
+              },
+              {
+                  "dependency": "full eBOSS covariance or overlap model",
+                  "status": "open",
+                  "source": "future workflow",
+                  "notes": "Needed before full tracer-family interpretation.",
+              },
+          ]
+
+          write_csv(
+              OUT / "v4_170_dependency_status.csv",
+              dependency_status_rows,
+              ["dependency", "status", "source", "notes"],
+          )
+
+          selected_next_route = "limited_lrgxelg_reference_package_upload_or_chain_manifest_validator_with_scope_guards"
+
+          route_decision = {
+              "version": "v4.170",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Reference covariance is still not closed, but the acquisition routes and exact package schema are now explicit.",
+              "selected_next_route": selected_next_route,
+              "why_next": "The lane now needs either a manually uploaded reference package, a Planck chain manifest, or a precomputed six-slot reference ensemble to validate schema before any pressure-like calculation.",
+              "preferred_route_order": [
+                  "R1 Planck posterior chain route",
+                  "R3 precomputed six-slot reference ensemble route",
+                  "R2 documented parameter covariance matrix route",
+                  "R4 CAMB/CLASS route only if install becomes reproducible",
+                  "R5 LCDM-lite sensitivity proxy as diagnostic fallback only",
+              ],
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+
+          with open(OUT / "v4_170_route_decision.json", "w", encoding="utf-8") as f:
+              json.dump(route_decision, f, indent=2)
+
+          with open(OUT / "v4_170_scope_guards.json", "w", encoding="utf-8") as f:
+              json.dump({
+                  "scope": "limited LRGxELG reference covariance acquisition route only",
+                  "ingests_scientific_reference_covariance": False,
+                  "ingests_planck_chains": False,
+                  "computes_reference_covariance": False,
+                  "computes_residuals": False,
+                  "computes_pressure": False,
+                  "computes_likelihood": False,
+                  "computes_bic": False,
+                  "computes_posterior_comparison": False,
+                  "validates_tairid": False,
+              }, f, indent=2)
+
+          with open(OUT / "v4_170_blocked_claims.json", "w", encoding="utf-8") as f:
+              json.dump({"blocked_claims": BLOCKED_CLAIMS}, f, indent=2)
+
+          summary_lines = []
+          summary_lines.append("# TAIRID v4.170 - Reference Covariance Acquisition Or Chain Route")
+          summary_lines.append("")
+          summary_lines.append("Expected result: `" + RESULT_LABEL + "`")
+          summary_lines.append("")
+          summary_lines.append("## Clean result")
+          summary_lines.append("")
+          summary_lines.append("This workflow does not ingest reference covariance. It writes the route map and the exact package schema needed to close the reference side honestly.")
+          summary_lines.append("")
+          summary_lines.append("## Preferred route order")
+          for item in route_decision["preferred_route_order"]:
+              summary_lines.append("- " + item)
+          summary_lines.append("")
+          summary_lines.append("## Next route")
+          summary_lines.append("")
+          summary_lines.append("`" + selected_next_route + "`")
+          summary_lines.append("")
+          summary_lines.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary_lines.append("- " + item)
+          (OUT / "v4_170_summary.md").write_text("\n".join(summary_lines), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_170": True,
+              "result_label_present": RESULT_LABEL.endswith("no_ingestion_no_pressure_no_validation"),
+              "labels_count_is_six": len(LABELS) == 6,
+              "source_targets_written": len(source_targets) >= 5,
+              "reachability_rows_written": (OUT / "v4_170_external_route_reachability.csv").exists(),
+              "acquisition_routes_count_is_five": len(acquisition_routes) == 5,
+              "acquisition_routes_written": (OUT / "v4_170_reference_covariance_acquisition_routes.csv").exists(),
+              "package_schema_written": (OUT / "v4_170_reference_package_schema.csv").exists(),
+              "ensemble_template_written": (OUT / "v4_170_reference_ensemble_template.csv").exists(),
+              "covariance_template_written": (OUT / "v4_170_reference_covariance_template.csv").exists(),
+              "dependency_status_written": (OUT / "v4_170_dependency_status.csv").exists(),
+              "route_decision_written": (OUT / "v4_170_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_170_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_170_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_170_summary.md").exists(),
+              "reference_covariance_not_ingested": True,
+              "planck_chains_not_ingested": True,
+              "pressure_not_computed": True,
+              "likelihood_not_computed": True,
+              "validation_not_claimed": True,
+              "next_route_selected": selected_next_route == "limited_lrgxelg_reference_package_upload_or_chain_manifest_validator_with_scope_guards",
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.170",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "claim_boundary": "route_and_schema_only_no_reference_covariance_ingestion_no_pressure_no_validation",
+          }
+          with open(OUT / "v4_170_parser_health_report.json", "w", encoding="utf-8") as f:
+              json.dump(health, f, indent=2)
+
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.170 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_170_outputs/run_v4_170.py
+
+      - name: Upload v4.170 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-170-limited-lrgxelg-reference-covariance-acquisition-or-chain-route-output
+          path: tairid_v4_170_outputs/
