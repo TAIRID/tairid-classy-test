@@ -1,0 +1,469 @@
+name: 000 TAIRID v4.175 - Limited LRGxELG Planck Candidate Review And Header Probe With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-175-limited-lrgxelg-planck-candidate-review-and-header-probe-with-scope-guards.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-175-planck-candidate-review-and-header-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.175 Planck candidate review and header probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_175_outputs
+          cat > tairid_v4_175_outputs/run_v4_175.py <<'PY'
+          import csv
+          import json
+          import re
+          import urllib.request
+          from urllib.parse import urljoin
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_175_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_planck_candidate_review_and_header_probe_passed_candidate_rankings_written_no_full_download_no_ingestion_no_pressure_no_validation"
+
+          BLOCKED_CLAIMS = [
+              "no full external package downloaded",
+              "no Planck chain ingested",
+              "no Planck covariance ingested",
+              "no reference covariance computed",
+              "no reference ensemble computed",
+              "no residuals computed",
+              "no pressure computed",
+              "no final chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          SOURCE_TARGETS = [
+              {
+                  "target_id": "planck_cosmological_parameters_wiki",
+                  "source_family": "official_planck_documentation",
+                  "url": "https://wiki.cosmos.esa.int/planck-legacy-archive/index.php/Cosmological_Parameters",
+              },
+              {
+                  "target_id": "planck_irsa_release3_ancillary",
+                  "source_family": "official_planck_mirror_context",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/",
+              },
+              {
+                  "target_id": "planck_legacy_archive_base",
+                  "source_family": "official_planck_archive",
+                  "url": "https://pla.esac.esa.int/pla/",
+              },
+          ]
+
+          KEYWORDS = [
+              "COM_CosmoParams",
+              "CosmoParams",
+              "base-plikHM-TTTEEE-lowl-lowE",
+              "base_plik",
+              "TTTEEE",
+              "lowE",
+              "lensing",
+              "fullGrid",
+              "parameter-tables",
+              ".zip",
+              ".tar",
+              ".tgz",
+              ".gz",
+              ".txt",
+          ]
+
+          PREFERRED_URL_MARKERS = [
+              "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip",
+              "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE",
+              "COM_CosmoParams_parameter-tables_R3.01.zip",
+              "COM_CosmoParams_fullGrid_R3.01.zip",
+              "COM_CosmoParams_base-plikHM_R3.01.zip",
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def fetch_text(url, max_bytes=350000, timeout=14):
+              record = {
+                  "url": url,
+                  "reachable": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_read": 0,
+                  "error": "",
+                  "text": "",
+              }
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "TAIRID-v4.175-candidate-review/1.0"},
+                  )
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      record["reachable"] = True
+                      record["status_code"] = getattr(resp, "status", "")
+                      record["content_type"] = resp.headers.get("Content-Type", "")
+                      record["bytes_read"] = len(data)
+                      record["text"] = data.decode("utf-8", errors="replace")
+              except Exception as exc:
+                  record["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+              return record
+
+          def extract_links(base_url, text):
+              links = set()
+              href_pattern = r"(?:href|src)\s*=\s*[\"']([^\"']+)[\"']"
+              loose_pattern = r"https?://[^\s\"'<>]+"
+              for match in re.finditer(href_pattern, text, re.IGNORECASE):
+                  links.add(urljoin(base_url, match.group(1)))
+              for match in re.finditer(loose_pattern, text):
+                  links.add(match.group(0).rstrip(").,;"))
+              return sorted(links)
+
+          def classify_candidate(url):
+              lower = url.lower()
+              if "com_cosmoparams" in lower and lower.endswith(".zip"):
+                  return "cosmoparams_zip_candidate"
+              if "com_cosmoparams" in lower and (".tar" in lower or ".gz" in lower):
+                  return "legacy_cosmoparams_archive_candidate"
+              if "powerspect" in lower or "powerspect" in lower:
+                  return "power_spectrum_candidate_not_chain"
+              if "parameter-tables" in lower:
+                  return "parameter_tables_candidate"
+              if "cosmological_parameters#parameter_chains" in lower:
+                  return "documentation_anchor"
+              if "cosmomc" in lower:
+                  return "cosmomc_context"
+              return "other_candidate"
+
+          def score_candidate(url):
+              lower = url.lower()
+              score = 0
+              reasons = []
+              for marker in PREFERRED_URL_MARKERS:
+                  if marker.lower() in lower:
+                      score += 20
+                      reasons.append("preferred:" + marker)
+              for keyword in KEYWORDS:
+                  if keyword.lower() in lower:
+                      score += 1
+                      reasons.append(keyword)
+              if "r3.00" in lower or "r3.01" in lower:
+                  score += 5
+                  reasons.append("release3")
+              if "plik" in lower and "ttteee" in lower and "lowe" in lower:
+                  score += 8
+                  reasons.append("planck_2018_baseline_like")
+              if "power" in lower or "powerspect" in lower:
+                  score -= 8
+                  reasons.append("not_parameter_chain_power_spectrum")
+              if "#parameter_chains" in lower:
+                  score -= 3
+                  reasons.append("documentation_anchor_not_data")
+              return score, ";".join(reasons)
+
+          def probe_header_or_preview(url, timeout=14):
+              record = {
+                  "candidate_url": url,
+                  "probe_attempted": True,
+                  "probe_reachable": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length": "",
+                  "last_modified": "",
+                  "bytes_previewed": 0,
+                  "error": "",
+              }
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "TAIRID-v4.175-header-probe/1.0", "Range": "bytes=0-2047"},
+                  )
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(2048)
+                      record["probe_reachable"] = True
+                      record["status_code"] = getattr(resp, "status", "")
+                      record["content_type"] = resp.headers.get("Content-Type", "")
+                      record["content_length"] = resp.headers.get("Content-Length", "")
+                      record["last_modified"] = resp.headers.get("Last-Modified", "")
+                      record["bytes_previewed"] = len(data)
+              except Exception as exc:
+                  record["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+              return record
+
+          source_rows = []
+          raw_candidates = []
+          for target in SOURCE_TARGETS:
+              fetched = fetch_text(target["url"])
+              source_rows.append({
+                  "target_id": target["target_id"],
+                  "source_family": target["source_family"],
+                  "url": target["url"],
+                  "reachable": fetched["reachable"],
+                  "status_code": fetched["status_code"],
+                  "content_type": fetched["content_type"],
+                  "bytes_read": fetched["bytes_read"],
+                  "error": fetched["error"],
+              })
+
+              if fetched["reachable"]:
+                  for link in extract_links(target["url"], fetched["text"]):
+                      lower = link.lower()
+                      if any(keyword.lower() in lower for keyword in KEYWORDS):
+                          score, reasons = score_candidate(link)
+                          raw_candidates.append({
+                              "source_target_id": target["target_id"],
+                              "source_family": target["source_family"],
+                              "source_url": target["url"],
+                              "candidate_url": link,
+                              "candidate_kind": classify_candidate(link),
+                              "rank_score": score,
+                              "rank_reasons": reasons,
+                              "candidate_status": "ranked_candidate_not_ingested",
+                          })
+
+          # Deduplicate by candidate URL.
+          dedup = {}
+          for row in raw_candidates:
+              key = row["candidate_url"]
+              if key not in dedup or int(row["rank_score"]) > int(dedup[key]["rank_score"]):
+                  dedup[key] = row
+          ranked = sorted(dedup.values(), key=lambda r: (-int(r["rank_score"]), r["candidate_url"]))
+
+          write_csv(
+              OUT / "v4_175_source_reachability.csv",
+              source_rows,
+              ["target_id", "source_family", "url", "reachable", "status_code", "content_type", "bytes_read", "error"],
+          )
+
+          write_csv(
+              OUT / "v4_175_ranked_candidate_links.csv",
+              ranked,
+              ["source_target_id", "source_family", "source_url", "candidate_url", "candidate_kind", "rank_score", "rank_reasons", "candidate_status"],
+          )
+
+          top_candidates = ranked[:12]
+          probe_rows = []
+          for row in top_candidates:
+              probe = probe_header_or_preview(row["candidate_url"])
+              combined = dict(row)
+              combined.update(probe)
+              combined["probe_status"] = "header_or_2048_byte_preview_only_not_full_download_not_ingested"
+              probe_rows.append(combined)
+
+          write_csv(
+              OUT / "v4_175_top_candidate_header_probe.csv",
+              probe_rows,
+              [
+                  "source_target_id",
+                  "source_family",
+                  "source_url",
+                  "candidate_url",
+                  "candidate_kind",
+                  "rank_score",
+                  "rank_reasons",
+                  "candidate_status",
+                  "probe_attempted",
+                  "probe_reachable",
+                  "status_code",
+                  "content_type",
+                  "content_length",
+                  "last_modified",
+                  "bytes_previewed",
+                  "error",
+                  "probe_status",
+              ],
+          )
+
+          if ranked:
+              top_candidate = ranked[0]
+              package_status = "candidate_links_found_not_ingested"
+          else:
+              top_candidate = {
+                  "candidate_url": "",
+                  "candidate_kind": "",
+                  "rank_score": "",
+                  "rank_reasons": "",
+              }
+              package_status = "no_candidate_links_found"
+
+          manifest_draft = {
+              "candidate_package_url": top_candidate["candidate_url"],
+              "candidate_kind": top_candidate["candidate_kind"],
+              "candidate_rank_score": top_candidate["rank_score"],
+              "candidate_rank_reasons": top_candidate["rank_reasons"],
+              "chain_file": "data/reference/replace_with_downloaded_or_exported_chain_file.csv",
+              "parameter_fields": ["Omega_m", "H0_km_s_Mpc", "rd_Mpc", "sigma8_z0"],
+              "source_family": "Planck candidate route from v4.175; verify before use",
+              "provenance_url_or_note": top_candidate["candidate_url"],
+              "license_or_use_note": "replace after checking source terms",
+              "scope_boundary": "manifest draft only; not a scientific ingestion",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+
+          (OUT / "v4_175_candidate_manifest_draft.json").write_text(
+              json.dumps(manifest_draft, indent=2),
+              encoding="utf-8",
+          )
+
+          acquisition_plan = []
+          acquisition_plan.append("# TAIRID v4.175 Candidate Review And Header Probe")
+          acquisition_plan.append("")
+          acquisition_plan.append("This workflow ranks Planck/CosmoParams candidate links and probes only headers or a tiny preview.")
+          acquisition_plan.append("It does not download a full package and does not ingest scientific data.")
+          acquisition_plan.append("")
+          acquisition_plan.append("## Top candidate")
+          acquisition_plan.append("")
+          if top_candidate["candidate_url"]:
+              acquisition_plan.append("`" + top_candidate["candidate_url"] + "`")
+              acquisition_plan.append("")
+              acquisition_plan.append("Kind: `" + str(top_candidate["candidate_kind"]) + "`")
+              acquisition_plan.append("Rank score: `" + str(top_candidate["rank_score"]) + "`")
+          else:
+              acquisition_plan.append("No candidate link was found.")
+          acquisition_plan.append("")
+          acquisition_plan.append("## Clean next action")
+          acquisition_plan.append("")
+          acquisition_plan.append("Review the top candidate list. If a candidate is the correct Planck parameter chain/product, the next workflow may do a controlled content inventory.")
+          acquisition_plan.append("")
+          acquisition_plan.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              acquisition_plan.append("- " + item)
+          (OUT / "v4_175_candidate_review_instructions.md").write_text(
+              "\n".join(acquisition_plan),
+              encoding="utf-8",
+          )
+
+          selected_next_route = "limited_lrgxelg_planck_candidate_package_content_inventory_no_science_ingestion_with_scope_guards" if ranked else "limited_lrgxelg_manual_reference_package_acquisition_still_required_with_scope_guards"
+
+          route_decision = {
+              "version": "v4.175",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Candidate Planck/CosmoParams links were ranked and top candidates were header/preview-probed only. No full package was downloaded or ingested.",
+              "reachable_source_count": sum(1 for row in source_rows if row["reachable"]),
+              "source_target_count": len(SOURCE_TARGETS),
+              "candidate_link_count": len(ranked),
+              "header_probe_count": len(probe_rows),
+              "package_status": package_status,
+              "top_candidate_url": top_candidate["candidate_url"],
+              "selected_next_route": selected_next_route,
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+
+          (OUT / "v4_175_route_decision.json").write_text(json.dumps(route_decision, indent=2), encoding="utf-8")
+
+          (OUT / "v4_175_scope_guards.json").write_text(
+              json.dumps(
+                  {
+                      "scope": "candidate ranking and header probe only",
+                      "full_external_package_downloaded": False,
+                      "bytes_preview_limit_per_candidate": 2048,
+                      "planck_chain_ingested": False,
+                      "reference_covariance_ingested": False,
+                      "reference_covariance_computed": False,
+                      "residuals_computed": False,
+                      "pressure_computed": False,
+                      "likelihood_computed": False,
+                      "bic_computed": False,
+                      "posterior_comparison_computed": False,
+                      "tairid_validated": False,
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          (OUT / "v4_175_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = []
+          summary.append("# TAIRID v4.175 - Planck Candidate Review And Header Probe")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("Candidate source links were ranked and top candidates were probed only by header or tiny preview.")
+          summary.append("")
+          summary.append("Candidate link count: `" + str(len(ranked)) + "`")
+          summary.append("Header probe count: `" + str(len(probe_rows)) + "`")
+          summary.append("")
+          summary.append("Top candidate: `" + str(top_candidate["candidate_url"]) + "`")
+          summary.append("")
+          summary.append("Selected next route: `" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_175_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_175": True,
+              "result_label_present": RESULT_LABEL.endswith("no_full_download_no_ingestion_no_pressure_no_validation"),
+              "source_reachability_written": (OUT / "v4_175_source_reachability.csv").exists(),
+              "candidate_ranking_written": (OUT / "v4_175_ranked_candidate_links.csv").exists(),
+              "header_probe_written": (OUT / "v4_175_top_candidate_header_probe.csv").exists(),
+              "manifest_draft_written": (OUT / "v4_175_candidate_manifest_draft.json").exists(),
+              "instructions_written": (OUT / "v4_175_candidate_review_instructions.md").exists(),
+              "route_decision_written": (OUT / "v4_175_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_175_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_175_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_175_summary.md").exists(),
+              "source_targets_present": len(SOURCE_TARGETS) == 3,
+              "next_route_selected": bool(selected_next_route),
+              "no_full_external_package_downloaded": True,
+              "no_chain_ingested": True,
+              "no_reference_covariance_computed": True,
+              "no_pressure_computed": True,
+              "no_validation_claimed": True,
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.175",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "candidate_link_count": len(ranked),
+              "header_probe_count": len(probe_rows),
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "candidate_review_and_header_probe_only_no_full_download_no_ingestion_no_pressure_no_validation",
+          }
+
+          (OUT / "v4_175_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.175 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_175_outputs/run_v4_175.py
+
+      - name: Upload v4.175 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-175-limited-lrgxelg-planck-candidate-review-and-header-probe-output
+          path: tairid_v4_175_outputs/
