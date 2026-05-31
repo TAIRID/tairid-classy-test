@@ -1,0 +1,497 @@
+name: 000 TAIRID v4.168b - Limited LRGxELG Residual Parameter Driver Attribution Safe Replacement
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-168b-limited-lrgxelg-residual-parameter-driver-attribution-safe-replacement.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-168b-safe-replacement:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.168b parameter-driver lattice attribution preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_168b_outputs
+          cat > tairid_v4_168b_outputs/run_v4_168b.py <<'PY'
+          import csv
+          import json
+          import math
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_168b_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          ROLES = {
+              "DM_ov_rd_z0p70": "geometry_transverse",
+              "DH_ov_rd_z0p70": "geometry_radial",
+              "fsigma8_z0p70": "growth",
+              "DM_ov_rd_z0p845": "geometry_transverse",
+              "DH_ov_rd_z0p845": "geometry_radial",
+              "fsigma8_z0p845": "growth",
+          }
+
+          REDSHIFTS = {
+              "DM_ov_rd_z0p70": 0.700,
+              "DH_ov_rd_z0p70": 0.700,
+              "fsigma8_z0p70": 0.700,
+              "DM_ov_rd_z0p845": 0.845,
+              "DH_ov_rd_z0p845": 0.845,
+              "fsigma8_z0p845": 0.845,
+          }
+
+          OBSERVED = {
+              "DM_ov_rd_z0p70": 17.954174,
+              "DH_ov_rd_z0p70": 21.221161,
+              "fsigma8_z0p70": 0.433572,
+              "DM_ov_rd_z0p845": 18.896851,
+              "DH_ov_rd_z0p845": 20.910056,
+              "fsigma8_z0p845": 0.296822,
+          }
+
+          OBSERVED_SIGMA = {
+              "DM_ov_rd_z0p70": 0.508712,
+              "DH_ov_rd_z0p70": 1.197674,
+              "fsigma8_z0p70": 0.050037,
+              "DM_ov_rd_z0p845": 0.776274,
+              "DH_ov_rd_z0p845": 2.861697,
+              "fsigma8_z0p845": 0.081385,
+          }
+
+          # Exact six-slot LCDM-lite prototype vector carried forward from v4.159.
+          REFERENCE = {
+              "DM_ov_rd_z0p70": 17.5805195461,
+              "DH_ov_rd_z0p70": 20.2449335870,
+              "fsigma8_z0p70": 0.4618546966,
+              "DM_ov_rd_z0p845": 20.3899796593,
+              "DH_ov_rd_z0p845": 18.5350397709,
+              "fsigma8_z0p845": 0.4480660425,
+          }
+
+          CENTRAL_PARAMS = {
+              "Omega_m": 0.315,
+              "H0_km_s_Mpc": 67.36,
+              "rd_Mpc": 147.09,
+              "sigma8_z0": 0.811,
+              "growth_index_gamma": 0.55,
+          }
+
+          PARAM_STEPS = {
+              "Omega_m": 0.01,
+              "H0_km_s_Mpc": 1.0,
+              "rd_Mpc": 1.0,
+              "sigma8_z0": 0.02,
+              "growth_index_gamma": 0.02,
+          }
+
+          BLOCKED_CLAIMS = [
+              "no fitting claim",
+              "no fitted cosmological parameter claim",
+              "no full reference covariance",
+              "no Planck posterior covariance",
+              "no final pressure",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no TAIRID validation",
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow(row)
+
+          def dot(a, b):
+              return sum(x * y for x, y in zip(a, b))
+
+          def norm(a):
+              return math.sqrt(dot(a, a))
+
+          def safe_cosine(a, b):
+              na = norm(a)
+              nb = norm(b)
+              if na == 0.0 or nb == 0.0:
+                  return 0.0
+              return dot(a, b) / (na * nb)
+
+          def e_z(z, omega_m):
+              return math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+          def simpson_integral_inverse_e(z, omega_m, n=2000):
+              if n % 2:
+                  n += 1
+              h = z / n
+              total = 1.0 / e_z(0.0, omega_m) + 1.0 / e_z(z, omega_m)
+              for i in range(1, n):
+                  coeff = 4 if i % 2 else 2
+                  total += coeff / e_z(i * h, omega_m)
+              return h * total / 3.0
+
+          def growth_factor_cpt(z, omega_m):
+              ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+              omz = omega_m * (1.0 + z) ** 3 / ez2
+              olz = (1.0 - omega_m) / ez2
+              gz = 5.0 * omz / (2.0 * (omz ** (4.0 / 7.0) - olz + (1.0 + omz / 2.0) * (1.0 + olz / 70.0)))
+              om0 = omega_m
+              ol0 = 1.0 - omega_m
+              g0 = 5.0 * om0 / (2.0 * (om0 ** (4.0 / 7.0) - ol0 + (1.0 + om0 / 2.0) * (1.0 + ol0 / 70.0)))
+              return gz / (g0 * (1.0 + z))
+
+          def model_vector(params):
+              c_km_s = 299792.458
+              omega_m = params["Omega_m"]
+              h0 = params["H0_km_s_Mpc"]
+              rd = params["rd_Mpc"]
+              sigma8 = params["sigma8_z0"]
+              gamma = params["growth_index_gamma"]
+
+              values = []
+              for z in (0.700, 0.845):
+                  dm = (c_km_s / h0) * simpson_integral_inverse_e(z, omega_m) / rd
+                  dh = c_km_s / (h0 * e_z(z, omega_m)) / rd
+                  ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+                  omz = omega_m * (1.0 + z) ** 3 / ez2
+                  f_growth = omz ** gamma
+                  fs8 = f_growth * sigma8 * growth_factor_cpt(z, omega_m)
+                  values.extend([dm, dh, fs8])
+              return dict(zip(LABELS, values))
+
+          residual_raw = [OBSERVED[label] - REFERENCE[label] for label in LABELS]
+          residual_sigma_units = [residual_raw[i] / OBSERVED_SIGMA[LABELS[i]] for i in range(len(LABELS))]
+          residual_norm_sigma_units = norm(residual_sigma_units)
+
+          residual_rows = []
+          for i, label in enumerate(LABELS):
+              residual_rows.append({
+                  "label": label,
+                  "z": REDSHIFTS[label],
+                  "role": ROLES[label],
+                  "observed": OBSERVED[label],
+                  "lcdm_lite_reference": REFERENCE[label],
+                  "observed_minus_reference": residual_raw[i],
+                  "observed_sigma": OBSERVED_SIGMA[label],
+                  "observed_sigma_units_preview_not_pressure": residual_sigma_units[i],
+              })
+
+          write_csv(
+              OUT / "v4_168b_residual_vector.csv",
+              residual_rows,
+              [
+                  "label",
+                  "z",
+                  "role",
+                  "observed",
+                  "lcdm_lite_reference",
+                  "observed_minus_reference",
+                  "observed_sigma",
+                  "observed_sigma_units_preview_not_pressure",
+              ],
+          )
+
+          central_model = model_vector(CENTRAL_PARAMS)
+
+          driver_rows = []
+          driver_vectors = {}
+          driver_step_vectors = {}
+          for driver_name, step in PARAM_STEPS.items():
+              plus_params = dict(CENTRAL_PARAMS)
+              minus_params = dict(CENTRAL_PARAMS)
+              plus_params[driver_name] += step
+              minus_params[driver_name] -= step
+
+              plus = model_vector(plus_params)
+              minus = model_vector(minus_params)
+
+              raw_step_vector = []
+              sigma_unit_step_vector = []
+              for label in LABELS:
+                  raw_step = (plus[label] - minus[label]) / 2.0
+                  raw_step_vector.append(raw_step)
+                  sigma_unit_step_vector.append(raw_step / OBSERVED_SIGMA[label])
+
+              driver_step_vectors[driver_name] = raw_step_vector
+              driver_vectors[driver_name] = sigma_unit_step_vector
+
+              cos = safe_cosine(residual_sigma_units, sigma_unit_step_vector)
+              projection_units = dot(
+                  residual_sigma_units,
+                  [x / norm(sigma_unit_step_vector) for x in sigma_unit_step_vector],
+              ) if norm(sigma_unit_step_vector) else 0.0
+
+              driver_rows.append({
+                  "driver": driver_name,
+                  "step": step,
+                  "cosine_to_residual_sigma_unit_shape": cos,
+                  "absolute_cosine": abs(cos),
+                  "driver_step_norm_sigma_units": norm(sigma_unit_step_vector),
+                  "residual_projection_along_driver_units_not_fit": projection_units,
+                  "interpretation": "shape attribution only; not a fitted parameter",
+              })
+
+          driver_rows_sorted = sorted(driver_rows, key=lambda r: r["absolute_cosine"], reverse=True)
+          write_csv(
+              OUT / "v4_168b_driver_cosine_attribution.csv",
+              driver_rows_sorted,
+              [
+                  "driver",
+                  "step",
+                  "cosine_to_residual_sigma_unit_shape",
+                  "absolute_cosine",
+                  "driver_step_norm_sigma_units",
+                  "residual_projection_along_driver_units_not_fit",
+                  "interpretation",
+              ],
+          )
+
+          component_rows = []
+          for driver_name, vec in driver_vectors.items():
+              vnorm = norm(vec)
+              for i, label in enumerate(LABELS):
+                  component_rows.append({
+                      "driver": driver_name,
+                      "label": label,
+                      "z": REDSHIFTS[label],
+                      "role": ROLES[label],
+                      "driver_component_raw_one_step": driver_step_vectors[driver_name][i],
+                      "driver_component_sigma_units_one_step": vec[i],
+                      "normalized_loading": vec[i] / vnorm if vnorm else 0.0,
+                  })
+
+          write_csv(
+              OUT / "v4_168b_variable_driver_lattice_components.csv",
+              component_rows,
+              [
+                  "driver",
+                  "label",
+                  "z",
+                  "role",
+                  "driver_component_raw_one_step",
+                  "driver_component_sigma_units_one_step",
+                  "normalized_loading",
+              ],
+          )
+
+          # Driver-to-driver cosine matrix, with explicit H0/rd degeneracy guard.
+          driver_names = list(PARAM_STEPS.keys())
+          driver_cosine_rows = []
+          for a in driver_names:
+              for b in driver_names:
+                  driver_cosine_rows.append({
+                      "driver_a": a,
+                      "driver_b": b,
+                      "cosine": safe_cosine(driver_vectors[a], driver_vectors[b]),
+                  })
+
+          write_csv(
+              OUT / "v4_168b_driver_to_driver_cosine_matrix_long.csv",
+              driver_cosine_rows,
+              ["driver_a", "driver_b", "cosine"],
+          )
+
+          h0_rd_cosine = safe_cosine(driver_vectors["H0_km_s_Mpc"], driver_vectors["rd_Mpc"])
+          h0_rd_near_duplicate = abs(h0_rd_cosine) >= 0.95
+
+          family_map = {
+              "Omega_m": "matter_density_shape",
+              "H0_km_s_Mpc": "geometry_scale_degenerate_with_rd",
+              "rd_Mpc": "geometry_scale_degenerate_with_H0",
+              "sigma8_z0": "growth_amplitude",
+              "growth_index_gamma": "growth_index_shape",
+          }
+
+          family_rows = []
+          for row in driver_rows_sorted:
+              family_rows.append({
+                  "family": family_map[row["driver"]],
+                  "driver": row["driver"],
+                  "absolute_cosine": row["absolute_cosine"],
+                  "signed_cosine": row["cosine_to_residual_sigma_unit_shape"],
+                  "status": "attribution preview only",
+              })
+
+          write_csv(
+              OUT / "v4_168b_family_driver_summary.csv",
+              family_rows,
+              ["family", "driver", "absolute_cosine", "signed_cosine", "status"],
+          )
+
+          # Node and edge tables for a simple lattice viewer.
+          node_rows = []
+          for label in LABELS:
+              node_rows.append({
+                  "node_id": label,
+                  "node_type": "observed_variable",
+                  "role": ROLES[label],
+                  "z": REDSHIFTS[label],
+              })
+          for driver_name in driver_names:
+              node_rows.append({
+                  "node_id": driver_name,
+                  "node_type": "driver_direction",
+                  "role": family_map[driver_name],
+                  "z": "",
+              })
+
+          edge_rows = []
+          edge_threshold = 0.15
+          for row in component_rows:
+              if abs(float(row["normalized_loading"])) >= edge_threshold:
+                  edge_rows.append({
+                      "source": row["driver"],
+                      "target": row["label"],
+                      "edge_type": "driver_loading",
+                      "weight": row["normalized_loading"],
+                      "absolute_weight": abs(float(row["normalized_loading"])),
+                      "note": "lattice loading; not fitted causation",
+                  })
+
+          write_csv(OUT / "v4_168b_lattice_nodes.csv", node_rows, ["node_id", "node_type", "role", "z"])
+          write_csv(OUT / "v4_168b_lattice_edges.csv", edge_rows, ["source", "target", "edge_type", "weight", "absolute_weight", "note"])
+
+          route_decision = {
+              "version": "v4.168b",
+              "title": "Limited LRGxELG residual parameter-driver lattice attribution preview - safe replacement",
+              "result_label": "limited_lrgxelg_residual_parameter_driver_lattice_attribution_safe_replacement_passed_driver_lattice_artifacts_written_no_fitting_claim_no_pressure_no_validation",
+              "residual_norm_sigma_units_preview_not_pressure": residual_norm_sigma_units,
+              "top_driver_by_absolute_cosine": driver_rows_sorted[0]["driver"],
+              "top_driver_absolute_cosine": driver_rows_sorted[0]["absolute_cosine"],
+              "top_driver_signed_cosine": driver_rows_sorted[0]["cosine_to_residual_sigma_unit_shape"],
+              "h0_rd_cosine": h0_rd_cosine,
+              "h0_rd_near_duplicate_guard": h0_rd_near_duplicate,
+              "selected_next_route": "limited_lrgxelg_theory_observation_bridge_ledger_with_scope_guards",
+              "truth_boundary": [
+                  "This is a local driver-shape attribution preview.",
+                  "It is not a fit.",
+                  "It is not a fitted cosmological parameter estimate.",
+                  "It is not final pressure.",
+                  "It is not likelihood, BIC, or posterior comparison.",
+                  "It is not TAIRID validation.",
+              ],
+          }
+
+          with open(OUT / "v4_168b_route_decision.json", "w", encoding="utf-8") as f:
+              json.dump(route_decision, f, indent=2)
+
+          with open(OUT / "v4_168b_blocked_claims.json", "w", encoding="utf-8") as f:
+              json.dump({"blocked_claims": BLOCKED_CLAIMS}, f, indent=2)
+
+          with open(OUT / "v4_168b_scope_guards.json", "w", encoding="utf-8") as f:
+              json.dump({
+                  "scope": "limited two-redshift LRGxELG product only",
+                  "uses_observed_values": True,
+                  "uses_lcdm_lite_reference_vector": True,
+                  "uses_observed_diagonal_sigma_for_scaling": True,
+                  "uses_real_planck_reference_covariance": False,
+                  "computes_pressure": False,
+                  "computes_likelihood": False,
+                  "computes_bic": False,
+                  "validates_tairid": False,
+              }, f, indent=2)
+
+          summary_md = []
+          summary_md.append("# TAIRID v4.168b - Residual Parameter-Driver Lattice Attribution Preview")
+          summary_md.append("")
+          summary_md.append("This is a safe replacement workflow for the same v4.168 test.")
+          summary_md.append("")
+          summary_md.append("## Clean result")
+          summary_md.append("")
+          summary_md.append("The workflow compares the six-slot residual vector against local LCDM-lite driver directions.")
+          summary_md.append("The comparison is performed in observed-sigma-unit preview space.")
+          summary_md.append("")
+          summary_md.append("## Top attribution preview")
+          summary_md.append("")
+          summary_md.append(f"Top driver by absolute cosine: `{driver_rows_sorted[0]['driver']}`")
+          summary_md.append(f"Signed cosine: `{driver_rows_sorted[0]['cosine_to_residual_sigma_unit_shape']:.6f}`")
+          summary_md.append(f"Absolute cosine: `{driver_rows_sorted[0]['absolute_cosine']:.6f}`")
+          summary_md.append("")
+          summary_md.append("## Degeneracy guard")
+          summary_md.append("")
+          summary_md.append(f"H0/rd driver cosine: `{h0_rd_cosine:.6f}`")
+          summary_md.append("The H0 and rd directions are nearly duplicate geometry-scale directions in this setup.")
+          summary_md.append("Their coefficients must not be interpreted as separate fitted cosmological parameters.")
+          summary_md.append("")
+          summary_md.append("## Boundary")
+          summary_md.append("")
+          for claim in BLOCKED_CLAIMS:
+              summary_md.append(f"- {claim}")
+          summary_md.append("")
+          summary_md.append("## Selected next route")
+          summary_md.append("")
+          summary_md.append("`limited_lrgxelg_theory_observation_bridge_ledger_with_scope_guards`")
+          (OUT / "v4_168b_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          rule_checks = {
+              "workflow_version_is_v4_168b": True,
+              "six_labels_present": len(LABELS) == 6,
+              "six_observed_values_present": len(OBSERVED) == 6,
+              "six_reference_values_present": len(REFERENCE) == 6,
+              "six_sigma_values_present": len(OBSERVED_SIGMA) == 6,
+              "residual_vector_length_is_six": len(residual_raw) == 6,
+              "residual_norm_finite": math.isfinite(residual_norm_sigma_units),
+              "driver_count_is_five": len(driver_names) == 5,
+              "all_driver_vectors_length_six": all(len(driver_vectors[d]) == 6 for d in driver_names),
+              "all_driver_cosines_finite": all(math.isfinite(r["cosine_to_residual_sigma_unit_shape"]) for r in driver_rows),
+              "top_driver_selected": bool(driver_rows_sorted[0]["driver"]),
+              "h0_rd_degeneracy_guard_written": h0_rd_near_duplicate,
+              "node_table_written": (OUT / "v4_168b_lattice_nodes.csv").exists(),
+              "edge_table_written": (OUT / "v4_168b_lattice_edges.csv").exists(),
+              "driver_table_written": (OUT / "v4_168b_driver_cosine_attribution.csv").exists(),
+              "component_table_written": (OUT / "v4_168b_variable_driver_lattice_components.csv").exists(),
+              "family_summary_written": (OUT / "v4_168b_family_driver_summary.csv").exists(),
+              "route_decision_written": (OUT / "v4_168b_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_168b_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_168b_blocked_claims.json").exists(),
+              "no_fitting_claim": True,
+              "no_pressure_claim": True,
+              "no_validation_claim": True,
+              "next_route_selected": route_decision["selected_next_route"] == "limited_lrgxelg_theory_observation_bridge_ledger_with_scope_guards",
+          }
+
+          failed = [name for name, ok in rule_checks.items() if not ok]
+          health = {
+              "rule_pass_count": len(rule_checks) - len(failed),
+              "rule_total_count": len(rule_checks),
+              "failed_gates": failed,
+              "result_label": route_decision["result_label"],
+          }
+
+          with open(OUT / "v4_168b_parser_health_report.json", "w", encoding="utf-8") as f:
+              json.dump(health, f, indent=2)
+
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.168b failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_168b_outputs/run_v4_168b.py
+
+      - name: Upload v4.168b artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-168b-limited-lrgxelg-residual-parameter-driver-attribution-safe-replacement-output
+          path: tairid_v4_168b_outputs/
