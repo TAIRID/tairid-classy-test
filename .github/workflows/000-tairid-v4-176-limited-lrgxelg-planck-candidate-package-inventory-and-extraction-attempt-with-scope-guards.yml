@@ -1,0 +1,642 @@
+name: 000 TAIRID v4.176 - Limited LRGxELG Planck Candidate Package Inventory And Extraction Attempt With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-176-limited-lrgxelg-planck-candidate-package-inventory-and-extraction-attempt-with-scope-guards.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-176-package-inventory-and-extraction-attempt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.176 controlled package inventory and extraction attempt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_176_outputs
+          cat > tairid_v4_176_outputs/run_v4_176.py <<'PY'
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          import os
+          import re
+          import shutil
+          import sys
+          import time
+          import urllib.request
+          import urllib.error
+          import zipfile
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_176_outputs")
+          TMP = OUT / "tmp_downloads"
+          TMP.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_planck_candidate_package_inventory_and_extraction_attempt_passed_inventory_written_no_pressure_no_validation"
+
+          MAX_DOWNLOAD_BYTES = int(os.environ.get("TAIRID_MAX_DOWNLOAD_BYTES", str(350 * 1024 * 1024)))
+          SMALL_TEXT_PREVIEW_BYTES = int(os.environ.get("TAIRID_SMALL_TEXT_PREVIEW_BYTES", str(750_000)))
+          MAX_PREVIEW_FILES = int(os.environ.get("TAIRID_MAX_PREVIEW_FILES", "80"))
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          BLOCKED_CLAIMS = [
+              "no reference ensemble accepted",
+              "no reference covariance accepted",
+              "no Planck posterior accepted",
+              "no residuals computed",
+              "no pressure computed",
+              "no final chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          # Ordered from v4.175. The parameter-tables package is tested early because it is often smaller
+          # and can quickly prove whether useful parameters are exposed without a huge chain download.
+          CANDIDATES = [
+              {
+                  "candidate_id": "C1_base_plikHM_TTTEEE_lowl_lowE_R3_00",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip",
+                  "kind": "primary_baseline_planck_cosmoparams_zip",
+                  "reason": "Top v4.175 candidate; Planck 2018 baseline-like label.",
+              },
+              {
+                  "candidate_id": "C2_parameter_tables_R3_01",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_parameter-tables_R3.01.zip",
+                  "kind": "parameter_tables_zip",
+                  "reason": "May be smaller and expose parameter summaries quickly.",
+              },
+              {
+                  "candidate_id": "C3_base_plikHM_R3_01",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM_R3.01.zip",
+                  "kind": "alternate_base_plikHM_zip",
+                  "reason": "Alternate Planck CosmoParams package from v4.175.",
+              },
+              {
+                  "candidate_id": "C4_fullGrid_R3_01",
+                  "url": "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_fullGrid_R3.01.zip",
+                  "kind": "full_grid_zip",
+                  "reason": "May be large; inventory only if within size cap.",
+              },
+          ]
+
+          PARAMETER_MARKERS = [
+              "omegam", "omega_m", "omega matter", "omega_cdm", "omegabh2", "omegach2",
+              "h0", "hubble", "sigma8", "s8", "rdrag", "r_d", "rd", "theta", "thetastar",
+              "base_plik", "ttteee", "lowe", "lensing"
+          ]
+
+          CHAIN_FILE_MARKERS = [
+              ".txt", ".dat", ".paramnames", ".minimum", ".bestfit", ".margestats", ".likestats",
+              ".converge", ".ranges", ".covmat", ".inputparams"
+          ]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def head_probe(url, timeout=20):
+              out = {
+                  "url": url,
+                  "head_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length": "",
+                  "last_modified": "",
+                  "accept_ranges": "",
+                  "error": "",
+              }
+              try:
+                  req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "TAIRID-v4.176/1.0"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      out["head_ok"] = True
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length"] = resp.headers.get("Content-Length", "")
+                      out["last_modified"] = resp.headers.get("Last-Modified", "")
+                      out["accept_ranges"] = resp.headers.get("Accept-Ranges", "")
+              except Exception as exc:
+                  out["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+              return out
+
+          def safe_int(value):
+              try:
+                  return int(value)
+              except Exception:
+                  return None
+
+          def download_with_cap(url, out_path, cap_bytes, timeout=60):
+              result = {
+                  "download_attempted": True,
+                  "download_ok": False,
+                  "downloaded_bytes": 0,
+                  "sha256": "",
+                  "error": "",
+                  "skipped_reason": "",
+              }
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.176/1.0"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp, open(out_path, "wb") as f:
+                      total = 0
+                      while True:
+                          chunk = resp.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          total += len(chunk)
+                          if total > cap_bytes:
+                              result["skipped_reason"] = f"download exceeded cap {cap_bytes} bytes"
+                              result["downloaded_bytes"] = total
+                              try:
+                                  f.close()
+                                  out_path.unlink(missing_ok=True)
+                              except Exception:
+                                  pass
+                              return result
+                          f.write(chunk)
+                      result["downloaded_bytes"] = total
+                  result["sha256"] = sha256_file(out_path)
+                  result["download_ok"] = True
+              except Exception as exc:
+                  result["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+                  try:
+                      out_path.unlink(missing_ok=True)
+                  except Exception:
+                      pass
+              return result
+
+          def classify_zip_member(name, size):
+              lower = name.lower()
+              kind = "other"
+              if lower.endswith(".paramnames"):
+                  kind = "paramnames"
+              elif lower.endswith(".margestats"):
+                  kind = "margestats"
+              elif lower.endswith(".bestfit"):
+                  kind = "bestfit"
+              elif lower.endswith(".minimum"):
+                  kind = "minimum"
+              elif lower.endswith(".likestats"):
+                  kind = "likestats"
+              elif lower.endswith(".covmat"):
+                  kind = "covmat"
+              elif lower.endswith(".ranges"):
+                  kind = "ranges"
+              elif lower.endswith(".converge"):
+                  kind = "converge"
+              elif lower.endswith(".inputparams"):
+                  kind = "inputparams"
+              elif lower.endswith(".txt") or lower.endswith(".dat"):
+                  kind = "txt_or_dat"
+              elif lower.endswith(".csv"):
+                  kind = "csv"
+              elif lower.endswith(".fits") or lower.endswith(".fit"):
+                  kind = "fits"
+              elif lower.endswith(".pdf"):
+                  kind = "pdf"
+              elif lower.endswith(".zip") or lower.endswith(".tar") or lower.endswith(".gz"):
+                  kind = "nested_archive"
+              chain_like = any(marker in lower for marker in CHAIN_FILE_MARKERS)
+              small_text_like = kind in {"paramnames", "margestats", "bestfit", "minimum", "likestats", "covmat", "ranges", "converge", "inputparams", "txt_or_dat", "csv"}
+              return kind, chain_like, small_text_like and size <= SMALL_TEXT_PREVIEW_BYTES
+
+          def preview_member(zf, info, max_bytes=SMALL_TEXT_PREVIEW_BYTES):
+              try:
+                  data = zf.read(info.filename, pwd=None)
+                  if len(data) > max_bytes:
+                      data = data[:max_bytes]
+                  text = data.decode("utf-8", errors="replace")
+                  return text
+              except Exception as exc:
+                  return "PREVIEW_ERROR: " + type(exc).__name__ + ": " + str(exc)[:240]
+
+          def marker_hits(text):
+              low = text.lower()
+              hits = []
+              for marker in PARAMETER_MARKERS:
+                  if marker.lower() in low:
+                      hits.append(marker)
+              return sorted(set(hits))
+
+          def inventory_zip(path, candidate):
+              member_rows = []
+              preview_rows = []
+              package_result = {
+                  "zip_open_ok": False,
+                  "zip_member_count": 0,
+                  "chain_like_count": 0,
+                  "paramnames_count": 0,
+                  "covmat_count": 0,
+                  "margestats_count": 0,
+                  "bestfit_count": 0,
+                  "marker_hit_count": 0,
+                  "usable_route_hint": "none",
+                  "error": "",
+              }
+              try:
+                  with zipfile.ZipFile(path, "r") as zf:
+                      infos = zf.infolist()
+                      package_result["zip_open_ok"] = True
+                      package_result["zip_member_count"] = len(infos)
+
+                      previewed = 0
+                      for info in infos:
+                          if info.is_dir():
+                              continue
+                          kind, chain_like, should_preview = classify_zip_member(info.filename, info.file_size)
+                          if chain_like:
+                              package_result["chain_like_count"] += 1
+                          if kind == "paramnames":
+                              package_result["paramnames_count"] += 1
+                          if kind == "covmat":
+                              package_result["covmat_count"] += 1
+                          if kind == "margestats":
+                              package_result["margestats_count"] += 1
+                          if kind == "bestfit":
+                              package_result["bestfit_count"] += 1
+
+                          member_rows.append({
+                              "candidate_id": candidate["candidate_id"],
+                              "member_name": info.filename,
+                              "member_size": info.file_size,
+                              "compressed_size": info.compress_size,
+                              "kind": kind,
+                              "chain_like": chain_like,
+                              "preview_eligible": should_preview,
+                          })
+
+                      # Preview the most useful files first.
+                      sorted_infos = sorted(
+                          [i for i in infos if not i.is_dir()],
+                          key=lambda i: (
+                              0 if i.filename.lower().endswith(".paramnames") else
+                              1 if i.filename.lower().endswith(".margestats") else
+                              2 if i.filename.lower().endswith(".bestfit") else
+                              3 if i.filename.lower().endswith(".covmat") else
+                              4,
+                              i.file_size,
+                              i.filename
+                          )
+                      )
+                      for info in sorted_infos:
+                          if previewed >= MAX_PREVIEW_FILES:
+                              break
+                          kind, chain_like, should_preview = classify_zip_member(info.filename, info.file_size)
+                          if not should_preview:
+                              continue
+                          text = preview_member(zf, info)
+                          hits = marker_hits(text)
+                          if hits:
+                              package_result["marker_hit_count"] += len(hits)
+                          preview_rows.append({
+                              "candidate_id": candidate["candidate_id"],
+                              "member_name": info.filename,
+                              "kind": kind,
+                              "member_size": info.file_size,
+                              "marker_hits": ";".join(hits),
+                              "first_1200_chars": text[:1200].replace("\r", "\\r").replace("\n", "\\n"),
+                              "preview_status": "small_text_preview_only_not_science_ingestion",
+                          })
+                          previewed += 1
+
+                      if package_result["paramnames_count"] > 0 and (package_result["margestats_count"] > 0 or package_result["covmat_count"] > 0):
+                          package_result["usable_route_hint"] = "parameter_summary_or_covariance_like_files_found"
+                      elif package_result["paramnames_count"] > 0:
+                          package_result["usable_route_hint"] = "paramnames_found_need_chain_or_stats_files"
+                      elif package_result["margestats_count"] > 0:
+                          package_result["usable_route_hint"] = "margestats_found_parameter_table_route_possible"
+                      elif package_result["chain_like_count"] > 0:
+                          package_result["usable_route_hint"] = "chain_like_files_found_need_deeper_inventory"
+                      else:
+                          package_result["usable_route_hint"] = "no_obvious_chain_route"
+              except Exception as exc:
+                  package_result["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+              return package_result, member_rows, preview_rows
+
+          header_rows = []
+          download_rows = []
+          all_member_rows = []
+          all_preview_rows = []
+          package_rows = []
+
+          for candidate in CANDIDATES:
+              head = head_probe(candidate["url"])
+              clen = safe_int(head.get("content_length", ""))
+              can_attempt = True
+              skip_reason = ""
+              if clen is not None and clen > MAX_DOWNLOAD_BYTES:
+                  can_attempt = False
+                  skip_reason = f"content_length {clen} exceeds cap {MAX_DOWNLOAD_BYTES}"
+
+              header_row = dict(candidate)
+              header_row.update(head)
+              header_row["max_download_bytes"] = MAX_DOWNLOAD_BYTES
+              header_row["download_allowed_by_size_gate"] = can_attempt
+              header_row["size_gate_skip_reason"] = skip_reason
+              header_rows.append(header_row)
+
+              if not can_attempt:
+                  download_rows.append({
+                      "candidate_id": candidate["candidate_id"],
+                      "url": candidate["url"],
+                      "download_attempted": False,
+                      "download_ok": False,
+                      "downloaded_bytes": 0,
+                      "sha256": "",
+                      "error": "",
+                      "skipped_reason": skip_reason,
+                  })
+                  package_rows.append({
+                      "candidate_id": candidate["candidate_id"],
+                      "zip_open_ok": False,
+                      "zip_member_count": 0,
+                      "chain_like_count": 0,
+                      "paramnames_count": 0,
+                      "covmat_count": 0,
+                      "margestats_count": 0,
+                      "bestfit_count": 0,
+                      "marker_hit_count": 0,
+                      "usable_route_hint": "skipped_size_gate",
+                      "error": skip_reason,
+                  })
+                  continue
+
+              local_name = candidate["candidate_id"] + ".zip"
+              local_path = TMP / local_name
+              dl = download_with_cap(candidate["url"], local_path, MAX_DOWNLOAD_BYTES)
+              dl_row = {"candidate_id": candidate["candidate_id"], "url": candidate["url"]}
+              dl_row.update(dl)
+              download_rows.append(dl_row)
+
+              if dl["download_ok"]:
+                  pkg_result, member_rows, preview_rows = inventory_zip(local_path, candidate)
+                  pkg_row = {"candidate_id": candidate["candidate_id"]}
+                  pkg_row.update(pkg_result)
+                  package_rows.append(pkg_row)
+                  all_member_rows.extend(member_rows)
+                  all_preview_rows.extend(preview_rows)
+                  # Keep disk controlled.
+                  try:
+                      local_path.unlink(missing_ok=True)
+                  except Exception:
+                      pass
+              else:
+                  package_rows.append({
+                      "candidate_id": candidate["candidate_id"],
+                      "zip_open_ok": False,
+                      "zip_member_count": 0,
+                      "chain_like_count": 0,
+                      "paramnames_count": 0,
+                      "covmat_count": 0,
+                      "margestats_count": 0,
+                      "bestfit_count": 0,
+                      "marker_hit_count": 0,
+                      "usable_route_hint": "download_failed_or_skipped",
+                      "error": dl.get("error", "") or dl.get("skipped_reason", ""),
+                  })
+
+          write_csv(
+              OUT / "v4_176_candidate_header_and_size_gates.csv",
+              header_rows,
+              [
+                  "candidate_id", "url", "kind", "reason", "head_ok", "status_code",
+                  "content_type", "content_length", "last_modified", "accept_ranges",
+                  "error", "max_download_bytes", "download_allowed_by_size_gate", "size_gate_skip_reason"
+              ],
+          )
+
+          write_csv(
+              OUT / "v4_176_download_attempts.csv",
+              download_rows,
+              ["candidate_id", "url", "download_attempted", "download_ok", "downloaded_bytes", "sha256", "error", "skipped_reason"],
+          )
+
+          write_csv(
+              OUT / "v4_176_package_inventory_summary.csv",
+              package_rows,
+              [
+                  "candidate_id", "zip_open_ok", "zip_member_count", "chain_like_count",
+                  "paramnames_count", "covmat_count", "margestats_count", "bestfit_count",
+                  "marker_hit_count", "usable_route_hint", "error"
+              ],
+          )
+
+          write_csv(
+              OUT / "v4_176_zip_member_inventory.csv",
+              all_member_rows,
+              ["candidate_id", "member_name", "member_size", "compressed_size", "kind", "chain_like", "preview_eligible"],
+          )
+
+          write_csv(
+              OUT / "v4_176_small_text_previews.csv",
+              all_preview_rows,
+              ["candidate_id", "member_name", "kind", "member_size", "marker_hits", "first_1200_chars", "preview_status"],
+          )
+
+          found_covmat = any(int(row.get("covmat_count", 0)) > 0 for row in package_rows)
+          found_margestats = any(int(row.get("margestats_count", 0)) > 0 for row in package_rows)
+          found_paramnames = any(int(row.get("paramnames_count", 0)) > 0 for row in package_rows)
+          found_chain_like = any(int(row.get("chain_like_count", 0)) > 0 for row in package_rows)
+          any_download_ok = any(bool(row.get("download_ok")) for row in download_rows)
+          any_zip_open = any(bool(row.get("zip_open_ok")) for row in package_rows)
+
+          if found_covmat and found_paramnames:
+              selected_next_route = "limited_lrgxelg_planck_covmat_or_chain_parameter_extraction_no_pressure_with_scope_guards"
+              package_status = "covmat_and_paramnames_found"
+          elif found_margestats or found_paramnames:
+              selected_next_route = "limited_lrgxelg_planck_parameter_table_extraction_no_pressure_with_scope_guards"
+              package_status = "parameter_summary_route_found"
+          elif found_chain_like:
+              selected_next_route = "limited_lrgxelg_planck_chain_like_file_deeper_inventory_no_pressure_with_scope_guards"
+              package_status = "chain_like_route_found"
+          elif any_download_ok and any_zip_open:
+              selected_next_route = "limited_lrgxelg_planck_package_not_useful_try_next_candidate_or_manual_route_with_scope_guards"
+              package_status = "package_downloaded_but_no_useful_reference_route_found"
+          else:
+              selected_next_route = "limited_lrgxelg_planck_package_download_blocked_or_failed_manual_route_with_scope_guards"
+              package_status = "no_package_inventory_obtained"
+
+          extraction_map_rows = [
+              {
+                  "needed_quantity": "reference mean vector",
+                  "possible_source_found": found_margestats or found_paramnames,
+                  "candidate_route": "margestats or parameter-table extraction",
+                  "status": "possible_only_not_extracted" if (found_margestats or found_paramnames) else "not_found",
+              },
+              {
+                  "needed_quantity": "reference parameter covariance",
+                  "possible_source_found": found_covmat,
+                  "candidate_route": "covmat extraction and propagation",
+                  "status": "possible_only_not_extracted" if found_covmat else "not_found",
+              },
+              {
+                  "needed_quantity": "reference ensemble",
+                  "possible_source_found": found_chain_like,
+                  "candidate_route": "chain-like file extraction or conversion",
+                  "status": "possible_only_not_extracted" if found_chain_like else "not_found",
+              },
+              {
+                  "needed_quantity": "six-slot LRGxELG reference covariance",
+                  "possible_source_found": False,
+                  "candidate_route": "later transformation from samples/covmat",
+                  "status": "not_built_in_v4_176",
+              },
+          ]
+
+          write_csv(
+              OUT / "v4_176_reference_gap_extraction_map.csv",
+              extraction_map_rows,
+              ["needed_quantity", "possible_source_found", "candidate_route", "status"],
+          )
+
+          route_decision = {
+              "version": "v4.176",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Controlled package inventory and small-text extraction attempt completed. No pressure or validation was computed.",
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "max_download_bytes": MAX_DOWNLOAD_BYTES,
+              "candidate_count": len(CANDIDATES),
+              "download_ok_count": sum(1 for row in download_rows if row.get("download_ok")),
+              "zip_open_count": sum(1 for row in package_rows if row.get("zip_open_ok")),
+              "member_inventory_count": len(all_member_rows),
+              "small_text_preview_count": len(all_preview_rows),
+              "found_paramnames": found_paramnames,
+              "found_margestats": found_margestats,
+              "found_covmat": found_covmat,
+              "found_chain_like": found_chain_like,
+              "truth_boundary": "inventory_and_preview_only; no reference ensemble/covariance accepted",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+
+          (OUT / "v4_176_route_decision.json").write_text(json.dumps(route_decision, indent=2), encoding="utf-8")
+
+          (OUT / "v4_176_scope_guards.json").write_text(json.dumps({
+              "scope": "controlled Planck/CosmoParams package inventory and small-text preview only",
+              "max_download_bytes": MAX_DOWNLOAD_BYTES,
+              "science_values_accepted": False,
+              "reference_ensemble_accepted": False,
+              "reference_covariance_accepted": False,
+              "reference_covariance_computed": False,
+              "residuals_computed": False,
+              "pressure_computed": False,
+              "likelihood_computed": False,
+              "bic_computed": False,
+              "posterior_comparison_computed": False,
+              "tairid_validated": False
+          }, indent=2), encoding="utf-8")
+
+          (OUT / "v4_176_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = []
+          summary.append("# TAIRID v4.176 - Planck Candidate Package Inventory And Extraction Attempt")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("This workflow moves from link-finding to controlled package inventory.")
+          summary.append("It may download candidate ZIP files if they pass the size gate, list their contents, and preview small text files.")
+          summary.append("")
+          summary.append("Package status: `" + package_status + "`")
+          summary.append("")
+          summary.append("Selected next route: `" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Counts")
+          summary.append("")
+          summary.append("- Downloads succeeded: `" + str(route_decision["download_ok_count"]) + "`")
+          summary.append("- ZIPs opened: `" + str(route_decision["zip_open_count"]) + "`")
+          summary.append("- ZIP members inventoried: `" + str(len(all_member_rows)) + "`")
+          summary.append("- Small text previews: `" + str(len(all_preview_rows)) + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_176_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_176": True,
+              "result_label_present": RESULT_LABEL.endswith("no_pressure_no_validation"),
+              "candidate_count_at_least_three": len(CANDIDATES) >= 3,
+              "header_gate_written": (OUT / "v4_176_candidate_header_and_size_gates.csv").exists(),
+              "download_attempts_written": (OUT / "v4_176_download_attempts.csv").exists(),
+              "package_inventory_summary_written": (OUT / "v4_176_package_inventory_summary.csv").exists(),
+              "zip_member_inventory_written": (OUT / "v4_176_zip_member_inventory.csv").exists(),
+              "small_text_previews_written": (OUT / "v4_176_small_text_previews.csv").exists(),
+              "extraction_map_written": (OUT / "v4_176_reference_gap_extraction_map.csv").exists(),
+              "route_decision_written": (OUT / "v4_176_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_176_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_176_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_176_summary.md").exists(),
+              "next_route_selected": bool(selected_next_route),
+              "no_reference_ensemble_accepted": True,
+              "no_reference_covariance_accepted": True,
+              "no_pressure_computed": True,
+              "no_likelihood_computed": True,
+              "no_validation_claimed": True,
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.176",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "download_ok_count": route_decision["download_ok_count"],
+              "zip_open_count": route_decision["zip_open_count"],
+              "member_inventory_count": len(all_member_rows),
+              "small_text_preview_count": len(all_preview_rows),
+              "claim_boundary": "package_inventory_and_preview_only_no_pressure_no_validation",
+          }
+
+          (OUT / "v4_176_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.176 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_176_outputs/run_v4_176.py
+
+      - name: Upload v4.176 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-176-limited-lrgxelg-planck-candidate-package-inventory-and-extraction-attempt-output
+          path: tairid_v4_176_outputs/
