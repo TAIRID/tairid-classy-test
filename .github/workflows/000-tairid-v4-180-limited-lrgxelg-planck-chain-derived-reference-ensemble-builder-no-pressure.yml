@@ -1,0 +1,537 @@
+name: 000 TAIRID v4.180 - Limited LRGxELG Planck Chain Derived Reference Ensemble Builder No Pressure
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-180-limited-lrgxelg-planck-chain-derived-reference-ensemble-builder-no-pressure.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-180-planck-chain-derived-reference-ensemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.180 Planck chain derived reference ensemble builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_180_outputs
+          cat > tairid_v4_180_outputs/run_v4_180.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import os
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_180_outputs")
+          TMP = OUT / "tmp_downloads"
+          TMP.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_planck_chain_derived_reference_ensemble_builder_passed_reference_ensemble_and_covariance_written_no_pressure_no_validation"
+
+          PACKAGE_URL = "https://irsa.ipac.caltech.edu/data/Planck/release_3/ancillary-data/cosmoparams/COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00.zip"
+          PACKAGE_ID = "COM_CosmoParams_base-plikHM-TTTEEE-lowl-lowE_R3.00"
+
+          BASE_PREFIX = "base/plikHM_TTTEEE_lowl_lowE"
+          PARAMNAMES_MEMBER = BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE.paramnames"
+          CHAIN_MEMBERS = [
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_1.txt",
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_2.txt",
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_3.txt",
+              BASE_PREFIX + "/base_plikHM_TTTEEE_lowl_lowE_4.txt",
+          ]
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          PARAM_ALIASES = {
+              "Omega_m": ["omegam", "Omega_m"],
+              "H0_km_s_Mpc": ["H0", "h0"],
+              "sigma8_z0": ["sigma8"],
+              "rdragh_Mpc_times_h": ["rdragh", "rdrag_h"],
+          }
+
+          BLOCKED_CLAIMS = [
+              "no observed residuals computed",
+              "no pressure computed",
+              "no final chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          MAX_DOWNLOAD_BYTES = int(os.environ.get("TAIRID_MAX_DOWNLOAD_BYTES", str(350 * 1024 * 1024)))
+          MAX_EXPORT_ROWS = int(os.environ.get("TAIRID_MAX_EXPORT_ROWS", "5000"))
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_with_cap(url, out_path, cap_bytes):
+              result = {
+                  "url": url,
+                  "download_attempted": True,
+                  "download_ok": False,
+                  "downloaded_bytes": 0,
+                  "sha256": "",
+                  "error": "",
+                  "skipped_reason": "",
+              }
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.180/1.0"})
+                  with urllib.request.urlopen(req, timeout=90) as resp, open(out_path, "wb") as f:
+                      total = 0
+                      while True:
+                          chunk = resp.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          total += len(chunk)
+                          if total > cap_bytes:
+                              result["downloaded_bytes"] = total
+                              result["skipped_reason"] = "download exceeded cap " + str(cap_bytes)
+                              try:
+                                  f.close()
+                                  out_path.unlink(missing_ok=True)
+                              except Exception:
+                                  pass
+                              return result
+                          f.write(chunk)
+                      result["downloaded_bytes"] = total
+                  result["sha256"] = sha256_file(out_path)
+                  result["download_ok"] = True
+              except Exception as exc:
+                  result["error"] = type(exc).__name__ + ": " + str(exc)[:240]
+                  try:
+                      out_path.unlink(missing_ok=True)
+                  except Exception:
+                      pass
+              return result
+
+          def parse_paramnames(text):
+              rows = []
+              for raw in text.splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split(None, 1)
+                  parameter = parts[0].strip()
+                  rows.append({
+                      "parameter": parameter,
+                      "clean_parameter": parameter.rstrip("*"),
+                      "derived_flag": parameter.endswith("*"),
+                      "display_label": parts[1].strip() if len(parts) > 1 else "",
+                  })
+              return rows
+
+          def find_param_index(paramnames_rows, aliases):
+              clean_lookup = {}
+              full_lookup = {}
+              for idx, row in enumerate(paramnames_rows):
+                  clean_lookup[row["clean_parameter"].lower()] = idx
+                  full_lookup[row["parameter"].lower()] = idx
+              for alias in aliases:
+                  a = alias.lower().rstrip("*")
+                  if a in clean_lookup:
+                      return clean_lookup[a]
+                  if alias.lower() in full_lookup:
+                      return full_lookup[alias.lower()]
+              return None
+
+          def e_z(z, omega_m):
+              return math.sqrt(omega_m * (1.0 + z) ** 3 + (1.0 - omega_m))
+
+          def simpson_integral_inverse_e(z, omega_m, n=1200):
+              if n % 2:
+                  n += 1
+              hstep = z / n
+              total = 1.0 / e_z(0.0, omega_m) + 1.0 / e_z(z, omega_m)
+              for i in range(1, n):
+                  total += (4 if i % 2 else 2) / e_z(i * hstep, omega_m)
+              return hstep * total / 3.0
+
+          def growth_factor_cpt(z, omega_m):
+              ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+              omz = omega_m * (1.0 + z) ** 3 / ez2
+              olz = (1.0 - omega_m) / ez2
+              gz = 5.0 * omz / (2.0 * (omz ** (4.0 / 7.0) - olz + (1.0 + omz / 2.0) * (1.0 + olz / 70.0)))
+              om0 = omega_m
+              ol0 = 1.0 - omega_m
+              g0 = 5.0 * om0 / (2.0 * (om0 ** (4.0 / 7.0) - ol0 + (1.0 + om0 / 2.0) * (1.0 + ol0 / 70.0)))
+              return gz / (g0 * (1.0 + z))
+
+          def six_slot_vector(omega_m, h0, rdragh, sigma8):
+              h = h0 / 100.0
+              rd = rdragh / h
+              c_km_s = 299792.458
+              gamma = 0.55
+              values = []
+              for z in [0.700, 0.845]:
+                  ez = e_z(z, omega_m)
+                  dm_rd = (c_km_s / h0) * simpson_integral_inverse_e(z, omega_m) / rd
+                  dh_rd = c_km_s / (h0 * ez) / rd
+                  ez2 = omega_m * (1.0 + z) ** 3 + (1.0 - omega_m)
+                  omz = omega_m * (1.0 + z) ** 3 / ez2
+                  fs8 = (omz ** gamma) * sigma8 * growth_factor_cpt(z, omega_m)
+                  values.extend([dm_rd, dh_rd, fs8])
+              return values, rd
+
+          def weighted_mean(values, weights):
+              sw = sum(weights)
+              return sum(v * w for v, w in zip(values, weights)) / sw if sw else float("nan")
+
+          def weighted_cov_matrix(matrix_rows, weights):
+              n = len(matrix_rows)
+              m = len(matrix_rows[0]) if n else 0
+              sw = sum(weights)
+              if n == 0 or sw == 0:
+                  return [], []
+              means = []
+              for j in range(m):
+                  means.append(sum(matrix_rows[i][j] * weights[i] for i in range(n)) / sw)
+              # Frequency-style weighted covariance with effective dof correction.
+              sw2 = sum(w * w for w in weights)
+              denom = sw - (sw2 / sw) if sw > 0 else 0
+              if denom <= 0:
+                  denom = sw
+              cov = []
+              for a in range(m):
+                  row = []
+                  for b in range(m):
+                      num = sum(weights[i] * (matrix_rows[i][a] - means[a]) * (matrix_rows[i][b] - means[b]) for i in range(n))
+                      row.append(num / denom)
+                  cov.append(row)
+              return means, cov
+
+          def matrix_to_rows(matrix, row_names, col_names):
+              rows = []
+              for i, rname in enumerate(row_names):
+                  row = {"row_label": rname}
+                  for j, cname in enumerate(col_names):
+                      row[cname] = matrix[i][j] if i < len(matrix) and j < len(matrix[i]) else ""
+                  rows.append(row)
+              return rows
+
+          download_path = TMP / "planck_candidate.zip"
+          download = download_with_cap(PACKAGE_URL, download_path, MAX_DOWNLOAD_BYTES)
+
+          paramnames_rows = []
+          mapping_rows = []
+          chain_status_rows = []
+          sample_rows_export = []
+          parameter_matrix = []
+          reference_matrix = []
+          weights = []
+          skipped_rows = 0
+          total_rows = 0
+          rd_values = []
+          package_status = "download_failed_or_blocked"
+          selected_next_route = "limited_lrgxelg_planck_chain_download_failed_try_manual_route_with_scope_guards"
+
+          if download["download_ok"]:
+              try:
+                  with zipfile.ZipFile(download_path, "r") as zf:
+                      member_names = set(zf.namelist())
+                      if PARAMNAMES_MEMBER in member_names:
+                          paramnames_rows = parse_paramnames(zf.read(PARAMNAMES_MEMBER).decode("utf-8", errors="replace"))
+
+                      index_map = {}
+                      for field, aliases in PARAM_ALIASES.items():
+                          idx = find_param_index(paramnames_rows, aliases)
+                          index_map[field] = idx
+                          mapping_rows.append({
+                              "field": field,
+                              "aliases": ";".join(aliases),
+                              "paramnames_index_zero_based": idx if idx is not None else "",
+                              "chain_column_index_with_two_column_offset": idx + 2 if idx is not None else "",
+                              "mapping_ok": idx is not None,
+                          })
+
+                      mapping_ok = all(index_map[field] is not None for field in PARAM_ALIASES)
+
+                      if mapping_ok:
+                          needed_cols = {field: index_map[field] + 2 for field in PARAM_ALIASES}
+                          max_needed_col = max(needed_cols.values())
+
+                          for member in CHAIN_MEMBERS:
+                              present = member in member_names
+                              member_rows = 0
+                              member_used = 0
+                              member_skipped = 0
+                              if present:
+                                  with zf.open(member, "r") as f:
+                                      for raw in f:
+                                          line = raw.decode("utf-8", errors="replace").strip()
+                                          if not line or line.startswith("#"):
+                                              continue
+                                          parts = line.split()
+                                          member_rows += 1
+                                          total_rows += 1
+                                          if len(parts) <= max_needed_col:
+                                              member_skipped += 1
+                                              skipped_rows += 1
+                                              continue
+                                          try:
+                                              weight = float(parts[0])
+                                              minus_loglike = float(parts[1])
+                                              omega_m = float(parts[needed_cols["Omega_m"]])
+                                              h0 = float(parts[needed_cols["H0_km_s_Mpc"]])
+                                              sigma8 = float(parts[needed_cols["sigma8_z0"]])
+                                              rdragh = float(parts[needed_cols["rdragh_Mpc_times_h"]])
+                                              vector, rd = six_slot_vector(omega_m, h0, rdragh, sigma8)
+                                          except Exception:
+                                              member_skipped += 1
+                                              skipped_rows += 1
+                                              continue
+
+                                          weights.append(weight)
+                                          parameter_matrix.append([omega_m, h0, rdragh, rd, sigma8])
+                                          reference_matrix.append(vector)
+                                          rd_values.append(rd)
+                                          member_used += 1
+
+                                          if len(sample_rows_export) < MAX_EXPORT_ROWS:
+                                              row = {
+                                                  "sample_id": f"{member}:{member_rows}",
+                                                  "weight": weight,
+                                                  "minus_loglike": minus_loglike,
+                                                  "Omega_m": omega_m,
+                                                  "H0_km_s_Mpc": h0,
+                                                  "rdragh_Mpc_times_h": rdragh,
+                                                  "rd_Mpc": rd,
+                                                  "sigma8_z0": sigma8,
+                                              }
+                                              for label, val in zip(LABELS, vector):
+                                                  row[label] = val
+                                              sample_rows_export.append(row)
+
+                              chain_status_rows.append({
+                                  "chain_member": member,
+                                  "present": present,
+                                  "member_rows_seen": member_rows,
+                                  "member_rows_used": member_used,
+                                  "member_rows_skipped": member_skipped,
+                              })
+
+                          if reference_matrix:
+                              package_status = "planck_chain_reference_ensemble_built"
+                              selected_next_route = "limited_lrgxelg_observed_plus_planck_chain_reference_covariance_preview_no_validation_with_scope_guards"
+                          else:
+                              package_status = "chain_files_present_but_no_samples_extracted"
+                              selected_next_route = "limited_lrgxelg_planck_chain_column_mapping_repair_with_scope_guards"
+                      else:
+                          package_status = "paramnames_present_but_required_mapping_incomplete"
+                          selected_next_route = "limited_lrgxelg_planck_chain_parameter_mapping_repair_with_scope_guards"
+              except Exception as exc:
+                  package_status = "zip_or_chain_processing_failed"
+                  selected_next_route = "limited_lrgxelg_planck_chain_processing_repair_with_scope_guards"
+                  chain_status_rows.append({
+                      "chain_member": "exception",
+                      "present": False,
+                      "member_rows_seen": 0,
+                      "member_rows_used": 0,
+                      "member_rows_skipped": 0,
+                      "error": type(exc).__name__ + ": " + str(exc)[:240],
+                  })
+
+          param_names = ["Omega_m", "H0_km_s_Mpc", "rdragh_Mpc_times_h", "rd_Mpc", "sigma8_z0"]
+          param_means, param_cov = weighted_cov_matrix(parameter_matrix, weights) if parameter_matrix else ([], [])
+          ref_means, ref_cov = weighted_cov_matrix(reference_matrix, weights) if reference_matrix else ([], [])
+
+          param_summary_rows = []
+          if param_means:
+              for i, pname in enumerate(param_names):
+                  param_summary_rows.append({
+                      "parameter": pname,
+                      "weighted_mean": param_means[i],
+                      "weighted_sigma": math.sqrt(param_cov[i][i]) if param_cov and param_cov[i][i] > 0 else "",
+                      "status": "chain_derived_parameter_summary",
+                  })
+
+          ref_vector_rows = []
+          if ref_means:
+              for label, val in zip(LABELS, ref_means):
+                  z = 0.700 if "z0p70" in label else 0.845
+                  role = "growth_consolidation" if "fsigma8" in label else ("transverse_geometry_reach" if label.startswith("DM") else "radial_geometry_pacing_access")
+                  sigma = math.sqrt(ref_cov[LABELS.index(label)][LABELS.index(label)]) if ref_cov and ref_cov[LABELS.index(label)][LABELS.index(label)] > 0 else ""
+                  ref_vector_rows.append({
+                      "label": label,
+                      "z": z,
+                      "role": role,
+                      "chain_weighted_reference_mean": val,
+                      "chain_reference_sigma": sigma,
+                      "status": "chain_derived_reference_mean_and_sigma_no_observed_residuals_no_pressure",
+                  })
+
+          # Build correlation matrix if covariance exists.
+          ref_corr = []
+          if ref_cov:
+              for i in range(len(LABELS)):
+                  row = []
+                  for j in range(len(LABELS)):
+                      denom = math.sqrt(ref_cov[i][i] * ref_cov[j][j]) if ref_cov[i][i] > 0 and ref_cov[j][j] > 0 else 0
+                      row.append(ref_cov[i][j] / denom if denom else "")
+                  ref_corr.append(row)
+
+          write_csv(OUT / "v4_180_download_status.csv", [download], ["url", "download_attempted", "download_ok", "downloaded_bytes", "sha256", "error", "skipped_reason"])
+          write_csv(OUT / "v4_180_paramnames_table.csv", paramnames_rows, ["parameter", "clean_parameter", "derived_flag", "display_label"])
+          write_csv(OUT / "v4_180_chain_column_mapping.csv", mapping_rows, ["field", "aliases", "paramnames_index_zero_based", "chain_column_index_with_two_column_offset", "mapping_ok"])
+          write_csv(OUT / "v4_180_chain_member_status.csv", chain_status_rows, ["chain_member", "present", "member_rows_seen", "member_rows_used", "member_rows_skipped"])
+          write_csv(OUT / "v4_180_reference_ensemble_sample_export.csv", sample_rows_export, ["sample_id", "weight", "minus_loglike", "Omega_m", "H0_km_s_Mpc", "rdragh_Mpc_times_h", "rd_Mpc", "sigma8_z0"] + LABELS)
+          write_csv(OUT / "v4_180_chain_parameter_summary.csv", param_summary_rows, ["parameter", "weighted_mean", "weighted_sigma", "status"])
+          write_csv(OUT / "v4_180_chain_parameter_covariance.csv", matrix_to_rows(param_cov, param_names, param_names), ["row_label"] + param_names)
+          write_csv(OUT / "v4_180_chain_derived_reference_vector.csv", ref_vector_rows, ["label", "z", "role", "chain_weighted_reference_mean", "chain_reference_sigma", "status"])
+          write_csv(OUT / "v4_180_chain_derived_six_slot_reference_covariance.csv", matrix_to_rows(ref_cov, LABELS, LABELS), ["row_label"] + LABELS)
+          write_csv(OUT / "v4_180_chain_derived_six_slot_reference_correlation.csv", matrix_to_rows(ref_corr, LABELS, LABELS), ["row_label"] + LABELS)
+
+          total_weight = sum(weights)
+          effective_n = (total_weight * total_weight / sum(w*w for w in weights)) if weights and sum(w*w for w in weights) > 0 else 0
+          status = {
+              "version": "v4.180",
+              "result_label": RESULT_LABEL,
+              "package_status": package_status,
+              "download_ok": download["download_ok"],
+              "paramnames_count": len(paramnames_rows),
+              "chain_rows_seen": total_rows,
+              "chain_rows_used": len(reference_matrix),
+              "chain_rows_skipped": skipped_rows,
+              "total_weight": total_weight,
+              "effective_sample_size_preview": effective_n,
+              "reference_ensemble_built": len(reference_matrix) > 0,
+              "six_slot_reference_covariance_built": len(ref_cov) == 6,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "chain_derived_reference_ensemble_and_covariance_only_no_observed_residuals_no_pressure_no_validation",
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+          (OUT / "v4_180_readiness_report.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+
+          (OUT / "v4_180_route_decision.json").write_text(json.dumps({
+              "version": "v4.180",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Planck chain files were mapped into a weighted six-slot LRGxELG reference ensemble and covariance if sample extraction succeeded. No observed residuals or pressure were computed.",
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "blocked_claims": BLOCKED_CLAIMS,
+          }, indent=2), encoding="utf-8")
+
+          (OUT / "v4_180_scope_guards.json").write_text(json.dumps({
+              "scope": "Planck chain-derived reference ensemble and covariance builder only",
+              "observed_values_used": False,
+              "observed_residuals_computed": False,
+              "reference_ensemble_built": len(reference_matrix) > 0,
+              "six_slot_reference_covariance_built": len(ref_cov) == 6,
+              "pressure_computed": False,
+              "likelihood_computed": False,
+              "bic_computed": False,
+              "posterior_comparison_computed": False,
+              "tairid_validated": False,
+          }, indent=2), encoding="utf-8")
+
+          (OUT / "v4_180_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = []
+          summary.append("# TAIRID v4.180 - Planck Chain Derived Reference Ensemble Builder")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("This workflow extracts the Planck chain sample files, maps columns by paramnames, builds a weighted six-slot LRGxELG reference ensemble, and writes a chain-derived six-slot reference covariance.")
+          summary.append("")
+          summary.append("Package status: `" + package_status + "`")
+          summary.append("")
+          summary.append("Rows used: `" + str(len(reference_matrix)) + "`")
+          summary.append("")
+          summary.append("Selected next route: `" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_180_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_180": True,
+              "result_label_present": RESULT_LABEL.endswith("no_pressure_no_validation"),
+              "download_status_written": (OUT / "v4_180_download_status.csv").exists(),
+              "paramnames_table_written": (OUT / "v4_180_paramnames_table.csv").exists(),
+              "chain_mapping_written": (OUT / "v4_180_chain_column_mapping.csv").exists(),
+              "chain_member_status_written": (OUT / "v4_180_chain_member_status.csv").exists(),
+              "sample_export_written": (OUT / "v4_180_reference_ensemble_sample_export.csv").exists(),
+              "parameter_summary_written": (OUT / "v4_180_chain_parameter_summary.csv").exists(),
+              "parameter_covariance_written": (OUT / "v4_180_chain_parameter_covariance.csv").exists(),
+              "reference_vector_written": (OUT / "v4_180_chain_derived_reference_vector.csv").exists(),
+              "reference_covariance_written": (OUT / "v4_180_chain_derived_six_slot_reference_covariance.csv").exists(),
+              "reference_correlation_written": (OUT / "v4_180_chain_derived_six_slot_reference_correlation.csv").exists(),
+              "readiness_report_written": (OUT / "v4_180_readiness_report.json").exists(),
+              "route_decision_written": (OUT / "v4_180_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_180_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_180_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_180_summary.md").exists(),
+              "no_observed_values_used": True,
+              "no_residuals_computed": True,
+              "no_pressure_computed": True,
+              "no_validation_claimed": True,
+              "next_route_selected": bool(selected_next_route),
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.180",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "package_status": package_status,
+              "reference_ensemble_built": len(reference_matrix) > 0,
+              "six_slot_reference_covariance_built": len(ref_cov) == 6,
+              "chain_rows_used": len(reference_matrix),
+              "effective_sample_size_preview": effective_n,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "chain_derived_reference_ensemble_and_covariance_only_no_pressure_no_validation",
+          }
+
+          (OUT / "v4_180_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.180 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_180_outputs/run_v4_180.py
+
+      - name: Upload v4.180 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-180-limited-lrgxelg-planck-chain-derived-reference-ensemble-builder-output
+          path: tairid_v4_180_outputs/
