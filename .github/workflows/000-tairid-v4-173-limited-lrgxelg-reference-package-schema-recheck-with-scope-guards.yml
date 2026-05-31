@@ -1,0 +1,573 @@
+name: 000 TAIRID v4.173 - Limited LRGxELG Reference Package Schema Recheck With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-173-limited-lrgxelg-reference-package-schema-recheck-with-scope-guards.yml"
+      - "data/reference/**"
+      - "reference/**"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-173-reference-package-schema-recheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.173 reference package schema recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_173_outputs
+          cat > tairid_v4_173_outputs/run_v4_173.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_173_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "limited_lrgxelg_reference_package_schema_recheck_passed_status_written_no_pressure_no_validation"
+
+          LABELS = [
+              "DM_ov_rd_z0p70",
+              "DH_ov_rd_z0p70",
+              "fsigma8_z0p70",
+              "DM_ov_rd_z0p845",
+              "DH_ov_rd_z0p845",
+              "fsigma8_z0p845",
+          ]
+
+          REQUIRED_METADATA = [
+              "source_family",
+              "provenance_url_or_note",
+              "license_or_use_note",
+          ]
+
+          OPTIONAL_PARAMETER_FIELDS = [
+              "Omega_m",
+              "H0_km_s_Mpc",
+              "rd_Mpc",
+              "sigma8_z0",
+              "growth_index_gamma",
+          ]
+
+          BLOCKED_CLAIMS = [
+              "no pressure",
+              "no final chi-square",
+              "no likelihood",
+              "no BIC",
+              "no posterior comparison",
+              "no QSO covariance",
+              "no full eBOSS covariance",
+              "no LCDM ruled-out claim",
+              "no TAIRID validation",
+          ]
+
+          EXPECTED_PATHS = {
+              "reference_ensemble": [
+                  "data/reference/lrgxelg_reference_ensemble.csv",
+                  "data/reference/limited_lrgxelg_reference_ensemble.csv",
+                  "reference/lrgxelg_reference_ensemble.csv",
+                  "reference/limited_lrgxelg_reference_ensemble.csv",
+              ],
+              "reference_covariance": [
+                  "data/reference/lrgxelg_reference_covariance.csv",
+                  "data/reference/limited_lrgxelg_reference_covariance.csv",
+                  "reference/lrgxelg_reference_covariance.csv",
+                  "reference/limited_lrgxelg_reference_covariance.csv",
+              ],
+              "chain_manifest": [
+                  "data/reference/planck_chain_manifest.json",
+                  "data/reference/lrgxelg_planck_chain_manifest.json",
+                  "reference/planck_chain_manifest.json",
+                  "reference/lrgxelg_planck_chain_manifest.json",
+              ],
+              "package_manifest": [
+                  "data/reference/lrgxelg_reference_package_manifest.json",
+                  "data/reference/limited_lrgxelg_reference_package_manifest.json",
+                  "reference/lrgxelg_reference_package_manifest.json",
+                  "reference/limited_lrgxelg_reference_package_manifest.json",
+              ],
+          }
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def finite_float(value):
+              try:
+                  x = float(value)
+                  return math.isfinite(x), x
+              except Exception:
+                  return False, None
+
+          def read_csv(path):
+              with open(path, "r", newline="", encoding="utf-8") as f:
+                  return list(csv.DictReader(f))
+
+          def matrix_symmetry_and_diag(rows):
+              matrix = []
+              for row in rows:
+                  vals = []
+                  for label in LABELS:
+                      ok, val = finite_float(row.get(label, ""))
+                      if not ok:
+                          return False, False, None, None, "non-finite covariance cell"
+                      vals.append(val)
+                  matrix.append(vals)
+              max_asym = 0.0
+              min_diag = None
+              for i in range(6):
+                  if min_diag is None or matrix[i][i] < min_diag:
+                      min_diag = matrix[i][i]
+                  for j in range(6):
+                      max_asym = max(max_asym, abs(matrix[i][j] - matrix[j][i]))
+              symmetric = max_asym <= 1e-8
+              positive_diag = min_diag is not None and min_diag > 0.0
+              return symmetric, positive_diag, max_asym, min_diag, ""
+
+          def validate_ensemble(path):
+              base = {
+                  "candidate_type": "reference_ensemble",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": 0,
+                  "missing_columns": "",
+                  "problem_cells": "",
+                  "quality_level": "missing",
+                  "notes": "",
+              }
+              if not path.exists():
+                  base["notes"] = "file not present"
+                  return base
+
+              try:
+                  rows = read_csv(path)
+              except Exception as exc:
+                  base["quality_level"] = "unreadable"
+                  base["notes"] = "could not read csv: " + str(exc)[:160]
+                  return base
+
+              base["row_count"] = len(rows)
+              if not rows:
+                  base["quality_level"] = "empty"
+                  base["notes"] = "file has no rows"
+                  return base
+
+              fieldnames = list(rows[0].keys())
+              required = ["sample_id", *LABELS, *REQUIRED_METADATA]
+              missing = [col for col in required if col not in fieldnames]
+              base["missing_columns"] = ";".join(missing)
+
+              problem_cells = []
+              for ridx, row in enumerate(rows, start=1):
+                  for label in LABELS:
+                      ok, _ = finite_float(row.get(label, ""))
+                      if not ok:
+                          problem_cells.append(f"row{ridx}:{label}")
+                  for meta in REQUIRED_METADATA:
+                      if not str(row.get(meta, "")).strip():
+                          problem_cells.append(f"row{ridx}:{meta}_blank")
+              base["problem_cells"] = ";".join(problem_cells[:80])
+
+              if missing:
+                  base["quality_level"] = "bad_schema"
+                  base["notes"] = "missing required columns"
+              elif len(rows) < 2:
+                  base["quality_level"] = "insufficient_rows"
+                  base["notes"] = "at least two rows are needed for a later covariance builder"
+              elif problem_cells:
+                  base["quality_level"] = "bad_values_or_metadata"
+                  base["notes"] = "non-finite values or blank required metadata"
+              else:
+                  base["valid"] = True
+                  base["quality_level"] = "schema_valid"
+                  base["notes"] = "schema-valid ensemble; later workflow may build diagnostic reference covariance from it"
+              return base
+
+          def validate_covariance(path):
+              base = {
+                  "candidate_type": "reference_covariance",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": 0,
+                  "missing_columns": "",
+                  "problem_cells": "",
+                  "quality_level": "missing",
+                  "notes": "",
+              }
+              if not path.exists():
+                  base["notes"] = "file not present"
+                  return base
+
+              try:
+                  rows = read_csv(path)
+              except Exception as exc:
+                  base["quality_level"] = "unreadable"
+                  base["notes"] = "could not read csv: " + str(exc)[:160]
+                  return base
+
+              base["row_count"] = len(rows)
+              if not rows:
+                  base["quality_level"] = "empty"
+                  base["notes"] = "file has no rows"
+                  return base
+
+              fieldnames = list(rows[0].keys())
+              required = ["row_label", *LABELS]
+              missing = [col for col in required if col not in fieldnames]
+              base["missing_columns"] = ";".join(missing)
+              if missing:
+                  base["quality_level"] = "bad_schema"
+                  base["notes"] = "missing required columns"
+                  return base
+
+              row_labels = [row.get("row_label", "") for row in rows]
+              if row_labels != LABELS:
+                  base["quality_level"] = "bad_order"
+                  base["notes"] = "row order must exactly match expected six-label order"
+                  return base
+
+              symmetric, positive_diag, max_asym, min_diag, problem = matrix_symmetry_and_diag(rows)
+              if problem:
+                  base["problem_cells"] = problem
+                  base["quality_level"] = "bad_values"
+                  base["notes"] = problem
+              elif not symmetric:
+                  base["quality_level"] = "not_symmetric"
+                  base["notes"] = "matrix is not symmetric; max_asym=" + str(max_asym)
+              elif not positive_diag:
+                  base["quality_level"] = "bad_diagonal"
+                  base["notes"] = "diagonal must be positive; min_diag=" + str(min_diag)
+              else:
+                  base["valid"] = True
+                  base["quality_level"] = "schema_valid"
+                  base["notes"] = "schema-valid covariance; later workflow may read it, but pressure is still blocked until provenance is checked"
+              return base
+
+          def validate_chain_manifest(path):
+              base = {
+                  "candidate_type": "chain_manifest",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": "",
+                  "missing_columns": "",
+                  "problem_cells": "",
+                  "quality_level": "missing",
+                  "notes": "",
+              }
+              if not path.exists():
+                  base["notes"] = "file not present"
+                  return base
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  base["quality_level"] = "bad_json"
+                  base["notes"] = "invalid JSON: " + str(exc)[:160]
+                  return base
+
+              required = [
+                  "chain_file",
+                  "parameter_fields",
+                  "source_family",
+                  "provenance_url_or_note",
+                  "license_or_use_note",
+              ]
+              missing = [key for key in required if key not in data]
+              base["missing_columns"] = ";".join(missing)
+              if missing:
+                  base["quality_level"] = "bad_schema"
+                  base["notes"] = "missing required manifest keys"
+                  return base
+
+              chain_path = Path(str(data.get("chain_file", "")))
+              parameter_fields = data.get("parameter_fields", [])
+              if not chain_path.exists():
+                  base["quality_level"] = "chain_file_missing"
+                  base["notes"] = "manifest present, but referenced chain_file is missing"
+              elif not isinstance(parameter_fields, list) or len(parameter_fields) < 3:
+                  base["quality_level"] = "bad_parameter_fields"
+                  base["notes"] = "parameter_fields must be a list with at least three fields"
+              else:
+                  base["valid"] = True
+                  base["quality_level"] = "schema_valid"
+                  base["notes"] = "schema-valid chain manifest; later workflow may prepare a reference ensemble"
+              return base
+
+          def validate_package_manifest(path):
+              base = {
+                  "candidate_type": "package_manifest",
+                  "path": str(path),
+                  "present": path.exists(),
+                  "valid": False,
+                  "row_count": "",
+                  "missing_columns": "",
+                  "problem_cells": "",
+                  "quality_level": "missing",
+                  "notes": "",
+              }
+              if not path.exists():
+                  base["notes"] = "file not present"
+                  return base
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  base["quality_level"] = "bad_json"
+                  base["notes"] = "invalid JSON: " + str(exc)[:160]
+                  return base
+
+              required = [
+                  "package_type",
+                  "source_family",
+                  "provenance_url_or_note",
+                  "license_or_use_note",
+              ]
+              missing = [key for key in required if key not in data]
+              base["missing_columns"] = ";".join(missing)
+              if missing:
+                  base["quality_level"] = "bad_schema"
+                  base["notes"] = "missing required package manifest keys"
+              else:
+                  base["valid"] = True
+                  base["quality_level"] = "schema_valid"
+                  base["notes"] = "valid metadata manifest; not scientific data by itself"
+              return base
+
+          candidate_inventory = []
+          for candidate_type, paths in EXPECTED_PATHS.items():
+              for raw in paths:
+                  p = Path(raw)
+                  candidate_inventory.append({
+                      "candidate_type": candidate_type,
+                      "path": raw,
+                      "present": p.exists(),
+                      "size_bytes": p.stat().st_size if p.exists() else "",
+                      "reason": "expected_path",
+                  })
+
+          for root in [Path("data/reference"), Path("reference")]:
+              if root.exists():
+                  for p in root.rglob("*"):
+                      if p.is_file() and p.suffix.lower() in [".csv", ".json", ".txt"]:
+                          if not any(row["path"] == str(p) for row in candidate_inventory):
+                              candidate_inventory.append({
+                                  "candidate_type": "nearby_candidate",
+                                  "path": str(p),
+                                  "present": True,
+                                  "size_bytes": p.stat().st_size,
+                                  "reason": "nearby_reference_folder_candidate",
+                              })
+
+          write_csv(
+              OUT / "v4_173_candidate_inventory.csv",
+              candidate_inventory,
+              ["candidate_type", "path", "present", "size_bytes", "reason"],
+          )
+
+          validation_rows = []
+          for raw in EXPECTED_PATHS["reference_ensemble"]:
+              validation_rows.append(validate_ensemble(Path(raw)))
+          for raw in EXPECTED_PATHS["reference_covariance"]:
+              validation_rows.append(validate_covariance(Path(raw)))
+          for raw in EXPECTED_PATHS["chain_manifest"]:
+              validation_rows.append(validate_chain_manifest(Path(raw)))
+          for raw in EXPECTED_PATHS["package_manifest"]:
+              validation_rows.append(validate_package_manifest(Path(raw)))
+
+          write_csv(
+              OUT / "v4_173_schema_recheck_report.csv",
+              validation_rows,
+              [
+                  "candidate_type",
+                  "path",
+                  "present",
+                  "valid",
+                  "row_count",
+                  "missing_columns",
+                  "problem_cells",
+                  "quality_level",
+                  "notes",
+              ],
+          )
+
+          valid_ensembles = [r for r in validation_rows if r["candidate_type"] == "reference_ensemble" and r["valid"]]
+          valid_covariances = [r for r in validation_rows if r["candidate_type"] == "reference_covariance" and r["valid"]]
+          valid_chains = [r for r in validation_rows if r["candidate_type"] == "chain_manifest" and r["valid"]]
+          valid_manifests = [r for r in validation_rows if r["candidate_type"] == "package_manifest" and r["valid"]]
+
+          if valid_ensembles:
+              package_status = "valid_reference_ensemble_found"
+              selected_next_route = "limited_lrgxelg_reference_ensemble_covariance_builder_no_pressure_with_scope_guards"
+          elif valid_covariances:
+              package_status = "valid_reference_covariance_found"
+              selected_next_route = "limited_lrgxelg_reference_covariance_matrix_reader_no_pressure_with_scope_guards"
+          elif valid_chains:
+              package_status = "valid_chain_manifest_found"
+              selected_next_route = "planck_chain_manifest_to_limited_lrgxelg_reference_ensemble_with_scope_guards"
+          else:
+              package_status = "no_valid_reference_package_found"
+              selected_next_route = "limited_lrgxelg_reference_data_still_missing_pause_or_external_chain_download_with_scope_guards"
+
+          status = {
+              "version": "v4.173",
+              "result_label": RESULT_LABEL,
+              "package_status": package_status,
+              "valid_reference_ensemble_count": len(valid_ensembles),
+              "valid_reference_covariance_count": len(valid_covariances),
+              "valid_chain_manifest_count": len(valid_chains),
+              "valid_package_manifest_count": len(valid_manifests),
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "schema_recheck_only_no_pressure_no_validation",
+          }
+
+          (OUT / "v4_173_package_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+
+          route_rows = [
+              {
+                  "condition": "valid reference ensemble found",
+                  "selected_route": "limited_lrgxelg_reference_ensemble_covariance_builder_no_pressure_with_scope_guards",
+                  "meaning": "A real six-slot ensemble can be converted into a reference covariance in a later workflow.",
+              },
+              {
+                  "condition": "valid direct covariance found",
+                  "selected_route": "limited_lrgxelg_reference_covariance_matrix_reader_no_pressure_with_scope_guards",
+                  "meaning": "A documented six-by-six matrix can be read and inspected in a later workflow.",
+              },
+              {
+                  "condition": "valid chain manifest found",
+                  "selected_route": "planck_chain_manifest_to_limited_lrgxelg_reference_ensemble_with_scope_guards",
+                  "meaning": "A chain file may be transformed into a six-slot reference ensemble later.",
+              },
+              {
+                  "condition": "no valid package found",
+                  "selected_route": "limited_lrgxelg_reference_data_still_missing_pause_or_external_chain_download_with_scope_guards",
+                  "meaning": "Do not compute pressure; acquire real reference package first.",
+              },
+          ]
+
+          write_csv(
+              OUT / "v4_173_route_decision_matrix.csv",
+              route_rows,
+              ["condition", "selected_route", "meaning"],
+          )
+
+          (OUT / "v4_173_scope_guards.json").write_text(
+              json.dumps(
+                  {
+                      "scope": "schema recheck only",
+                      "scientific_reference_data_ingested": False,
+                      "reference_covariance_computed": False,
+                      "residuals_computed": False,
+                      "pressure_computed": False,
+                      "likelihood_computed": False,
+                      "bic_computed": False,
+                      "posterior_comparison_computed": False,
+                      "tairid_validated": False,
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          (OUT / "v4_173_blocked_claims.json").write_text(
+              json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2),
+              encoding="utf-8",
+          )
+
+          route_decision = {
+              "version": "v4.173",
+              "result_label": RESULT_LABEL,
+              "clean_result": "Reference package schema was rechecked. No pressure or validation was computed.",
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "blocked_claims": BLOCKED_CLAIMS,
+          }
+          (OUT / "v4_173_route_decision.json").write_text(json.dumps(route_decision, indent=2), encoding="utf-8")
+
+          summary = []
+          summary.append("# TAIRID v4.173 - Reference Package Schema Recheck")
+          summary.append("")
+          summary.append("Expected result: `" + RESULT_LABEL + "`")
+          summary.append("")
+          summary.append("## Clean result")
+          summary.append("")
+          summary.append("The repository was rechecked for a filled reference ensemble, direct covariance matrix, chain manifest, or package manifest.")
+          summary.append("")
+          summary.append("Package status: `" + package_status + "`")
+          summary.append("")
+          summary.append("Selected next route: `" + selected_next_route + "`")
+          summary.append("")
+          summary.append("## Boundary")
+          for item in BLOCKED_CLAIMS:
+              summary.append("- " + item)
+          (OUT / "v4_173_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          rules = {
+              "version_is_v4_173": True,
+              "result_label_present": RESULT_LABEL.endswith("no_pressure_no_validation"),
+              "six_labels_present": len(LABELS) == 6,
+              "candidate_inventory_written": (OUT / "v4_173_candidate_inventory.csv").exists(),
+              "schema_recheck_report_written": (OUT / "v4_173_schema_recheck_report.csv").exists(),
+              "package_status_written": (OUT / "v4_173_package_status.json").exists(),
+              "route_decision_matrix_written": (OUT / "v4_173_route_decision_matrix.csv").exists(),
+              "route_decision_written": (OUT / "v4_173_route_decision.json").exists(),
+              "scope_guards_written": (OUT / "v4_173_scope_guards.json").exists(),
+              "blocked_claims_written": (OUT / "v4_173_blocked_claims.json").exists(),
+              "summary_written": (OUT / "v4_173_summary.md").exists(),
+              "validation_rows_present": len(validation_rows) >= 12,
+              "package_status_selected": package_status in [
+                  "valid_reference_ensemble_found",
+                  "valid_reference_covariance_found",
+                  "valid_chain_manifest_found",
+                  "no_valid_reference_package_found",
+              ],
+              "next_route_selected": bool(selected_next_route),
+              "no_pressure_computed": True,
+              "no_likelihood_computed": True,
+              "no_bic_computed": True,
+              "no_posterior_comparison": True,
+              "no_validation_claim": True,
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.173",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "schema_recheck_only_no_pressure_no_validation",
+          }
+          (OUT / "v4_173_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.173 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_173_outputs/run_v4_173.py
+
+      - name: Upload v4.173 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-173-limited-lrgxelg-reference-package-schema-recheck-output
+          path: tairid_v4_173_outputs/
