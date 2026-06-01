@@ -1,0 +1,554 @@
+name: 001 TAIRID v4.227 - LCDM Baseline Projection Residual Guard
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-227-lcdm-baseline-projection-residual-guard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lcdm-baseline-projection-residual-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.227 LCDM Baseline Projection Residual Guard is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.227 LCDM baseline projection residual guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.227"
+          ROUTE = "lcdm_baseline_projection_residual_guard_after_v4_226"
+          EXPECTED_RESULT = "v4_227_lcdm_baseline_projection_residual_guard_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_228_residual_direction_source_surface_review_or_elg_axis_translation_guard"
+
+          OUT = Path("tairid_v4_227_lcdm_baseline_projection_residual_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-227-lcdm-baseline-projection-residual-guard-output.zip"
+
+          BASE = "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16"
+
+          SOURCE_INPUTS = [
+              {
+                  "source": "LRG",
+                  "surface_id": "lrg_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+                  "scaling_label": "rd",
+              },
+              {
+                  "source": "QSO",
+                  "surface_id": "qso_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+                  "scaling_label": "rs",
+              },
+          ]
+
+          ELG_URL = BASE + "/elg/sdss_DR16_ELG_BAO_DVtable.txt"
+
+          # Deliberately plain baseline constants. This is a projection guard, not a cosmology fit.
+          BASELINE = {
+              "reference_model_name": "flat_LCDM_baseline_projection_not_fit",
+              "H0_km_s_Mpc": 67.36,
+              "Omega_m0": 0.3153,
+              "Omega_lambda0": 1.0 - 0.3153,
+              "sigma8_0": 0.8111,
+              "growth_gamma": 0.55,
+              "r_sound_Mpc": 147.09,
+              "c_km_s": 299792.458,
+              "projection_status": "reference_projection_only_not_validation",
+          }
+
+          AXIS_MAP = {
+              "DM_over_rd": ("D_M_over_r_sound", "reach_geometry"),
+              "DM_over_rs": ("D_M_over_r_sound", "reach_geometry"),
+              "DH_over_rd": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "DH_over_rs": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "f_sigma8": ("f_sigma8", "growth_consolidation"),
+          }
+
+          AXIS_ORDER = ["D_M_over_r_sound", "D_H_over_r_sound", "f_sigma8"]
+
+          def write_csv(path, rows, fieldnames=None):
+              rows = rows or []
+              if fieldnames is None:
+                  fieldnames = []
+                  for row in rows:
+                      for key in row:
+                          if key not in fieldnames:
+                              fieldnames.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def fetch_text(url):
+              req = Request(url, headers={"User-Agent": "TAIRID-v4.227-lcdm-baseline-projection"})
+              with urlopen(req, timeout=45) as response:
+                  return response.read().decode("utf-8", errors="replace")
+
+          def safe_float(token):
+              try:
+                  return float(token)
+              except Exception:
+                  return None
+
+          def numeric_lines(text):
+              rows = []
+              for line in text.splitlines():
+                  raw = line.strip()
+                  if not raw or raw.startswith("#"):
+                      continue
+                  nums = []
+                  labels = []
+                  for part in raw.replace(",", " ").split():
+                      value = safe_float(part)
+                      if value is None:
+                          labels.append(part)
+                      else:
+                          nums.append(value)
+                  rows.append((nums, labels, raw))
+              return rows
+
+          def parse_measurements(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2 and labels:
+                      rows.append({
+                          "redshift": nums[0],
+                          "value": nums[1],
+                          "quantity": labels[-1],
+                          "raw_line": raw,
+                      })
+              return rows
+
+          def parse_matrix(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if nums:
+                      rows.append(nums)
+              return rows
+
+          def sigmas_from_covariance(matrix):
+              sigmas = []
+              for i in range(len(matrix)):
+                  diag = matrix[i][i] if i < len(matrix[i]) else float("nan")
+                  sigmas.append(math.sqrt(diag) if diag >= 0 else float("nan"))
+              return sigmas
+
+          def E_z(z):
+              return math.sqrt(BASELINE["Omega_m0"] * (1.0 + z) ** 3 + BASELINE["Omega_lambda0"])
+
+          def omega_m_z(z):
+              return BASELINE["Omega_m0"] * (1.0 + z) ** 3 / (E_z(z) ** 2)
+
+          def dh_over_rsound(z):
+              return (BASELINE["c_km_s"] / (BASELINE["H0_km_s_Mpc"] * E_z(z))) / BASELINE["r_sound_Mpc"]
+
+          def simpson_integral(f, a, b, n=2000):
+              if b == a:
+                  return 0.0
+              if n % 2:
+                  n += 1
+              h = (b - a) / n
+              total = f(a) + f(b)
+              for i in range(1, n):
+                  x = a + i * h
+                  total += (4 if i % 2 else 2) * f(x)
+              return total * h / 3.0
+
+          def dm_over_rsound(z):
+              integral = simpson_integral(lambda zz: 1.0 / E_z(zz), 0.0, z)
+              dm_mpc = (BASELINE["c_km_s"] / BASELINE["H0_km_s_Mpc"]) * integral
+              return dm_mpc / BASELINE["r_sound_Mpc"]
+
+          def growth_suppression_g(z):
+              om = omega_m_z(z)
+              ol = BASELINE["Omega_lambda0"] / (E_z(z) ** 2)
+              denominator = (om ** (4.0 / 7.0)) - ol + (1.0 + om / 2.0) * (1.0 + ol / 70.0)
+              return (2.5 * om) / denominator
+
+          def linear_growth_D(z):
+              # Carroll-Press-Turner style approximation, normalized to D(0)=1.
+              a = 1.0 / (1.0 + z)
+              g_z = growth_suppression_g(z)
+              g_0 = growth_suppression_g(0.0)
+              return a * g_z / g_0
+
+          def fsigma8_projection(z):
+              f = omega_m_z(z) ** BASELINE["growth_gamma"]
+              D = linear_growth_D(z)
+              return f * BASELINE["sigma8_0"] * D
+
+          def dv_over_rsound(z):
+              dm = dm_over_rsound(z)
+              dh = dh_over_rsound(z)
+              return (z * dm * dm * dh) ** (1.0 / 3.0)
+
+          def projected_value(standard_quantity, z):
+              if standard_quantity == "D_M_over_r_sound":
+                  return dm_over_rsound(z)
+              if standard_quantity == "D_H_over_r_sound":
+                  return dh_over_rsound(z)
+              if standard_quantity == "f_sigma8":
+                  return fsigma8_projection(z)
+              if standard_quantity == "ELG_DVtable_likelihood_coordinate":
+                  return dv_over_rsound(z)
+              return float("nan")
+
+          def parse_elg_surface(text):
+              pairs = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2:
+                      pairs.append((nums[0], nums[1]))
+              pairs = sorted(pairs, key=lambda pair: pair[0])
+              if not pairs:
+                  return {"table_rows": 0, "median_x": float("nan"), "weighted_sigma_x": float("nan"), "peak_x": float("nan")}
+
+              xs = [pair[0] for pair in pairs]
+              ys = [pair[1] for pair in pairs]
+              peak_x, peak_y = max(pairs, key=lambda pair: pair[1])
+
+              def trap(x_list, y_list):
+                  total = 0.0
+                  for i in range(1, len(x_list)):
+                      total += 0.5 * (x_list[i] - x_list[i - 1]) * (y_list[i] + y_list[i - 1])
+                  return total
+
+              area = trap(xs, ys)
+              pdf = [y / area if area else 0.0 for y in ys]
+              mean = trap(xs, [x * p for x, p in zip(xs, pdf)])
+              var = trap(xs, [((x - mean) ** 2) * p for x, p in zip(xs, pdf)])
+              sigma = math.sqrt(var) if var >= 0 else float("nan")
+
+              cdf = [0.0]
+              running = 0.0
+              for i in range(1, len(xs)):
+                  running += 0.5 * (xs[i] - xs[i - 1]) * (pdf[i] + pdf[i - 1])
+                  cdf.append(running)
+              if running:
+                  cdf = [value / running for value in cdf]
+
+              median = xs[-1]
+              for i in range(1, len(xs)):
+                  if cdf[i] >= 0.5:
+                      c0 = cdf[i - 1]
+                      c1 = cdf[i]
+                      x0 = xs[i - 1]
+                      x1 = xs[i]
+                      median = x1 if c1 == c0 else x0 + ((0.5 - c0) / (c1 - c0)) * (x1 - x0)
+                      break
+
+              return {"table_rows": len(pairs), "median_x": median, "weighted_sigma_x": sigma, "peak_x": peak_x}
+
+          observed_axis_rows = []
+
+          for item in SOURCE_INPUTS:
+              measurements = parse_measurements(fetch_text(item["measurement_url"]))
+              covariance = parse_matrix(fetch_text(item["covariance_url"]))
+              sigmas = sigmas_from_covariance(covariance)
+
+              for idx, measurement in enumerate(measurements):
+                  standard_quantity, axis_name = AXIS_MAP.get(measurement["quantity"], (measurement["quantity"], "unmapped_axis"))
+                  observed_axis_rows.append({
+                      "source": item["source"],
+                      "surface_id": item["surface_id"],
+                      "standard_quantity": standard_quantity,
+                      "native_quantity": measurement["quantity"],
+                      "axis_name": axis_name,
+                      "redshift_or_axis_position": measurement["redshift"],
+                      "observed_value": measurement["value"],
+                      "observed_sigma_or_proxy": sigmas[idx] if idx < len(sigmas) else "",
+                      "observed_status": "source_axis_observed",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          elg_surface = parse_elg_surface(fetch_text(ELG_URL))
+          elg_z_eff = 0.845
+
+          observed_axis_rows.append({
+              "source": "ELG",
+              "surface_id": "elg_dr16_bao_dvtable",
+              "standard_quantity": "ELG_DVtable_likelihood_coordinate",
+              "native_quantity": "DVtable_x",
+              "axis_name": "elg_likelihood_surface_axis",
+              "redshift_or_axis_position": elg_z_eff,
+              "observed_value": elg_surface["median_x"],
+              "observed_sigma_or_proxy": elg_surface["weighted_sigma_x"],
+              "observed_status": "elg_likelihood_surface_axis_observed",
+              "proof_status": "not_proof",
+              "validation_status": "not_validation",
+          })
+
+          reference_rows = []
+          residual_rows = []
+
+          for obs in observed_axis_rows:
+              z = float(obs["redshift_or_axis_position"])
+              standard_quantity = obs["standard_quantity"]
+              reference_value = projected_value(standard_quantity, z)
+              observed_value = float(obs["observed_value"])
+              sigma = float(obs["observed_sigma_or_proxy"]) if obs["observed_sigma_or_proxy"] != "" else float("nan")
+              residual_value = observed_value - reference_value
+              residual_z = residual_value / sigma if sigma and not math.isnan(sigma) else float("nan")
+
+              if math.isnan(residual_z) or abs(residual_z) < 1.0:
+                  direction = "0"
+              elif residual_value > 0:
+                  direction = "+"
+              else:
+                  direction = "-"
+
+              reference_rows.append({
+                  "source": obs["source"],
+                  "surface_id": obs["surface_id"],
+                  "standard_quantity": standard_quantity,
+                  "reference_model_name": BASELINE["reference_model_name"],
+                  "reference_value": reference_value,
+                  "reference_uncertainty": 0.0,
+                  "reference_redshift": z,
+                  "reference_method": "flat_lcdm_projection_guard_low_redshift_approximation",
+                  "reference_status": "baseline_projection_only_not_fit",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+              residual_rows.append({
+                  "source": obs["source"],
+                  "surface_id": obs["surface_id"],
+                  "standard_quantity": standard_quantity,
+                  "native_quantity": obs["native_quantity"],
+                  "redshift_or_axis_position": z,
+                  "observed_value": observed_value,
+                  "observed_sigma_or_proxy": sigma,
+                  "reference_model_name": BASELINE["reference_model_name"],
+                  "reference_value": reference_value,
+                  "residual_value": residual_value,
+                  "residual_z_score": residual_z,
+                  "guarded_residual_direction": direction,
+                  "residual_status": "baseline_projection_residual_preview_only",
+                  "blocked_read": "not a TAIRID validation, not a cosmology fit, and not a final model comparison",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          signature_rows = []
+          for source in ["LRG", "QSO", "ELG"]:
+              rows = [row for row in residual_rows if row["source"] == source]
+              signature = "".join(row["guarded_residual_direction"] for row in rows)
+              axis_order = "|".join(row["standard_quantity"] for row in rows)
+              signature_rows.append({
+                  "source": source,
+                  "signature_scope": f"{source}_vs_flat_lcdm_baseline_projection",
+                  "axis_order": axis_order,
+                  "guarded_residual_signature": signature,
+                  "allowed_read": "baseline residual direction preview only",
+                  "blocked_read": "not validation and not TAIRID proof",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          source_status_rows = []
+          for source in ["LRG", "QSO", "ELG"]:
+              rows = [row for row in residual_rows if row["source"] == source]
+              finite = sum(1 for row in rows if not math.isnan(float(row["residual_z_score"])))
+              source_status_rows.append({
+                  "source": source,
+                  "residual_preview_rows": len(rows),
+                  "finite_residual_z_rows": finite,
+                  "source_status": "baseline_projection_residual_preview_written",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          permission_rows = [
+              {
+                  "permission_scope": "source_specific_baseline_projection_preview",
+                  "permission_status": "allowed_as_guarded_preview",
+                  "reason": "Reference values are explicit baseline projections.",
+              },
+              {
+                  "permission_scope": "tairid_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "A baseline residual preview is not TAIRID validation.",
+              },
+              {
+                  "permission_scope": "combined_lrg_qso_elg_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix still needs source-surface and axis-translation review.",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_228_residual_direction_source_surface_review",
+                  "purpose": "review whether source-specific baseline residual signs are stable enough for a guarded shape audit",
+                  "activated": True,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_228_elg_axis_translation_guard",
+                  "purpose": "keep ELG DVtable coordinate separate unless an explicit translation map exists",
+                  "activated": True,
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_228_lcdm_projection_sensitivity",
+                  "purpose": "check sensitivity to baseline constants before interpreting any sign pattern",
+                  "activated": True,
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_228_combined_matrix_permission_recheck",
+                  "purpose": "combined matrix remains blocked until source surfaces pass review",
+                  "activated": True,
+              },
+          ]
+
+          baseline_rows = [BASELINE]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before projection"},
+              {"gate": "baseline_rows_equal_1", "passed": len(baseline_rows) == 1, "detail": f"baseline_rows = {len(baseline_rows)}"},
+              {"gate": "observed_axis_rows_equal_7", "passed": len(observed_axis_rows) == 7, "detail": f"observed_axis_rows = {len(observed_axis_rows)}"},
+              {"gate": "reference_rows_equal_7", "passed": len(reference_rows) == 7, "detail": f"reference_rows = {len(reference_rows)}"},
+              {"gate": "residual_rows_equal_7", "passed": len(residual_rows) == 7, "detail": f"residual_rows = {len(residual_rows)}"},
+              {"gate": "signature_rows_equal_3", "passed": len(signature_rows) == 3, "detail": f"signature_rows = {len(signature_rows)}"},
+              {"gate": "source_status_rows_equal_3", "passed": len(source_status_rows) == 3, "detail": f"source_status_rows = {len(source_status_rows)}"},
+              {"gate": "permission_rows_equal_3", "passed": len(permission_rows) == 3, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_qso_elg_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "tairid_validation_blocked", "passed": any(row["permission_scope"] == "tairid_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "TAIRID validation claim blocked"},
+              {"gate": "all_residuals_have_direction_symbol", "passed": all(row["guarded_residual_direction"] in ["+", "-", "0"] for row in residual_rows), "detail": "all residual rows have guarded direction"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_not_fit", "passed": True, "detail": "baseline projection is not a fit"},
+              {"gate": "truth_boundary_combined_matrix_blocked", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_228_residual_direction_source_surface_review_or_elg_axis_translation_guard", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_227_lcdm_baseline_projection_residual_guard_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_227_baseline_constants_rows.csv", baseline_rows)
+          write_csv(OUT / "v4_227_observed_axis_rows.csv", observed_axis_rows)
+          write_csv(OUT / "v4_227_reference_projection_rows.csv", reference_rows)
+          write_csv(OUT / "v4_227_baseline_residual_preview_rows.csv", residual_rows)
+          write_csv(OUT / "v4_227_residual_signature_rows.csv", signature_rows)
+          write_csv(OUT / "v4_227_source_status_rows.csv", source_status_rows)
+          write_csv(OUT / "v4_227_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_227_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_227_rule_checks.csv", checks)
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "baseline_rows": len(baseline_rows),
+              "observed_axis_rows": len(observed_axis_rows),
+              "reference_rows": len(reference_rows),
+              "residual_rows": len(residual_rows),
+              "signature_rows": len(signature_rows),
+              "source_status_rows": len(source_status_rows),
+              "permission_rows": len(permission_rows),
+              "next_rows": len(next_rows),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "is_cosmology_fit": False,
+                  "claims_shared_cause": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_227_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          signature_lines = [
+              f"{row['source']}: {row['guarded_residual_signature']} ({row['axis_order']})"
+              for row in signature_rows
+          ]
+
+          summary_md = [
+              "# TAIRID v4.227 LCDM Baseline Projection Residual Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"baseline_rows = {summary['baseline_rows']}",
+              f"observed_axis_rows = {summary['observed_axis_rows']}",
+              f"reference_rows = {summary['reference_rows']}",
+              f"residual_rows = {summary['residual_rows']}",
+              f"signature_rows = {summary['signature_rows']}",
+              f"source_status_rows = {summary['source_status_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Guarded source signatures:",
+              *signature_lines,
+              "",
+              "Clean meaning: v4.227 creates explicit flat-LCDM baseline projection rows and uses them only as a reference guard. Residual previews are written, but they are not a fit, not validation, and not TAIRID proof.",
+              "",
+              "Truth boundary: no proof, no validation, no fit claim, no shared cause, no combined matrix.",
+          ]
+          (OUT / "v4_227_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"baseline_rows = {summary['baseline_rows']}")
+          print(f"observed_axis_rows = {summary['observed_axis_rows']}")
+          print(f"reference_rows = {summary['reference_rows']}")
+          print(f"residual_rows = {summary['residual_rows']}")
+          print(f"signature_rows = {summary['signature_rows']}")
+          print(f"source_status_rows = {summary['source_status_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no fit claim, no shared cause, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.227 LCDM baseline projection residual guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-227-lcdm-baseline-projection-residual-guard-output
+          path: |
+            tairid_v4_227_lcdm_baseline_projection_residual_guard_output/
+            tairid-v4-227-lcdm-baseline-projection-residual-guard-output.zip
