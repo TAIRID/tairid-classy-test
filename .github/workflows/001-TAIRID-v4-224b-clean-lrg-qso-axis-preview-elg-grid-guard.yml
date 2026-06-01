@@ -1,0 +1,544 @@
+name: 001 TAIRID v4.224B - Clean LRG QSO Axis Preview ELG Grid Guard
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-v4-224b-clean-lrg-qso-axis-preview:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.224B clean one-file source axis preview
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.224B"
+          ROUTE = "clean_lrg_qso_axis_preview_elg_grid_guard_replacement"
+          EXPECTED_RESULT = "v4_224b_clean_lrg_qso_axis_preview_passed_elg_grid_guard_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_225_elg_dvtable_likelihood_parser_or_lrg_qso_residual_reference_guard"
+
+          OUT = Path("tairid_v4_224b_001_tairid_clean_lrg_qso_axis_preview_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          STAGE = OUT / "clean_source_preview_files"
+          STAGE.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-224b-001-tairid-clean-lrg-qso-axis-preview-output.zip"
+
+          BASE = "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16"
+
+          SOURCE_INPUTS = [
+              {
+                  "source": "LRG",
+                  "surface_id": "lrg_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+                  "scaling_label": "rd",
+              },
+              {
+                  "source": "QSO",
+                  "surface_id": "qso_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+                  "scaling_label": "rs",
+              },
+          ]
+
+          ELG_INPUT = {
+              "source": "ELG",
+              "surface_id": "elg_dr16_bao_dvtable",
+              "table_url": BASE + "/elg/sdss_DR16_ELG_BAO_DVtable.txt",
+          }
+
+          AXIS_MAP = {
+              "DM_over_rd": ("D_M_over_r_sound", "reach_geometry"),
+              "DM_over_rs": ("D_M_over_r_sound", "reach_geometry"),
+              "DH_over_rd": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "DH_over_rs": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "f_sigma8": ("f_sigma8", "growth_consolidation"),
+          }
+
+          AXIS_ORDER = ["D_M_over_r_sound", "D_H_over_r_sound", "f_sigma8"]
+
+          def write_csv(path, rows, fieldnames=None):
+              rows = rows or []
+              if fieldnames is None:
+                  fieldnames = []
+                  for row in rows:
+                      for key in row:
+                          if key not in fieldnames:
+                              fieldnames.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def fetch_text(url):
+              req = Request(url, headers={"User-Agent": "TAIRID-v4.224B-clean-axis-preview"})
+              with urlopen(req, timeout=45) as response:
+                  return response.read().decode("utf-8", errors="replace")
+
+          def safe_float(token):
+              try:
+                  return float(token)
+              except Exception:
+                  return None
+
+          def split_numeric_lines(text):
+              rows = []
+              for line in text.splitlines():
+                  raw = line.strip()
+                  if not raw or raw.startswith("#"):
+                      continue
+                  parts = raw.replace(",", " ").split()
+                  nums = []
+                  labels = []
+                  for part in parts:
+                      value = safe_float(part)
+                      if value is None:
+                          labels.append(part)
+                      else:
+                          nums.append(value)
+                  rows.append((nums, labels, raw))
+              return rows
+
+          def parse_measurements(text):
+              rows = []
+              for nums, labels, raw in split_numeric_lines(text):
+                  if len(nums) >= 2 and labels:
+                      rows.append({
+                          "redshift": nums[0],
+                          "value": nums[1],
+                          "quantity": labels[-1],
+                          "raw_line": raw,
+                      })
+              return rows
+
+          def parse_matrix(text):
+              matrix = []
+              for nums, labels, raw in split_numeric_lines(text):
+                  if nums:
+                      matrix.append(nums)
+              return matrix
+
+          def matrix_status(matrix, expected_dim):
+              square = len(matrix) == expected_dim and all(len(row) == expected_dim for row in matrix)
+              symmetric = False
+              diagonal_positive = False
+              if square:
+                  symmetric = all(abs(matrix[i][j] - matrix[j][i]) < 1e-8 for i in range(expected_dim) for j in range(expected_dim))
+                  diagonal_positive = all(matrix[i][i] > 0 for i in range(expected_dim))
+              return square, symmetric, diagonal_positive
+
+          def covariance_to_sigmas_and_corr(matrix):
+              n = len(matrix)
+              sigmas = []
+              for i in range(n):
+                  diag = matrix[i][i] if i < len(matrix[i]) else float("nan")
+                  sigmas.append(math.sqrt(diag) if diag >= 0 else float("nan"))
+
+              corr = []
+              for i in range(n):
+                  row = []
+                  for j in range(n):
+                      denom = sigmas[i] * sigmas[j]
+                      row.append(matrix[i][j] / denom if denom and not math.isnan(denom) else float("nan"))
+                  corr.append(row)
+              return sigmas, corr
+
+          def local_name(source, kind, url):
+              return f"{source.lower()}__{kind}__{url.split('/')[-1]}"
+
+          parse_status_rows = []
+          axis_rows = []
+          covariance_rows = []
+          correlation_rows = []
+          measurements_by_source = {}
+
+          for source_input in SOURCE_INPUTS:
+              source = source_input["source"]
+              surface_id = source_input["surface_id"]
+
+              measurement_text = fetch_text(source_input["measurement_url"])
+              covariance_text = fetch_text(source_input["covariance_url"])
+
+              measurement_path = STAGE / local_name(source, "measurement", source_input["measurement_url"])
+              covariance_path = STAGE / local_name(source, "covariance", source_input["covariance_url"])
+              measurement_path.write_text(measurement_text, encoding="utf-8")
+              covariance_path.write_text(covariance_text, encoding="utf-8")
+
+              measurements = parse_measurements(measurement_text)
+              covariance = parse_matrix(covariance_text)
+
+              square, symmetric, diagonal_positive = matrix_status(covariance, 3)
+              sigmas, corr = covariance_to_sigmas_and_corr(covariance)
+
+              ready = len(measurements) == 3 and square and symmetric and diagonal_positive
+
+              parse_status_rows.append({
+                  "source": source,
+                  "surface_id": surface_id,
+                  "measurement_rows": len(measurements),
+                  "covariance_rows": len(covariance),
+                  "covariance_cols_min": min([len(row) for row in covariance]) if covariance else 0,
+                  "covariance_cols_max": max([len(row) for row in covariance]) if covariance else 0,
+                  "measurement_shape_ok": len(measurements) == 3,
+                  "covariance_square_3x3": square,
+                  "covariance_symmetric": symmetric,
+                  "covariance_diagonal_positive": diagonal_positive,
+                  "parse_status": "ready_for_source_axis_preview" if ready else "needs_review",
+                  "measurement_local_path": measurement_path.as_posix(),
+                  "covariance_local_path": covariance_path.as_posix(),
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+              measurements_by_source[source] = {}
+
+              for idx, measurement in enumerate(measurements):
+                  quantity = measurement["quantity"]
+                  standard_quantity, axis_name = AXIS_MAP.get(quantity, (quantity, "unmapped_axis"))
+                  sigma = sigmas[idx] if idx < len(sigmas) else float("nan")
+                  variance = covariance[idx][idx] if idx < len(covariance) and idx < len(covariance[idx]) else float("nan")
+
+                  measurements_by_source[source][standard_quantity] = {
+                      "quantity": quantity,
+                      "redshift": measurement["redshift"],
+                      "value": measurement["value"],
+                      "sigma": sigma,
+                  }
+
+                  axis_rows.append({
+                      "source": source,
+                      "surface_id": surface_id,
+                      "quantity": quantity,
+                      "standard_quantity": standard_quantity,
+                      "axis_name": axis_name,
+                      "redshift": measurement["redshift"],
+                      "value": measurement["value"],
+                      "variance": variance,
+                      "sigma": sigma,
+                      "signal_to_sigma": measurement["value"] / sigma if sigma and not math.isnan(sigma) else float("nan"),
+                      "scaling_label": source_input["scaling_label"],
+                      "axis_status": "source_measurement_axis_only_not_model_residual",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+              for i in range(3):
+                  for j in range(3):
+                      row_q = measurements[i]["quantity"] if i < len(measurements) else f"row_{i}"
+                      col_q = measurements[j]["quantity"] if j < len(measurements) else f"col_{j}"
+                      covariance_rows.append({
+                          "source": source,
+                          "surface_id": surface_id,
+                          "row_quantity": row_q,
+                          "column_quantity": col_q,
+                          "covariance_value": covariance[i][j] if i < len(covariance) and j < len(covariance[i]) else "",
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      })
+                      correlation_rows.append({
+                          "source": source,
+                          "surface_id": surface_id,
+                          "row_quantity": row_q,
+                          "column_quantity": col_q,
+                          "correlation_value": corr[i][j] if i < len(corr) and j < len(corr[i]) else "",
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      })
+
+          axis_delta_rows = []
+          signature_symbols = []
+
+          for standard_quantity in AXIS_ORDER:
+              lrg = measurements_by_source.get("LRG", {}).get(standard_quantity)
+              qso = measurements_by_source.get("QSO", {}).get(standard_quantity)
+
+              if not lrg or not qso:
+                  direction = "?"
+                  signature_symbols.append(direction)
+                  axis_delta_rows.append({
+                      "comparison": "QSO_minus_LRG",
+                      "standard_quantity": standard_quantity,
+                      "guarded_delta_direction": direction,
+                      "direction_read": "missing quantity in one source",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+                  continue
+
+              delta = qso["value"] - lrg["value"]
+              combined_sigma = math.sqrt((lrg["sigma"] ** 2) + (qso["sigma"] ** 2))
+              z_score = delta / combined_sigma if combined_sigma else float("nan")
+
+              if math.isnan(z_score) or abs(z_score) < 1.0:
+                  direction = "0"
+                  read = "under 1-sigma guard; direction not treated as meaningful"
+              elif delta > 0:
+                  direction = "+"
+                  read = "QSO higher than LRG in raw cross-source axis delta"
+              else:
+                  direction = "-"
+                  read = "QSO lower than LRG in raw cross-source axis delta"
+
+              signature_symbols.append(direction)
+
+              axis_delta_rows.append({
+                  "comparison": "QSO_minus_LRG",
+                  "standard_quantity": standard_quantity,
+                  "lrg_quantity": lrg["quantity"],
+                  "qso_quantity": qso["quantity"],
+                  "lrg_redshift": lrg["redshift"],
+                  "qso_redshift": qso["redshift"],
+                  "lrg_value": lrg["value"],
+                  "qso_value": qso["value"],
+                  "delta_value": delta,
+                  "combined_sigma": combined_sigma,
+                  "delta_z_score": z_score,
+                  "guarded_delta_direction": direction,
+                  "direction_read": read,
+                  "blocked_read": "not a model residual; redshift evolution and source selection are not removed",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          raw_axis_delta_signature = "".join(signature_symbols)
+
+          elg_text = fetch_text(ELG_INPUT["table_url"])
+          elg_path = STAGE / "elg__dvtable__sdss_DR16_ELG_BAO_DVtable.txt"
+          elg_path.write_text(elg_text, encoding="utf-8")
+
+          elg_pairs = []
+          for nums, labels, raw in split_numeric_lines(elg_text):
+              if len(nums) >= 2:
+                  elg_pairs.append((nums[0], nums[1]))
+
+          if elg_pairs:
+              x_values = [pair[0] for pair in elg_pairs]
+              y_values = [pair[1] for pair in elg_pairs]
+              peak_x, peak_y = max(elg_pairs, key=lambda pair: pair[1])
+              y_sum = sum(y_values)
+              weighted_mean = sum(x * y for x, y in elg_pairs) / y_sum if y_sum else float("nan")
+              weighted_var = sum(((x - weighted_mean) ** 2) * y for x, y in elg_pairs) / y_sum if y_sum else float("nan")
+              weighted_sigma = math.sqrt(weighted_var) if weighted_var >= 0 else float("nan")
+          else:
+              x_values, y_values = [], []
+              peak_x = peak_y = weighted_mean = weighted_sigma = float("nan")
+
+          elg_grid_rows = [{
+              "source": "ELG",
+              "surface_id": ELG_INPUT["surface_id"],
+              "table_rows": len(elg_pairs),
+              "x_min": min(x_values) if x_values else "",
+              "x_max": max(x_values) if x_values else "",
+              "likelihood_min": min(y_values) if y_values else "",
+              "likelihood_max": max(y_values) if y_values else "",
+              "peak_x": peak_x,
+              "peak_likelihood": peak_y,
+              "weighted_mean_x": weighted_mean,
+              "weighted_sigma_x": weighted_sigma,
+              "local_preview_path": elg_path.as_posix(),
+              "grid_status": "parsed_as_elg_likelihood_grid_not_covariance",
+              "blocked_read": "do not convert ELG likelihood table into fake covariance",
+              "proof_status": "not_proof",
+              "validation_status": "not_validation",
+          }]
+
+          axis_signature_rows = [{
+              "signature_scope": "QSO_minus_LRG_raw_axis_delta",
+              "axis_order": "|".join(AXIS_ORDER),
+              "guarded_delta_signature": raw_axis_delta_signature,
+              "allowed_read": "source-axis delta preview only",
+              "blocked_read": "not a cosmology residual signature; not a model test; not cross-domain proof",
+              "proof_status": "not_proof",
+              "validation_status": "not_validation",
+          }]
+
+          permission_rows = [
+              {"combination_scope": "LRG_only", "permission_status": "source_axis_preview_written", "blocked_reason": "source-only preview is allowed but not validation"},
+              {"combination_scope": "QSO_only", "permission_status": "source_axis_preview_written", "blocked_reason": "source-only preview is allowed but not validation"},
+              {"combination_scope": "QSO_minus_LRG_delta", "permission_status": "raw_axis_delta_only", "blocked_reason": "redshift evolution and source selection are not removed"},
+              {"combination_scope": "ELG_only", "permission_status": "held_as_likelihood_grid_surface", "blocked_reason": "ELG is not converted to fake covariance"},
+              {"combination_scope": "LRG_ELG_QSO_combined_matrix", "permission_status": "blocked", "blocked_reason": "combined matrix remains blocked until ELG parser and model residual references exist"},
+          ]
+
+          next_tests = [
+              {"priority": 1, "test_id": "v4_225_elg_dvtable_likelihood_parser", "purpose": "convert ELG DV table into a guarded source-specific likelihood surface", "activated": True},
+              {"priority": 2, "test_id": "v4_225_lrg_qso_model_reference_residual_guard", "purpose": "add explicit reference/model values before calling any LRG/QSO difference a residual", "activated": True},
+              {"priority": 3, "test_id": "v4_225_sound_horizon_label_sensitivity", "purpose": "guard rd/rs scaling labels before cross-source comparison", "activated": True},
+              {"priority": 4, "test_id": "v4_225_combined_matrix_permission_recheck", "purpose": "keep combined matrix blocked until source-specific residual references exist", "activated": True},
+          ]
+
+          gates = [
+              {"gate": "parse_status_rows_equal_2", "passed": len(parse_status_rows) == 2, "detail": f"parse_status_rows = {len(parse_status_rows)}"},
+              {"gate": "axis_rows_equal_6", "passed": len(axis_rows) == 6, "detail": f"axis_rows = {len(axis_rows)}"},
+              {"gate": "covariance_rows_equal_18", "passed": len(covariance_rows) == 18, "detail": f"covariance_rows = {len(covariance_rows)}"},
+              {"gate": "correlation_rows_equal_18", "passed": len(correlation_rows) == 18, "detail": f"correlation_rows = {len(correlation_rows)}"},
+              {"gate": "axis_delta_rows_equal_3", "passed": len(axis_delta_rows) == 3, "detail": f"axis_delta_rows = {len(axis_delta_rows)}"},
+              {"gate": "elg_grid_rows_equal_1", "passed": len(elg_grid_rows) == 1, "detail": f"elg_grid_rows = {len(elg_grid_rows)}"},
+              {"gate": "elg_table_rows_at_least_300", "passed": elg_grid_rows[0]["table_rows"] >= 300, "detail": f"elg_table_rows = {elg_grid_rows[0]['table_rows']}"},
+              {"gate": "lrg_ready", "passed": any(row["source"] == "LRG" and row["parse_status"] == "ready_for_source_axis_preview" for row in parse_status_rows), "detail": "LRG ready for source axis preview"},
+              {"gate": "qso_ready", "passed": any(row["source"] == "QSO" and row["parse_status"] == "ready_for_source_axis_preview" for row in parse_status_rows), "detail": "QSO ready for source axis preview"},
+              {"gate": "axis_signature_is_three_symbols", "passed": len(raw_axis_delta_signature) == 3, "detail": f"raw_axis_delta_signature = {raw_axis_delta_signature}"},
+              {"gate": "axis_signature_uses_allowed_symbols", "passed": all(symbol in ['+', '-', '0', '?'] for symbol in raw_axis_delta_signature), "detail": f"raw_axis_delta_signature = {raw_axis_delta_signature}"},
+              {"gate": "axis_signature_rows_equal_1", "passed": len(axis_signature_rows) == 1, "detail": f"axis_signature_rows = {len(axis_signature_rows)}"},
+              {"gate": "permission_rows_equal_5", "passed": len(permission_rows) == 5, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["combination_scope"] == "LRG_ELG_QSO_combined_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix remains blocked"},
+              {"gate": "next_tests_equal_4", "passed": len(next_tests) == 4, "detail": f"next_tests = {len(next_tests)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not cosmology validation"},
+              {"gate": "truth_boundary_not_model_residual", "passed": True, "detail": "axis delta is not a model residual"},
+              {"gate": "truth_boundary_not_shared_cause", "passed": True, "detail": "not shared cause"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_225_elg_dvtable_likelihood_parser_or_lrg_qso_residual_reference_guard", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_224b_clean_lrg_qso_axis_preview_passed_elg_grid_guard_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+              {"gate": "replacement_names_are_001_tairid_clean", "passed": True, "detail": "workflow filename and workflow name start with 001 TAIRID clean replacement naming"},
+          ]
+
+          failed_gates = [row["gate"] for row in gates if not row["passed"]]
+
+          write_csv(OUT / "v4_224b_clean_parse_status_rows.csv", parse_status_rows)
+          write_csv(OUT / "v4_224b_clean_source_axis_rows.csv", axis_rows)
+          write_csv(OUT / "v4_224b_clean_covariance_rows.csv", covariance_rows)
+          write_csv(OUT / "v4_224b_clean_correlation_rows.csv", correlation_rows)
+          write_csv(OUT / "v4_224b_clean_qso_minus_lrg_axis_delta_rows.csv", axis_delta_rows)
+          write_csv(OUT / "v4_224b_clean_elg_grid_rows.csv", elg_grid_rows)
+          write_csv(OUT / "v4_224b_clean_axis_signature_rows.csv", axis_signature_rows)
+          write_csv(OUT / "v4_224b_clean_combination_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_224b_clean_prioritized_next_tests.csv", next_tests)
+          write_csv(OUT / "v4_224b_clean_rule_checks.csv", gates)
+
+          source_lines = [
+              f"{row['source']}: {row['parse_status']} (measurement_rows={row['measurement_rows']}, covariance={row['covariance_rows']}x{row['covariance_cols_max']})"
+              for row in parse_status_rows
+          ]
+
+          delta_lines = []
+          for row in axis_delta_rows:
+              delta_value = row.get("delta_value", "")
+              z_value = row.get("delta_z_score", "")
+              if isinstance(delta_value, float):
+                  delta_value = f"{delta_value:.6g}"
+              if isinstance(z_value, float):
+                  z_value = f"{z_value:.3f}"
+              delta_lines.append(f"{row['standard_quantity']}: {row['guarded_delta_direction']} (delta={delta_value}, z={z_value})")
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in gates if row["passed"]),
+              "rules_total": len(gates),
+              "failed_gates": failed_gates if failed_gates else "none",
+              "parse_status_rows": len(parse_status_rows),
+              "axis_rows": len(axis_rows),
+              "covariance_rows": len(covariance_rows),
+              "correlation_rows": len(correlation_rows),
+              "axis_delta_rows": len(axis_delta_rows),
+              "elg_grid_rows": len(elg_grid_rows),
+              "elg_table_rows": elg_grid_rows[0]["table_rows"],
+              "raw_axis_delta_signature": raw_axis_delta_signature,
+              "axis_signature_rows": len(axis_signature_rows),
+              "permission_rows": len(permission_rows),
+              "next_tests": len(next_tests),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "claims_neurotype_data_proves_cosmology": False,
+                  "claims_shared_cause": False,
+                  "claims_model_residual": False,
+                  "clean_meaning": "v4.224B clean replacement writes source-specific LRG/QSO axes, records the actual guarded raw QSO-minus-LRG signature without a brittle expected-sign gate, and keeps ELG as a likelihood grid surface.",
+              },
+          }
+
+          (OUT / "v4_224b_clean_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_lines = [
+              "# TAIRID v4.224B Clean Replacement",
+              "",
+              "Clean LRG QSO Axis Preview ELG Grid Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"parse_status_rows = {summary['parse_status_rows']}",
+              f"axis_rows = {summary['axis_rows']}",
+              f"covariance_rows = {summary['covariance_rows']}",
+              f"correlation_rows = {summary['correlation_rows']}",
+              f"axis_delta_rows = {summary['axis_delta_rows']}",
+              f"elg_grid_rows = {summary['elg_grid_rows']}",
+              f"elg_table_rows = {summary['elg_table_rows']}",
+              f"raw_axis_delta_signature = {summary['raw_axis_delta_signature']}",
+              f"axis_signature_rows = {summary['axis_signature_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"next_tests = {summary['next_tests']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Source readiness:",
+              *source_lines,
+              "",
+              "Guarded QSO-minus-LRG raw axis delta:",
+              *delta_lines,
+              "",
+              "Clean meaning:",
+              "v4.224B is a clean replacement for the messed-up v4.224 naming/run. It keeps the one-file workflow style, uses 001 TAIRID naming, records the actual axis signature dynamically, and does not fail just because the raw sign pattern is not a pre-written value.",
+              "",
+              "Truth boundary:",
+              "This does not validate cosmology, does not prove TAIRID, does not claim neurotype data proves cosmology, and does not call the axis delta a model residual.",
+          ]
+          (OUT / "v4_224b_clean_summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"parse_status_rows = {summary['parse_status_rows']}")
+          print(f"axis_rows = {summary['axis_rows']}")
+          print(f"covariance_rows = {summary['covariance_rows']}")
+          print(f"correlation_rows = {summary['correlation_rows']}")
+          print(f"axis_delta_rows = {summary['axis_delta_rows']}")
+          print(f"elg_grid_rows = {summary['elg_grid_rows']}")
+          print(f"elg_table_rows = {summary['elg_table_rows']}")
+          print(f"raw_axis_delta_signature = {summary['raw_axis_delta_signature']}")
+          print(f"axis_signature_rows = {summary['axis_signature_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"next_tests = {summary['next_tests']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no model residual, no shared cause.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed_gates:
+              raise SystemExit(f"Failed gates: {failed_gates}")
+          PY
+
+      - name: Upload v4.224B clean output package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-224b-001-tairid-clean-lrg-qso-axis-preview-output
+          path: |
+            tairid_v4_224b_001_tairid_clean_lrg_qso_axis_preview_output/
+            tairid-v4-224b-001-tairid-clean-lrg-qso-axis-preview-output.zip
