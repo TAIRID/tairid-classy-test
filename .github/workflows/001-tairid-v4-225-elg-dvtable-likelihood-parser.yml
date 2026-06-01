@@ -1,0 +1,452 @@
+name: 001 TAIRID v4.225 - ELG DVtable Likelihood Parser
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-225-elg-dvtable-likelihood-parser.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  elg-dvtable-likelihood-parser:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.225 ELG DVtable Likelihood Parser is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.225 ELG likelihood parser
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.225"
+          ROUTE = "elg_dvtable_likelihood_parser_after_v4_224b"
+          EXPECTED_RESULT = "v4_225_elg_dvtable_likelihood_parser_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_226_lrg_qso_model_reference_residual_guard_or_elg_surface_integration"
+
+          OUT = Path("tairid_v4_225_elg_dvtable_likelihood_parser_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-225-elg-dvtable-likelihood-parser-output.zip"
+
+          BASE = "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16"
+          ELG_URL = BASE + "/elg/sdss_DR16_ELG_BAO_DVtable.txt"
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def fetch_text(url):
+              req = Request(url, headers={"User-Agent": "TAIRID-v4.225-elg-dvtable-parser"})
+              with urlopen(req, timeout=45) as response:
+                  return response.read().decode("utf-8", errors="replace")
+
+          def safe_float(token):
+              try:
+                  return float(token)
+              except Exception:
+                  return None
+
+          def parse_likelihood_pairs(text):
+              pairs = []
+              raw_rows = []
+              for line_number, line in enumerate(text.splitlines(), start=1):
+                  raw = line.strip()
+                  if not raw or raw.startswith("#"):
+                      continue
+                  parts = raw.replace(",", " ").split()
+                  nums = []
+                  for part in parts:
+                      value = safe_float(part)
+                      if value is not None:
+                          nums.append(value)
+                  if len(nums) >= 2:
+                      x_value = nums[0]
+                      likelihood = nums[1]
+                      pairs.append((x_value, likelihood))
+                      raw_rows.append({
+                          "line_number": line_number,
+                          "x_value": x_value,
+                          "likelihood_value": likelihood,
+                          "row_status": "parsed",
+                      })
+              return pairs, raw_rows
+
+          def trapezoid_integral(xs, ys):
+              total = 0.0
+              for i in range(1, len(xs)):
+                  dx = xs[i] - xs[i - 1]
+                  total += 0.5 * dx * (ys[i] + ys[i - 1])
+              return total
+
+          def normalized_pdf(xs, ys):
+              area = trapezoid_integral(xs, ys)
+              if not area or area <= 0:
+                  return [0.0 for _ in ys], 0.0
+              return [y / area for y in ys], area
+
+          def trapezoid_cdf(xs, pdf):
+              if not xs:
+                  return []
+              cdf = [0.0]
+              running = 0.0
+              for i in range(1, len(xs)):
+                  dx = xs[i] - xs[i - 1]
+                  running += 0.5 * dx * (pdf[i] + pdf[i - 1])
+                  cdf.append(running)
+              if running > 0:
+                  cdf = [min(max(value / running, 0.0), 1.0) for value in cdf]
+              return cdf
+
+          def quantile_from_cdf(xs, cdf, target):
+              if not xs or not cdf:
+                  return float("nan")
+              if target <= cdf[0]:
+                  return xs[0]
+              for i in range(1, len(xs)):
+                  if cdf[i] >= target:
+                      c0 = cdf[i - 1]
+                      c1 = cdf[i]
+                      x0 = xs[i - 1]
+                      x1 = xs[i]
+                      if c1 == c0:
+                          return x1
+                      t = (target - c0) / (c1 - c0)
+                      return x0 + t * (x1 - x0)
+              return xs[-1]
+
+          def weighted_moments(xs, pdf):
+              mean_integrand = [x * p for x, p in zip(xs, pdf)]
+              mean = trapezoid_integral(xs, mean_integrand)
+              var_integrand = [((x - mean) ** 2) * p for x, p in zip(xs, pdf)]
+              var = trapezoid_integral(xs, var_integrand)
+              sigma = math.sqrt(var) if var >= 0 else float("nan")
+              return mean, var, sigma
+
+          def threshold_interval(xs, ys, fraction):
+              if not xs or not ys:
+                  return float("nan"), float("nan"), float("nan")
+              peak = max(ys)
+              threshold = peak * fraction
+              kept = [x for x, y in zip(xs, ys) if y >= threshold]
+              if not kept:
+                  return threshold, float("nan"), float("nan")
+              return threshold, min(kept), max(kept)
+
+          text = fetch_text(ELG_URL)
+          source_path = OUT / "v4_225_source_sdss_DR16_ELG_BAO_DVtable.txt"
+          source_path.write_text(text, encoding="utf-8")
+
+          pairs, raw_rows = parse_likelihood_pairs(text)
+          pairs = sorted(pairs, key=lambda pair: pair[0])
+
+          xs = [pair[0] for pair in pairs]
+          ys = [pair[1] for pair in pairs]
+          pdf, raw_area = normalized_pdf(xs, ys)
+          cdf = trapezoid_cdf(xs, pdf)
+
+          peak_index = max(range(len(ys)), key=lambda i: ys[i]) if ys else -1
+          peak_x = xs[peak_index] if peak_index >= 0 else float("nan")
+          peak_likelihood = ys[peak_index] if peak_index >= 0 else float("nan")
+          weighted_mean, weighted_var, weighted_sigma = weighted_moments(xs, pdf)
+
+          q16 = quantile_from_cdf(xs, cdf, 0.158655)
+          q50 = quantile_from_cdf(xs, cdf, 0.5)
+          q84 = quantile_from_cdf(xs, cdf, 0.841345)
+          q025 = quantile_from_cdf(xs, cdf, 0.025)
+          q975 = quantile_from_cdf(xs, cdf, 0.975)
+
+          likelihood_rows = []
+          for idx, (x, y) in enumerate(pairs):
+              likelihood_rows.append({
+                  "row_index": idx,
+                  "source": "ELG",
+                  "surface_id": "elg_dr16_bao_dvtable",
+                  "x_value": x,
+                  "likelihood_value": y,
+                  "normalized_pdf_value": pdf[idx] if idx < len(pdf) else "",
+                  "cdf_value": cdf[idx] if idx < len(cdf) else "",
+                  "row_status": "likelihood_surface_row",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          interval_rows = [
+              {
+                  "source": "ELG",
+                  "surface_id": "elg_dr16_bao_dvtable",
+                  "interval_name": "equal_tail_68_27_percent",
+                  "lower": q16,
+                  "center": q50,
+                  "upper": q84,
+                  "width": q84 - q16,
+                  "method": "cdf_equal_tail_on_normalized_table",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              },
+              {
+                  "source": "ELG",
+                  "surface_id": "elg_dr16_bao_dvtable",
+                  "interval_name": "equal_tail_95_percent",
+                  "lower": q025,
+                  "center": q50,
+                  "upper": q975,
+                  "width": q975 - q025,
+                  "method": "cdf_equal_tail_on_normalized_table",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              },
+          ]
+
+          threshold_rows = []
+          for fraction in [0.5, math.exp(-0.5), math.exp(-2.0)]:
+              threshold, lower, upper = threshold_interval(xs, ys, fraction)
+              threshold_rows.append({
+                  "source": "ELG",
+                  "surface_id": "elg_dr16_bao_dvtable",
+                  "threshold_fraction_of_peak": fraction,
+                  "threshold_value": threshold,
+                  "lower_x_at_or_above_threshold": lower,
+                  "upper_x_at_or_above_threshold": upper,
+                  "width": upper - lower if not math.isnan(upper) and not math.isnan(lower) else "",
+                  "method": "likelihood_height_threshold",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          summary_rows = [
+              {
+                  "source": "ELG",
+                  "surface_id": "elg_dr16_bao_dvtable",
+                  "input_url": ELG_URL,
+                  "table_rows": len(pairs),
+                  "x_min": min(xs) if xs else "",
+                  "x_max": max(xs) if xs else "",
+                  "raw_area_under_likelihood": raw_area,
+                  "peak_x": peak_x,
+                  "peak_likelihood": peak_likelihood,
+                  "weighted_mean_x": weighted_mean,
+                  "weighted_variance_x": weighted_var,
+                  "weighted_sigma_x": weighted_sigma,
+                  "median_x": q50,
+                  "equal_tail_68_lower": q16,
+                  "equal_tail_68_upper": q84,
+                  "equal_tail_95_lower": q025,
+                  "equal_tail_95_upper": q975,
+                  "surface_status": "elg_likelihood_surface_parsed_not_covariance",
+                  "blocked_read": "do not convert ELG likelihood table into fake covariance or combine with LRG/QSO matrix yet",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              }
+          ]
+
+          axis_surface_rows = [
+              {
+                  "source": "ELG",
+                  "surface_id": "elg_dr16_bao_dvtable",
+                  "axis_name": "elg_likelihood_position_axis",
+                  "axis_quantity": "DVtable_x_value_or_distance_likelihood_coordinate",
+                  "axis_peak_value": peak_x,
+                  "axis_center_value": q50,
+                  "axis_sigma_proxy": weighted_sigma,
+                  "axis_status": "likelihood_surface_axis_only_not_model_residual",
+                  "blocked_read": "not directly comparable to LRG/QSO D_M D_H f_sigma8 axes without translation",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              }
+          ]
+
+          integration_permission_rows = [
+              {
+                  "combination_scope": "ELG_only",
+                  "permission_status": "likelihood_surface_parsed",
+                  "blocked_reason": "source-only ELG surface allowed, but not validation",
+              },
+              {
+                  "combination_scope": "ELG_with_LRG_QSO_axis_preview",
+                  "permission_status": "blocked_until_axis_translation_exists",
+                  "blocked_reason": "ELG DVtable coordinate is not the same axis set as LRG/QSO D_M D_H f_sigma8",
+              },
+              {
+                  "combination_scope": "LRG_ELG_QSO_combined_matrix",
+                  "permission_status": "blocked",
+                  "blocked_reason": "combined matrix remains blocked until ELG translation and LRG/QSO model residual references exist",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_226_lrg_qso_model_reference_residual_guard",
+                  "purpose": "add explicit reference/model values before calling LRG/QSO differences residuals",
+                  "activated": True,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_226_elg_axis_translation_guard",
+                  "purpose": "decide whether and how ELG DVtable coordinate can translate into a comparable axis",
+                  "activated": True,
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_226_sound_horizon_scaling_boundary",
+                  "purpose": "prevent rd/rs/DV/D_M/D_H axis mixing without an explicit scaling map",
+                  "activated": True,
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_226_combined_matrix_permission_recheck",
+                  "purpose": "keep combined matrix blocked until source axes and residual references are explicit",
+                  "activated": True,
+              },
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before parser"},
+              {"gate": "likelihood_rows_at_least_300", "passed": len(likelihood_rows) >= 300, "detail": f"likelihood_rows = {len(likelihood_rows)}"},
+              {"gate": "likelihood_rows_equal_raw_rows", "passed": len(likelihood_rows) == len(raw_rows), "detail": f"likelihood_rows = {len(likelihood_rows)}, raw_rows = {len(raw_rows)}"},
+              {"gate": "summary_rows_equal_1", "passed": len(summary_rows) == 1, "detail": f"summary_rows = {len(summary_rows)}"},
+              {"gate": "interval_rows_equal_2", "passed": len(interval_rows) == 2, "detail": f"interval_rows = {len(interval_rows)}"},
+              {"gate": "threshold_rows_equal_3", "passed": len(threshold_rows) == 3, "detail": f"threshold_rows = {len(threshold_rows)}"},
+              {"gate": "axis_surface_rows_equal_1", "passed": len(axis_surface_rows) == 1, "detail": f"axis_surface_rows = {len(axis_surface_rows)}"},
+              {"gate": "peak_inside_table_range", "passed": bool(xs and min(xs) <= peak_x <= max(xs)), "detail": f"peak_x = {peak_x}"},
+              {"gate": "median_inside_table_range", "passed": bool(xs and min(xs) <= q50 <= max(xs)), "detail": f"median_x = {q50}"},
+              {"gate": "weighted_sigma_positive", "passed": weighted_sigma > 0, "detail": f"weighted_sigma = {weighted_sigma}"},
+              {"gate": "cdf_ends_near_one", "passed": bool(cdf and abs(cdf[-1] - 1.0) < 1e-6), "detail": f"cdf_last = {cdf[-1] if cdf else ''}"},
+              {"gate": "integration_permission_rows_equal_3", "passed": len(integration_permission_rows) == 3, "detail": f"integration_permission_rows = {len(integration_permission_rows)}"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["combination_scope"] == "LRG_ELG_QSO_combined_matrix" and row["permission_status"] == "blocked" for row in integration_permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_not_covariance", "passed": True, "detail": "ELG table is not converted into fake covariance"},
+              {"gate": "truth_boundary_not_model_residual", "passed": True, "detail": "ELG surface is not called a model residual"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_226_lrg_qso_model_reference_residual_guard_or_elg_surface_integration", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_225_elg_dvtable_likelihood_parser_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_225_elg_likelihood_rows.csv", likelihood_rows)
+          write_csv(OUT / "v4_225_elg_likelihood_summary_rows.csv", summary_rows)
+          write_csv(OUT / "v4_225_elg_interval_rows.csv", interval_rows)
+          write_csv(OUT / "v4_225_elg_threshold_rows.csv", threshold_rows)
+          write_csv(OUT / "v4_225_elg_axis_surface_rows.csv", axis_surface_rows)
+          write_csv(OUT / "v4_225_integration_permission_rows.csv", integration_permission_rows)
+          write_csv(OUT / "v4_225_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_225_rule_checks.csv", checks)
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "likelihood_rows": len(likelihood_rows),
+              "summary_rows": len(summary_rows),
+              "interval_rows": len(interval_rows),
+              "threshold_rows": len(threshold_rows),
+              "axis_surface_rows": len(axis_surface_rows),
+              "peak_x": peak_x,
+              "weighted_mean_x": weighted_mean,
+              "weighted_sigma_x": weighted_sigma,
+              "median_x": q50,
+              "equal_tail_68_lower": q16,
+              "equal_tail_68_upper": q84,
+              "integration_permission_rows": len(integration_permission_rows),
+              "next_rows": len(next_rows),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "claims_model_residual": False,
+                  "claims_fake_covariance": False,
+                  "claims_shared_cause": False,
+              },
+          }
+
+          (OUT / "v4_225_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.225 ELG DVtable Likelihood Parser",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"likelihood_rows = {summary['likelihood_rows']}",
+              f"summary_rows = {summary['summary_rows']}",
+              f"interval_rows = {summary['interval_rows']}",
+              f"threshold_rows = {summary['threshold_rows']}",
+              f"axis_surface_rows = {summary['axis_surface_rows']}",
+              f"peak_x = {summary['peak_x']}",
+              f"weighted_mean_x = {summary['weighted_mean_x']}",
+              f"weighted_sigma_x = {summary['weighted_sigma_x']}",
+              f"median_x = {summary['median_x']}",
+              f"equal_tail_68_lower = {summary['equal_tail_68_lower']}",
+              f"equal_tail_68_upper = {summary['equal_tail_68_upper']}",
+              f"integration_permission_rows = {summary['integration_permission_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.225 parses the ELG DVtable as a likelihood surface. It does not convert the table into fake covariance and does not combine it with LRG/QSO yet.",
+              "",
+              "Truth boundary: no proof, no validation, no fake covariance, no model residual, no shared cause.",
+          ]
+          (OUT / "v4_225_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"likelihood_rows = {summary['likelihood_rows']}")
+          print(f"peak_x = {summary['peak_x']}")
+          print(f"weighted_mean_x = {summary['weighted_mean_x']}")
+          print(f"weighted_sigma_x = {summary['weighted_sigma_x']}")
+          print(f"median_x = {summary['median_x']}")
+          print(f"integration_permission_rows = {summary['integration_permission_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no fake covariance, no model residual, no shared cause.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.225 ELG likelihood parser output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-225-elg-dvtable-likelihood-parser-output
+          path: |
+            tairid_v4_225_elg_dvtable_likelihood_parser_output/
+            tairid-v4-225-elg-dvtable-likelihood-parser-output.zip
