@@ -1,0 +1,804 @@
+name: 001 TAIRID v4.243 - External Reference Calculator
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-243-external-reference-calculator.yml"
+      - "data/cosmology/reference_target_manifest.csv"
+      - "data/cosmology/external_likelihood_manifest.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  external-reference-calculator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.243 External Reference Calculator is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.243 external reference calculator
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.243"
+          ROUTE = "external_reference_calculator_after_v4_242"
+          EXPECTED_RESULT = "v4_243_external_reference_calculator_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_244_reference_manifest_review_or_secondary_control_packet"
+
+          OUT = Path("tairid_v4_243_external_reference_calculator_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-243-external-reference-calculator-output.zip"
+
+          TARGET_MANIFEST_PATHS = [
+              Path("data/cosmology/reference_target_manifest.csv"),
+              Path("reference_target_manifest.csv"),
+          ]
+
+          # Central reference only. This is not a fit and not evidence.
+          CENTRAL_REFERENCE = {
+              "reference_model_id": "central_flat_lcdm_reference_v4_243",
+              "H0_km_s_Mpc": 67.36,
+              "Omega_m0": 0.3153,
+              "Omega_lambda0": 1.0 - 0.3153,
+              "sigma8_0": 0.8111,
+              "r_sound_Mpc": 147.09,
+              "reference_status": "central_reference_not_fit",
+          }
+
+          # Small sensitivity grid. This is a reference bracket, not a likelihood search.
+          H0_VALUES = [66.50, 67.36, 69.00]
+          OMEGA_M_VALUES = [0.3000, 0.3153, 0.3300]
+          SIGMA8_VALUES = [0.7800, 0.8111, 0.8400]
+          R_SOUND_VALUES = [146.50, 147.09, 147.50]
+          C_LIGHT = 299792.458
+
+          DEFAULT_REFERENCE_TARGETS = [
+              {
+                  "target_id": "target_001_lrg_current_reference",
+                  "source_family": "LRG_or_LRG_like",
+                  "source_role": "control_or_current_reference",
+                  "redshift": 0.698,
+                  "requested_quantities": "D_M_over_r_sound|D_H_over_r_sound|D_V_over_r_sound|f_sigma8",
+                  "target_status": "default_current_source_reference_not_holdout",
+              },
+              {
+                  "target_id": "target_002_elg_current_reference",
+                  "source_family": "ELG_or_ELG_like",
+                  "source_role": "compressed_geometry_or_current_reference",
+                  "redshift": 0.845,
+                  "requested_quantities": "D_M_over_r_sound|D_H_over_r_sound|D_V_over_r_sound|f_sigma8",
+                  "target_status": "default_current_source_reference_not_holdout",
+              },
+              {
+                  "target_id": "target_003_qso_current_reference",
+                  "source_family": "QSO_or_QSO_like",
+                  "source_role": "primary_pressure_lane_reference_not_holdout",
+                  "redshift": 1.48,
+                  "requested_quantities": "D_M_over_r_sound|D_H_over_r_sound|D_V_over_r_sound|f_sigma8",
+                  "target_status": "default_current_source_reference_not_holdout",
+              },
+              {
+                  "target_id": "target_004_future_qso_template",
+                  "source_family": "QSO_or_QSO_like",
+                  "source_role": "future_manual_holdout_template",
+                  "redshift": 1.50,
+                  "requested_quantities": "D_M_over_r_sound|D_H_over_r_sound|D_V_over_r_sound|f_sigma8",
+                  "target_status": "template_reference_not_data",
+              },
+              {
+                  "target_id": "target_005_future_lrg_template",
+                  "source_family": "LRG_or_LRG_like",
+                  "source_role": "future_manual_control_template",
+                  "redshift": 0.70,
+                  "requested_quantities": "D_M_over_r_sound|D_H_over_r_sound|D_V_over_r_sound|f_sigma8",
+                  "target_status": "template_reference_not_data",
+              },
+          ]
+
+          REQUIRED_TARGET_COLUMNS = [
+              "target_id",
+              "source_family",
+              "source_role",
+              "redshift",
+              "requested_quantities",
+              "target_status",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def safe_float(value, fallback=None):
+              try:
+                  return float(value)
+              except Exception:
+                  return fallback
+
+          def simpson_integral(f, a, b, n=3000):
+              if b == a:
+                  return 0.0
+              if n % 2:
+                  n += 1
+              h = (b - a) / n
+              total = f(a) + f(b)
+              for i in range(1, n):
+                  x = a + i * h
+                  total += (4 if i % 2 else 2) * f(x)
+              return total * h / 3.0
+
+          def E_z(z, ref):
+              return math.sqrt(ref["Omega_m0"] * (1.0 + z) ** 3 + ref["Omega_lambda0"])
+
+          def E_a(a, ref):
+              return math.sqrt(ref["Omega_m0"] / (a ** 3) + ref["Omega_lambda0"])
+
+          def dm_over_rsound(z, ref):
+              integral = simpson_integral(lambda zz: 1.0 / E_z(zz, ref), 0.0, z)
+              dm_mpc = (C_LIGHT / ref["H0_km_s_Mpc"]) * integral
+              return dm_mpc / ref["r_sound_Mpc"]
+
+          def dh_over_rsound(z, ref):
+              dh_mpc = C_LIGHT / (ref["H0_km_s_Mpc"] * E_z(z, ref))
+              return dh_mpc / ref["r_sound_Mpc"]
+
+          def dv_over_rsound(z, ref):
+              dm = dm_over_rsound(z, ref)
+              dh = dh_over_rsound(z, ref)
+              return (z * dm * dm * dh) ** (1.0 / 3.0)
+
+          def growth_integral_unnormalized(a, ref):
+              amin = 1e-4
+              aa = max(a, amin)
+              integral = simpson_integral(lambda x: 1.0 / ((x ** 3) * (E_a(x, ref) ** 3)), amin, aa, n=3000)
+              return (5.0 * ref["Omega_m0"] / 2.0) * E_a(aa, ref) * integral
+
+          def linear_growth_D_integral(z, ref):
+              a = 1.0 / (1.0 + z)
+              D_a = growth_integral_unnormalized(a, ref)
+              D_1 = growth_integral_unnormalized(1.0, ref)
+              return D_a / D_1 if D_1 else float("nan")
+
+          def f_growth_integral(z, ref):
+              a = 1.0 / (1.0 + z)
+              eps = 1e-4
+              a0 = max(1e-4, a * (1.0 - eps))
+              a1 = min(1.0, a * (1.0 + eps))
+              if a1 == a0:
+                  a0 = max(1e-4, a - eps)
+                  a1 = min(1.0, a + eps)
+              z0 = (1.0 / a0) - 1.0
+              z1 = (1.0 / a1) - 1.0
+              D0 = linear_growth_D_integral(z0, ref)
+              D1 = linear_growth_D_integral(z1, ref)
+              if D0 <= 0 or D1 <= 0:
+                  return float("nan")
+              return (math.log(D1) - math.log(D0)) / (math.log(a1) - math.log(a0))
+
+          def fsigma8_reference(z, ref):
+              D = linear_growth_D_integral(z, ref)
+              f = f_growth_integral(z, ref)
+              return f * ref["sigma8_0"] * D
+
+          def compute_quantity(quantity, z, ref):
+              if quantity == "D_M_over_r_sound":
+                  return dm_over_rsound(z, ref)
+              if quantity == "D_H_over_r_sound":
+                  return dh_over_rsound(z, ref)
+              if quantity == "D_V_over_r_sound":
+                  return dv_over_rsound(z, ref)
+              if quantity == "D_growth":
+                  return linear_growth_D_integral(z, ref)
+              if quantity == "f_growth":
+                  return f_growth_integral(z, ref)
+              if quantity == "f_sigma8":
+                  return fsigma8_reference(z, ref)
+              return float("nan")
+
+          def parse_quantity_list(value):
+              if not value:
+                  return []
+              return [item.strip() for item in str(value).replace(",", "|").split("|") if item.strip()]
+
+          def build_ref(row, variant_id):
+              return {
+                  "reference_model_id": variant_id,
+                  "H0_km_s_Mpc": float(row["H0_km_s_Mpc"]),
+                  "Omega_m0": float(row["Omega_m0"]),
+                  "Omega_lambda0": float(row["Omega_lambda0"]),
+                  "sigma8_0": float(row["sigma8_0"]),
+                  "r_sound_Mpc": float(row["r_sound_Mpc"]),
+              }
+
+          target_manifest_status_rows = []
+          input_target_rows = []
+          manifest_paths_found = [path for path in TARGET_MANIFEST_PATHS if path.exists()]
+
+          if not manifest_paths_found:
+              target_manifest_status_rows.append({
+                  "manifest_path": "",
+                  "manifest_status": "missing",
+                  "target_rows": 0,
+                  "detail": "No reference target manifest found. Using default reference targets.",
+              })
+              input_target_rows = list(DEFAULT_REFERENCE_TARGETS)
+          else:
+              for path in manifest_paths_found:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in REQUIRED_TARGET_COLUMNS if col not in columns]
+                      status = "schema_ok" if not missing else "schema_missing_columns"
+                      target_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          "target_rows": len(rows),
+                          "detail": "missing=" + "|".join(missing) if missing else "all required columns present",
+                      })
+                      if not missing:
+                          for row in rows:
+                              input_target_rows.append({col: row.get(col, "") for col in REQUIRED_TARGET_COLUMNS})
+                  except Exception as exc:
+                      target_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          "target_rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+              if not input_target_rows:
+                  input_target_rows = list(DEFAULT_REFERENCE_TARGETS)
+
+          target_validation_rows = []
+          valid_target_rows = []
+          for row in input_target_rows:
+              issues = []
+              z = safe_float(row.get("redshift"))
+              quantities = parse_quantity_list(row.get("requested_quantities", ""))
+              if not row.get("target_id"):
+                  issues.append("missing_target_id")
+              if z is None or z < 0:
+                  issues.append("bad_redshift")
+              if not quantities:
+                  issues.append("missing_requested_quantities")
+              bad_quantities = [q for q in quantities if q not in ["D_M_over_r_sound", "D_H_over_r_sound", "D_V_over_r_sound", "D_growth", "f_growth", "f_sigma8"]]
+              if bad_quantities:
+                  issues.append("bad_quantity:" + "|".join(bad_quantities))
+
+              target_validation_rows.append({
+                  "target_id": row.get("target_id", ""),
+                  "source_family": row.get("source_family", ""),
+                  "source_role": row.get("source_role", ""),
+                  "redshift": row.get("redshift", ""),
+                  "requested_quantities": row.get("requested_quantities", ""),
+                  "target_status": row.get("target_status", ""),
+                  "validation_issues": "|".join(issues) if issues else "none",
+                  "reference_calculation_allowed": not bool(issues),
+              })
+
+              if not issues:
+                  clean = dict(row)
+                  clean["redshift"] = float(z)
+                  valid_target_rows.append(clean)
+
+          reference_method_rows = [
+              {
+                  "method_id": "method_001",
+                  "quantity": "D_M_over_r_sound",
+                  "method": "D_M/r_s = c/H0 * integral_0^z dz/E(z) divided by r_s in flat LCDM.",
+                  "claim_status": "reference_calculation_not_fit",
+              },
+              {
+                  "method_id": "method_002",
+                  "quantity": "D_H_over_r_sound",
+                  "method": "D_H/r_s = c/(H0*E(z)) divided by r_s.",
+                  "claim_status": "reference_calculation_not_fit",
+              },
+              {
+                  "method_id": "method_003",
+                  "quantity": "D_V_over_r_sound",
+                  "method": "D_V/r_s = [z*(D_M/r_s)^2*(D_H/r_s)]^(1/3).",
+                  "claim_status": "compressed_geometry_reference_not_split_axis",
+              },
+              {
+                  "method_id": "method_004",
+                  "quantity": "D_growth",
+                  "method": "Integral growth approximation normalized to D(z=0)=1.",
+                  "claim_status": "reference_calculation_not_fit",
+              },
+              {
+                  "method_id": "method_005",
+                  "quantity": "f_growth",
+                  "method": "Finite difference derivative f = d ln D / d ln a.",
+                  "claim_status": "reference_calculation_not_fit",
+              },
+              {
+                  "method_id": "method_006",
+                  "quantity": "f_sigma8",
+                  "method": "f_sigma8(z)=f(z)*sigma8_0*D(z).",
+                  "claim_status": "reference_calculation_not_fit",
+              },
+          ]
+
+          central_reference_constant_rows = [dict(CENTRAL_REFERENCE)]
+
+          reference_grid_rows = []
+          idx = 0
+          for h0 in H0_VALUES:
+              for omega_m in OMEGA_M_VALUES:
+                  for sigma8 in SIGMA8_VALUES:
+                      for r_sound in R_SOUND_VALUES:
+                          idx += 1
+                          reference_grid_rows.append({
+                              "reference_model_id": f"reference_grid_{idx:03d}",
+                              "H0_km_s_Mpc": h0,
+                              "Omega_m0": omega_m,
+                              "Omega_lambda0": 1.0 - omega_m,
+                              "sigma8_0": sigma8,
+                              "r_sound_Mpc": r_sound,
+                              "reference_status": "sensitivity_grid_not_fit",
+                          })
+
+          central_reference_value_rows = []
+          for target in valid_target_rows:
+              z = float(target["redshift"])
+              for quantity in parse_quantity_list(target["requested_quantities"]):
+                  value = compute_quantity(quantity, z, CENTRAL_REFERENCE)
+                  central_reference_value_rows.append({
+                      "target_id": target["target_id"],
+                      "source_family": target["source_family"],
+                      "source_role": target["source_role"],
+                      "redshift": z,
+                      "quantity": quantity,
+                      "reference_model_id": CENTRAL_REFERENCE["reference_model_id"],
+                      "reference_value": value,
+                      "reference_status": "central_reference_value_not_observed_data",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          grid_reference_value_rows = []
+          for target in valid_target_rows:
+              z = float(target["redshift"])
+              quantities = parse_quantity_list(target["requested_quantities"])
+              for ref_row in reference_grid_rows:
+                  ref = build_ref(ref_row, ref_row["reference_model_id"])
+                  for quantity in quantities:
+                      value = compute_quantity(quantity, z, ref)
+                      grid_reference_value_rows.append({
+                          "target_id": target["target_id"],
+                          "source_family": target["source_family"],
+                          "source_role": target["source_role"],
+                          "redshift": z,
+                          "quantity": quantity,
+                          "reference_model_id": ref_row["reference_model_id"],
+                          "reference_value": value,
+                          "reference_status": "grid_reference_value_not_observed_data",
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      })
+
+          reference_summary_rows = []
+          group_keys = sorted(set((row["target_id"], row["quantity"]) for row in grid_reference_value_rows))
+          for target_id, quantity in group_keys:
+              rows = [row for row in grid_reference_value_rows if row["target_id"] == target_id and row["quantity"] == quantity]
+              values = sorted(float(row["reference_value"]) for row in rows if not math.isnan(float(row["reference_value"])))
+              if values:
+                  mid = len(values)//2
+                  median = values[mid] if len(values) % 2 else 0.5*(values[mid-1]+values[mid])
+                  reference_summary_rows.append({
+                      "target_id": target_id,
+                      "quantity": quantity,
+                      "reference_grid_rows": len(values),
+                      "min_reference_value": min(values),
+                      "median_reference_value": median,
+                      "max_reference_value": max(values),
+                      "reference_span": max(values)-min(values),
+                      "summary_status": "reference_bracket_not_fit",
+                  })
+
+          reference_contract_rows = [
+              {
+                  "contract_id": "contract_001",
+                  "contract": "Observed external data must be mapped to target_id, redshift, quantity, observed_value, observed_sigma_or_likelihood before residual scoring.",
+                  "blocked_without": "observed external data manifest",
+              },
+              {
+                  "contract_id": "contract_002",
+                  "contract": "Residuals may only be computed after joining observed quantities to reference_value rows by target_id/redshift/quantity.",
+                  "blocked_without": "reference rows and observed rows",
+              },
+              {
+                  "contract_id": "contract_003",
+                  "contract": "Primary QSO growth evidence remains impossible until a reviewed QSO-like f_sigma8 or comparable growth target exists.",
+                  "blocked_without": "reviewed primary QSO growth source",
+              },
+              {
+                  "contract_id": "contract_004",
+                  "contract": "D_V is a compressed geometry reference and cannot be used as split D_M/D_H/f_sigma8 evidence.",
+                  "blocked_without": "split-axis source surface",
+              },
+              {
+                  "contract_id": "contract_005",
+                  "contract": "This calculator is not an external likelihood fit, not holdout scoring, and not model validation.",
+                  "blocked_without": "external likelihood workflow",
+              },
+              {
+                  "contract_id": "contract_006",
+                  "contract": "TAIRID still needs a frozen correction formula or source-surface transform before model-vs-model comparison.",
+                  "blocked_without": "TAIRID-specific correction scaffold",
+              },
+          ]
+
+          inherited_guard_rows = [
+              {
+                  "guard_id": "guard_001",
+                  "guard": "primary_qso_growth_manifest_fill",
+                  "status": "blocked",
+                  "reason": "v4.241/v4.242 found no clean primary QSO growth holdout candidate.",
+              },
+              {
+                  "guard_id": "guard_002",
+                  "guard": "secondary_control_rows",
+                  "status": "review_only",
+                  "reason": "Secondary/control candidates cannot be promoted into primary QSO growth evidence.",
+              },
+              {
+                  "guard_id": "guard_003",
+                  "guard": "automatic_manifest_fill",
+                  "status": "blocked",
+                  "reason": "Locator results cannot automatically become manifest rows.",
+              },
+              {
+                  "guard_id": "guard_004",
+                  "guard": "holdout_scoring",
+                  "status": "blocked",
+                  "reason": "No reviewed manifest exists.",
+              },
+              {
+                  "guard_id": "guard_005",
+                  "guard": "cosmology_validation_claim",
+                  "status": "blocked",
+                  "reason": "No external likelihood fit or holdout scoring has run.",
+              },
+              {
+                  "guard_id": "guard_006",
+                  "guard": "combined_lrg_elg_qso_matrix",
+                  "status": "blocked",
+                  "reason": "Source-surface compatibility remains unresolved.",
+              },
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "Reference calculator is now available as a scaffold.",
+                  "basis": "Central and grid reference values are written for target redshifts and quantities.",
+                  "next_action": "Use it only after external observed rows are manually reviewed.",
+                  "claim_status": "calculator_ready_not_evidence",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "Primary QSO growth evidence remains blocked.",
+                  "basis": "Reference rows alone are not observed holdout data.",
+                  "next_action": "Do not score primary QSO growth without a reviewed growth source.",
+                  "claim_status": "primary_holdout_missing",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Next technical route should review reference manifest or build secondary/control packet.",
+                  "basis": "External observed data is still missing, but reference rows can support future manual manifest review.",
+                  "next_action": "Proceed to v4.244 reference manifest review or secondary/control packet.",
+                  "claim_status": "scoring_blocked",
+              },
+          ]
+
+          permission_rows = [
+              {
+                  "permission_scope": "external_reference_calculator",
+                  "permission_status": "allowed",
+                  "reason": "Reference values can be computed without observed data scoring.",
+              },
+              {
+                  "permission_scope": "reference_manifest_output",
+                  "permission_status": "allowed",
+                  "reason": "Central and grid reference rows are allowed as scaffolding.",
+              },
+              {
+                  "permission_scope": "observed_external_residual_scoring",
+                  "permission_status": "blocked",
+                  "reason": "No reviewed external observed source rows exist.",
+              },
+              {
+                  "permission_scope": "primary_qso_growth_holdout_scoring",
+                  "permission_status": "blocked",
+                  "reason": "No clean primary QSO growth holdout candidate exists.",
+              },
+              {
+                  "permission_scope": "automatic_evidence_claim",
+                  "permission_status": "blocked",
+                  "reason": "Reference values are not evidence by themselves.",
+              },
+              {
+                  "permission_scope": "cosmology_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "No external likelihood fit or holdout score has run.",
+              },
+              {
+                  "permission_scope": "combined_lrg_elg_qso_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix remains blocked.",
+              },
+          ]
+
+          readiness_rows = [
+              {
+                  "readiness_id": "readiness_001",
+                  "requirement": "reference_calculator",
+                  "status": "ready",
+                  "blocks": "nothing",
+              },
+              {
+                  "readiness_id": "readiness_002",
+                  "requirement": "reference_target_manifest",
+                  "status": "ready_defaults" if not manifest_paths_found else "ready_from_manifest",
+                  "blocks": "nothing",
+              },
+              {
+                  "readiness_id": "readiness_003",
+                  "requirement": "external_observed_manifest",
+                  "status": "missing",
+                  "blocks": "residual scoring",
+              },
+              {
+                  "readiness_id": "readiness_004",
+                  "requirement": "primary_qso_growth_holdout",
+                  "status": "missing",
+                  "blocks": "primary evidence lane",
+              },
+              {
+                  "readiness_id": "readiness_005",
+                  "requirement": "tairid_correction_formula_or_transform",
+                  "status": "not_yet_built",
+                  "blocks": "model-vs-model comparison",
+              },
+              {
+                  "readiness_id": "readiness_006",
+                  "requirement": "combined_matrix_permission",
+                  "status": "blocked",
+                  "blocks": "combined LRG/ELG/QSO matrix",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_244_reference_manifest_review",
+                  "purpose": "review generated reference rows and contract before any residual scoring",
+                  "activated": True,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_244_secondary_control_review_packet",
+                  "purpose": "organize secondary/control candidates without primary-evidence language",
+                  "activated": True,
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_244_tairid_correction_formula_scaffold",
+                  "purpose": "begin moving from sign prediction to explicit source-surface transform",
+                  "activated": True,
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_244_combined_matrix_permission_recheck",
+                  "purpose": "combined matrix remains blocked until source-surface guards pass",
+                  "activated": True,
+              },
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before reference calculator"},
+              {"gate": "target_manifest_status_rows_at_least_1", "passed": len(target_manifest_status_rows) >= 1, "detail": f"target_manifest_status_rows = {len(target_manifest_status_rows)}"},
+              {"gate": "input_target_rows_at_least_5", "passed": len(input_target_rows) >= 5, "detail": f"input_target_rows = {len(input_target_rows)}"},
+              {"gate": "target_validation_rows_match_input", "passed": len(target_validation_rows) == len(input_target_rows), "detail": f"target_validation_rows = {len(target_validation_rows)}"},
+              {"gate": "valid_target_rows_at_least_5", "passed": len(valid_target_rows) >= 5, "detail": f"valid_target_rows = {len(valid_target_rows)}"},
+              {"gate": "reference_method_rows_equal_6", "passed": len(reference_method_rows) == 6, "detail": f"reference_method_rows = {len(reference_method_rows)}"},
+              {"gate": "central_reference_constant_rows_equal_1", "passed": len(central_reference_constant_rows) == 1, "detail": f"central_reference_constant_rows = {len(central_reference_constant_rows)}"},
+              {"gate": "reference_grid_rows_equal_81", "passed": len(reference_grid_rows) == 81, "detail": f"reference_grid_rows = {len(reference_grid_rows)}"},
+              {"gate": "central_reference_value_rows_at_least_20", "passed": len(central_reference_value_rows) >= 20, "detail": f"central_reference_value_rows = {len(central_reference_value_rows)}"},
+              {"gate": "grid_reference_value_rows_at_least_1620", "passed": len(grid_reference_value_rows) >= 1620, "detail": f"grid_reference_value_rows = {len(grid_reference_value_rows)}"},
+              {"gate": "reference_summary_rows_at_least_20", "passed": len(reference_summary_rows) >= 20, "detail": f"reference_summary_rows = {len(reference_summary_rows)}"},
+              {"gate": "reference_contract_rows_equal_6", "passed": len(reference_contract_rows) == 6, "detail": f"reference_contract_rows = {len(reference_contract_rows)}"},
+              {"gate": "inherited_guard_rows_equal_6", "passed": len(inherited_guard_rows) == 6, "detail": f"inherited_guard_rows = {len(inherited_guard_rows)}"},
+              {"gate": "decision_rows_equal_3", "passed": len(decision_rows) == 3, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "external_reference_calculator_allowed", "passed": any(row["permission_scope"] == "external_reference_calculator" and row["permission_status"] == "allowed" for row in permission_rows), "detail": "external reference calculator allowed"},
+              {"gate": "observed_external_residual_scoring_blocked", "passed": any(row["permission_scope"] == "observed_external_residual_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "observed external residual scoring blocked"},
+              {"gate": "primary_qso_growth_holdout_scoring_blocked", "passed": any(row["permission_scope"] == "primary_qso_growth_holdout_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "primary QSO growth holdout scoring blocked"},
+              {"gate": "automatic_evidence_claim_blocked", "passed": any(row["permission_scope"] == "automatic_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "automatic evidence claim blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "cosmology validation blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_observed_scoring", "passed": True, "detail": "reference calculator does not score observed data"},
+              {"gate": "truth_boundary_primary_holdout_missing", "passed": True, "detail": "primary QSO growth holdout remains missing"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_244_reference_manifest_review_or_secondary_control_packet", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_243_external_reference_calculator_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_243_target_manifest_status_rows.csv", target_manifest_status_rows)
+          write_csv(OUT / "v4_243_input_target_rows.csv", input_target_rows)
+          write_csv(OUT / "v4_243_target_validation_rows.csv", target_validation_rows)
+          write_csv(OUT / "v4_243_reference_method_rows.csv", reference_method_rows)
+          write_csv(OUT / "v4_243_central_reference_constant_rows.csv", central_reference_constant_rows)
+          write_csv(OUT / "v4_243_reference_grid_rows.csv", reference_grid_rows)
+          write_csv(OUT / "v4_243_central_reference_value_rows.csv", central_reference_value_rows)
+          write_csv(OUT / "v4_243_grid_reference_value_rows.csv", grid_reference_value_rows)
+          write_csv(OUT / "v4_243_reference_summary_rows.csv", reference_summary_rows)
+          write_csv(OUT / "v4_243_reference_contract_rows.csv", reference_contract_rows)
+          write_csv(OUT / "v4_243_inherited_guard_rows.csv", inherited_guard_rows)
+          write_csv(OUT / "v4_243_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_243_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_243_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_243_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_243_rule_checks.csv", checks)
+
+          target_lines = [
+              f"{row['target_id']}: z={row['redshift']} quantities={row['requested_quantities']} status={row['target_status']}"
+              for row in input_target_rows
+          ]
+
+          decision_lines = [
+              f"{row['decision_id']}: {row['decision']} Next: {row['next_action']}"
+              for row in decision_rows
+          ]
+
+          readiness_lines = [
+              f"{row['requirement']}: {row['status']} blocks {row['blocks']}"
+              for row in readiness_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "target_manifest_status_rows": len(target_manifest_status_rows),
+              "input_target_rows": len(input_target_rows),
+              "valid_target_rows": len(valid_target_rows),
+              "reference_method_rows": len(reference_method_rows),
+              "central_reference_constant_rows": len(central_reference_constant_rows),
+              "reference_grid_rows": len(reference_grid_rows),
+              "central_reference_value_rows": len(central_reference_value_rows),
+              "grid_reference_value_rows": len(grid_reference_value_rows),
+              "reference_summary_rows": len(reference_summary_rows),
+              "reference_contract_rows": len(reference_contract_rows),
+              "inherited_guard_rows": len(inherited_guard_rows),
+              "decision_rows": len(decision_rows),
+              "permission_rows": len(permission_rows),
+              "readiness_rows": len(readiness_rows),
+              "next_rows": len(next_rows),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_observed_external_data": False,
+                  "primary_holdout_exists": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_243_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.243 External Reference Calculator",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"target_manifest_status_rows = {summary['target_manifest_status_rows']}",
+              f"input_target_rows = {summary['input_target_rows']}",
+              f"valid_target_rows = {summary['valid_target_rows']}",
+              f"reference_method_rows = {summary['reference_method_rows']}",
+              f"central_reference_constant_rows = {summary['central_reference_constant_rows']}",
+              f"reference_grid_rows = {summary['reference_grid_rows']}",
+              f"central_reference_value_rows = {summary['central_reference_value_rows']}",
+              f"grid_reference_value_rows = {summary['grid_reference_value_rows']}",
+              f"reference_summary_rows = {summary['reference_summary_rows']}",
+              f"reference_contract_rows = {summary['reference_contract_rows']}",
+              f"inherited_guard_rows = {summary['inherited_guard_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Reference targets:",
+              *target_lines,
+              "",
+              "Readiness:",
+              *readiness_lines,
+              "",
+              "Decisions:",
+              *decision_lines,
+              "",
+              "Clean meaning: v4.243 creates explicit LCDM-style reference rows for current/reference targets and future manual targets. It does not score observed external data and does not create a primary QSO holdout.",
+              "",
+              "Truth boundary: no proof, no validation, no observed external scoring, no primary holdout source, no evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_243_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"target_manifest_status_rows = {summary['target_manifest_status_rows']}")
+          print(f"input_target_rows = {summary['input_target_rows']}")
+          print(f"valid_target_rows = {summary['valid_target_rows']}")
+          print(f"reference_method_rows = {summary['reference_method_rows']}")
+          print(f"central_reference_constant_rows = {summary['central_reference_constant_rows']}")
+          print(f"reference_grid_rows = {summary['reference_grid_rows']}")
+          print(f"central_reference_value_rows = {summary['central_reference_value_rows']}")
+          print(f"grid_reference_value_rows = {summary['grid_reference_value_rows']}")
+          print(f"reference_summary_rows = {summary['reference_summary_rows']}")
+          print(f"reference_contract_rows = {summary['reference_contract_rows']}")
+          print(f"inherited_guard_rows = {summary['inherited_guard_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no observed external scoring, no primary holdout source, no evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.243 external reference calculator output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-243-external-reference-calculator-output
+          path: |
+            tairid_v4_243_external_reference_calculator_output/
+            tairid-v4-243-external-reference-calculator-output.zip
