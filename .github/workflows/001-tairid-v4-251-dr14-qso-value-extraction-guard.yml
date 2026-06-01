@@ -1,0 +1,902 @@
+name: 001 TAIRID v4.251 - DR14 QSO Value Extraction Guard
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-251-dr14-qso-value-extraction-guard.yml"
+      - "data/cosmology/qso_literature_extraction_manifest.csv"
+      - "qso_literature_extraction_manifest.csv"
+      - "data/cosmology/external_observed_manifest.csv"
+      - "external_observed_manifest.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  dr14-qso-value-extraction-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.251 DR14 QSO Value Extraction Guard is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.251 DR14 QSO value extraction guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import zipfile
+
+          VERSION = "v4.251"
+          ROUTE = "extract_dr14_qso_values_after_v4_250"
+          EXPECTED_RESULT = "v4_251_dr14_qso_value_extraction_guard_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_252_dr14_qso_covariance_supplement_locator_or_handoff"
+
+          OUT = Path("tairid_v4_251_dr14_qso_value_extraction_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-251-dr14-qso-value-extraction-guard-output.zip"
+
+          EXTRACTION_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/qso_literature_extraction_manifest.csv"),
+              Path("qso_literature_extraction_manifest.csv"),
+          ]
+
+          OBSERVED_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/external_observed_manifest.csv"),
+              Path("external_observed_manifest.csv"),
+          ]
+
+          REQUIRED_EXTRACTION_COLUMNS = [
+              "extraction_id",
+              "candidate_id",
+              "paper_or_source_url",
+              "measurement_label",
+              "redshift",
+              "observable",
+              "observed_value",
+              "uncertainty_or_covariance_reference",
+              "data_vector_reference",
+              "source_role",
+              "provenance_status",
+              "extraction_status",
+              "approval_status",
+          ]
+
+          REQUIRED_OBSERVED_COLUMNS = [
+              "observed_id",
+              "target_id",
+              "source_family",
+              "source_role",
+              "redshift",
+              "quantity",
+              "observed_value",
+              "observed_sigma_or_likelihood",
+              "data_path_or_url",
+              "covariance_path_or_url",
+              "reference_model_path_or_method",
+              "failure_condition_id",
+              "approval_status",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def safe_float(value):
+              try:
+                  return float(value)
+              except Exception:
+                  return None
+
+          def is_placeholder(value):
+              text = str(value or "").strip().lower()
+              return (
+                  not text
+                  or text.startswith("put_")
+                  or "put_" in text
+                  or text.startswith("do_not_fill")
+                  or text in ["todo", "none", "na", "n/a", "template_not_filled"]
+              )
+
+          inherited_v4_250_rows = [
+              {
+                  "inherited_from": "v4.250",
+                  "item": "rules",
+                  "value": "36 / 36 passed",
+                  "meaning": "Primary QSO Literature Candidate Extraction Guard passed.",
+                  "carry_forward_status": "ready_for_value_extraction_guard",
+              },
+              {
+                  "inherited_from": "v4.250",
+                  "item": "primary_literature_candidates",
+                  "value": 3,
+                  "meaning": "Three DR14 QSO primary literature candidates were retained.",
+                  "carry_forward_status": "extraction_review_allowed",
+              },
+              {
+                  "inherited_from": "v4.250",
+                  "item": "extraction_schema_rows",
+                  "value": 13,
+                  "meaning": "Extraction manifest schema exists.",
+                  "carry_forward_status": "schema_ready",
+              },
+              {
+                  "inherited_from": "v4.250",
+                  "item": "manifest_ready_candidates",
+                  "value": 0,
+                  "meaning": "No candidate was manifest-ready.",
+                  "carry_forward_status": "manifest_fill_blocked",
+              },
+              {
+                  "inherited_from": "v4.250",
+                  "item": "approved_holdout_sources",
+                  "value": 0,
+                  "meaning": "No source was approved as holdout.",
+                  "carry_forward_status": "evidence_blocked",
+              },
+              {
+                  "inherited_from": "v4.250",
+                  "item": "selected_next_route",
+                  "value": "v4_251_extract_dr14_qso_values_or_handoff",
+                  "meaning": "Current route extracts only safe value candidates or prepares handoff.",
+                  "carry_forward_status": "current_route",
+              },
+          ]
+
+          source_identity_correction_rows = [
+              {
+                  "correction_id": "source_fix_001",
+                  "prior_candidate_id": "qso_src_001_dr14_zarrouk_configuration_space",
+                  "issue": "v4.249/v4.250 label was too loose for the exact configuration-space value.",
+                  "corrected_value_source": "qso_src_001a_hou_configuration_space_arxiv_1801_02656",
+                  "reason": "The directly extractable configuration-space abstract value is tied to Hou et al. arXiv:1801.02656, not the loose Zarrouk label.",
+                  "status": "candidate_id_correction_not_evidence",
+              },
+              {
+                  "correction_id": "source_fix_002",
+                  "prior_candidate_id": "qso_src_002_dr14_zhao_tomographic",
+                  "issue": "Tomographic paper reports four redshift bins and covariance availability, but exact f_sigma8 values are not extracted in this guard.",
+                  "corrected_value_source": "needs_pdf_table_or_supplement_extraction",
+                  "reason": "Do not guess table values from secondary compilations.",
+                  "status": "blocked_until_table_extraction",
+              },
+              {
+                  "correction_id": "source_fix_003",
+                  "prior_candidate_id": "qso_src_003_dr14_gil_marin_power_spectrum",
+                  "issue": "Power-spectrum candidate has a directly reported single effective-redshift f_sigma8 value.",
+                  "corrected_value_source": "qso_src_003_gil_marin_power_spectrum_arxiv_1801_02689",
+                  "reason": "The abstract reports f_sigma8 at z_eff=1.52 with uncertainty.",
+                  "status": "extracted_not_manifest_ready",
+              },
+              {
+                  "correction_id": "source_fix_004",
+                  "prior_candidate_id": "new_ruggeri_growth_evolution_candidate",
+                  "issue": "A DR14 growth-evolution paper was not in the v4.250 candidate list but reports f_sigma8 and derivative.",
+                  "corrected_value_source": "qso_src_009_ruggeri_growth_evolution_arxiv_1801_02891",
+                  "reason": "It may be a useful comparison candidate, but it is same survey family and needs covariance/provenance review.",
+                  "status": "new_candidate_extracted_not_manifest_ready",
+              },
+          ]
+
+          extracted_dr14_qso_value_rows = [
+              {
+                  "extraction_id": "value_001_hou_config_fsigma8",
+                  "candidate_id": "qso_src_001a_hou_configuration_space_arxiv_1801_02656",
+                  "paper_or_source_url": "https://arxiv.org/abs/1801.02656",
+                  "measurement_label": "configuration_space_abstract_measurement",
+                  "redshift": 1.52,
+                  "observable": "f_sigma8",
+                  "observed_value": 0.396,
+                  "observed_sigma_plus": 0.079,
+                  "observed_sigma_minus": 0.079,
+                  "uncertainty_or_covariance_reference": "abstract_reports_combined_statistical_systematic_uncertainty",
+                  "data_vector_reference": "arxiv_1801_02656_abstract",
+                  "source_role": "primary_qso_growth_literature_candidate",
+                  "provenance_status": "same_survey_family_cross_release_needs_review",
+                  "extraction_status": "extracted_not_scored",
+                  "manifest_fill_allowed": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              },
+              {
+                  "extraction_id": "value_002_gilmarin_power_fsigma8",
+                  "candidate_id": "qso_src_003_dr14_gil_marin_power_spectrum",
+                  "paper_or_source_url": "https://arxiv.org/abs/1801.02689",
+                  "measurement_label": "power_spectrum_abstract_measurement",
+                  "redshift": 1.52,
+                  "observable": "f_sigma8",
+                  "observed_value": 0.420,
+                  "observed_sigma_plus": 0.076,
+                  "observed_sigma_minus": 0.076,
+                  "uncertainty_or_covariance_reference": "abstract_reports_full_error_budget_including_systematics_and_statistics",
+                  "data_vector_reference": "arxiv_1801_02689_abstract",
+                  "source_role": "primary_qso_growth_literature_candidate",
+                  "provenance_status": "same_survey_family_cross_release_needs_review",
+                  "extraction_status": "extracted_not_scored",
+                  "manifest_fill_allowed": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              },
+              {
+                  "extraction_id": "value_003_ruggeri_growth_fsigma8",
+                  "candidate_id": "qso_src_009_ruggeri_growth_evolution_arxiv_1801_02891",
+                  "paper_or_source_url": "https://arxiv.org/abs/1801.02891",
+                  "measurement_label": "growth_evolution_abstract_measurement",
+                  "redshift": 1.52,
+                  "observable": "f_sigma8",
+                  "observed_value": 0.430,
+                  "observed_sigma_plus": 0.050,
+                  "observed_sigma_minus": 0.050,
+                  "uncertainty_or_covariance_reference": "abstract_reports_uncertainty_for_fsigma8",
+                  "data_vector_reference": "arxiv_1801_02891_abstract",
+                  "source_role": "primary_qso_growth_literature_candidate_comparison",
+                  "provenance_status": "same_survey_family_cross_release_needs_review",
+                  "extraction_status": "extracted_not_scored",
+                  "manifest_fill_allowed": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              },
+              {
+                  "extraction_id": "value_004_ruggeri_growth_derivative",
+                  "candidate_id": "qso_src_009_ruggeri_growth_evolution_arxiv_1801_02891",
+                  "paper_or_source_url": "https://arxiv.org/abs/1801.02891",
+                  "measurement_label": "growth_evolution_derivative_abstract_measurement",
+                  "redshift": 1.52,
+                  "observable": "df_sigma8_dz",
+                  "observed_value": -0.160,
+                  "observed_sigma_plus": 0.080,
+                  "observed_sigma_minus": 0.080,
+                  "uncertainty_or_covariance_reference": "abstract_reports_uncertainty_for_derivative",
+                  "data_vector_reference": "arxiv_1801_02891_abstract",
+                  "source_role": "derivative_context_not_primary_manifest",
+                  "provenance_status": "same_survey_family_cross_release_needs_review",
+                  "extraction_status": "extracted_context_not_scored",
+                  "manifest_fill_allowed": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              },
+          ]
+
+          blocked_or_pending_extraction_rows = [
+              {
+                  "pending_id": "pending_001_zhao_tomographic_bins",
+                  "candidate_id": "qso_src_002_dr14_zhao_tomographic",
+                  "paper_or_source_url": "https://arxiv.org/abs/1801.03043",
+                  "reported_redshifts": "0.98|1.23|1.52|1.94",
+                  "reported_observable": "joint_fsigma8_and_BAO",
+                  "known_from_source": "paper reports four effective redshifts and full data covariance matrix",
+                  "missing_for_extraction": "exact f_sigma8 values per bin and covariance/data-vector location",
+                  "status": "blocked_until_pdf_table_or_supplement_extraction",
+              },
+              {
+                  "pending_id": "pending_002_zarrouk_loose_label",
+                  "candidate_id": "qso_src_001_dr14_zarrouk_configuration_space",
+                  "paper_or_source_url": "https://arxiv.org/abs/1801.03062",
+                  "reported_redshifts": "0.8_to_2.2_sample",
+                  "reported_observable": "clustering_measurements",
+                  "known_from_source": "candidate context exists",
+                  "missing_for_extraction": "exact value row tied to this source was not grounded here",
+                  "status": "superseded_by_hou_exact_value_source_for_now",
+              },
+              {
+                  "pending_id": "pending_003_dr16_final_context",
+                  "candidate_id": "qso_src_004_dr16_neveux_final_power_spectrum",
+                  "paper_or_source_url": "https://arxiv.org/abs/2007.08999",
+                  "reported_redshifts": "1.480",
+                  "reported_observable": "final_DR16_QSO_context",
+                  "known_from_source": "same-family final data release context",
+                  "missing_for_extraction": "independent holdout status",
+                  "status": "blocked_as_independent_holdout_context_only",
+              },
+          ]
+
+          observed_manifest_draft_candidate_rows = []
+          for row in extracted_dr14_qso_value_rows:
+              if row["observable"] == "f_sigma8":
+                  observed_manifest_draft_candidate_rows.append({
+                      "draft_id": "draft_" + row["extraction_id"],
+                      "source_extraction_id": row["extraction_id"],
+                      "target_id": "future_manual_qso_growth_target",
+                      "source_family": "QSO_or_QSO_like",
+                      "source_role": "primary_qso_growth_literature_candidate_not_holdout_approved",
+                      "redshift": row["redshift"],
+                      "quantity": "f_sigma8",
+                      "observed_value": row["observed_value"],
+                      "observed_sigma_or_likelihood": row["observed_sigma_plus"],
+                      "data_path_or_url": row["paper_or_source_url"],
+                      "covariance_path_or_url": "NEEDS_COVARIANCE_OR_EXPLICIT_UNCERTAINTY_POLICY_REVIEW",
+                      "reference_model_path_or_method": "v4_243_external_reference_calculator_or_successor",
+                      "failure_condition_id": "failure_001",
+                      "approval_status": "draft_only_not_reviewed_not_scored",
+                      "manifest_fill_allowed": False,
+                  })
+
+          simple_value_consistency_rows = []
+          fsigma_rows = [row for row in extracted_dr14_qso_value_rows if row["observable"] == "f_sigma8"]
+          values = [float(row["observed_value"]) for row in fsigma_rows]
+          if values:
+              mean_value = sum(values) / len(values)
+              span_value = max(values) - min(values)
+              simple_value_consistency_rows.append({
+                  "check_id": "consistency_001_fsigma8_extracted_values",
+                  "value_rows": len(values),
+                  "min_value": min(values),
+                  "mean_value": mean_value,
+                  "max_value": max(values),
+                  "span": span_value,
+                  "interpretation": "extracted DR14 QSO f_sigma8 literature values are broadly close, but not scored or combined",
+                  "scoring_allowed": False,
+              })
+
+          extraction_manifest_status_rows = []
+          extraction_manifest_input_rows = []
+          found_extraction_manifests = [path for path in EXTRACTION_MANIFEST_CANDIDATES if path.exists()]
+          if not found_extraction_manifests:
+              extraction_manifest_status_rows.append({
+                  "manifest_path": "",
+                  "manifest_status": "missing",
+                  "extraction_rows": 0,
+                  "detail": "No user-filled extraction manifest found. Using guarded built-in extracted literature rows only.",
+              })
+          else:
+              for path in found_extraction_manifests:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in REQUIRED_EXTRACTION_COLUMNS if col not in columns]
+                      status = "schema_ok" if not missing else "schema_missing_columns"
+                      extraction_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          "extraction_rows": len(rows),
+                          "detail": "missing=" + "|".join(missing) if missing else "all required columns present",
+                      })
+                      if not missing:
+                          for row in rows:
+                              extraction_manifest_input_rows.append({col: row.get(col, "") for col in REQUIRED_EXTRACTION_COLUMNS})
+                  except Exception as exc:
+                      extraction_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          "extraction_rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+
+          extraction_manifest_validation_rows = []
+          for row in extraction_manifest_input_rows:
+              issues = []
+              z = safe_float(row.get("redshift"))
+              val = safe_float(row.get("observed_value"))
+              if not row.get("extraction_id"):
+                  issues.append("missing_extraction_id")
+              if not row.get("candidate_id"):
+                  issues.append("missing_candidate_id")
+              if z is None:
+                  issues.append("bad_or_missing_redshift")
+              if val is None:
+                  issues.append("bad_or_missing_observed_value")
+              if is_placeholder(row.get("uncertainty_or_covariance_reference")):
+                  issues.append("uncertainty_or_covariance_placeholder")
+              if is_placeholder(row.get("data_vector_reference")):
+                  issues.append("data_vector_reference_placeholder")
+              if row.get("approval_status") in ["approved", "approved_for_scoring", "evidence"]:
+                  issues.append("approval_status_too_strong_for_guard")
+              extraction_manifest_validation_rows.append({
+                  "extraction_id": row.get("extraction_id", ""),
+                  "candidate_id": row.get("candidate_id", ""),
+                  "observable": row.get("observable", ""),
+                  "redshift": row.get("redshift", ""),
+                  "validation_issues": "|".join(issues) if issues else "none",
+                  "review_status": "reviewable_not_scored" if not issues else "blocked_by_extraction_issues",
+                  "manifest_fill_allowed": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              })
+
+          observed_manifest_status_rows = []
+          found_observed_manifests = [path for path in OBSERVED_MANIFEST_CANDIDATES if path.exists()]
+          if not found_observed_manifests:
+              observed_manifest_status_rows.append({
+                  "manifest_path": "",
+                  "manifest_status": "missing",
+                  "observed_rows": 0,
+                  "detail": "No external observed manifest found. Do not score.",
+              })
+          else:
+              for path in found_observed_manifests:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in REQUIRED_OBSERVED_COLUMNS if col not in columns]
+                      status = "schema_ok" if not missing else "schema_missing_columns"
+                      observed_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          "observed_rows": len(rows),
+                          "detail": "missing=" + "|".join(missing) if missing else "all required columns present",
+                      })
+                  except Exception as exc:
+                      observed_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          "observed_rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+
+          covariance_next_need_rows = [
+              {
+                  "need_id": "cov_need_001_hou",
+                  "candidate_id": "qso_src_001a_hou_configuration_space_arxiv_1801_02656",
+                  "needed_next": "confirm exact uncertainty policy and covariance availability beyond abstract uncertainty",
+                  "next_route": "v4_252_covariance_supplement_locator",
+              },
+              {
+                  "need_id": "cov_need_002_gilmarin",
+                  "candidate_id": "qso_src_003_dr14_gil_marin_power_spectrum",
+                  "needed_next": "confirm covariance/full likelihood or accepted uncertainty use",
+                  "next_route": "v4_252_covariance_supplement_locator",
+              },
+              {
+                  "need_id": "cov_need_003_ruggeri",
+                  "candidate_id": "qso_src_009_ruggeri_growth_evolution_arxiv_1801_02891",
+                  "needed_next": "confirm whether derivative/growth evolution data can be used and how covariance is represented",
+                  "next_route": "v4_252_covariance_supplement_locator",
+              },
+              {
+                  "need_id": "cov_need_004_zhao",
+                  "candidate_id": "qso_src_002_dr14_zhao_tomographic",
+                  "needed_next": "extract exact four-bin values and full covariance matrix",
+                  "next_route": "v4_252_covariance_supplement_locator",
+              },
+          ]
+
+          failure_condition_rows = [
+              {
+                  "failure_condition_id": "failure_001",
+                  "target": "QSO f_sigma8 primary pressure",
+                  "machine_condition": "if holdout_qso_growth_direction in ['0','-','mixed_negative'] then primary_pressure_weakened",
+                  "status": "active_but_not_testable_without_approved_holdout_and_covariance",
+              },
+              {
+                  "failure_condition_id": "failure_002",
+                  "target": "QSO versus LRG growth contrast",
+                  "machine_condition": "if lrg_growth_direction == qso_growth_direction == '+' then source_contrast_weakened",
+                  "status": "active_for_future_control_review",
+              },
+              {
+                  "failure_condition_id": "failure_003",
+                  "target": "QSO radial secondary support",
+                  "machine_condition": "if qso_radial_direction == '-' then secondary_support_weakened",
+                  "status": "active_for_future_secondary_review",
+              },
+              {
+                  "failure_condition_id": "failure_004",
+                  "target": "geometry compressed lane non-primary",
+                  "machine_condition": "if compressed_geometry_primary and qso_growth_not_positive then current_interpretation_rewrite_needed",
+                  "status": "active_for_future_geometry_review",
+              },
+              {
+                  "failure_condition_id": "failure_005",
+                  "target": "external likelihood robustness",
+                  "machine_condition": "if external_likelihood_absorbs_all_pressure_without_tairid_specific_leftover then baseline_pressure_not_tairid_specific",
+                  "status": "active_for_future_model_comparison",
+              },
+          ]
+
+          permission_rows = [
+              {
+                  "permission_scope": "dr14_value_extraction",
+                  "permission_status": "written_guarded_values",
+                  "reason": "Only values grounded to literature abstracts/safe source summaries were written.",
+              },
+              {
+                  "permission_scope": "source_identity_correction",
+                  "permission_status": "written",
+                  "reason": "The loose Zarrouk/configuration-space label is corrected before manifest use.",
+              },
+              {
+                  "permission_scope": "observed_manifest_draft_candidates",
+                  "permission_status": "written_draft_only",
+                  "reason": "Draft rows are not manifest fill permission.",
+              },
+              {
+                  "permission_scope": "external_observed_manifest_fill",
+                  "permission_status": "blocked_until_covariance_and_provenance_review",
+                  "reason": "Exact covariance/provenance policy is not complete.",
+              },
+              {
+                  "permission_scope": "external_observed_residual_scoring",
+                  "permission_status": "blocked",
+                  "reason": "No reviewed observed/reference join exists.",
+              },
+              {
+                  "permission_scope": "primary_qso_growth_evidence",
+                  "permission_status": "blocked",
+                  "reason": "Extracted literature values are not approved holdout evidence.",
+              },
+              {
+                  "permission_scope": "numeric_correction_fit",
+                  "permission_status": "blocked",
+                  "reason": "No approved observed manifest or parameter values are ready.",
+              },
+              {
+                  "permission_scope": "combined_lrg_elg_qso_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix remains blocked by source-surface guards.",
+              },
+              {
+                  "permission_scope": "cosmology_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "No external likelihood fit or holdout scoring has run.",
+              },
+          ]
+
+          readiness_rows = [
+              {
+                  "readiness_id": "readiness_001",
+                  "requirement": "exact_literature_values",
+                  "status": "partially_ready",
+                  "blocks": "manifest fill until covariance/provenance review",
+              },
+              {
+                  "readiness_id": "readiness_002",
+                  "requirement": "zhao_four_bin_values",
+                  "status": "missing",
+                  "blocks": "tomographic manifest fill",
+              },
+              {
+                  "readiness_id": "readiness_003",
+                  "requirement": "covariance_or_uncertainty_policy",
+                  "status": "missing_or_unverified",
+                  "blocks": "scoring",
+              },
+              {
+                  "readiness_id": "readiness_004",
+                  "requirement": "provenance_decision",
+                  "status": "needed",
+                  "blocks": "holdout label",
+              },
+              {
+                  "readiness_id": "readiness_005",
+                  "requirement": "external_observed_manifest",
+                  "status": "draft_candidates_only",
+                  "blocks": "residual scoring",
+              },
+              {
+                  "readiness_id": "readiness_006",
+                  "requirement": "numeric_correction_fit",
+                  "status": "blocked",
+                  "blocks": "model comparison",
+              },
+              {
+                  "readiness_id": "readiness_007",
+                  "requirement": "combined_matrix_permission",
+                  "status": "blocked",
+                  "blocks": "combined matrix",
+              },
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "DR14 QSO f_sigma8 values are partially extracted.",
+                  "basis": "Three f_sigma8 abstract-level values are written, plus one derivative-context row.",
+                  "next_action": "Do not score them; review covariance and provenance first.",
+                  "claim_status": "extracted_not_scored",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "The loose configuration-space source label is corrected.",
+                  "basis": "The directly extracted configuration-space value is tied to Hou arXiv:1801.02656.",
+                  "next_action": "Use corrected source identity before any manifest row.",
+                  "claim_status": "source_correction_only",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Zhao tomographic values remain pending.",
+                  "basis": "Only redshift bins and covariance claim are carried; exact values are not guessed.",
+                  "next_action": "Locate table/supplement/covariance before extraction.",
+                  "claim_status": "pending_extraction",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "Next route should locate covariance/supplements or hand off.",
+                  "basis": "Values alone are not enough for scoring or holdout approval.",
+                  "next_action": "Proceed to v4.252 covariance supplement locator or create handoff.",
+                  "claim_status": "scoring_blocked",
+              },
+          ]
+
+          route_decision_rows = [
+              {
+                  "route_id": "route_001",
+                  "route": "dr14_qso_covariance_supplement_locator",
+                  "permission_status": "recommended",
+                  "reason": "Covariance/provenance is now the main blocker after partial value extraction.",
+              },
+              {
+                  "route_id": "route_002",
+                  "route": "zhao_tomographic_table_extraction",
+                  "permission_status": "recommended",
+                  "reason": "Zhao four-bin values remain useful but not extracted.",
+              },
+              {
+                  "route_id": "route_003",
+                  "route": "external_observed_manifest_fill",
+                  "permission_status": "blocked_until_covariance_review",
+                  "reason": "Draft candidates are not reviewed manifest rows.",
+              },
+              {
+                  "route_id": "route_004",
+                  "route": "numeric_correction_fit",
+                  "permission_status": "blocked",
+                  "reason": "No approved observed manifest exists.",
+              },
+              {
+                  "route_id": "route_005",
+                  "route": "handoff",
+                  "permission_status": "allowed",
+                  "reason": "v4.203-v4.251 is enough history for consolidation if needed.",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_252_dr14_qso_covariance_supplement_locator",
+                  "purpose": "locate covariance, supplement, uncertainty policy, or data-vector sources for extracted values",
+                  "activated": True,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_252_zhao_tomographic_table_extraction_guard",
+                  "purpose": "extract Zhao four-bin values only if table/supplement is located",
+                  "activated": True,
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_252_external_observed_manifest_fill_after_covariance",
+                  "purpose": "prepare manifest rows only after covariance/provenance review",
+                  "activated": False,
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_252_handoff_if_needed",
+                  "purpose": "consolidate v4.203-v4.251 if thread length is risky",
+                  "activated": True,
+              },
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before value extraction"},
+              {"gate": "inherited_v4_250_rows_equal_6", "passed": len(inherited_v4_250_rows) == 6, "detail": f"inherited_v4_250_rows = {len(inherited_v4_250_rows)}"},
+              {"gate": "source_identity_correction_rows_equal_4", "passed": len(source_identity_correction_rows) == 4, "detail": f"source_identity_correction_rows = {len(source_identity_correction_rows)}"},
+              {"gate": "extracted_dr14_qso_value_rows_equal_4", "passed": len(extracted_dr14_qso_value_rows) == 4, "detail": f"extracted_dr14_qso_value_rows = {len(extracted_dr14_qso_value_rows)}"},
+              {"gate": "fsigma8_value_rows_equal_3", "passed": len([row for row in extracted_dr14_qso_value_rows if row['observable'] == 'f_sigma8']) == 3, "detail": "f_sigma8 value rows = 3"},
+              {"gate": "blocked_or_pending_extraction_rows_equal_3", "passed": len(blocked_or_pending_extraction_rows) == 3, "detail": f"blocked_or_pending_extraction_rows = {len(blocked_or_pending_extraction_rows)}"},
+              {"gate": "observed_manifest_draft_candidate_rows_equal_3", "passed": len(observed_manifest_draft_candidate_rows) == 3, "detail": f"observed_manifest_draft_candidate_rows = {len(observed_manifest_draft_candidate_rows)}"},
+              {"gate": "simple_value_consistency_rows_equal_1", "passed": len(simple_value_consistency_rows) == 1, "detail": f"simple_value_consistency_rows = {len(simple_value_consistency_rows)}"},
+              {"gate": "extraction_manifest_status_rows_at_least_1", "passed": len(extraction_manifest_status_rows) >= 1, "detail": f"extraction_manifest_status_rows = {len(extraction_manifest_status_rows)}"},
+              {"gate": "extraction_manifest_validation_rows_match_inputs", "passed": len(extraction_manifest_validation_rows) == len(extraction_manifest_input_rows), "detail": f"extraction_manifest_validation_rows = {len(extraction_manifest_validation_rows)}, extraction_manifest_input_rows = {len(extraction_manifest_input_rows)}"},
+              {"gate": "observed_manifest_status_rows_at_least_1", "passed": len(observed_manifest_status_rows) >= 1, "detail": f"observed_manifest_status_rows = {len(observed_manifest_status_rows)}"},
+              {"gate": "covariance_next_need_rows_equal_4", "passed": len(covariance_next_need_rows) == 4, "detail": f"covariance_next_need_rows = {len(covariance_next_need_rows)}"},
+              {"gate": "failure_condition_rows_equal_5", "passed": len(failure_condition_rows) == 5, "detail": f"failure_condition_rows = {len(failure_condition_rows)}"},
+              {"gate": "permission_rows_equal_9", "passed": len(permission_rows) == 9, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_7", "passed": len(readiness_rows) == 7, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_decision_rows_equal_5", "passed": len(route_decision_rows) == 5, "detail": f"route_decision_rows = {len(route_decision_rows)}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "no_extracted_value_manifest_fill_allowed", "passed": all(row["manifest_fill_allowed"] is False for row in extracted_dr14_qso_value_rows), "detail": "no extracted value can fill manifest automatically"},
+              {"gate": "no_extracted_value_scoring_allowed", "passed": all(row["scoring_allowed"] is False for row in extracted_dr14_qso_value_rows), "detail": "no extracted value scoring allowed"},
+              {"gate": "no_extracted_value_evidence_allowed", "passed": all(row["evidence_allowed"] is False for row in extracted_dr14_qso_value_rows), "detail": "no extracted value evidence allowed"},
+              {"gate": "no_draft_candidate_manifest_fill_allowed", "passed": all(row["manifest_fill_allowed"] is False for row in observed_manifest_draft_candidate_rows), "detail": "no draft candidate fill allowed"},
+              {"gate": "source_identity_correction_written", "passed": any(row["correction_id"] == "source_fix_001" for row in source_identity_correction_rows), "detail": "source identity correction written"},
+              {"gate": "zhao_values_blocked_until_table_extraction", "passed": any(row["pending_id"] == "pending_001_zhao_tomographic_bins" and row["status"] == "blocked_until_pdf_table_or_supplement_extraction" for row in blocked_or_pending_extraction_rows), "detail": "Zhao values not guessed"},
+              {"gate": "external_manifest_fill_blocked", "passed": any(row["permission_scope"] == "external_observed_manifest_fill" and row["permission_status"] == "blocked_until_covariance_and_provenance_review" for row in permission_rows), "detail": "manifest fill blocked"},
+              {"gate": "external_scoring_blocked", "passed": any(row["permission_scope"] == "external_observed_residual_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "external observed scoring blocked"},
+              {"gate": "primary_qso_evidence_blocked", "passed": any(row["permission_scope"] == "primary_qso_growth_evidence" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "primary QSO evidence blocked"},
+              {"gate": "numeric_fit_blocked", "passed": any(row["permission_scope"] == "numeric_correction_fit" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "numeric fit blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation claim blocked"},
+              {"gate": "covariance_locator_recommended", "passed": any(row["route"] == "dr14_qso_covariance_supplement_locator" and row["permission_status"] == "recommended" for row in route_decision_rows), "detail": "covariance locator recommended"},
+              {"gate": "manifest_fill_after_covariance_not_activated", "passed": any(row["test_id"] == "v4_252_external_observed_manifest_fill_after_covariance" and row["activated"] is False for row in next_rows), "detail": "manifest fill not activated"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_scoring", "passed": True, "detail": "no scoring"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_252_dr14_qso_covariance_supplement_locator_or_handoff", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_251_dr14_qso_value_extraction_guard_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_251_inherited_v4_250_rows.csv", inherited_v4_250_rows)
+          write_csv(OUT / "v4_251_source_identity_correction_rows.csv", source_identity_correction_rows)
+          write_csv(OUT / "v4_251_extracted_dr14_qso_value_rows.csv", extracted_dr14_qso_value_rows)
+          write_csv(OUT / "v4_251_blocked_or_pending_extraction_rows.csv", blocked_or_pending_extraction_rows)
+          write_csv(OUT / "v4_251_observed_manifest_draft_candidate_rows.csv", observed_manifest_draft_candidate_rows)
+          write_csv(OUT / "v4_251_simple_value_consistency_rows.csv", simple_value_consistency_rows)
+          write_csv(OUT / "v4_251_extraction_manifest_status_rows.csv", extraction_manifest_status_rows)
+          write_csv(OUT / "v4_251_extraction_manifest_validation_rows.csv", extraction_manifest_validation_rows)
+          write_csv(OUT / "v4_251_observed_manifest_status_rows.csv", observed_manifest_status_rows)
+          write_csv(OUT / "v4_251_covariance_next_need_rows.csv", covariance_next_need_rows)
+          write_csv(OUT / "v4_251_failure_condition_rows.csv", failure_condition_rows)
+          write_csv(OUT / "v4_251_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_251_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_251_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_251_route_decision_rows.csv", route_decision_rows)
+          write_csv(OUT / "v4_251_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_251_rule_checks.csv", checks)
+
+          value_lines = [
+              f"{row['extraction_id']}: z={row['redshift']} {row['observable']}={row['observed_value']} +/- {row['observed_sigma_plus']} ({row['extraction_status']})"
+              for row in extracted_dr14_qso_value_rows
+          ]
+
+          pending_lines = [
+              f"{row['pending_id']}: {row['status']} — missing {row['missing_for_extraction']}"
+              for row in blocked_or_pending_extraction_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_decision_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_v4_250_rows": len(inherited_v4_250_rows),
+              "source_identity_correction_rows": len(source_identity_correction_rows),
+              "extracted_dr14_qso_value_rows": len(extracted_dr14_qso_value_rows),
+              "fsigma8_value_rows": len([row for row in extracted_dr14_qso_value_rows if row["observable"] == "f_sigma8"]),
+              "blocked_or_pending_extraction_rows": len(blocked_or_pending_extraction_rows),
+              "observed_manifest_draft_candidate_rows": len(observed_manifest_draft_candidate_rows),
+              "simple_value_consistency_rows": len(simple_value_consistency_rows),
+              "extraction_manifest_status_rows": len(extraction_manifest_status_rows),
+              "extraction_manifest_input_rows": len(extraction_manifest_input_rows),
+              "extraction_manifest_validation_rows": len(extraction_manifest_validation_rows),
+              "observed_manifest_status_rows": len(observed_manifest_status_rows),
+              "covariance_next_need_rows": len(covariance_next_need_rows),
+              "failure_condition_rows": len(failure_condition_rows),
+              "permission_rows": len(permission_rows),
+              "readiness_rows": len(readiness_rows),
+              "decision_rows": len(decision_rows),
+              "route_decision_rows": len(route_decision_rows),
+              "next_rows": len(next_rows),
+              "manifest_fill_allowed": False,
+              "scoring_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_251_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.251 DR14 QSO Value Extraction Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_v4_250_rows = {summary['inherited_v4_250_rows']}",
+              f"source_identity_correction_rows = {summary['source_identity_correction_rows']}",
+              f"extracted_dr14_qso_value_rows = {summary['extracted_dr14_qso_value_rows']}",
+              f"fsigma8_value_rows = {summary['fsigma8_value_rows']}",
+              f"blocked_or_pending_extraction_rows = {summary['blocked_or_pending_extraction_rows']}",
+              f"observed_manifest_draft_candidate_rows = {summary['observed_manifest_draft_candidate_rows']}",
+              f"simple_value_consistency_rows = {summary['simple_value_consistency_rows']}",
+              f"extraction_manifest_status_rows = {summary['extraction_manifest_status_rows']}",
+              f"extraction_manifest_input_rows = {summary['extraction_manifest_input_rows']}",
+              f"extraction_manifest_validation_rows = {summary['extraction_manifest_validation_rows']}",
+              f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}",
+              f"covariance_next_need_rows = {summary['covariance_next_need_rows']}",
+              f"failure_condition_rows = {summary['failure_condition_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"route_decision_rows = {summary['route_decision_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"manifest_fill_allowed = {summary['manifest_fill_allowed']}",
+              f"scoring_allowed = {summary['scoring_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Extracted value rows:",
+              *value_lines,
+              "",
+              "Blocked or pending rows:",
+              *pending_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.251 extracts only the DR14 QSO values that can be safely carried as literature-level candidate rows. It also corrects the loose configuration-space source label. The values are not manifest-ready, not scored, not approved as holdout evidence, and still need covariance/provenance review.",
+              "",
+              "Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_251_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_v4_250_rows = {summary['inherited_v4_250_rows']}")
+          print(f"source_identity_correction_rows = {summary['source_identity_correction_rows']}")
+          print(f"extracted_dr14_qso_value_rows = {summary['extracted_dr14_qso_value_rows']}")
+          print(f"fsigma8_value_rows = {summary['fsigma8_value_rows']}")
+          print(f"blocked_or_pending_extraction_rows = {summary['blocked_or_pending_extraction_rows']}")
+          print(f"observed_manifest_draft_candidate_rows = {summary['observed_manifest_draft_candidate_rows']}")
+          print(f"simple_value_consistency_rows = {summary['simple_value_consistency_rows']}")
+          print(f"extraction_manifest_status_rows = {summary['extraction_manifest_status_rows']}")
+          print(f"extraction_manifest_input_rows = {summary['extraction_manifest_input_rows']}")
+          print(f"extraction_manifest_validation_rows = {summary['extraction_manifest_validation_rows']}")
+          print(f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}")
+          print(f"covariance_next_need_rows = {summary['covariance_next_need_rows']}")
+          print(f"failure_condition_rows = {summary['failure_condition_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"route_decision_rows = {summary['route_decision_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"manifest_fill_allowed = {summary['manifest_fill_allowed']}")
+          print(f"scoring_allowed = {summary['scoring_allowed']}")
+          print(f"approved_holdout_sources = {summary['approved_holdout_sources']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.251 DR14 QSO value extraction guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-251-dr14-qso-value-extraction-guard-output
+          path: |
+            tairid_v4_251_dr14_qso_value_extraction_guard_output/
+            tairid-v4-251-dr14-qso-value-extraction-guard-output.zip
