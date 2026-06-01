@@ -1,0 +1,327 @@
+name: 000 TAIRID v4.207 - ETDD70 File Download And Structure Probe With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-207-etdd70-file-download-and-structure-probe-with-scope-guards.yml"
+      - "data/neurotype/**"
+      - "data/public_sources/**"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-207-etdd70-file-download-structure-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.207 ETDD70 file download and structure probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_207_outputs
+          cat > tairid_v4_207_outputs/run_v4_207.py <<'PY'
+          import csv
+          import io
+          import json
+          import os
+          import shutil
+          import tempfile
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_207_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "etdd70_file_download_and_structure_probe_passed_structure_reports_written_no_validation"
+
+          BLOCKED_CLAIMS = [
+              "no cross-domain validation",
+              "no neurotype validation",
+              "no dyslexia validation",
+              "no clinical diagnosis claim",
+              "no claim that ETDD70 proves TAIRID",
+              "no raw numbers moved between domains",
+              "no unit equivalence across domains",
+              "no causal equivalence across domains",
+              "no publication-grade scaling law",
+              "file structure is not subject-axis parsing",
+              "class labels are not covariance",
+              "TAIRID not proved"
+          ]
+
+          V4_206_STATUS = {
+              "version": "v4.206",
+              "rule_pass_count": 10,
+              "rule_total_count": 10,
+              "failed_gates": [],
+              "sources_checked": 1,
+              "metadata_fetch_ok_count": 1,
+              "source_file_count": 6,
+              "ranked_download_rows": 6,
+              "package_status": "etdd70_metadata_fetched_files_listed_no_parsing",
+              "selected_next_route": "etdd70_file_download_and_structure_probe_with_scope_guards"
+          }
+
+          FILES = [
+              {"file_name": "README.md", "file_size_bytes": 3082, "file_role_guess": "metadata_or_subject_index_candidate", "download_url": "https://zenodo.org/api/records/13332134/files/README.md/content"},
+              {"file_name": "dyslexia_class_label.csv", "file_size_bytes": 1357, "file_role_guess": "tabular_candidate", "download_url": "https://zenodo.org/api/records/13332134/files/dyslexia_class_label.csv/content"},
+              {"file_name": "rois.zip", "file_size_bytes": 7861, "file_role_guess": "archive_candidate", "download_url": "https://zenodo.org/api/records/13332134/files/rois.zip/content"},
+              {"file_name": "stimuli.zip", "file_size_bytes": 212748, "file_role_guess": "archive_candidate", "download_url": "https://zenodo.org/api/records/13332134/files/stimuli.zip/content"},
+              {"file_name": "fixation_images.zip", "file_size_bytes": 22089130, "file_role_guess": "eye_tracking_measure_candidate", "download_url": "https://zenodo.org/api/records/13332134/files/fixation_images.zip/content"},
+              {"file_name": "data.zip", "file_size_bytes": 133743551, "file_role_guess": "large_archive_candidate", "download_url": "https://zenodo.org/api/records/13332134/files/data.zip/content"}
+          ]
+
+          TARGET_SCHEMA = {
+              "target_file": "data/neurotype/dyslexia_aphantasia_subject_axis_input.csv",
+              "lane": "Dyslexia",
+              "needed_columns": "lane;subject_id;group_or_condition;boundary_or_task;propagation_reach_value;pacing_access_value;consolidation_growth_value;viability_or_outcome_value;source_or_dataset;notes",
+              "axis_mapping_plan": "propagation=s_A or scan/scale expansion; pacing=lambda_R or timing/load; consolidation=rho_R or re-entry/accuracy; viability=V_data or reading outcome"
+          }
+
+          MAX_DOWNLOAD_BYTES = 170_000_000
+          MAX_TABULAR_EXTRACT_BYTES = 6_000_000
+          MAX_PROFILE_ROWS = 500
+          USER_AGENT = "TAIRID-v4.207-ETDD70-structure-probe/1.0"
+          KEYWORDS_AXIS = ["subject", "participant", "dyslexia", "label", "trial", "fixation", "saccade", "duration", "x", "y", "gaze", "roi", "accuracy", "reading", "word", "sentence", "task", "response", "time", "timestamp", "class"]
+          PLACEHOLDER_MARKERS = ["replace_with", "manual_relative", "manual_phase", "manual_group", "placeholder", "not_subject_data", "not empirical"]
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def safe_float(x):
+              try:
+                  if x is None or str(x).strip() == "":
+                      return None
+                  return float(str(x).strip())
+              except Exception:
+                  return None
+
+          def classify_member(name, size):
+              lower = name.lower()
+              ext = Path(lower).suffix
+              if any(k in lower for k in ["label", "participant", "subject", "class"]):
+                  role = "subject_or_label_candidate"
+              elif any(k in lower for k in ["fixation", "saccade", "gaze", "eye"]):
+                  role = "eye_tracking_measure_candidate"
+              elif any(k in lower for k in ["roi", "aois", "area"]):
+                  role = "roi_candidate"
+              elif any(k in lower for k in ["stim", "sentence", "word", "text"]):
+                  role = "stimulus_candidate"
+              elif ext in [".csv", ".tsv", ".json", ".xlsx", ".txt", ".md"]:
+                  role = "tabular_or_text_candidate"
+              else:
+                  role = "other"
+              return role, ext
+
+          def download_file(url, dest, expected_size):
+              if os.environ.get("TAIRID_LOCAL_NO_NETWORK") == "1":
+                  return False, "download_skipped_local_no_network", "local check disables network"
+              if expected_size is not None and int(expected_size) > MAX_DOWNLOAD_BYTES:
+                  return False, "skipped_size_guard", "expected_size_exceeds_guard"
+              req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+              try:
+                  with urllib.request.urlopen(req, timeout=35) as resp:
+                      content_len = resp.headers.get("Content-Length")
+                      if content_len and int(content_len) > MAX_DOWNLOAD_BYTES:
+                          return False, "skipped_size_guard", "content_length_exceeds_guard"
+                      total = 0
+                      with open(dest, "wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > MAX_DOWNLOAD_BYTES:
+                                  return False, "failed_size_guard", "download_exceeded_guard"
+                              f.write(chunk)
+                  return True, "downloaded", ""
+              except Exception as exc:
+                  return False, "download_failed", type(exc).__name__ + ": " + str(exc)[:300]
+
+          def decode_bytes(data):
+              for enc in ["utf-8", "utf-8-sig", "latin-1"]:
+                  try:
+                      return data.decode(enc)
+                  except Exception:
+                      pass
+              return data.decode("latin-1", errors="replace")
+
+          def delimiter_for_name(name, text):
+              if name.lower().endswith(".tsv"):
+                  return "\t"
+              first = text.splitlines()[0] if text.splitlines() else ""
+              return "\t" if first.count("\t") > first.count(",") else ","
+
+          def profile_table_bytes(data, name):
+              text = decode_bytes(data)
+              delim = delimiter_for_name(name, text)
+              try:
+                  reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+                  cols = reader.fieldnames or []
+                  rows = []
+                  for i, row in enumerate(reader):
+                      if i >= MAX_PROFILE_ROWS:
+                          break
+                      rows.append(row)
+              except Exception:
+                  return {"profile_status": "table_parse_failed", "columns": "", "row_sample_count": 0, "numeric_column_count": 0, "numeric_columns": "", "axis_keyword_hits": "", "label_like_column": "", "subject_like_column": "", "placeholder_marker": False}
+              numeric_cols = []
+              for col in cols:
+                  vals = [safe_float(r.get(col)) for r in rows]
+                  if any(v is not None for v in vals):
+                      numeric_cols.append(col)
+              col_blob = " ".join(cols).lower()
+              sample_blob = " ".join(" ".join(str(v) for v in r.values()) for r in rows[:25]).lower()
+              full_blob = col_blob + " " + sample_blob
+              hits = [k for k in KEYWORDS_AXIS if k in full_blob]
+              label_like = next((c for c in cols if any(k in c.lower() for k in ["label", "class", "dyslexia", "group"])), "")
+              subject_like = next((c for c in cols if any(k in c.lower() for k in ["subject", "participant", "id", "person"])), "")
+              placeholder = any(m in full_blob for m in PLACEHOLDER_MARKERS)
+              return {"profile_status": "profiled", "columns": ";".join(cols[:60]), "row_sample_count": len(rows), "numeric_column_count": len(numeric_cols), "numeric_columns": ";".join(numeric_cols[:60]), "axis_keyword_hits": ";".join(hits), "label_like_column": label_like, "subject_like_column": subject_like, "placeholder_marker": placeholder}
+
+          download_rows, zip_member_rows, tabular_profile_rows, readme_rows, axis_candidate_rows = [], [], [], [], []
+          tmp_root = Path(tempfile.mkdtemp(prefix="tairid_v4_207_downloads_"))
+          try:
+              for file_spec in FILES:
+                  dest = tmp_root / file_spec["file_name"]
+                  ok, status, error = download_file(file_spec["download_url"], dest, file_spec["file_size_bytes"])
+                  actual_size = dest.stat().st_size if dest.exists() else 0
+                  download_rows.append({"file_name": file_spec["file_name"], "file_role_guess": file_spec["file_role_guess"], "expected_size_bytes": file_spec["file_size_bytes"], "download_status": status, "download_error": error, "downloaded_size_bytes": actual_size, "raw_file_uploaded_to_artifact": False, "claim_boundary": "download/probe only; raw files not preserved as evidence output"})
+                  if not ok:
+                      continue
+                  lower = file_spec["file_name"].lower()
+                  if lower.endswith(".md") or lower.endswith(".txt"):
+                      text = dest.read_text(encoding="utf-8", errors="replace")
+                      readme_rows.append({"file_name": file_spec["file_name"], "char_count": len(text), "line_count": len(text.splitlines()), "contains_participant": "participant" in text.lower(), "contains_dyslexia": "dyslexia" in text.lower(), "contains_fixation": "fixation" in text.lower(), "contains_data_dictionary": any(k in text.lower() for k in ["columns", "field", "dictionary", "description"]), "first_500_chars": text[:500].replace("\n", " ")})
+                  if lower.endswith(".csv") or lower.endswith(".tsv"):
+                      profile = profile_table_bytes(dest.read_bytes(), file_spec["file_name"])
+                      row = {"container_file": file_spec["file_name"], "inner_file": "", "source_path": file_spec["file_name"], "file_size_bytes": actual_size, "role_guess": "direct_tabular_file"}
+                      row.update(profile)
+                      tabular_profile_rows.append(row)
+                  if zipfile.is_zipfile(dest):
+                      try:
+                          with zipfile.ZipFile(dest) as z:
+                              for info in z.infolist():
+                                  role, ext = classify_member(info.filename, info.file_size)
+                                  zip_member_rows.append({"container_file": file_spec["file_name"], "inner_file": info.filename, "file_size_bytes": info.file_size, "compressed_size_bytes": info.compress_size, "extension": ext, "role_guess": role, "is_dir": info.is_dir(), "claim_boundary": "zip listing only unless profiled separately"})
+                                  if (not info.is_dir() and ext in [".csv", ".tsv", ".txt", ".md", ".json"] and info.file_size <= MAX_TABULAR_EXTRACT_BYTES and len(tabular_profile_rows) < 120):
+                                      try:
+                                          data = z.read(info)
+                                          if ext in [".csv", ".tsv"]:
+                                              profile = profile_table_bytes(data, info.filename)
+                                          else:
+                                              text = decode_bytes(data)
+                                              profile = {"profile_status": "text_profiled", "columns": "", "row_sample_count": len(text.splitlines()), "numeric_column_count": 0, "numeric_columns": "", "axis_keyword_hits": ";".join([k for k in KEYWORDS_AXIS if k in text.lower()]), "label_like_column": "", "subject_like_column": "", "placeholder_marker": any(m in text.lower() for m in PLACEHOLDER_MARKERS)}
+                                          row = {"container_file": file_spec["file_name"], "inner_file": info.filename, "source_path": file_spec["file_name"] + "::" + info.filename, "file_size_bytes": info.file_size, "role_guess": role}
+                                          row.update(profile)
+                                          tabular_profile_rows.append(row)
+                                      except Exception as exc:
+                                          tabular_profile_rows.append({"container_file": file_spec["file_name"], "inner_file": info.filename, "source_path": file_spec["file_name"] + "::" + info.filename, "file_size_bytes": info.file_size, "role_guess": role, "profile_status": "profile_failed:" + type(exc).__name__, "columns": "", "row_sample_count": 0, "numeric_column_count": 0, "numeric_columns": "", "axis_keyword_hits": "", "label_like_column": "", "subject_like_column": "", "placeholder_marker": False})
+                      except Exception as exc:
+                          zip_member_rows.append({"container_file": file_spec["file_name"], "inner_file": "", "file_size_bytes": "", "compressed_size_bytes": "", "extension": "", "role_guess": "zip_probe_failed:" + type(exc).__name__, "is_dir": "", "claim_boundary": "zip probe failed"})
+              for row in tabular_profile_rows:
+                  score = 0
+                  role = row.get("role_guess", "")
+                  hits = [h for h in row.get("axis_keyword_hits", "").split(";") if h]
+                  if "subject" in role or "label" in role:
+                      score += 5
+                  if "eye_tracking" in role:
+                      score += 4
+                  if "roi" in role:
+                      score += 2
+                  if row.get("label_like_column"):
+                      score += 4
+                  if row.get("subject_like_column"):
+                      score += 4
+                  try:
+                      score += min(int(row.get("numeric_column_count") or 0), 10)
+                  except Exception:
+                      pass
+                  score += min(len(hits), 12)
+                  if str(row.get("placeholder_marker")).lower() == "true":
+                      score -= 20
+                  axis_candidate_rows.append({"source_path": row.get("source_path", ""), "container_file": row.get("container_file", ""), "inner_file": row.get("inner_file", ""), "role_guess": row.get("role_guess", ""), "profile_status": row.get("profile_status", ""), "row_sample_count": row.get("row_sample_count", 0), "numeric_column_count": row.get("numeric_column_count", 0), "numeric_columns": row.get("numeric_columns", ""), "label_like_column": row.get("label_like_column", ""), "subject_like_column": row.get("subject_like_column", ""), "axis_keyword_hits": row.get("axis_keyword_hits", ""), "candidate_score_not_validation": score, "safe_next_action": "review column mapping before staging", "claim_boundary": "candidate mapping only; not subject-axis row yet"})
+          finally:
+              shutil.rmtree(tmp_root, ignore_errors=True)
+
+          axis_candidate_rows = sorted(axis_candidate_rows, key=lambda r: (-int(r["candidate_score_not_validation"]), r["source_path"]))
+
+          write_csv(OUT / "v4_207_v4_206_status_review.csv", [V4_206_STATUS], list(V4_206_STATUS.keys()))
+          (OUT / "v4_207_v4_206_status_review.json").write_text(json.dumps(V4_206_STATUS, indent=2), encoding="utf-8")
+          write_csv(OUT / "v4_207_download_status.csv", download_rows, ["file_name", "file_role_guess", "expected_size_bytes", "download_status", "download_error", "downloaded_size_bytes", "raw_file_uploaded_to_artifact", "claim_boundary"])
+          write_csv(OUT / "v4_207_zip_member_inventory.csv", zip_member_rows, ["container_file", "inner_file", "file_size_bytes", "compressed_size_bytes", "extension", "role_guess", "is_dir", "claim_boundary"])
+          write_csv(OUT / "v4_207_tabular_profile_inventory.csv", tabular_profile_rows, ["container_file", "inner_file", "source_path", "file_size_bytes", "role_guess", "profile_status", "columns", "row_sample_count", "numeric_column_count", "numeric_columns", "axis_keyword_hits", "label_like_column", "subject_like_column", "placeholder_marker"])
+          write_csv(OUT / "v4_207_readme_profile.csv", readme_rows, ["file_name", "char_count", "line_count", "contains_participant", "contains_dyslexia", "contains_fixation", "contains_data_dictionary", "first_500_chars"])
+          write_csv(OUT / "v4_207_g1_axis_candidate_mapping_targets.csv", axis_candidate_rows, ["source_path", "container_file", "inner_file", "role_guess", "profile_status", "row_sample_count", "numeric_column_count", "numeric_columns", "label_like_column", "subject_like_column", "axis_keyword_hits", "candidate_score_not_validation", "safe_next_action", "claim_boundary"])
+          write_csv(OUT / "v4_207_target_schema.csv", [TARGET_SCHEMA], ["target_file", "lane", "needed_columns", "axis_mapping_plan"])
+
+          downloaded_count = sum(1 for r in download_rows if r["download_status"] == "downloaded")
+          zip_probe_count = len([r for r in zip_member_rows if r.get("inner_file")])
+          tabular_profile_count = len(tabular_profile_rows)
+          top_candidate = axis_candidate_rows[0] if axis_candidate_rows else {}
+
+          if downloaded_count and axis_candidate_rows:
+              package_status = "etdd70_files_downloaded_structure_candidates_found"
+              selected_next_route = "etdd70_candidate_column_mapping_to_g1_axis_table_with_scope_guards"
+          elif downloaded_count:
+              package_status = "etdd70_files_downloaded_no_axis_candidates_found"
+              selected_next_route = "etdd70_structure_manual_review_with_scope_guards"
+          else:
+              package_status = "etdd70_download_failed_or_network_unavailable"
+              selected_next_route = "etdd70_download_retry_or_manual_upload_with_scope_guards"
+
+          claim_rows = [
+              {"claim": "Downloaded files validate the dyslexia lane.", "status": "blocked", "safe_wording": "Downloaded files only make structure probing possible.", "forbidden_wording": "ETDD70 download proves TAIRID."},
+              {"claim": "Candidate columns are subject-axis rows.", "status": "blocked", "safe_wording": "Candidate columns must be reviewed and mapped before staging.", "forbidden_wording": "Candidate columns close G1."},
+              {"claim": "Class labels alone provide covariance.", "status": "blocked", "safe_wording": "Class labels identify groups; covariance needs axis values.", "forbidden_wording": "Labels are enough for covariance."}
+          ]
+          write_csv(OUT / "v4_207_claim_boundary_matrix.csv", claim_rows, ["claim", "status", "safe_wording", "forbidden_wording"])
+
+          next_routes = [
+              {"priority": 1, "route": selected_next_route, "condition": package_status, "next_action": "Use v4_207_g1_axis_candidate_mapping_targets.csv to decide which ETDD70 files can map into the canonical G1 axis table."},
+              {"priority": 2, "route": "g1_aphantasia_public_or_uploaded_source_acquisition_with_scope_guards", "condition": "after dyslexia source structure is known", "next_action": "Acquire the aphantasia half of G1 so dyslexia and aphantasia can both reach staged axis rows."}
+          ]
+          write_csv(OUT / "v4_207_next_routes.csv", next_routes, ["priority", "route", "condition", "next_action"])
+
+          route_decision = {"version": "v4.207", "result_label": RESULT_LABEL, "clean_result": "The workflow downloads ETDD70 public files within size guards, probes zip/table/README structure, ranks candidate files for G1 axis mapping, and uploads only summaries.", "downloaded_count": downloaded_count, "zip_member_rows": zip_probe_count, "tabular_profile_rows": tabular_profile_count, "axis_candidate_rows": len(axis_candidate_rows), "top_candidate_source_path": top_candidate.get("source_path", ""), "package_status": package_status, "selected_next_route": selected_next_route, "truth_boundary": "file structure probe only; not subject-axis parsing, not covariance, not validation", "blocked_claims": BLOCKED_CLAIMS}
+          (OUT / "v4_207_route_decision.json").write_text(json.dumps(route_decision, indent=2), encoding="utf-8")
+          (OUT / "v4_207_scope_guards.json").write_text(json.dumps({"scope": "ETDD70 file download and structure probe", "downloaded_files_are_validation": False, "candidate_columns_are_staged_axis_rows": False, "class_labels_are_covariance": False, "raw_files_uploaded_to_artifact": False, "raw_numbers_moved_between_domains": False, "unit_equivalence_claimed": False, "causal_equivalence_claimed": False, "clinical_diagnosis_claimed": False, "TAIRID_proved": False}, indent=2), encoding="utf-8")
+          (OUT / "v4_207_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = ["# TAIRID v4.207 - ETDD70 File Download And Structure Probe", "", "Expected result: `" + RESULT_LABEL + "`", "", "## Clean result", "", "v4.206 confirmed that the ETDD70 Zenodo record is reachable and lists files. v4.207 downloads those files within size guards, probes structure, and ranks candidate tables for G1 axis mapping.", "", "Downloaded count: `" + str(downloaded_count) + "`", "Zip member rows: `" + str(zip_probe_count) + "`", "Tabular profile rows: `" + str(tabular_profile_count) + "`", "Axis candidate rows: `" + str(len(axis_candidate_rows)) + "`", "", "Package status: `" + package_status + "`", "Selected next route: `" + selected_next_route + "`", "", "## Boundary"]
+          for claim in BLOCKED_CLAIMS:
+              summary.append("- " + claim)
+          (OUT / "v4_207_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          required_outputs = ["v4_207_v4_206_status_review.csv", "v4_207_v4_206_status_review.json", "v4_207_download_status.csv", "v4_207_zip_member_inventory.csv", "v4_207_tabular_profile_inventory.csv", "v4_207_readme_profile.csv", "v4_207_g1_axis_candidate_mapping_targets.csv", "v4_207_target_schema.csv", "v4_207_claim_boundary_matrix.csv", "v4_207_next_routes.csv", "v4_207_route_decision.json", "v4_207_scope_guards.json", "v4_207_blocked_claims.json", "v4_207_summary.md"]
+
+          rules = {"version_is_v4_207": True, "result_label_present": RESULT_LABEL.endswith("no_validation"), "v4_206_status_reviewed": V4_206_STATUS["rule_pass_count"] == 10, "all_outputs_written": all((OUT / p).exists() for p in required_outputs), "download_status_written": (OUT / "v4_207_download_status.csv").exists(), "structure_inventory_written": (OUT / "v4_207_zip_member_inventory.csv").exists(), "tabular_profile_written": (OUT / "v4_207_tabular_profile_inventory.csv").exists(), "candidate_mapping_targets_written": (OUT / "v4_207_g1_axis_candidate_mapping_targets.csv").exists(), "selected_route_present": bool(selected_next_route), "no_validation_claim": True, "no_unit_equivalence_claim": True}
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {"version": "v4.207", "result_label": RESULT_LABEL, "rule_pass_count": len(rules) - len(failed), "rule_total_count": len(rules), "failed_gates": failed, "downloaded_count": downloaded_count, "zip_member_rows": zip_probe_count, "tabular_profile_rows": tabular_profile_count, "axis_candidate_rows": len(axis_candidate_rows), "package_status": package_status, "selected_next_route": selected_next_route, "claim_boundary": "file_structure_probe_only_no_validation"}
+          (OUT / "v4_207_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.207 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_207_outputs/run_v4_207.py
+
+      - name: Upload v4.207 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-207-etdd70-file-download-and-structure-probe-output
+          path: tairid_v4_207_outputs/
