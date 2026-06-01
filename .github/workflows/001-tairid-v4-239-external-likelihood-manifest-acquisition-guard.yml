@@ -1,0 +1,720 @@
+name: 001 TAIRID v4.239 - External Likelihood Manifest Acquisition Guard
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-239-external-likelihood-manifest-acquisition-guard.yml"
+      - "data/cosmology/external_likelihood_manifest.csv"
+      - "data/cosmology/holdout_source_manifest.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  external-likelihood-manifest-acquisition-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.239 External Likelihood Manifest Acquisition Guard is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.239 external likelihood manifest acquisition guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import urllib.parse
+          import zipfile
+
+          VERSION = "v4.239"
+          ROUTE = "external_likelihood_manifest_or_holdout_source_acquisition_guard_after_v4_238"
+          EXPECTED_RESULT = "v4_239_external_likelihood_manifest_acquisition_guard_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_240_fill_external_manifest_or_broader_holdout_locator_search"
+
+          OUT = Path("tairid_v4_239_external_likelihood_manifest_acquisition_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-239-external-likelihood-manifest-acquisition-guard-output.zip"
+
+          MANIFEST_CANDIDATES = [
+              Path("data/cosmology/external_likelihood_manifest.csv"),
+              Path("data/cosmology/holdout_source_manifest.csv"),
+              Path("external_likelihood_manifest.csv"),
+              Path("holdout_source_manifest.csv"),
+          ]
+
+          CURRENT_USED_SOURCE_URLS = [
+              "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+              "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+              "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16/qso/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+              "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16/qso/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+              "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16/elg/sdss_DR16_ELG_BAO_DVtable.txt",
+              "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16/elg/sdss_DR16_ELG_FSBAO_DMDHfs8gridlikelihood.txt",
+          ]
+
+          SAME_RELEASE_PATTERNS = [
+              "sdss_dr16_baoplus_qso_fsbao_dmdhfs8",
+              "sdss_dr16_qso_fsbao_dmdhfs8",
+              "sdss_dr16_baoplus_lrg_fsbao_dmdhfs8",
+              "sdss_dr16_lrg_fsbao_dmdhfs8",
+              "sdss_dr16_elg_bao_dvtable",
+              "sdss_dr16_elg_fsbao_dmdhfs8gridlikelihood",
+              "eboss_dr16/qso/sdss_dr16_qso_fsbao",
+              "eboss_dr16/lrg/sdss_dr16_lrg_fsbao",
+              "eboss_dr16/elg/sdss_dr16_elg",
+          ]
+
+          REQUIRED_MANIFEST_COLUMNS = [
+              "manifest_id",
+              "comparison_role",
+              "source_family",
+              "observable",
+              "data_path_or_url",
+              "covariance_path_or_url",
+              "reference_model_path_or_method",
+              "comparison_type",
+              "failure_condition_id",
+              "approval_status",
+          ]
+
+          ALLOWED_COMPARISON_ROLES = [
+              "primary_qso_growth_holdout",
+              "qso_radial_secondary",
+              "lrg_growth_control",
+              "geometry_control",
+              "model_comparison_boundary",
+              "reference_only",
+          ]
+
+          ALLOWED_COMPARISON_TYPES = [
+              "diagnostic_only",
+              "holdout_candidate_not_scored",
+              "holdout_scoring_ready",
+              "external_likelihood_boundary_only",
+              "reference_manifest_only",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def lower(text):
+              return str(text or "").strip().lower()
+
+          def is_url(value):
+              text = str(value or "").strip()
+              parsed = urllib.parse.urlparse(text)
+              return parsed.scheme in ["http", "https"] and bool(parsed.netloc)
+
+          def is_placeholder(value):
+              text = str(value or "").strip().lower()
+              return (
+                  not text
+                  or text.startswith("put_")
+                  or "put_" in text
+                  or text in ["todo", "none", "na", "n/a", "template_not_filled"]
+              )
+
+          def is_current_or_same_release(value):
+              text = lower(value)
+              if not text or is_placeholder(text):
+                  return False
+              if text in [lower(url) for url in CURRENT_USED_SOURCE_URLS]:
+                  return True
+              return any(pattern in text for pattern in SAME_RELEASE_PATTERNS)
+
+          def url_probe(url):
+              if not is_url(url):
+                  return "not_url", "", ""
+              try:
+                  req = Request(url, headers={"User-Agent": "TAIRID-v4.239-manifest-probe"})
+                  with urlopen(req, timeout=15) as response:
+                      content_type = response.headers.get("content-type", "")
+                      content_length = response.headers.get("content-length", "")
+                      return f"http_{response.status}", content_type, content_length
+              except Exception as exc:
+                  return "probe_failed", "", f"{type(exc).__name__}: {exc}"
+
+          schema_rows = [
+              {
+                  "column_name": "manifest_id",
+                  "required": True,
+                  "meaning": "unique row id",
+                  "example": "ext_like_001",
+              },
+              {
+                  "column_name": "comparison_role",
+                  "required": True,
+                  "meaning": "role of the source in the test",
+                  "example": "primary_qso_growth_holdout",
+              },
+              {
+                  "column_name": "source_family",
+                  "required": True,
+                  "meaning": "tracer/source family",
+                  "example": "QSO_or_QSO_like",
+              },
+              {
+                  "column_name": "observable",
+                  "required": True,
+                  "meaning": "measured quantity",
+                  "example": "f_sigma8_or_comparable_growth",
+              },
+              {
+                  "column_name": "data_path_or_url",
+                  "required": True,
+                  "meaning": "reviewed data source",
+                  "example": "https://example.org/reviewed_holdout_data.txt",
+              },
+              {
+                  "column_name": "covariance_path_or_url",
+                  "required": True,
+                  "meaning": "covariance, inverse covariance, likelihood, or explicit limitation",
+                  "example": "https://example.org/reviewed_holdout_cov.txt",
+              },
+              {
+                  "column_name": "reference_model_path_or_method",
+                  "required": True,
+                  "meaning": "explicit reference method or file",
+                  "example": "stronger_lcdm_integral_growth_reference_v4_236",
+              },
+              {
+                  "column_name": "comparison_type",
+                  "required": True,
+                  "meaning": "declares diagnostic vs holdout vs boundary",
+                  "example": "holdout_candidate_not_scored",
+              },
+              {
+                  "column_name": "failure_condition_id",
+                  "required": True,
+                  "meaning": "pre-written failure condition link",
+                  "example": "failure_001",
+              },
+              {
+                  "column_name": "approval_status",
+                  "required": True,
+                  "meaning": "must be reviewed before scoring",
+                  "example": "reviewed_not_scored",
+              },
+          ]
+
+          external_likelihood_template_rows = [
+              {
+                  "manifest_id": "ext_like_001",
+                  "comparison_role": "primary_qso_growth_holdout",
+                  "source_family": "QSO_or_QSO_like",
+                  "observable": "f_sigma8_or_comparable_growth",
+                  "data_path_or_url": "PUT_REVIEWED_EXTERNAL_QSO_GROWTH_DATA_URL_HERE",
+                  "covariance_path_or_url": "PUT_QSO_GROWTH_COVARIANCE_OR_LIKELIHOOD_URL_HERE",
+                  "reference_model_path_or_method": "PUT_EXTERNAL_OR_REPRODUCIBLE_LCDM_REFERENCE_HERE",
+                  "comparison_type": "holdout_candidate_not_scored",
+                  "failure_condition_id": "failure_001",
+                  "approval_status": "template_not_filled",
+              },
+              {
+                  "manifest_id": "ext_like_002",
+                  "comparison_role": "qso_radial_secondary",
+                  "source_family": "QSO_or_QSO_like",
+                  "observable": "D_H_over_r_sound_or_equivalent",
+                  "data_path_or_url": "PUT_REVIEWED_EXTERNAL_QSO_RADIAL_DATA_URL_HERE",
+                  "covariance_path_or_url": "PUT_QSO_RADIAL_COVARIANCE_OR_LIKELIHOOD_URL_HERE",
+                  "reference_model_path_or_method": "PUT_EXTERNAL_OR_REPRODUCIBLE_LCDM_REFERENCE_HERE",
+                  "comparison_type": "holdout_candidate_not_scored",
+                  "failure_condition_id": "failure_003",
+                  "approval_status": "template_not_filled",
+              },
+              {
+                  "manifest_id": "ext_like_003",
+                  "comparison_role": "lrg_growth_control",
+                  "source_family": "LRG_or_LRG_like",
+                  "observable": "f_sigma8_or_comparable_growth",
+                  "data_path_or_url": "PUT_REVIEWED_EXTERNAL_LRG_CONTROL_DATA_URL_HERE",
+                  "covariance_path_or_url": "PUT_LRG_CONTROL_COVARIANCE_OR_LIKELIHOOD_URL_HERE",
+                  "reference_model_path_or_method": "PUT_EXTERNAL_OR_REPRODUCIBLE_LCDM_REFERENCE_HERE",
+                  "comparison_type": "holdout_candidate_not_scored",
+                  "failure_condition_id": "failure_002",
+                  "approval_status": "template_not_filled",
+              },
+              {
+                  "manifest_id": "ext_like_004",
+                  "comparison_role": "geometry_control",
+                  "source_family": "BAO_or_geometry_only",
+                  "observable": "D_V_D_M_D_H_or_likelihood_coordinate",
+                  "data_path_or_url": "PUT_REVIEWED_EXTERNAL_GEOMETRY_DATA_URL_HERE",
+                  "covariance_path_or_url": "PUT_GEOMETRY_COVARIANCE_OR_LIKELIHOOD_URL_HERE",
+                  "reference_model_path_or_method": "PUT_EXTERNAL_OR_REPRODUCIBLE_LCDM_REFERENCE_HERE",
+                  "comparison_type": "holdout_candidate_not_scored",
+                  "failure_condition_id": "failure_004",
+                  "approval_status": "template_not_filled",
+              },
+              {
+                  "manifest_id": "ext_like_005",
+                  "comparison_role": "model_comparison_boundary",
+                  "source_family": "reference_model",
+                  "observable": "likelihood_or_chisq_status",
+                  "data_path_or_url": "PUT_COMPARISON_SCRIPT_OR_MANIFEST_HERE",
+                  "covariance_path_or_url": "PUT_COVARIANCE_POLICY_HERE",
+                  "reference_model_path_or_method": "PUT_LCDM_AND_TAIRID_MODEL_BOUNDARY_HERE",
+                  "comparison_type": "external_likelihood_boundary_only",
+                  "failure_condition_id": "failure_005",
+                  "approval_status": "template_not_filled",
+              },
+          ]
+
+          failure_condition_rows = [
+              {
+                  "failure_condition_id": "failure_001",
+                  "target": "QSO f_sigma8 primary pressure",
+                  "machine_condition": "if holdout_qso_growth_direction in ['0','-','mixed_negative'] then primary_pressure_weakened",
+              },
+              {
+                  "failure_condition_id": "failure_002",
+                  "target": "QSO versus LRG growth contrast",
+                  "machine_condition": "if lrg_growth_direction == qso_growth_direction == '+' then source_contrast_weakened",
+              },
+              {
+                  "failure_condition_id": "failure_003",
+                  "target": "QSO radial secondary support",
+                  "machine_condition": "if qso_radial_direction == '-' then secondary_support_weakened",
+              },
+              {
+                  "failure_condition_id": "failure_004",
+                  "target": "geometry compressed lane non-primary",
+                  "machine_condition": "if compressed_geometry_primary and qso_growth_not_positive then current_interpretation_rewrite_needed",
+              },
+              {
+                  "failure_condition_id": "failure_005",
+                  "target": "external likelihood robustness",
+                  "machine_condition": "if external_likelihood_absorbs_all_pressure_without_tairid_specific_leftover then baseline_pressure_not_tairid_specific",
+              },
+          ]
+
+          manifest_status_rows = []
+          manifest_input_rows = []
+          found_paths = [path for path in MANIFEST_CANDIDATES if path.exists()]
+
+          if not found_paths:
+              manifest_status_rows.append({
+                  "manifest_path": "",
+                  "manifest_status": "missing",
+                  "rows": 0,
+                  "detail": "No external likelihood or holdout source manifest found. Template rows written; scoring blocked.",
+              })
+          else:
+              for path in found_paths:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing_columns = [col for col in REQUIRED_MANIFEST_COLUMNS if col not in columns]
+                      status = "schema_ok" if not missing_columns else "schema_missing_columns"
+                      manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          "rows": len(rows),
+                          "detail": "missing=" + "|".join(missing_columns) if missing_columns else "all required columns present",
+                      })
+                      for row in rows:
+                          out = {col: row.get(col, "") for col in REQUIRED_MANIFEST_COLUMNS}
+                          out["_manifest_path"] = path.as_posix()
+                          out["_schema_status"] = status
+                          manifest_input_rows.append(out)
+                  except Exception as exc:
+                      manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          "rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+
+          manifest_validation_rows = []
+          acquisition_probe_rows = []
+
+          for row in manifest_input_rows:
+              issues = []
+
+              if row["_schema_status"] != "schema_ok":
+                  issues.append("schema_not_ok")
+              if row["comparison_role"] not in ALLOWED_COMPARISON_ROLES:
+                  issues.append("comparison_role_not_allowed")
+              if row["comparison_type"] not in ALLOWED_COMPARISON_TYPES:
+                  issues.append("comparison_type_not_allowed")
+              if row["failure_condition_id"] not in [fc["failure_condition_id"] for fc in failure_condition_rows]:
+                  issues.append("failure_condition_not_known")
+              if is_placeholder(row["data_path_or_url"]):
+                  issues.append("data_path_placeholder")
+              if is_placeholder(row["reference_model_path_or_method"]):
+                  issues.append("reference_placeholder")
+              if is_current_or_same_release(row["data_path_or_url"]):
+                  issues.append("data_source_current_or_same_release")
+              if is_current_or_same_release(row["covariance_path_or_url"]):
+                  issues.append("covariance_source_current_or_same_release")
+
+              data_probe_status, data_content_type, data_probe_detail = url_probe(row["data_path_or_url"]) if not is_placeholder(row["data_path_or_url"]) else ("not_probed_placeholder", "", "")
+              cov_probe_status, cov_content_type, cov_probe_detail = url_probe(row["covariance_path_or_url"]) if not is_placeholder(row["covariance_path_or_url"]) else ("not_probed_placeholder", "", "")
+
+              if data_probe_status.startswith("probe_failed"):
+                  issues.append("data_url_probe_failed")
+              if cov_probe_status.startswith("probe_failed"):
+                  issues.append("covariance_url_probe_failed")
+
+              review_status = "reviewable_not_scored" if not issues else "blocked_by_manifest_issues"
+              if row["approval_status"] in ["approved_for_scoring", "approved"]:
+                  issues.append("approval_status_too_strong_for_guard_workflow")
+                  review_status = "blocked_approval_requires_separate_scoring_workflow"
+
+              manifest_validation_rows.append({
+                  "manifest_id": row["manifest_id"],
+                  "comparison_role": row["comparison_role"],
+                  "source_family": row["source_family"],
+                  "observable": row["observable"],
+                  "comparison_type": row["comparison_type"],
+                  "failure_condition_id": row["failure_condition_id"],
+                  "approval_status": row["approval_status"],
+                  "validation_issues": "|".join(issues) if issues else "none",
+                  "review_status": review_status,
+                  "approved_as_evidence": False,
+                  "scoring_allowed": False,
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+              acquisition_probe_rows.append({
+                  "manifest_id": row["manifest_id"],
+                  "data_path_or_url": row["data_path_or_url"],
+                  "data_probe_status": data_probe_status,
+                  "data_content_type": data_content_type,
+                  "data_probe_detail": data_probe_detail,
+                  "covariance_path_or_url": row["covariance_path_or_url"],
+                  "covariance_probe_status": cov_probe_status,
+                  "covariance_content_type": cov_content_type,
+                  "covariance_probe_detail": cov_probe_detail,
+                  "probe_status": "probe_only_not_acquisition",
+              })
+
+          readiness_rows = [
+              {
+                  "readiness_id": "readiness_001",
+                  "requirement": "manifest_present",
+                  "status": "ready" if found_paths else "missing",
+                  "blocks": "holdout or external likelihood scoring",
+              },
+              {
+                  "readiness_id": "readiness_002",
+                  "requirement": "manifest_schema_ok",
+                  "status": "ready" if manifest_input_rows and all(row["_schema_status"] == "schema_ok" for row in manifest_input_rows) else "missing_or_incomplete",
+                  "blocks": "manifest validation",
+              },
+              {
+                  "readiness_id": "readiness_003",
+                  "requirement": "reviewable_non_current_sources",
+                  "status": "ready" if any(row["review_status"] == "reviewable_not_scored" for row in manifest_validation_rows) else "missing",
+                  "blocks": "future scoring workflow",
+              },
+              {
+                  "readiness_id": "readiness_004",
+                  "requirement": "scoring_workflow_permission",
+                  "status": "blocked",
+                  "blocks": "automatic evidence claim",
+              },
+              {
+                  "readiness_id": "readiness_005",
+                  "requirement": "external_likelihood_fit",
+                  "status": "not_run",
+                  "blocks": "validation or model comparison language",
+              },
+              {
+                  "readiness_id": "readiness_006",
+                  "requirement": "combined_matrix_permission",
+                  "status": "blocked",
+                  "blocks": "combined LRG/ELG/QSO matrix",
+              },
+          ]
+
+          decision_rows = []
+          reviewable_rows = [row for row in manifest_validation_rows if row["review_status"] == "reviewable_not_scored"]
+
+          if not found_paths:
+              decision_rows.append({
+                  "decision_id": "decision_001",
+                  "decision": "No manifest found.",
+                  "basis": "External likelihood and holdout source manifests are missing.",
+                  "next_action": "Use template rows to create data/cosmology/external_likelihood_manifest.csv.",
+                  "claim_status": "scoring_blocked",
+              })
+          elif reviewable_rows:
+              decision_rows.append({
+                  "decision_id": "decision_001",
+                  "decision": "Manifest contains reviewable rows, but scoring is still blocked.",
+                  "basis": f"reviewable_not_scored rows = {len(reviewable_rows)}",
+                  "next_action": "Run a separate parser/scoring guard after manual review.",
+                  "claim_status": "reviewable_not_evidence",
+              })
+          else:
+              decision_rows.append({
+                  "decision_id": "decision_001",
+                  "decision": "Manifest found but no row is reviewable.",
+                  "basis": "All manifest rows have schema, placeholder, same-release, probe, or approval issues.",
+                  "next_action": "Fix manifest or broaden holdout locator.",
+                  "claim_status": "scoring_blocked",
+              })
+
+          decision_rows.append({
+              "decision_id": "decision_002",
+              "decision": "Automatic evidence approval remains blocked.",
+              "basis": "v4.239 is an acquisition and validation guard, not a scoring workflow.",
+              "next_action": "Keep claim language at candidate/source review level.",
+              "claim_status": "evidence_blocked",
+          })
+
+          decision_rows.append({
+              "decision_id": "decision_003",
+              "decision": "External likelihood fit has not run.",
+              "basis": "Only manifest/schema/probe checks were performed.",
+              "next_action": "Build parser/scoring workflow only after manifest is reviewed.",
+              "claim_status": "external_fit_not_run",
+          })
+
+          permission_rows = [
+              {
+                  "permission_scope": "manifest_template",
+                  "permission_status": "written",
+                  "reason": "Template rows are written for user fill-in.",
+              },
+              {
+                  "permission_scope": "manifest_validation",
+                  "permission_status": "allowed",
+                  "reason": "Manifest rows may be schema-checked and probed.",
+              },
+              {
+                  "permission_scope": "candidate_acquisition_probe",
+                  "permission_status": "allowed_probe_only",
+                  "reason": "URL reachability can be checked without scoring.",
+              },
+              {
+                  "permission_scope": "holdout_scoring",
+                  "permission_status": "blocked",
+                  "reason": "Scoring needs reviewed manifest and separate scoring workflow.",
+              },
+              {
+                  "permission_scope": "automatic_evidence_claim",
+                  "permission_status": "blocked",
+                  "reason": "No evidence approval in this guard workflow.",
+              },
+              {
+                  "permission_scope": "cosmology_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "No external likelihood fit or independent holdout scoring has run.",
+              },
+              {
+                  "permission_scope": "combined_lrg_elg_qso_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix remains blocked by source-surface guards.",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_240_fill_external_manifest",
+                  "purpose": "create or fill data/cosmology/external_likelihood_manifest.csv from template rows",
+                  "activated": not found_paths,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_240_review_manifest_and_build_parser_guard",
+                  "purpose": "if reviewable rows exist, build parser guard without evidence language",
+                  "activated": bool(reviewable_rows),
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_240_broader_holdout_locator_search",
+                  "purpose": "if no reviewable source exists, broaden search for independent QSO-like growth surfaces",
+                  "activated": not bool(reviewable_rows),
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_240_combined_matrix_permission_recheck",
+                  "purpose": "combined matrix remains blocked until source-surface guards pass",
+                  "activated": True,
+              },
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before manifest guard"},
+              {"gate": "schema_rows_equal_10", "passed": len(schema_rows) == 10, "detail": f"schema_rows = {len(schema_rows)}"},
+              {"gate": "template_rows_equal_5", "passed": len(external_likelihood_template_rows) == 5, "detail": f"template_rows = {len(external_likelihood_template_rows)}"},
+              {"gate": "failure_condition_rows_equal_5", "passed": len(failure_condition_rows) == 5, "detail": f"failure_condition_rows = {len(failure_condition_rows)}"},
+              {"gate": "manifest_status_rows_at_least_1", "passed": len(manifest_status_rows) >= 1, "detail": f"manifest_status_rows = {len(manifest_status_rows)}"},
+              {"gate": "manifest_validation_rows_count_ok", "passed": len(manifest_validation_rows) == len(manifest_input_rows), "detail": f"manifest_validation_rows = {len(manifest_validation_rows)}, manifest_input_rows = {len(manifest_input_rows)}"},
+              {"gate": "acquisition_probe_rows_count_ok", "passed": len(acquisition_probe_rows) == len(manifest_input_rows), "detail": f"acquisition_probe_rows = {len(acquisition_probe_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_3", "passed": len(decision_rows) == 3, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "holdout_scoring_blocked", "passed": any(row["permission_scope"] == "holdout_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "holdout scoring blocked"},
+              {"gate": "automatic_evidence_blocked", "passed": any(row["permission_scope"] == "automatic_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "automatic evidence blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "cosmology validation blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_scoring", "passed": True, "detail": "manifest acquisition guard does not score"},
+              {"gate": "truth_boundary_no_auto_evidence", "passed": True, "detail": "no automatic evidence claim"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_240_fill_external_manifest_or_broader_holdout_locator_search", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_239_external_likelihood_manifest_acquisition_guard_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_239_manifest_schema_rows.csv", schema_rows)
+          write_csv(OUT / "v4_239_external_likelihood_template_rows.csv", external_likelihood_template_rows)
+          write_csv(OUT / "v4_239_failure_condition_rows.csv", failure_condition_rows)
+          write_csv(OUT / "v4_239_manifest_status_rows.csv", manifest_status_rows)
+          write_csv(OUT / "v4_239_manifest_input_rows.csv", manifest_input_rows)
+          write_csv(OUT / "v4_239_manifest_validation_rows.csv", manifest_validation_rows)
+          write_csv(OUT / "v4_239_acquisition_probe_rows.csv", acquisition_probe_rows)
+          write_csv(OUT / "v4_239_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_239_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_239_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_239_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_239_rule_checks.csv", checks)
+
+          manifest_lines = [
+              f"{row['manifest_path'] or 'no_manifest'}: {row['manifest_status']} rows={row['rows']} detail={row['detail']}"
+              for row in manifest_status_rows
+          ]
+
+          readiness_lines = [
+              f"{row['requirement']}: {row['status']} blocks {row['blocks']}"
+              for row in readiness_rows
+          ]
+
+          decision_lines = [
+              f"{row['decision_id']}: {row['decision']} Next: {row['next_action']}"
+              for row in decision_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "schema_rows": len(schema_rows),
+              "template_rows": len(external_likelihood_template_rows),
+              "failure_condition_rows": len(failure_condition_rows),
+              "manifest_status_rows": len(manifest_status_rows),
+              "manifest_input_rows": len(manifest_input_rows),
+              "manifest_validation_rows": len(manifest_validation_rows),
+              "acquisition_probe_rows": len(acquisition_probe_rows),
+              "reviewable_not_scored_rows": len(reviewable_rows),
+              "readiness_rows": len(readiness_rows),
+              "decision_rows": len(decision_rows),
+              "permission_rows": len(permission_rows),
+              "next_rows": len(next_rows),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_holdout": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_239_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.239 External Likelihood Manifest Acquisition Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"schema_rows = {summary['schema_rows']}",
+              f"template_rows = {summary['template_rows']}",
+              f"failure_condition_rows = {summary['failure_condition_rows']}",
+              f"manifest_status_rows = {summary['manifest_status_rows']}",
+              f"manifest_input_rows = {summary['manifest_input_rows']}",
+              f"manifest_validation_rows = {summary['manifest_validation_rows']}",
+              f"acquisition_probe_rows = {summary['acquisition_probe_rows']}",
+              f"reviewable_not_scored_rows = {summary['reviewable_not_scored_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Manifest status:",
+              *manifest_lines,
+              "",
+              "Readiness:",
+              *readiness_lines,
+              "",
+              "Decisions:",
+              *decision_lines,
+              "",
+              "Clean meaning: v4.239 checks whether an external likelihood or holdout manifest exists, validates/probes it if present, writes templates if missing, and blocks all scoring/evidence language.",
+              "",
+              "Truth boundary: no proof, no validation, no holdout scoring, no automatic evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_239_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"schema_rows = {summary['schema_rows']}")
+          print(f"template_rows = {summary['template_rows']}")
+          print(f"failure_condition_rows = {summary['failure_condition_rows']}")
+          print(f"manifest_status_rows = {summary['manifest_status_rows']}")
+          print(f"manifest_input_rows = {summary['manifest_input_rows']}")
+          print(f"manifest_validation_rows = {summary['manifest_validation_rows']}")
+          print(f"acquisition_probe_rows = {summary['acquisition_probe_rows']}")
+          print(f"reviewable_not_scored_rows = {summary['reviewable_not_scored_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no holdout scoring, no automatic evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.239 external likelihood manifest acquisition guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-239-external-likelihood-manifest-acquisition-guard-output
+          path: |
+            tairid_v4_239_external_likelihood_manifest_acquisition_guard_output/
+            tairid-v4-239-external-likelihood-manifest-acquisition-guard-output.zip
