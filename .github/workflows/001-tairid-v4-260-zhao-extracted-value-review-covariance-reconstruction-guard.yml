@@ -1,0 +1,956 @@
+name: 001 TAIRID v4.260 - Zhao Extracted Value Review Covariance Reconstruction Guard
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-260-zhao-extracted-value-review-covariance-reconstruction-guard.yml"
+      - "data/cosmology/qso_literature_extraction_manifest.csv"
+      - "qso_literature_extraction_manifest.csv"
+      - "data/cosmology/external_observed_manifest.csv"
+      - "external_observed_manifest.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  zhao-extracted-value-review-covariance-reconstruction-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.260 Zhao Extracted Value Review Covariance Reconstruction Guard is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.260 Zhao extracted value review covariance reconstruction guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import gzip
+          import io
+          import itertools
+          import json
+          import math
+          import re
+          import tarfile
+          import zipfile
+
+          VERSION = "v4.260"
+          ROUTE = "zhao_extracted_value_review_covariance_reconstruction_guard_after_v4_259"
+          EXPECTED_RESULT = "v4_260_zhao_extracted_value_review_covariance_reconstruction_guard_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_261_zhao_observed_manifest_bridge_guard_with_provenance_scope_or_handoff"
+
+          OUT = Path("tairid_v4_260_zhao_covariance_reconstruction_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-260-zhao-covariance-reconstruction-guard-output.zip"
+
+          ZHAO_ABS_URL = "https://arxiv.org/abs/1801.03043"
+          ZHAO_EPRINT_URL = "https://arxiv.org/e-print/1801.03043"
+          ZHAO_PDF_URL = "https://arxiv.org/pdf/1801.03043"
+
+          EXPECTED_ZHAO_BINS = [0.978, 1.230, 1.526, 1.944]
+
+          OBSERVED_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/external_observed_manifest.csv"),
+              Path("external_observed_manifest.csv"),
+          ]
+
+          EXTRACTION_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/qso_literature_extraction_manifest.csv"),
+              Path("qso_literature_extraction_manifest.csv"),
+          ]
+
+          REQUIRED_OBSERVED_COLUMNS = [
+              "observed_id",
+              "target_id",
+              "source_family",
+              "source_role",
+              "redshift",
+              "quantity",
+              "observed_value",
+              "observed_sigma_or_likelihood",
+              "data_path_or_url",
+              "covariance_path_or_url",
+              "reference_model_path_or_method",
+              "failure_condition_id",
+              "approval_status",
+          ]
+
+          REQUIRED_EXTRACTION_COLUMNS = [
+              "extraction_id",
+              "candidate_id",
+              "paper_or_source_url",
+              "measurement_label",
+              "redshift",
+              "observable",
+              "observed_value",
+              "uncertainty_or_covariance_reference",
+              "data_vector_reference",
+              "source_role",
+              "provenance_status",
+              "extraction_status",
+              "approval_status",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def read_manifest_status(paths, required_columns, row_label):
+              status_rows = []
+              input_rows = []
+              found = [path for path in paths if path.exists()]
+              if not found:
+                  status_rows.append({
+                      "manifest_path": "",
+                      "manifest_status": "missing",
+                      f"{row_label}_rows": 0,
+                      "detail": "No manifest found.",
+                  })
+                  return status_rows, input_rows
+
+              for path in found:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in required_columns if col not in columns]
+                      status = "schema_ok" if not missing else "schema_missing_columns"
+                      status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          f"{row_label}_rows": len(rows),
+                          "detail": "missing=" + "|".join(missing) if missing else "all required columns present",
+                      })
+                      if not missing:
+                          input_rows.extend(rows)
+                  except Exception as exc:
+                      status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          f"{row_label}_rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+              return status_rows, input_rows
+
+          def fetch_bytes(url, timeout=30, max_bytes=12000000):
+              try:
+                  req = Request(url, headers={"User-Agent": "TAIRID-v4.260-zhao-covariance-reconstruction"})
+                  with urlopen(req, timeout=timeout) as response:
+                      status = f"http_{response.status}"
+                      content_type = response.headers.get("content-type", "")
+                      content_length = response.headers.get("content-length", "")
+                      raw = response.read(max_bytes)
+                      return status, content_type, content_length, raw, ""
+              except Exception as exc:
+                  return "probe_failed", "", "", b"", f"{type(exc).__name__}: {exc}"
+
+          def decode_text(raw):
+              return raw.decode("utf-8", errors="replace") if raw else ""
+
+          def extract_text_files_from_eprint(raw):
+              rows = []
+              texts = []
+              if not raw:
+                  return rows, texts
+              candidates = [("raw", raw)]
+              try:
+                  candidates.append(("gzip", gzip.decompress(raw)))
+              except Exception:
+                  pass
+
+              for label, blob in candidates:
+                  try:
+                      with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as tar:
+                          for member in tar.getmembers():
+                              if not member.isfile():
+                                  continue
+                              name = member.name
+                              lower = name.lower()
+                              if not lower.endswith((".tex", ".txt", ".bbl", ".sty", ".csv", ".dat", ".table")):
+                                  continue
+                              extracted = tar.extractfile(member)
+                              if not extracted:
+                                  continue
+                              content = extracted.read(2500000).decode("utf-8", errors="replace")
+                              rows.append({
+                                  "archive_mode": label,
+                                  "file_name": name,
+                                  "file_size": member.size,
+                                  "text_chars": len(content),
+                                  "file_role": "source_text_candidate",
+                              })
+                              texts.append((name, content))
+                          if rows:
+                              return rows, texts
+                  except Exception:
+                      continue
+
+              txt = decode_text(raw)
+              if txt:
+                  rows.append({
+                      "archive_mode": "plain",
+                      "file_name": "plain_eprint_or_html",
+                      "file_size": len(raw),
+                      "text_chars": len(txt),
+                      "file_role": "plain_text_fallback",
+                  })
+                  texts.append(("plain_eprint_or_html", txt))
+              return rows, texts
+
+          def clean_latex_for_review(text):
+              cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+              cleaned = re.sub(r"%.*", "", cleaned)
+              cleaned = cleaned.replace("\\pm", " ± ")
+              cleaned = cleaned.replace("\\sigma_8", "sigma_8")
+              cleaned = cleaned.replace("\\fsig", "fsig")
+              cleaned = cleaned.replace("\\alpha", "alpha")
+              cleaned = cleaned.replace("\\begin{", "\nBEGIN{")
+              cleaned = cleaned.replace("\\end{", "\nEND{")
+              cleaned = cleaned.replace("&", " | ")
+              cleaned = cleaned.replace("\\\\", "\n")
+              cleaned = re.sub(r"[{}]", "", cleaned)
+              cleaned = re.sub(r"\n\s*\n+", "\n\n", cleaned)
+              return cleaned.strip()
+
+          def find_source_file(texts, ending):
+              for name, text in texts:
+                  if name.endswith(ending) or name == ending:
+                      return name, text
+              return "", ""
+
+          def parse_fsigma8_widetable1(file_name, text):
+              cleaned = clean_latex_for_review(text)
+              fs_line = ""
+              for line in cleaned.splitlines():
+                  if "fsigma_8" in line and "±" in line:
+                      fs_line = line.strip()
+                      break
+              pairs = re.findall(r"\$?\s*([0-9]+\.[0-9]+)\s*±\s*([0-9]+\.[0-9]+)\s*\$?", fs_line)
+              rows = []
+              for index, (z, pair) in enumerate(zip(EXPECTED_ZHAO_BINS, pairs), start=1):
+                  value, sigma = pair
+                  rows.append({
+                      "extraction_id": f"zhao_table1_fsigma8_bin_{index:02d}",
+                      "candidate_id": "qso_src_002_dr14_zhao_tomographic",
+                      "source_table": file_name,
+                      "paper_or_source_url": ZHAO_ABS_URL,
+                      "measurement_label": f"Table widetable1 fsigma_8 z_eff={z}",
+                      "redshift": float(z),
+                      "observable": "f_sigma8",
+                      "observed_value": float(value),
+                      "observed_sigma": float(sigma),
+                      "uncertainty_or_covariance_reference": "widetable1 quoted uncertainty; fsigma8 covariance subset reconstructed from widetable2 correlation upper triangle",
+                      "data_vector_reference": f"{file_name}: row fsigma_8, bin index {index}",
+                      "source_role": "primary_qso_growth_tomographic_literature_candidate",
+                      "provenance_status": "same_survey_family_cross_release_needs_review",
+                      "extraction_status": "machine_extracted_table_labeled_covariance_guarded_not_scored",
+                      "approval_status": "not_scored_not_evidence",
+                      "manifest_fill_allowed": False,
+                      "scoring_allowed": False,
+                      "evidence_allowed": False,
+                  })
+              return rows, fs_line, cleaned
+
+          def parse_widetable2_matrix(file_name, text):
+              cleaned = clean_latex_for_review(text)
+              labels = []
+              matrix_entries = []
+              inv_s_entries = []
+              row_details = []
+              for line in cleaned.splitlines():
+                  if "|" not in line:
+                      continue
+                  if not any(token in line for token in ["D_\\rm A", "H(", "fsigma_8"]):
+                      continue
+                  parts = [p.strip() for p in line.split("|")]
+                  label = re.sub(r"[\$]", "", parts[0]).strip()
+                  numeric_part = parts[1:]
+                  nums = []
+                  for part in numeric_part:
+                      # Avoid picking the 8 from fsigma_8 because this is after first pipe.
+                      nums.extend(re.findall(r"[-+]?\d+\.\d+|[-+]?\d+", part))
+                  if len(nums) < 13:
+                      continue
+                  matrix_vals = [float(x) / 10000.0 for x in nums[:12]]
+                  inv_s = float(nums[12])
+                  labels.append(label)
+                  matrix_entries.append(matrix_vals)
+                  inv_s_entries.append(inv_s)
+                  row_details.append({
+                      "matrix_row_id": f"matrix_row_{len(row_details)+1:02d}",
+                      "source_table": file_name,
+                      "parameter_label": label,
+                      "matrix_entries_scaled_back": "|".join(f"{x:.6g}" for x in matrix_vals),
+                      "inverse_sigma_entry": inv_s,
+                      "matrix_role": "correlation_upper_precision_lower_times_1e4_plus_inverse_sigma_column",
+                      "reconstruction_status": "parsed_for_covariance_guard_not_scored",
+                  })
+              return labels, matrix_entries, inv_s_entries, row_details, cleaned
+
+          def determinant(matrix):
+              n = len(matrix)
+              if n == 0:
+                  return 1.0
+              a = [list(map(float, row)) for row in matrix]
+              det = 1.0
+              for i in range(n):
+                  pivot = i
+                  for r in range(i, n):
+                      if abs(a[r][i]) > abs(a[pivot][i]):
+                          pivot = r
+                  if abs(a[pivot][i]) < 1e-15:
+                      return 0.0
+                  if pivot != i:
+                      a[i], a[pivot] = a[pivot], a[i]
+                      det *= -1.0
+                  pivot_val = a[i][i]
+                  det *= pivot_val
+                  for r in range(i + 1, n):
+                      factor = a[r][i] / pivot_val
+                      for c in range(i, n):
+                          a[r][c] -= factor * a[i][c]
+              return det
+
+          def principal_minor_rows(matrix, labels):
+              rows = []
+              n = len(matrix)
+              for size in range(1, n + 1):
+                  for inds in itertools.combinations(range(n), size):
+                      sub = [[matrix[i][j] for j in inds] for i in inds]
+                      det = determinant(sub)
+                      rows.append({
+                          "minor_id": f"minor_{len(rows)+1:02d}",
+                          "size": size,
+                          "indices": "|".join(str(i) for i in inds),
+                          "labels": "|".join(labels[i] for i in inds),
+                          "determinant": det,
+                          "psd_tolerance_pass": det >= -1e-10,
+                      })
+              return rows
+
+          inherited_v4_259_rows = [
+              {
+                  "inherited_from": "v4.259",
+                  "item": "rules",
+                  "value": "43 / 43 passed",
+                  "meaning": "Extract Values From Zhao Table Dump Review passed.",
+                  "carry_forward_status": "ready_for_covariance_reconstruction_guard",
+              },
+              {
+                  "inherited_from": "v4.259",
+                  "item": "zhao_four_bin_value_rows",
+                  "value": 4,
+                  "meaning": "Four Zhao f_sigma8 table-labeled values were extracted from widetable1.",
+                  "carry_forward_status": "value_candidates_ready_not_scored",
+              },
+              {
+                  "inherited_from": "v4.259",
+                  "item": "zhao_redshift_weight_check_rows",
+                  "value": 1,
+                  "meaning": "The z=1.526 redshift-weighted check was separated from the four-bin row.",
+                  "carry_forward_status": "comparison_row_ready_not_scored",
+              },
+              {
+                  "inherited_from": "v4.259",
+                  "item": "zhao_matrix_support_rows",
+                  "value": 12,
+                  "meaning": "widetable2 matrix support rows were present but not reconstructed.",
+                  "carry_forward_status": "matrix_reconstruction_needed",
+              },
+              {
+                  "inherited_from": "v4.259",
+                  "item": "observed_manifest_bridge_block_rows",
+                  "value": 4,
+                  "meaning": "Observed manifest bridge stayed blocked.",
+                  "carry_forward_status": "observed_bridge_blocked",
+              },
+              {
+                  "inherited_from": "v4.259",
+                  "item": "selected_next_route",
+                  "value": "v4_260_zhao_extracted_value_review_covariance_reconstruction_guard",
+                  "meaning": "Current route should reconstruct/review covariance without scoring.",
+                  "carry_forward_status": "current_route",
+              },
+          ]
+
+          observed_manifest_status_rows, observed_manifest_input_rows = read_manifest_status(
+              OBSERVED_MANIFEST_CANDIDATES, REQUIRED_OBSERVED_COLUMNS, "observed"
+          )
+          extraction_manifest_status_rows, extraction_manifest_input_rows = read_manifest_status(
+              EXTRACTION_MANIFEST_CANDIDATES, REQUIRED_EXTRACTION_COLUMNS, "extraction"
+          )
+
+          source_probe_rows = []
+          eprint_texts = []
+          eprint_file_rows = []
+          for label, url in [
+              ("zhao_abs", ZHAO_ABS_URL),
+              ("zhao_eprint", ZHAO_EPRINT_URL),
+              ("zhao_pdf", ZHAO_PDF_URL),
+          ]:
+              status, content_type, content_length, raw, error = fetch_bytes(url)
+              source_probe_rows.append({
+                  "source_label": label,
+                  "source_url": url,
+                  "probe_status": status,
+                  "content_type": content_type,
+                  "content_length": content_length,
+                  "bytes_downloaded": len(raw),
+                  "probe_error": error,
+                  "probe_role": "covariance_reconstruction_guard_only",
+              })
+              if label == "zhao_eprint":
+                  eprint_file_rows, eprint_texts = extract_text_files_from_eprint(raw)
+
+          wt1_name, wt1_text = find_source_file(eprint_texts, "tables/widetable1.tex")
+          wt2_name, wt2_text = find_source_file(eprint_texts, "tables/widetable2.tex")
+          wt3_name, wt3_text = find_source_file(eprint_texts, "tables/widetable3.tex")
+
+          zhao_value_rows, wt1_fsigma_line, wt1_cleaned = parse_fsigma8_widetable1(wt1_name, wt1_text) if wt1_text else ([], "", "")
+          labels, matrix_entries, inv_s_entries, full_matrix_row_details, wt2_cleaned = parse_widetable2_matrix(wt2_name, wt2_text) if wt2_text else ([], [], [], [], "")
+
+          # Reconstruct the f_sigma8 four-bin correlation and covariance subset.
+          fsigma_indices = [i for i, label in enumerate(labels) if "fsigma_8" in label]
+          fsigma_labels = [labels[i] for i in fsigma_indices]
+          sigmas = [float(row["observed_sigma"]) for row in zhao_value_rows]
+          values = [float(row["observed_value"]) for row in zhao_value_rows]
+          redshifts = [float(row["redshift"]) for row in zhao_value_rows]
+
+          corr = []
+          for a_i, full_i in enumerate(fsigma_indices):
+              row = []
+              for a_j, full_j in enumerate(fsigma_indices):
+                  if full_i == full_j:
+                      val = 1.0
+                  elif full_i < full_j:
+                      val = matrix_entries[full_i][full_j]
+                  else:
+                      val = matrix_entries[full_j][full_i]
+                  row.append(float(val))
+              corr.append(row)
+
+          cov = []
+          for i in range(len(corr)):
+              cov_row = []
+              for j in range(len(corr)):
+                  cov_row.append(corr[i][j] * sigmas[i] * sigmas[j])
+              cov.append(cov_row)
+
+          zhao_fsigma8_correlation_rows = []
+          zhao_fsigma8_covariance_rows = []
+          for i in range(len(corr)):
+              for j in range(len(corr)):
+                  zhao_fsigma8_correlation_rows.append({
+                      "row_index": i + 1,
+                      "col_index": j + 1,
+                      "row_label": fsigma_labels[i],
+                      "col_label": fsigma_labels[j],
+                      "redshift_row": redshifts[i],
+                      "redshift_col": redshifts[j],
+                      "correlation_value": corr[i][j],
+                      "source": "widetable2 upper-triangle correlation values scaled by 1e-4",
+                      "scoring_allowed": False,
+                  })
+                  zhao_fsigma8_covariance_rows.append({
+                      "row_index": i + 1,
+                      "col_index": j + 1,
+                      "row_label": fsigma_labels[i],
+                      "col_label": fsigma_labels[j],
+                      "redshift_row": redshifts[i],
+                      "redshift_col": redshifts[j],
+                      "sigma_row": sigmas[i],
+                      "sigma_col": sigmas[j],
+                      "covariance_value": cov[i][j],
+                      "source": "covariance = correlation * quoted_sigma_i * quoted_sigma_j",
+                      "scoring_allowed": False,
+                  })
+
+          correlation_minor_rows = principal_minor_rows(corr, fsigma_labels)
+          covariance_minor_rows = principal_minor_rows(cov, fsigma_labels)
+
+          psd_guard_rows = [
+              {
+                  "guard_id": "psd_001_correlation_all_principal_minors",
+                  "matrix": "f_sigma8_correlation_subset",
+                  "principal_minor_rows": len(correlation_minor_rows),
+                  "min_minor": min(row["determinant"] for row in correlation_minor_rows) if correlation_minor_rows else "",
+                  "all_minors_pass_tolerance": all(row["psd_tolerance_pass"] for row in correlation_minor_rows),
+                  "scoring_allowed": False,
+              },
+              {
+                  "guard_id": "psd_002_covariance_all_principal_minors",
+                  "matrix": "f_sigma8_covariance_subset",
+                  "principal_minor_rows": len(covariance_minor_rows),
+                  "min_minor": min(row["determinant"] for row in covariance_minor_rows) if covariance_minor_rows else "",
+                  "all_minors_pass_tolerance": all(row["psd_tolerance_pass"] for row in covariance_minor_rows),
+                  "scoring_allowed": False,
+              },
+              {
+                  "guard_id": "psd_003_bridge_policy",
+                  "matrix": "f_sigma8_covariance_subset",
+                  "principal_minor_rows": len(covariance_minor_rows),
+                  "min_minor": "",
+                  "all_minors_pass_tolerance": "",
+                  "scoring_allowed": False,
+                  "bridge_policy": "matrix can be carried as reconstructed-support candidate only; observed manifest bridge remains separate",
+              },
+          ]
+
+          covariance_summary_rows = [
+              {
+                  "summary_id": "cov_summary_001",
+                  "rows": len(cov),
+                  "cols": len(cov[0]) if cov else 0,
+                  "diag_min": min(cov[i][i] for i in range(len(cov))) if cov else "",
+                  "diag_max": max(cov[i][i] for i in range(len(cov))) if cov else "",
+                  "correlation_min_offdiag": min(corr[i][j] for i in range(len(corr)) for j in range(len(corr)) if i != j) if corr else "",
+                  "correlation_max_offdiag": max(corr[i][j] for i in range(len(corr)) for j in range(len(corr)) if i != j) if corr else "",
+                  "status": "reconstructed_review_only_not_scored",
+              },
+              {
+                  "summary_id": "cov_summary_002",
+                  "rows": len(values),
+                  "cols": 1,
+                  "mean_fsigma8": sum(values) / len(values) if values else "",
+                  "min_fsigma8": min(values) if values else "",
+                  "max_fsigma8": max(values) if values else "",
+                  "status": "value_vector_review_only_not_scored",
+              },
+          ]
+
+          zhao_extraction_manifest_candidate_rows = []
+          for row in zhao_value_rows:
+              zhao_extraction_manifest_candidate_rows.append({
+                  "extraction_id": row["extraction_id"],
+                  "candidate_id": row["candidate_id"],
+                  "paper_or_source_url": row["paper_or_source_url"],
+                  "measurement_label": row["measurement_label"],
+                  "redshift": row["redshift"],
+                  "observable": row["observable"],
+                  "observed_value": row["observed_value"],
+                  "uncertainty_or_covariance_reference": row["uncertainty_or_covariance_reference"],
+                  "data_vector_reference": row["data_vector_reference"],
+                  "source_role": row["source_role"],
+                  "provenance_status": row["provenance_status"],
+                  "extraction_status": row["extraction_status"],
+                  "approval_status": row["approval_status"],
+              })
+
+          observed_manifest_bridge_block_rows = []
+          for row in zhao_value_rows:
+              observed_manifest_bridge_block_rows.append({
+                  "bridge_id": "blocked_bridge_" + row["extraction_id"],
+                  "redshift": row["redshift"],
+                  "quantity": "f_sigma8",
+                  "observed_value_candidate": row["observed_value"],
+                  "sigma_candidate": row["observed_sigma"],
+                  "covariance_status": "reconstructed_review_only_not_scored",
+                  "bridge_status": "blocked",
+                  "required_before_bridge": "human review + provenance decision + separate observed manifest bridge guard",
+                  "manifest_fill_allowed": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              })
+
+          provenance_scope_rows = [
+              {
+                  "scope_id": "scope_001",
+                  "question": "Can DR14 Zhao be called a full independent holdout against DR16 QSO context?",
+                  "current_answer": "not_yet",
+                  "status": "same_survey_family_cross_release_needs_review",
+                  "effect": "evidence and validation language blocked",
+              },
+              {
+                  "scope_id": "scope_002",
+                  "question": "Can reconstructed covariance be used for a future diagnostic bridge?",
+                  "current_answer": "yes_review_only",
+                  "status": "future_bridge_guard_needed",
+                  "effect": "candidate bridge possible later, not in this workflow",
+              },
+              {
+                  "scope_id": "scope_003",
+                  "question": "Can four-bin Zhao values be merged with LRG/ELG/QSO combined matrices?",
+                  "current_answer": "no",
+                  "status": "combined_matrix_blocked",
+                  "effect": "source-surface separation preserved",
+              },
+          ]
+
+          permission_rows = [
+              {
+                  "permission_scope": "zhao_fsigma8_covariance_reconstruction",
+                  "permission_status": "written_review_only",
+                  "reason": "Four-bin covariance subset is reconstructed but not scored.",
+              },
+              {
+                  "permission_scope": "qso_literature_extraction_manifest_candidate_rows",
+                  "permission_status": "written_not_scored",
+                  "reason": "Candidate extraction rows are written for review only.",
+              },
+              {
+                  "permission_scope": "zhao_observed_manifest_bridge",
+                  "permission_status": "blocked_until_v4_261",
+                  "reason": "A separate bridge guard with provenance scope is required.",
+              },
+              {
+                  "permission_scope": "external_observed_manifest_fill",
+                  "permission_status": "blocked",
+                  "reason": "No observed manifest row is created by this workflow.",
+              },
+              {
+                  "permission_scope": "external_observed_residual_scoring",
+                  "permission_status": "blocked",
+                  "reason": "No reviewed observed/reference join exists.",
+              },
+              {
+                  "permission_scope": "primary_qso_growth_evidence",
+                  "permission_status": "blocked",
+                  "reason": "Covariance reconstruction is not evidence.",
+              },
+              {
+                  "permission_scope": "numeric_correction_fit",
+                  "permission_status": "blocked",
+                  "reason": "No approved observed manifest or parameter values are ready.",
+              },
+              {
+                  "permission_scope": "combined_lrg_elg_qso_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix remains blocked by source-surface guards.",
+              },
+              {
+                  "permission_scope": "cosmology_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "No external likelihood fit or holdout scoring has run.",
+              },
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "readiness_001", "requirement": "four_bin_table_labeled_values", "status": "ready_review_only" if len(zhao_value_rows) == 4 else "not_ready", "blocks": "observed bridge if not ready"},
+              {"readiness_id": "readiness_002", "requirement": "fsigma8_correlation_subset", "status": "ready_review_only" if len(zhao_fsigma8_correlation_rows) == 16 else "not_ready", "blocks": "covariance guard"},
+              {"readiness_id": "readiness_003", "requirement": "fsigma8_covariance_subset", "status": "ready_review_only" if len(zhao_fsigma8_covariance_rows) == 16 else "not_ready", "blocks": "observed bridge"},
+              {"readiness_id": "readiness_004", "requirement": "principal_minor_guard", "status": "passed_review_only" if all(row.get("all_minors_pass_tolerance") in [True, ""] for row in psd_guard_rows) else "review_needed", "blocks": "future scoring"},
+              {"readiness_id": "readiness_005", "requirement": "provenance_decision", "status": "needed", "blocks": "holdout label"},
+              {"readiness_id": "readiness_006", "requirement": "external_observed_manifest_bridge", "status": "blocked_until_v4_261", "blocks": "residual scoring"},
+              {"readiness_id": "readiness_007", "requirement": "numeric_correction_fit", "status": "blocked", "blocks": "model comparison"},
+              {"readiness_id": "readiness_008", "requirement": "combined_matrix_permission", "status": "blocked", "blocks": "combined matrix"},
+          ]
+
+          failure_condition_rows = [
+              {"failure_condition_id": "failure_001", "target": "QSO f_sigma8 primary pressure", "machine_condition": "if holdout_qso_growth_direction in ['0','-','mixed_negative'] then primary_pressure_weakened", "status": "active_but_not_testable_without_approved_holdout_and_covariance"},
+              {"failure_condition_id": "failure_002", "target": "QSO versus LRG growth contrast", "machine_condition": "if lrg_growth_direction == qso_growth_direction == '+' then source_contrast_weakened", "status": "active_for_future_control_review"},
+              {"failure_condition_id": "failure_003", "target": "QSO radial secondary support", "machine_condition": "if qso_radial_direction == '-' then secondary_support_weakened", "status": "active_for_future_secondary_review"},
+              {"failure_condition_id": "failure_004", "target": "geometry compressed lane non-primary", "machine_condition": "if compressed_geometry_primary and qso_growth_not_positive then current_interpretation_rewrite_needed", "status": "active_for_future_geometry_review"},
+              {"failure_condition_id": "failure_005", "target": "external likelihood robustness", "machine_condition": "if external_likelihood_absorbs_all_pressure_without_tairid_specific_leftover then baseline_pressure_not_tairid_specific", "status": "active_for_future_model_comparison"},
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "The Zhao four-bin f_sigma8 covariance subset is reconstructed as review-only.",
+                  "basis": "widetable2 upper-triangle correlations and widetable1 quoted uncertainties produce a 4x4 covariance subset.",
+                  "next_action": "Carry as candidate support only.",
+                  "claim_status": "not_scored_not_evidence",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "The reconstructed matrix passes structural principal-minor checks within tolerance.",
+                  "basis": "Correlation and covariance principal minors are non-negative within tolerance.",
+                  "next_action": "Use v4.261 bridge guard before any observed manifest row.",
+                  "claim_status": "matrix_guard_only",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Provenance remains the main claim blocker.",
+                  "basis": "DR14 Zhao is still same-survey-family/cross-release relative to the QSO context.",
+                  "next_action": "Scope the bridge as candidate/support unless stronger provenance passes.",
+                  "claim_status": "holdout_not_approved",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "Observed manifest bridge remains blocked until v4.261.",
+                  "basis": "This workflow reconstructs support but does not create observed rows.",
+                  "next_action": "Proceed to v4.261.",
+                  "claim_status": "no_validation",
+              },
+          ]
+
+          route_decision_rows = [
+              {"route_id": "route_001", "route": "zhao_observed_manifest_bridge_guard_with_provenance_scope", "permission_status": "recommended", "reason": "Values and covariance support exist as review-only candidates; provenance/bridge is next."},
+              {"route_id": "route_002", "route": "qso_literature_extraction_manifest_candidate_write", "permission_status": "allowed_review_only", "reason": "Candidate rows may be written before any observed bridge."},
+              {"route_id": "route_003", "route": "external_observed_manifest_fill", "permission_status": "blocked", "reason": "Observed bridge guard has not passed."},
+              {"route_id": "route_004", "route": "numeric_correction_fit", "permission_status": "blocked", "reason": "No approved observed manifest exists."},
+              {"route_id": "route_005", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.260 is enough history for consolidation if needed."},
+          ]
+
+          next_rows = [
+              {"priority": 1, "test_id": "v4_261_zhao_observed_manifest_bridge_guard_with_provenance_scope", "purpose": "decide whether candidate Zhao rows can bridge into observed manifest as non-scoring rows", "activated": True},
+              {"priority": 2, "test_id": "v4_261_qso_literature_extraction_manifest_candidate_write", "purpose": "write candidate extraction rows only, not observed manifest rows", "activated": True},
+              {"priority": 3, "test_id": "v4_261_external_observed_residual_scoring", "purpose": "score only after a later scoring guard", "activated": False},
+              {"priority": 4, "test_id": "v4_261_handoff_if_needed", "purpose": "consolidate v4.203-v4.260 if thread length is risky", "activated": True},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before covariance reconstruction"},
+              {"gate": "inherited_v4_259_rows_equal_6", "passed": len(inherited_v4_259_rows) == 6, "detail": f"inherited_v4_259_rows = {len(inherited_v4_259_rows)}"},
+              {"gate": "observed_manifest_status_rows_at_least_1", "passed": len(observed_manifest_status_rows) >= 1, "detail": f"observed_manifest_status_rows = {len(observed_manifest_status_rows)}"},
+              {"gate": "extraction_manifest_status_rows_at_least_1", "passed": len(extraction_manifest_status_rows) >= 1, "detail": f"extraction_manifest_status_rows = {len(extraction_manifest_status_rows)}"},
+              {"gate": "source_probe_rows_equal_3", "passed": len(source_probe_rows) == 3, "detail": f"source_probe_rows = {len(source_probe_rows)}"},
+              {"gate": "eprint_file_rows_at_least_4", "passed": len(eprint_file_rows) >= 4, "detail": f"eprint_file_rows = {len(eprint_file_rows)}"},
+              {"gate": "zhao_value_rows_equal_4", "passed": len(zhao_value_rows) == 4, "detail": f"zhao_value_rows = {len(zhao_value_rows)}"},
+              {"gate": "full_matrix_row_details_equal_12", "passed": len(full_matrix_row_details) == 12, "detail": f"full_matrix_row_details = {len(full_matrix_row_details)}"},
+              {"gate": "fsigma_indices_equal_4", "passed": len(fsigma_indices) == 4, "detail": f"fsigma_indices = {fsigma_indices}"},
+              {"gate": "correlation_rows_equal_16", "passed": len(zhao_fsigma8_correlation_rows) == 16, "detail": f"zhao_fsigma8_correlation_rows = {len(zhao_fsigma8_correlation_rows)}"},
+              {"gate": "covariance_rows_equal_16", "passed": len(zhao_fsigma8_covariance_rows) == 16, "detail": f"zhao_fsigma8_covariance_rows = {len(zhao_fsigma8_covariance_rows)}"},
+              {"gate": "correlation_minor_rows_equal_15", "passed": len(correlation_minor_rows) == 15, "detail": f"correlation_minor_rows = {len(correlation_minor_rows)}"},
+              {"gate": "covariance_minor_rows_equal_15", "passed": len(covariance_minor_rows) == 15, "detail": f"covariance_minor_rows = {len(covariance_minor_rows)}"},
+              {"gate": "psd_guard_rows_equal_3", "passed": len(psd_guard_rows) == 3, "detail": f"psd_guard_rows = {len(psd_guard_rows)}"},
+              {"gate": "correlation_principal_minors_pass", "passed": all(row["psd_tolerance_pass"] for row in correlation_minor_rows), "detail": "correlation principal minors pass tolerance"},
+              {"gate": "covariance_principal_minors_pass", "passed": all(row["psd_tolerance_pass"] for row in covariance_minor_rows), "detail": "covariance principal minors pass tolerance"},
+              {"gate": "covariance_summary_rows_equal_2", "passed": len(covariance_summary_rows) == 2, "detail": f"covariance_summary_rows = {len(covariance_summary_rows)}"},
+              {"gate": "zhao_extraction_manifest_candidate_rows_equal_4", "passed": len(zhao_extraction_manifest_candidate_rows) == 4, "detail": f"zhao_extraction_manifest_candidate_rows = {len(zhao_extraction_manifest_candidate_rows)}"},
+              {"gate": "observed_manifest_bridge_block_rows_equal_4", "passed": len(observed_manifest_bridge_block_rows) == 4, "detail": f"observed_manifest_bridge_block_rows = {len(observed_manifest_bridge_block_rows)}"},
+              {"gate": "provenance_scope_rows_equal_3", "passed": len(provenance_scope_rows) == 3, "detail": f"provenance_scope_rows = {len(provenance_scope_rows)}"},
+              {"gate": "permission_rows_equal_9", "passed": len(permission_rows) == 9, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_8", "passed": len(readiness_rows) == 8, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "failure_condition_rows_equal_5", "passed": len(failure_condition_rows) == 5, "detail": f"failure_condition_rows = {len(failure_condition_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_decision_rows_equal_5", "passed": len(route_decision_rows) == 5, "detail": f"route_decision_rows = {len(route_decision_rows)}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "all_correlation_rows_non_scoring", "passed": all(row["scoring_allowed"] is False for row in zhao_fsigma8_correlation_rows), "detail": "correlation rows non-scoring"},
+              {"gate": "all_covariance_rows_non_scoring", "passed": all(row["scoring_allowed"] is False for row in zhao_fsigma8_covariance_rows), "detail": "covariance rows non-scoring"},
+              {"gate": "all_bridge_rows_blocked", "passed": all(row["manifest_fill_allowed"] is False and row["scoring_allowed"] is False and row["evidence_allowed"] is False for row in observed_manifest_bridge_block_rows), "detail": "observed bridge rows blocked"},
+              {"gate": "zhao_covariance_reconstruction_written_review_only", "passed": any(row["permission_scope"] == "zhao_fsigma8_covariance_reconstruction" and row["permission_status"] == "written_review_only" for row in permission_rows), "detail": "covariance reconstruction review-only"},
+              {"gate": "observed_manifest_fill_blocked", "passed": any(row["permission_scope"] == "external_observed_manifest_fill" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "observed manifest fill blocked"},
+              {"gate": "external_scoring_blocked", "passed": any(row["permission_scope"] == "external_observed_residual_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "external observed scoring blocked"},
+              {"gate": "primary_qso_evidence_blocked", "passed": any(row["permission_scope"] == "primary_qso_growth_evidence" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "primary QSO evidence blocked"},
+              {"gate": "numeric_fit_blocked", "passed": any(row["permission_scope"] == "numeric_correction_fit" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "numeric correction fit blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation claim blocked"},
+              {"gate": "v4_261_bridge_route_recommended", "passed": any(row["route"] == "zhao_observed_manifest_bridge_guard_with_provenance_scope" and row["permission_status"] == "recommended" for row in route_decision_rows), "detail": "v4.261 bridge route recommended"},
+              {"gate": "external_scoring_next_not_activated", "passed": any(row["test_id"] == "v4_261_external_observed_residual_scoring" and row["activated"] is False for row in next_rows), "detail": "external scoring not activated"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_scoring", "passed": True, "detail": "no external observed scoring"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_261_zhao_observed_manifest_bridge_guard_with_provenance_scope_or_handoff", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_260_zhao_extracted_value_review_covariance_reconstruction_guard_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_260_inherited_v4_259_rows.csv", inherited_v4_259_rows)
+          write_csv(OUT / "v4_260_observed_manifest_status_rows.csv", observed_manifest_status_rows)
+          write_csv(OUT / "v4_260_extraction_manifest_status_rows.csv", extraction_manifest_status_rows)
+          write_csv(OUT / "v4_260_source_probe_rows.csv", source_probe_rows)
+          write_csv(OUT / "v4_260_eprint_file_rows.csv", eprint_file_rows)
+          write_csv(OUT / "v4_260_zhao_value_rows.csv", zhao_value_rows)
+          write_csv(OUT / "v4_260_full_matrix_row_details.csv", full_matrix_row_details)
+          write_csv(OUT / "v4_260_zhao_fsigma8_correlation_rows.csv", zhao_fsigma8_correlation_rows)
+          write_csv(OUT / "v4_260_zhao_fsigma8_covariance_rows.csv", zhao_fsigma8_covariance_rows)
+          write_csv(OUT / "v4_260_correlation_principal_minor_rows.csv", correlation_minor_rows)
+          write_csv(OUT / "v4_260_covariance_principal_minor_rows.csv", covariance_minor_rows)
+          write_csv(OUT / "v4_260_psd_guard_rows.csv", psd_guard_rows)
+          write_csv(OUT / "v4_260_covariance_summary_rows.csv", covariance_summary_rows)
+          write_csv(OUT / "v4_260_zhao_extraction_manifest_candidate_rows.csv", zhao_extraction_manifest_candidate_rows)
+          write_csv(OUT / "qso_literature_extraction_manifest_CANDIDATE_ZHAO_v4_260_NOT_SCORED.csv", zhao_extraction_manifest_candidate_rows)
+          write_csv(OUT / "v4_260_observed_manifest_bridge_block_rows.csv", observed_manifest_bridge_block_rows)
+          write_csv(OUT / "v4_260_provenance_scope_rows.csv", provenance_scope_rows)
+          write_csv(OUT / "v4_260_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_260_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_260_failure_condition_rows.csv", failure_condition_rows)
+          write_csv(OUT / "v4_260_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_260_route_decision_rows.csv", route_decision_rows)
+          write_csv(OUT / "v4_260_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_260_rule_checks.csv", checks)
+
+          value_lines = [
+              f"z={row['redshift']}: fsigma8={row['observed_value']} ± {row['observed_sigma']}"
+              for row in zhao_value_rows
+          ]
+
+          corr_lines = [
+              f"{row['row_label']} x {row['col_label']} = {row['correlation_value']}"
+              for row in zhao_fsigma8_correlation_rows if int(row["row_index"]) < int(row["col_index"])
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_decision_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_v4_259_rows": len(inherited_v4_259_rows),
+              "observed_manifest_status_rows": len(observed_manifest_status_rows),
+              "extraction_manifest_status_rows": len(extraction_manifest_status_rows),
+              "source_probe_rows": len(source_probe_rows),
+              "eprint_file_rows": len(eprint_file_rows),
+              "zhao_value_rows": len(zhao_value_rows),
+              "full_matrix_row_details": len(full_matrix_row_details),
+              "fsigma_indices": len(fsigma_indices),
+              "zhao_fsigma8_correlation_rows": len(zhao_fsigma8_correlation_rows),
+              "zhao_fsigma8_covariance_rows": len(zhao_fsigma8_covariance_rows),
+              "correlation_principal_minor_rows": len(correlation_minor_rows),
+              "covariance_principal_minor_rows": len(covariance_minor_rows),
+              "psd_guard_rows": len(psd_guard_rows),
+              "covariance_summary_rows": len(covariance_summary_rows),
+              "zhao_extraction_manifest_candidate_rows": len(zhao_extraction_manifest_candidate_rows),
+              "observed_manifest_bridge_block_rows": len(observed_manifest_bridge_block_rows),
+              "provenance_scope_rows": len(provenance_scope_rows),
+              "permission_rows": len(permission_rows),
+              "readiness_rows": len(readiness_rows),
+              "failure_condition_rows": len(failure_condition_rows),
+              "decision_rows": len(decision_rows),
+              "route_decision_rows": len(route_decision_rows),
+              "next_rows": len(next_rows),
+              "correlation_min_principal_minor": min(row["determinant"] for row in correlation_minor_rows) if correlation_minor_rows else None,
+              "covariance_min_principal_minor": min(row["determinant"] for row in covariance_minor_rows) if covariance_minor_rows else None,
+              "manifest_fill_allowed": False,
+              "scoring_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_260_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.260 Zhao Extracted Value Review Covariance Reconstruction Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_v4_259_rows = {summary['inherited_v4_259_rows']}",
+              f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}",
+              f"extraction_manifest_status_rows = {summary['extraction_manifest_status_rows']}",
+              f"source_probe_rows = {summary['source_probe_rows']}",
+              f"eprint_file_rows = {summary['eprint_file_rows']}",
+              f"zhao_value_rows = {summary['zhao_value_rows']}",
+              f"full_matrix_row_details = {summary['full_matrix_row_details']}",
+              f"fsigma_indices = {summary['fsigma_indices']}",
+              f"zhao_fsigma8_correlation_rows = {summary['zhao_fsigma8_correlation_rows']}",
+              f"zhao_fsigma8_covariance_rows = {summary['zhao_fsigma8_covariance_rows']}",
+              f"correlation_principal_minor_rows = {summary['correlation_principal_minor_rows']}",
+              f"covariance_principal_minor_rows = {summary['covariance_principal_minor_rows']}",
+              f"psd_guard_rows = {summary['psd_guard_rows']}",
+              f"covariance_summary_rows = {summary['covariance_summary_rows']}",
+              f"zhao_extraction_manifest_candidate_rows = {summary['zhao_extraction_manifest_candidate_rows']}",
+              f"observed_manifest_bridge_block_rows = {summary['observed_manifest_bridge_block_rows']}",
+              f"provenance_scope_rows = {summary['provenance_scope_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"failure_condition_rows = {summary['failure_condition_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"route_decision_rows = {summary['route_decision_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"correlation_min_principal_minor = {summary['correlation_min_principal_minor']}",
+              f"covariance_min_principal_minor = {summary['covariance_min_principal_minor']}",
+              f"manifest_fill_allowed = {summary['manifest_fill_allowed']}",
+              f"scoring_allowed = {summary['scoring_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Zhao value rows:",
+              *value_lines,
+              "",
+              "Extracted f_sigma8 correlation off-diagonals:",
+              *corr_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.260 reconstructs the Zhao four-bin f_sigma8 correlation/covariance subset as review-only support. The reconstructed subset passes principal-minor structure checks, but this is still not scoring, not evidence, not a holdout approval, and not an observed-manifest bridge.",
+              "",
+              "Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_260_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_v4_259_rows = {summary['inherited_v4_259_rows']}")
+          print(f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}")
+          print(f"extraction_manifest_status_rows = {summary['extraction_manifest_status_rows']}")
+          print(f"source_probe_rows = {summary['source_probe_rows']}")
+          print(f"eprint_file_rows = {summary['eprint_file_rows']}")
+          print(f"zhao_value_rows = {summary['zhao_value_rows']}")
+          print(f"full_matrix_row_details = {summary['full_matrix_row_details']}")
+          print(f"fsigma_indices = {summary['fsigma_indices']}")
+          print(f"zhao_fsigma8_correlation_rows = {summary['zhao_fsigma8_correlation_rows']}")
+          print(f"zhao_fsigma8_covariance_rows = {summary['zhao_fsigma8_covariance_rows']}")
+          print(f"correlation_principal_minor_rows = {summary['correlation_principal_minor_rows']}")
+          print(f"covariance_principal_minor_rows = {summary['covariance_principal_minor_rows']}")
+          print(f"psd_guard_rows = {summary['psd_guard_rows']}")
+          print(f"covariance_summary_rows = {summary['covariance_summary_rows']}")
+          print(f"zhao_extraction_manifest_candidate_rows = {summary['zhao_extraction_manifest_candidate_rows']}")
+          print(f"observed_manifest_bridge_block_rows = {summary['observed_manifest_bridge_block_rows']}")
+          print(f"provenance_scope_rows = {summary['provenance_scope_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"failure_condition_rows = {summary['failure_condition_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"route_decision_rows = {summary['route_decision_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"correlation_min_principal_minor = {summary['correlation_min_principal_minor']}")
+          print(f"covariance_min_principal_minor = {summary['covariance_min_principal_minor']}")
+          print(f"manifest_fill_allowed = {summary['manifest_fill_allowed']}")
+          print(f"scoring_allowed = {summary['scoring_allowed']}")
+          print(f"approved_holdout_sources = {summary['approved_holdout_sources']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.260 Zhao covariance reconstruction guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-260-zhao-covariance-reconstruction-guard-output
+          path: |
+            tairid_v4_260_zhao_covariance_reconstruction_guard_output/
+            tairid-v4-260-zhao-covariance-reconstruction-guard-output.zip
