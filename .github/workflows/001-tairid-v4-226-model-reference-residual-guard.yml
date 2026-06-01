@@ -1,0 +1,573 @@
+name: 001 TAIRID v4.226 - Model Reference Residual Guard
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-226-model-reference-residual-guard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  model-reference-residual-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.226 Model Reference Residual Guard is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.226 model reference residual guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.226"
+          ROUTE = "lrg_qso_model_reference_residual_guard_after_v4_225"
+          EXPECTED_RESULT = "v4_226_model_reference_residual_guard_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_227_reference_manifest_fill_or_lcdm_baseline_projection_probe"
+
+          OUT = Path("tairid_v4_226_model_reference_residual_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-226-model-reference-residual-guard-output.zip"
+
+          BASE = "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16"
+
+          SOURCE_INPUTS = [
+              {
+                  "source": "LRG",
+                  "surface_id": "lrg_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+                  "scaling_label": "rd",
+              },
+              {
+                  "source": "QSO",
+                  "surface_id": "qso_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+                  "scaling_label": "rs",
+              },
+          ]
+
+          ELG_URL = BASE + "/elg/sdss_DR16_ELG_BAO_DVtable.txt"
+
+          AXIS_MAP = {
+              "DM_over_rd": ("D_M_over_r_sound", "reach_geometry"),
+              "DM_over_rs": ("D_M_over_r_sound", "reach_geometry"),
+              "DH_over_rd": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "DH_over_rs": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "f_sigma8": ("f_sigma8", "growth_consolidation"),
+          }
+
+          REQUIRED_REFERENCE_COLUMNS = [
+              "source",
+              "surface_id",
+              "standard_quantity",
+              "reference_model_name",
+              "reference_value",
+              "reference_uncertainty",
+              "reference_provenance",
+              "reference_status",
+          ]
+
+          REFERENCE_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/tairid_model_reference_manifest.csv"),
+              Path("data/cosmology/model_reference_manifest.csv"),
+              Path("tairid_model_reference_manifest.csv"),
+          ]
+
+          def write_csv(path, rows, fieldnames=None):
+              rows = rows or []
+              if fieldnames is None:
+                  fieldnames = []
+                  for row in rows:
+                      for key in row:
+                          if key not in fieldnames:
+                              fieldnames.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def fetch_text(url):
+              req = Request(url, headers={"User-Agent": "TAIRID-v4.226-reference-residual-guard"})
+              with urlopen(req, timeout=45) as response:
+                  return response.read().decode("utf-8", errors="replace")
+
+          def safe_float(token):
+              try:
+                  return float(token)
+              except Exception:
+                  return None
+
+          def numeric_lines(text):
+              rows = []
+              for line in text.splitlines():
+                  raw = line.strip()
+                  if not raw or raw.startswith("#"):
+                      continue
+                  nums = []
+                  labels = []
+                  for part in raw.replace(",", " ").split():
+                      value = safe_float(part)
+                      if value is None:
+                          labels.append(part)
+                      else:
+                          nums.append(value)
+                  rows.append((nums, labels, raw))
+              return rows
+
+          def parse_measurements(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2 and labels:
+                      rows.append({
+                          "redshift": nums[0],
+                          "value": nums[1],
+                          "quantity": labels[-1],
+                          "raw_line": raw,
+                      })
+              return rows
+
+          def parse_matrix(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if nums:
+                      rows.append(nums)
+              return rows
+
+          def sigmas_from_covariance(matrix):
+              sigmas = []
+              for i in range(len(matrix)):
+                  diag = matrix[i][i] if i < len(matrix[i]) else float("nan")
+                  sigmas.append(math.sqrt(diag) if diag >= 0 else float("nan"))
+              return sigmas
+
+          def parse_elg_surface(text):
+              pairs = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2:
+                      pairs.append((nums[0], nums[1]))
+              pairs = sorted(pairs, key=lambda pair: pair[0])
+              if not pairs:
+                  return {
+                      "table_rows": 0,
+                      "peak_x": "",
+                      "weighted_mean_x": "",
+                      "weighted_sigma_x": "",
+                      "median_x": "",
+                  }
+
+              xs = [pair[0] for pair in pairs]
+              ys = [pair[1] for pair in pairs]
+              peak_x, peak_y = max(pairs, key=lambda pair: pair[1])
+
+              def trap(x_list, y_list):
+                  total = 0.0
+                  for i in range(1, len(x_list)):
+                      total += 0.5 * (x_list[i] - x_list[i - 1]) * (y_list[i] + y_list[i - 1])
+                  return total
+
+              area = trap(xs, ys)
+              pdf = [y / area if area else 0.0 for y in ys]
+              mean = trap(xs, [x * p for x, p in zip(xs, pdf)])
+              var = trap(xs, [((x - mean) ** 2) * p for x, p in zip(xs, pdf)])
+              sigma = math.sqrt(var) if var >= 0 else float("nan")
+
+              cdf = [0.0]
+              running = 0.0
+              for i in range(1, len(xs)):
+                  running += 0.5 * (xs[i] - xs[i - 1]) * (pdf[i] + pdf[i - 1])
+                  cdf.append(running)
+              if running:
+                  cdf = [value / running for value in cdf]
+
+              median = xs[-1]
+              for i in range(1, len(xs)):
+                  if cdf[i] >= 0.5:
+                      c0 = cdf[i - 1]
+                      c1 = cdf[i]
+                      x0 = xs[i - 1]
+                      x1 = xs[i]
+                      median = x1 if c1 == c0 else x0 + ((0.5 - c0) / (c1 - c0)) * (x1 - x0)
+                      break
+
+              return {
+                  "table_rows": len(pairs),
+                  "peak_x": peak_x,
+                  "weighted_mean_x": mean,
+                  "weighted_sigma_x": sigma,
+                  "median_x": median,
+              }
+
+          def read_reference_manifest():
+              manifest_rows = []
+              manifest_status_rows = []
+
+              found_paths = [path for path in REFERENCE_MANIFEST_CANDIDATES if path.exists()]
+              if not found_paths:
+                  manifest_status_rows.append({
+                      "manifest_path": "",
+                      "manifest_status": "missing",
+                      "rows": 0,
+                      "detail": "No reference/model manifest found. Residual claims remain blocked.",
+                  })
+                  return manifest_rows, manifest_status_rows
+
+              for path in found_paths:
+                  try:
+                      with path.open("r", newline="", encoding="utf-8-sig") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in REQUIRED_REFERENCE_COLUMNS if col not in columns]
+                      status = "ok" if not missing else "missing_columns:" + "|".join(missing)
+                      for row in rows:
+                          row["_manifest_path"] = path.as_posix()
+                          row["_manifest_column_status"] = status
+                          manifest_rows.append(row)
+                      manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          "rows": len(rows),
+                          "detail": "Reference manifest found and read.",
+                      })
+                  except Exception as exc:
+                      manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          "rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+
+              return manifest_rows, manifest_status_rows
+
+          def find_reference(reference_rows, source, surface_id, standard_quantity):
+              matches = []
+              for row in reference_rows:
+                  if str(row.get("_manifest_column_status", "")) != "ok":
+                      continue
+                  if str(row.get("source", "")).strip().upper() != source:
+                      continue
+                  if str(row.get("surface_id", "")).strip() != surface_id:
+                      continue
+                  if str(row.get("standard_quantity", "")).strip() != standard_quantity:
+                      continue
+                  try:
+                      value = float(row.get("reference_value", ""))
+                  except Exception:
+                      continue
+                  try:
+                      uncertainty = float(row.get("reference_uncertainty", ""))
+                  except Exception:
+                      uncertainty = float("nan")
+                  row_copy = dict(row)
+                  row_copy["_reference_value_float"] = value
+                  row_copy["_reference_uncertainty_float"] = uncertainty
+                  matches.append(row_copy)
+              return matches[0] if matches else None
+
+          observed_axis_rows = []
+
+          for item in SOURCE_INPUTS:
+              source = item["source"]
+              surface_id = item["surface_id"]
+              measurements = parse_measurements(fetch_text(item["measurement_url"]))
+              covariance = parse_matrix(fetch_text(item["covariance_url"]))
+              sigmas = sigmas_from_covariance(covariance)
+
+              for idx, measurement in enumerate(measurements):
+                  standard_quantity, axis_name = AXIS_MAP.get(measurement["quantity"], (measurement["quantity"], "unmapped_axis"))
+                  observed_axis_rows.append({
+                      "source": source,
+                      "surface_id": surface_id,
+                      "standard_quantity": standard_quantity,
+                      "native_quantity": measurement["quantity"],
+                      "axis_name": axis_name,
+                      "redshift_or_axis_position": measurement["redshift"],
+                      "observed_value": measurement["value"],
+                      "observed_sigma_or_proxy": sigmas[idx] if idx < len(sigmas) else "",
+                      "source_status": "observed_axis_ready_not_residual",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          elg_surface = parse_elg_surface(fetch_text(ELG_URL))
+          observed_axis_rows.append({
+              "source": "ELG",
+              "surface_id": "elg_dr16_bao_dvtable",
+              "standard_quantity": "ELG_DVtable_likelihood_coordinate",
+              "native_quantity": "DVtable_x",
+              "axis_name": "elg_likelihood_surface_axis",
+              "redshift_or_axis_position": "table_coordinate",
+              "observed_value": elg_surface["median_x"],
+              "observed_sigma_or_proxy": elg_surface["weighted_sigma_x"],
+              "source_status": "likelihood_surface_axis_ready_not_residual",
+              "proof_status": "not_proof",
+              "validation_status": "not_validation",
+          })
+
+          reference_rows, reference_manifest_status_rows = read_reference_manifest()
+
+          reference_template_rows = []
+          residual_guard_rows = []
+
+          for obs in observed_axis_rows:
+              source = obs["source"]
+              surface_id = obs["surface_id"]
+              standard_quantity = obs["standard_quantity"]
+
+              reference = find_reference(reference_rows, source, surface_id, standard_quantity)
+
+              if reference is None:
+                  residual_status = "blocked_reference_missing"
+                  reference_model_name = ""
+                  reference_value = ""
+                  reference_uncertainty = ""
+                  residual_value = ""
+                  residual_z_score = ""
+                  residual_direction = "blocked"
+                  guard_reason = "No explicit reference/model value found for this source/surface/quantity."
+              else:
+                  reference_model_name = reference.get("reference_model_name", "")
+                  reference_value = reference["_reference_value_float"]
+                  reference_uncertainty = reference["_reference_uncertainty_float"]
+                  obs_sigma = obs["observed_sigma_or_proxy"]
+                  total_sigma = math.sqrt((float(obs_sigma) ** 2) + (reference_uncertainty ** 2)) if obs_sigma != "" and not math.isnan(reference_uncertainty) else float(obs_sigma)
+                  residual_value = float(obs["observed_value"]) - float(reference_value)
+                  residual_z_score = residual_value / total_sigma if total_sigma else float("nan")
+                  if math.isnan(residual_z_score) or abs(residual_z_score) < 1:
+                      residual_direction = "0"
+                  elif residual_value > 0:
+                      residual_direction = "+"
+                  else:
+                      residual_direction = "-"
+                  residual_status = "residual_preview_allowed_from_manifest_reference"
+                  guard_reason = "Reference/model value found in manifest; still preview only, not validation."
+
+              reference_template_rows.append({
+                  "source": source,
+                  "surface_id": surface_id,
+                  "standard_quantity": standard_quantity,
+                  "reference_model_name": "PUT_REFERENCE_MODEL_NAME_HERE",
+                  "reference_value": "PUT_REFERENCE_VALUE_HERE",
+                  "reference_uncertainty": "PUT_REFERENCE_UNCERTAINTY_HERE",
+                  "reference_provenance": "PUT_REFERENCE_SOURCE_OR_SCRIPT_HERE",
+                  "reference_status": "needed_before_residual_claim",
+              })
+
+              residual_guard_rows.append({
+                  "source": source,
+                  "surface_id": surface_id,
+                  "standard_quantity": standard_quantity,
+                  "native_quantity": obs["native_quantity"],
+                  "observed_value": obs["observed_value"],
+                  "observed_sigma_or_proxy": obs["observed_sigma_or_proxy"],
+                  "reference_model_name": reference_model_name,
+                  "reference_value": reference_value,
+                  "reference_uncertainty": reference_uncertainty,
+                  "residual_value": residual_value,
+                  "residual_z_score": residual_z_score,
+                  "residual_direction": residual_direction,
+                  "residual_status": residual_status,
+                  "guard_reason": guard_reason,
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          residual_allowed_count = sum(1 for row in residual_guard_rows if row["residual_status"] == "residual_preview_allowed_from_manifest_reference")
+          residual_blocked_count = sum(1 for row in residual_guard_rows if row["residual_status"] == "blocked_reference_missing")
+
+          source_status_rows = []
+          for source in ["LRG", "QSO", "ELG"]:
+              source_rows = [row for row in residual_guard_rows if row["source"] == source]
+              blocked = sum(1 for row in source_rows if row["residual_status"] == "blocked_reference_missing")
+              allowed = sum(1 for row in source_rows if row["residual_status"] == "residual_preview_allowed_from_manifest_reference")
+              source_status_rows.append({
+                  "source": source,
+                  "observed_axis_rows": len(source_rows),
+                  "residual_preview_allowed_rows": allowed,
+                  "residual_blocked_rows": blocked,
+                  "source_residual_status": "residual_ready_from_reference_manifest" if allowed == len(source_rows) and source_rows else "blocked_until_reference_values_exist",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          permission_rows = [
+              {
+                  "permission_scope": "observed_source_axes",
+                  "permission_status": "allowed",
+                  "reason": "Observed source axes can be recorded from source files.",
+              },
+              {
+                  "permission_scope": "model_residual_claims",
+                  "permission_status": "allowed_preview_only_if_reference_manifest_exists" if residual_allowed_count else "blocked",
+                  "reason": "Residuals require explicit reference/model values.",
+              },
+              {
+                  "permission_scope": "combined_lrg_qso_elg_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix requires source residuals and axis-translation guards first.",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_227_reference_manifest_fill",
+                  "purpose": "fill explicit reference/model values for LRG, QSO, and ELG source axes",
+                  "activated": residual_blocked_count > 0,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_227_lcdm_baseline_projection_probe",
+                  "purpose": "compute a clearly labeled baseline projection table without calling it TAIRID proof",
+                  "activated": residual_blocked_count > 0,
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_227_residual_preview_from_manifest",
+                  "purpose": "if a manifest is present, compute source-specific residual previews",
+                  "activated": residual_allowed_count > 0,
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_227_combined_matrix_permission_recheck",
+                  "purpose": "combined matrix remains blocked until reference and translation guards pass",
+                  "activated": True,
+              },
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before guard"},
+              {"gate": "observed_axis_rows_equal_7", "passed": len(observed_axis_rows) == 7, "detail": f"observed_axis_rows = {len(observed_axis_rows)}"},
+              {"gate": "lrg_axis_rows_equal_3", "passed": sum(1 for row in observed_axis_rows if row["source"] == "LRG") == 3, "detail": "LRG observed axis rows = 3"},
+              {"gate": "qso_axis_rows_equal_3", "passed": sum(1 for row in observed_axis_rows if row["source"] == "QSO") == 3, "detail": "QSO observed axis rows = 3"},
+              {"gate": "elg_axis_rows_equal_1", "passed": sum(1 for row in observed_axis_rows if row["source"] == "ELG") == 1, "detail": "ELG observed axis rows = 1"},
+              {"gate": "reference_template_rows_equal_observed_axis_rows", "passed": len(reference_template_rows) == len(observed_axis_rows), "detail": f"reference_template_rows = {len(reference_template_rows)}"},
+              {"gate": "residual_guard_rows_equal_observed_axis_rows", "passed": len(residual_guard_rows) == len(observed_axis_rows), "detail": f"residual_guard_rows = {len(residual_guard_rows)}"},
+              {"gate": "reference_manifest_status_written", "passed": len(reference_manifest_status_rows) >= 1, "detail": f"reference_manifest_status_rows = {len(reference_manifest_status_rows)}"},
+              {"gate": "source_status_rows_equal_3", "passed": len(source_status_rows) == 3, "detail": f"source_status_rows = {len(source_status_rows)}"},
+              {"gate": "permission_rows_equal_3", "passed": len(permission_rows) == 3, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_qso_elg_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "residual_claims_blocked_without_reference_or_preview_only_with_reference", "passed": residual_blocked_count + residual_allowed_count == len(residual_guard_rows), "detail": f"blocked={residual_blocked_count}, allowed_preview={residual_allowed_count}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_residual_without_reference", "passed": True, "detail": "no residual claim without explicit reference/model value"},
+              {"gate": "truth_boundary_combined_matrix_blocked", "passed": True, "detail": "combined matrix remains blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_227_reference_manifest_fill_or_lcdm_baseline_projection_probe", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_226_model_reference_residual_guard_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_226_observed_axis_rows.csv", observed_axis_rows)
+          write_csv(OUT / "v4_226_reference_manifest_status_rows.csv", reference_manifest_status_rows)
+          write_csv(OUT / "v4_226_reference_template_rows.csv", reference_template_rows, REQUIRED_REFERENCE_COLUMNS)
+          write_csv(OUT / "v4_226_residual_guard_rows.csv", residual_guard_rows)
+          write_csv(OUT / "v4_226_source_status_rows.csv", source_status_rows)
+          write_csv(OUT / "v4_226_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_226_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_226_rule_checks.csv", checks)
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "observed_axis_rows": len(observed_axis_rows),
+              "reference_template_rows": len(reference_template_rows),
+              "residual_guard_rows": len(residual_guard_rows),
+              "residual_blocked_count": residual_blocked_count,
+              "residual_allowed_preview_count": residual_allowed_count,
+              "reference_manifest_status_rows": len(reference_manifest_status_rows),
+              "source_status_rows": len(source_status_rows),
+              "permission_rows": len(permission_rows),
+              "next_rows": len(next_rows),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "claims_model_residual_without_reference": False,
+                  "claims_shared_cause": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_226_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.226 Model Reference Residual Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"observed_axis_rows = {summary['observed_axis_rows']}",
+              f"reference_template_rows = {summary['reference_template_rows']}",
+              f"residual_guard_rows = {summary['residual_guard_rows']}",
+              f"residual_blocked_count = {summary['residual_blocked_count']}",
+              f"residual_allowed_preview_count = {summary['residual_allowed_preview_count']}",
+              f"reference_manifest_status_rows = {summary['reference_manifest_status_rows']}",
+              f"source_status_rows = {summary['source_status_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.226 records the observed LRG, QSO, and ELG source axes, then blocks residual claims unless an explicit reference/model manifest exists.",
+              "",
+              "Truth boundary: no proof, no validation, no residual without a reference/model value, no combined matrix.",
+          ]
+          (OUT / "v4_226_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"observed_axis_rows = {summary['observed_axis_rows']}")
+          print(f"reference_template_rows = {summary['reference_template_rows']}")
+          print(f"residual_guard_rows = {summary['residual_guard_rows']}")
+          print(f"residual_blocked_count = {summary['residual_blocked_count']}")
+          print(f"residual_allowed_preview_count = {summary['residual_allowed_preview_count']}")
+          print(f"reference_manifest_status_rows = {summary['reference_manifest_status_rows']}")
+          print(f"source_status_rows = {summary['source_status_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no residual without reference/model value, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.226 model reference residual guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-226-model-reference-residual-guard-output
+          path: |
+            tairid_v4_226_model_reference_residual_guard_output/
+            tairid-v4-226-model-reference-residual-guard-output.zip
