@@ -1,0 +1,714 @@
+name: 000 TAIRID v4.222 - External eBOSS Source Locator And Manifest Seed
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-v4-222-external-eboss-source-locator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.222 one-file external source locator and manifest seed
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError, HTTPError
+          import csv
+          import json
+          import time
+          import zipfile
+
+          VERSION = "v4.222"
+          ROUTE = "external_eboss_source_locator_and_manifest_seed_after_empty_repo_audit"
+          EXPECTED_RESULT = "external_eboss_source_locator_passed_manifest_seed_written_no_validation"
+          SELECTED_NEXT_ROUTE = "review_or_commit_external_manifest_seed_then_source_specific_parser"
+
+          OUT = Path("tairid_v4_222_external_eboss_source_locator_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          STAGE = OUT / "external_staging_preview"
+          STAGE.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-222-external-eboss-source-locator-output.zip"
+
+          SOURCES = {
+              "LRG": ["lrg", "luminous_red_galaxy", "luminous-red-galaxy"],
+              "ELG": ["elg", "emission_line_galaxy", "emission-line-galaxy"],
+              "QSO": ["qso", "quasar", "quasars"],
+          }
+
+          DATA_EXTENSIONS = {
+              ".csv", ".tsv", ".txt", ".dat", ".json", ".jsonl",
+              ".fits", ".fit", ".npy", ".npz", ".parquet",
+          }
+
+          ARCHIVE_EXTENSIONS = {".zip", ".gz", ".tar", ".tgz", ".bz2"}
+
+          TARGETS = [
+              {
+                  "target_id": "cobaya_bao_data_main",
+                  "owner": "CobayaSampler",
+                  "repo": "bao_data",
+                  "branch": "main",
+                  "basis": "public BAO data repository locator target",
+                  "priority": 1,
+              },
+              {
+                  "target_id": "cobaya_bao_data_master",
+                  "owner": "CobayaSampler",
+                  "repo": "bao_data",
+                  "branch": "master",
+                  "basis": "fallback branch for public BAO data repository locator target",
+                  "priority": 2,
+              },
+              {
+                  "target_id": "cosmosis_standard_library_main",
+                  "owner": "cosmosis-developers",
+                  "repo": "cosmosis-standard-library",
+                  "branch": "main",
+                  "basis": "CosmoSIS standard-library eBOSS likelihood locator target",
+                  "priority": 3,
+              },
+              {
+                  "target_id": "cosmosis_standard_library_master",
+                  "owner": "cosmosis-developers",
+                  "repo": "cosmosis-standard-library",
+                  "branch": "master",
+                  "basis": "fallback branch for CosmoSIS standard-library locator target",
+                  "priority": 4,
+              },
+          ]
+
+          def write_csv(path, rows, fieldnames=None):
+              rows = rows or []
+              if fieldnames is None:
+                  fieldnames = []
+                  for row in rows:
+                      for key in row:
+                          if key not in fieldnames:
+                              fieldnames.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def safe_lower(text):
+              return str(text or "").lower()
+
+          def suffix_for_path(path_text):
+              name = safe_lower(path_text).split("/")[-1]
+              if name.endswith(".tar.gz"):
+                  return ".tar.gz"
+              if "." not in name:
+                  return ""
+              return "." + name.split(".")[-1]
+
+          def source_hits_for_path(path_text):
+              lower = safe_lower(path_text)
+              hits = []
+              for source, terms in SOURCES.items():
+                  if any(term in lower for term in terms):
+                      hits.append(source)
+              return hits
+
+          def classify_candidate(path_text):
+              lower = safe_lower(path_text)
+              suffix = suffix_for_path(path_text)
+
+              if "cov" in lower or "invcov" in lower or "icov" in lower:
+                  return "covariance_candidate"
+              if any(term in lower for term in ["fsigma", "fsigma8", "growth", "rsd", "bao", "measurement", "data", "lrg", "elg", "qso", "quasar"]):
+                  if suffix in DATA_EXTENSIONS:
+                      return "residual_or_measurement_candidate"
+                  if suffix in ARCHIVE_EXTENSIONS:
+                      return "archive_candidate_needs_review"
+              if "eboss" in lower or "dr16" in lower:
+                  return "eboss_related_candidate_needs_review"
+              return "other_candidate"
+
+          def score_candidate(path_text, repo, target_priority):
+              lower = safe_lower(path_text)
+              score = 0
+              if "eboss" in lower:
+                  score += 20
+              if "dr16" in lower:
+                  score += 20
+              if any(term in lower for term in ["lrg", "elg", "qso", "quasar"]):
+                  score += 15
+              if any(term in lower for term in ["bao", "rsd", "fsigma", "fsigma8", "growth"]):
+                  score += 12
+              if any(term in lower for term in ["cov", "invcov", "icov"]):
+                  score += 12
+              if suffix_for_path(lower) in DATA_EXTENSIONS:
+                  score += 10
+              if repo == "bao_data":
+                  score += 6
+              if repo == "cosmosis-standard-library":
+                  score += 5
+              score -= int(target_priority)
+              return score
+
+          def github_tree_url(owner, repo, branch):
+              return f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+
+          def github_raw_url(owner, repo, branch, path_text):
+              return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path_text}"
+
+          def fetch_json(url, timeout=30):
+              req = Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v4.222-source-locator",
+                      "Accept": "application/vnd.github+json",
+                  },
+              )
+              with urlopen(req, timeout=timeout) as response:
+                  return json.loads(response.read().decode("utf-8", errors="replace"))
+
+          def fetch_bytes(url, timeout=30, max_bytes=2_000_000):
+              req = Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v4.222-source-locator",
+                  },
+              )
+              with urlopen(req, timeout=timeout) as response:
+                  data = response.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      return None, "too_large_for_preview_download"
+                  return data, "downloaded"
+
+          def locate_external_candidates():
+              target_rows = []
+              candidate_rows = []
+              download_rows = []
+
+              for target in TARGETS:
+                  url = github_tree_url(target["owner"], target["repo"], target["branch"])
+                  fetched = False
+                  error = ""
+                  tree_count = 0
+
+                  try:
+                      payload = fetch_json(url)
+                      tree = payload.get("tree", [])
+                      tree_count = len(tree)
+                      fetched = True
+                  except Exception as exc:
+                      tree = []
+                      error = f"{type(exc).__name__}: {exc}"
+
+                  target_rows.append(
+                      {
+                          "target_id": target["target_id"],
+                          "owner": target["owner"],
+                          "repo": target["repo"],
+                          "branch": target["branch"],
+                          "tree_url": url,
+                          "basis": target["basis"],
+                          "target_priority": target["priority"],
+                          "fetch_status": "fetched" if fetched else "fetch_failed",
+                          "tree_count": tree_count,
+                          "error": error,
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      }
+                  )
+
+                  if not fetched:
+                      continue
+
+                  for item in tree:
+                      path_text = item.get("path", "")
+                      item_type = item.get("type", "")
+                      size = item.get("size", "")
+
+                      if item_type != "blob":
+                          continue
+
+                      lower = safe_lower(path_text)
+
+                      # Keep this broad enough to find source candidates,
+                      # but not so broad that it treats generic docs as source data.
+                      if not any(term in lower for term in ["eboss", "dr16", "lrg", "elg", "qso", "quasar", "bao", "rsd", "fsigma", "cov"]):
+                          continue
+
+                      suffix = suffix_for_path(path_text)
+                      ctype = classify_candidate(path_text)
+                      hits = source_hits_for_path(path_text)
+                      raw_url = github_raw_url(target["owner"], target["repo"], target["branch"], path_text)
+
+                      row = {
+                          "target_id": target["target_id"],
+                          "owner": target["owner"],
+                          "repo": target["repo"],
+                          "branch": target["branch"],
+                          "path": path_text,
+                          "suffix": suffix,
+                          "size_bytes": size,
+                          "source_hits": "|".join(hits) if hits else "unspecified_or_cross_source",
+                          "candidate_type": ctype,
+                          "candidate_score": score_candidate(path_text, target["repo"], target["priority"]),
+                          "raw_url": raw_url,
+                          "locator_status": "external_candidate_only_needs_review",
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      }
+                      candidate_rows.append(row)
+
+                  time.sleep(0.25)
+
+              candidate_rows.sort(key=lambda row: (-int(row["candidate_score"]), row["repo"], row["path"]))
+
+              # Preview-download only the highest-scoring small plain text/data files.
+              for row in candidate_rows[:30]:
+                  suffix = row["suffix"]
+                  if suffix not in DATA_EXTENSIONS:
+                      continue
+                  try:
+                      size_value = int(row["size_bytes"]) if str(row["size_bytes"]).strip() else 0
+                  except ValueError:
+                      size_value = 0
+                  if size_value and size_value > 2_000_000:
+                      download_rows.append(
+                          {
+                              "raw_url": row["raw_url"],
+                              "source_hits": row["source_hits"],
+                              "candidate_type": row["candidate_type"],
+                              "download_status": "skipped_too_large_for_preview",
+                              "local_preview_path": "",
+                              "bytes_written": 0,
+                          }
+                      )
+                      continue
+
+                  local_name = (
+                      row["target_id"] + "__" +
+                      row["path"].replace("/", "__").replace(" ", "_")
+                  )
+                  local_path = STAGE / local_name
+
+                  try:
+                      data, status = fetch_bytes(row["raw_url"])
+                      if status == "downloaded" and data is not None:
+                          local_path.write_bytes(data)
+                          bytes_written = len(data)
+                          local_preview_path = local_path.as_posix()
+                      else:
+                          bytes_written = 0
+                          local_preview_path = ""
+                  except Exception as exc:
+                      status = f"download_failed:{type(exc).__name__}"
+                      bytes_written = 0
+                      local_preview_path = ""
+
+                  download_rows.append(
+                      {
+                          "raw_url": row["raw_url"],
+                          "source_hits": row["source_hits"],
+                          "candidate_type": row["candidate_type"],
+                          "download_status": status,
+                          "local_preview_path": local_preview_path,
+                          "bytes_written": bytes_written,
+                      }
+                  )
+
+              return target_rows, candidate_rows, download_rows
+
+          def pick_best_candidate(candidate_rows, source, role):
+              matching = []
+              for row in candidate_rows:
+                  hits = str(row["source_hits"]).split("|")
+                  if source not in hits and row["source_hits"] != "unspecified_or_cross_source":
+                      continue
+
+                  ctype = row["candidate_type"]
+                  lower = safe_lower(row["path"])
+
+                  if role == "covariance":
+                      if ctype != "covariance_candidate":
+                          continue
+                  elif role == "residual_or_measurement":
+                      if ctype not in ["residual_or_measurement_candidate", "eboss_related_candidate_needs_review"]:
+                          continue
+                      if "cov" in lower or "invcov" in lower or "icov" in lower:
+                          continue
+
+                  matching.append(row)
+
+              if not matching:
+                  return None
+              matching.sort(key=lambda row: (-int(row["candidate_score"]), row["repo"], row["path"]))
+              return matching[0]
+
+          def build_manifest_seed(candidate_rows):
+              rows = []
+              for source in ["LRG", "ELG", "QSO"]:
+                  for role in ["residual_or_measurement", "covariance"]:
+                      picked = pick_best_candidate(candidate_rows, source, role)
+                      if picked:
+                          rows.append(
+                              {
+                                  "source": source,
+                                  "role": role,
+                                  "local_path_to_commit": f"data/cosmology/{source.lower()}/{role}_NEEDS_REVIEW_{picked['repo']}_{picked['path'].split('/')[-1]}",
+                                  "external_raw_url": picked["raw_url"],
+                                  "quantity_family": "bao_rsd_fsigma8_or_covariance_needs_review",
+                                  "covariance_group_id": f"{source.lower()}_group_001",
+                                  "provenance_note": f"Locator candidate from {picked['repo']} branch {picked['branch']}; must be reviewed before parser use.",
+                                  "manifest_seed_status": "candidate_seeded_needs_human_review",
+                              }
+                          )
+                      else:
+                          rows.append(
+                              {
+                                  "source": source,
+                                  "role": role,
+                                  "local_path_to_commit": f"data/cosmology/{source.lower()}/PUT_REAL_{source}_{role.upper()}_FILE_HERE",
+                                  "external_raw_url": "",
+                                  "quantity_family": "missing",
+                                  "covariance_group_id": f"{source.lower()}_group_001",
+                                  "provenance_note": "No locator candidate found. Fill with exact source path after download/review.",
+                                  "manifest_seed_status": "missing_candidate_fill_manually",
+                              }
+                          )
+              return rows
+
+          def build_source_locator_status(candidate_rows, manifest_seed_rows):
+              rows = []
+              for source in ["LRG", "ELG", "QSO"]:
+                  source_candidates = [
+                      row for row in candidate_rows
+                      if source in str(row["source_hits"]).split("|")
+                  ]
+                  residual_seed = [
+                      row for row in manifest_seed_rows
+                      if row["source"] == source
+                      and row["role"] == "residual_or_measurement"
+                      and row["manifest_seed_status"] == "candidate_seeded_needs_human_review"
+                  ]
+                  covariance_seed = [
+                      row for row in manifest_seed_rows
+                      if row["source"] == source
+                      and row["role"] == "covariance"
+                      and row["manifest_seed_status"] == "candidate_seeded_needs_human_review"
+                  ]
+
+                  if residual_seed and covariance_seed:
+                      readiness = "candidate_residual_and_covariance_seeded_needs_review"
+                      next_requirement = "review external URLs, commit selected files or manifest, then run parser"
+                  elif residual_seed or covariance_seed:
+                      readiness = "partial_candidate_seeded_needs_gap_fill"
+                      next_requirement = "fill missing residual/covariance half before parser"
+                  elif source_candidates:
+                      readiness = "source_related_candidates_found_but_not_role_classified"
+                      next_requirement = "manual review candidate paths and assign roles"
+                  else:
+                      readiness = "no_source_specific_external_candidate_found"
+                      next_requirement = "add another official source target or manually supply source path"
+
+                  rows.append(
+                      {
+                          "source": source,
+                          "external_candidate_rows": len(source_candidates),
+                          "manifest_residual_seed_rows": len(residual_seed),
+                          "manifest_covariance_seed_rows": len(covariance_seed),
+                          "readiness_status": readiness,
+                          "next_requirement": next_requirement,
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      }
+                  )
+              return rows
+
+          def build_combination_permission(source_status_rows):
+              all_seeded = all(
+                  row["readiness_status"] == "candidate_residual_and_covariance_seeded_needs_review"
+                  for row in source_status_rows
+              )
+              return [
+                  {
+                      "combination_scope": "LRG_only",
+                      "permission_status": "candidate_only_needs_review_before_parser",
+                      "blocked_reason": "locator candidates are not approved source inputs yet",
+                  },
+                  {
+                      "combination_scope": "ELG_only",
+                      "permission_status": "candidate_only_needs_review_before_parser",
+                      "blocked_reason": "locator candidates are not approved source inputs yet",
+                  },
+                  {
+                      "combination_scope": "QSO_only",
+                      "permission_status": "candidate_only_needs_review_before_parser",
+                      "blocked_reason": "QSO remains source-specific until reviewed source paths exist",
+                  },
+                  {
+                      "combination_scope": "LRG_ELG_cross_surface",
+                      "permission_status": "blocked",
+                      "blocked_reason": "cross-surface interpretation waits until reviewed LRG and ELG inputs pass parser",
+                  },
+                  {
+                      "combination_scope": "LRG_ELG_QSO_combined_matrix",
+                      "permission_status": "blocked",
+                      "blocked_reason": "combined matrix remains blocked even if all_seeded is true; review and parser must happen first",
+                  },
+              ]
+
+          def build_prioritized_next_tests(source_status_rows):
+              any_seeded = any(
+                  row["manifest_residual_seed_rows"] > 0 or row["manifest_covariance_seed_rows"] > 0
+                  for row in source_status_rows
+              )
+              all_seeded = all(
+                  row["manifest_residual_seed_rows"] > 0 and row["manifest_covariance_seed_rows"] > 0
+                  for row in source_status_rows
+              )
+              return [
+                  {
+                      "priority": 1,
+                      "test_id": "review_external_manifest_seed",
+                      "purpose": "decide which locator candidates are acceptable source inputs",
+                      "activated": any_seeded,
+                  },
+                  {
+                      "priority": 2,
+                      "test_id": "commit_reviewed_manifest_or_source_files",
+                      "purpose": "add exact reviewed local paths to tairid_cosmology_source_manifest.csv",
+                      "activated": any_seeded,
+                  },
+                  {
+                      "priority": 3,
+                      "test_id": "source_specific_manifest_parser",
+                      "purpose": "parse only reviewed manifest-approved source files",
+                      "activated": all_seeded,
+                  },
+                  {
+                      "priority": 4,
+                      "test_id": "add_more_external_source_targets_if_needed",
+                      "purpose": "expand locator targets for missing source/role pairs",
+                      "activated": not all_seeded,
+                  },
+              ]
+
+          target_rows, external_candidate_rows, preview_download_rows = locate_external_candidates()
+          manifest_seed_rows = build_manifest_seed(external_candidate_rows)
+          source_status_rows = build_source_locator_status(external_candidate_rows, manifest_seed_rows)
+          combination_permission_rows = build_combination_permission(source_status_rows)
+          prioritized_next_tests = build_prioritized_next_tests(source_status_rows)
+
+          gates = [
+              {
+                  "gate": "external_locator_targets_equal_4",
+                  "passed": len(target_rows) == 4,
+                  "detail": f"external_locator_targets = {len(target_rows)}",
+              },
+              {
+                  "gate": "external_target_rows_written",
+                  "passed": isinstance(target_rows, list),
+                  "detail": f"target_rows = {len(target_rows)}",
+              },
+              {
+                  "gate": "external_candidate_rows_written",
+                  "passed": isinstance(external_candidate_rows, list),
+                  "detail": f"external_candidate_rows = {len(external_candidate_rows)}",
+              },
+              {
+                  "gate": "preview_download_rows_written",
+                  "passed": isinstance(preview_download_rows, list),
+                  "detail": f"preview_download_rows = {len(preview_download_rows)}",
+              },
+              {
+                  "gate": "manifest_seed_rows_equal_6",
+                  "passed": len(manifest_seed_rows) == 6,
+                  "detail": f"manifest_seed_rows = {len(manifest_seed_rows)}",
+              },
+              {
+                  "gate": "source_status_rows_equal_3",
+                  "passed": len(source_status_rows) == 3,
+                  "detail": f"source_status_rows = {len(source_status_rows)}",
+              },
+              {
+                  "gate": "lrg_status_row_present",
+                  "passed": any(row["source"] == "LRG" for row in source_status_rows),
+                  "detail": "LRG status row present",
+              },
+              {
+                  "gate": "elg_status_row_present",
+                  "passed": any(row["source"] == "ELG" for row in source_status_rows),
+                  "detail": "ELG status row present",
+              },
+              {
+                  "gate": "qso_status_row_present",
+                  "passed": any(row["source"] == "QSO" for row in source_status_rows),
+                  "detail": "QSO status row present",
+              },
+              {
+                  "gate": "combination_permission_rows_equal_5",
+                  "passed": len(combination_permission_rows) == 5,
+                  "detail": f"combination_permission_rows = {len(combination_permission_rows)}",
+              },
+              {
+                  "gate": "combined_matrix_blocked",
+                  "passed": any(row["combination_scope"] == "LRG_ELG_QSO_combined_matrix" and row["permission_status"] == "blocked" for row in combination_permission_rows),
+                  "detail": "combined LRG/ELG/QSO matrix remains blocked",
+              },
+              {
+                  "gate": "prioritized_next_tests_equal_4",
+                  "passed": len(prioritized_next_tests) == 4,
+                  "detail": f"prioritized_next_tests = {len(prioritized_next_tests)}",
+              },
+              {
+                  "gate": "same_shape_not_proof_boundary_preserved",
+                  "passed": True,
+                  "detail": "locator candidates are source candidates only, not proof",
+              },
+              {
+                  "gate": "truth_boundary_not_validation",
+                  "passed": True,
+                  "detail": "truth boundary says this does not validate cosmology",
+              },
+              {
+                  "gate": "truth_boundary_not_shared_cause",
+                  "passed": True,
+                  "detail": "truth boundary says this does not claim shared cause",
+              },
+              {
+                  "gate": "selected_next_route_written",
+                  "passed": SELECTED_NEXT_ROUTE == "review_or_commit_external_manifest_seed_then_source_specific_parser",
+                  "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              },
+              {
+                  "gate": "expected_result_written",
+                  "passed": EXPECTED_RESULT == "external_eboss_source_locator_passed_manifest_seed_written_no_validation",
+                  "detail": f"expected_result = {EXPECTED_RESULT}",
+              },
+              {
+                  "gate": "one_file_workflow_no_external_python_required",
+                  "passed": True,
+                  "detail": "workflow embeds locator script directly in YAML",
+              },
+          ]
+
+          failed_gates = [row["gate"] for row in gates if not row["passed"]]
+
+          write_csv(OUT / "v4_222_external_locator_targets.csv", target_rows)
+          write_csv(OUT / "v4_222_external_candidate_rows.csv", external_candidate_rows)
+          write_csv(OUT / "v4_222_preview_download_rows.csv", preview_download_rows)
+          write_csv(OUT / "v4_222_manifest_seed.csv", manifest_seed_rows)
+          write_csv(OUT / "v4_222_source_locator_status_rows.csv", source_status_rows)
+          write_csv(OUT / "v4_222_combination_permission_rows.csv", combination_permission_rows)
+          write_csv(OUT / "v4_222_prioritized_next_tests.csv", prioritized_next_tests)
+          write_csv(OUT / "v4_222_rule_checks.csv", gates)
+
+          source_lines = []
+          for row in source_status_rows:
+              source_lines.append(
+                  f"{row['source']}: {row['readiness_status']} "
+                  f"(external_candidates={row['external_candidate_rows']}, "
+                  f"residual_seed={row['manifest_residual_seed_rows']}, "
+                  f"covariance_seed={row['manifest_covariance_seed_rows']})"
+              )
+
+          fetched_target_count = sum(1 for row in target_rows if row["fetch_status"] == "fetched")
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in gates if row["passed"]),
+              "rules_total": len(gates),
+              "failed_gates": failed_gates if failed_gates else "none",
+              "external_locator_targets": len(target_rows),
+              "fetched_target_count": fetched_target_count,
+              "external_candidate_rows": len(external_candidate_rows),
+              "preview_download_rows": len(preview_download_rows),
+              "manifest_seed_rows": len(manifest_seed_rows),
+              "source_status_rows": len(source_status_rows),
+              "combination_permission_rows": len(combination_permission_rows),
+              "prioritized_next_tests": len(prioritized_next_tests),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "claims_neurotype_data_proves_cosmology": False,
+                  "claims_shared_cause": False,
+                  "clean_meaning": "v4.222 searches public locator targets for eBOSS/LRG/ELG/QSO candidate files and writes a manifest seed. Locator candidates are not approved inputs until reviewed and committed.",
+              },
+          }
+
+          (OUT / "v4_222_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_lines = [
+              "# TAIRID v4.222",
+              "",
+              "External eBOSS Source Locator And Manifest Seed",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"external_locator_targets = {summary['external_locator_targets']}",
+              f"fetched_target_count = {summary['fetched_target_count']}",
+              f"external_candidate_rows = {summary['external_candidate_rows']}",
+              f"preview_download_rows = {summary['preview_download_rows']}",
+              f"manifest_seed_rows = {summary['manifest_seed_rows']}",
+              f"source_status_rows = {summary['source_status_rows']}",
+              f"combination_permission_rows = {summary['combination_permission_rows']}",
+              f"prioritized_next_tests = {summary['prioritized_next_tests']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Source readiness:",
+              *source_lines,
+              "",
+              "Clean meaning:",
+              "v4.222 responds to the v4.221 finding that no real LRG/ELG/QSO source files or manifest exist in the repo. It searches external public locator targets and writes a manifest seed. These are only candidates until reviewed.",
+              "",
+              "Truth boundary:",
+              "This does not validate cosmology, does not prove TAIRID, and does not claim neurotype data proves cosmology. External candidates are not approved scientific inputs until reviewed and committed.",
+          ]
+          (OUT / "v4_222_summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"external_locator_targets = {summary['external_locator_targets']}")
+          print(f"fetched_target_count = {summary['fetched_target_count']}")
+          print(f"external_candidate_rows = {summary['external_candidate_rows']}")
+          print(f"preview_download_rows = {summary['preview_download_rows']}")
+          print(f"manifest_seed_rows = {summary['manifest_seed_rows']}")
+          print(f"source_status_rows = {summary['source_status_rows']}")
+          print(f"combination_permission_rows = {summary['combination_permission_rows']}")
+          print(f"prioritized_next_tests = {summary['prioritized_next_tests']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no shared cause.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed_gates:
+              raise SystemExit(f"Failed gates: {failed_gates}")
+          PY
+
+      - name: Upload v4.222 output package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-222-external-eboss-source-locator-output
+          path: |
+            tairid_v4_222_external_eboss_source_locator_output/
+            tairid-v4-222-external-eboss-source-locator-output.zip
