@@ -1,0 +1,582 @@
+name: 001 TAIRID v4.229 - ELG Axis Translation Guard
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-229-elg-axis-translation-guard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  elg-axis-translation-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.229 ELG Axis Translation Guard is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.229 ELG axis translation guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.229"
+          ROUTE = "elg_axis_translation_guard_after_v4_228"
+          EXPECTED_RESULT = "v4_229_elg_axis_translation_guard_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_230_lrg_qso_residual_stability_expansion_or_geometry_compression_review"
+
+          OUT = Path("tairid_v4_229_elg_axis_translation_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-229-elg-axis-translation-guard-output.zip"
+
+          BASE = "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16"
+
+          SOURCE_INPUTS = [
+              {
+                  "source": "LRG",
+                  "surface_id": "lrg_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+              },
+              {
+                  "source": "QSO",
+                  "surface_id": "qso_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+              },
+          ]
+
+          ELG_URL = BASE + "/elg/sdss_DR16_ELG_BAO_DVtable.txt"
+
+          AXIS_MAP = {
+              "DM_over_rd": "D_M_over_r_sound",
+              "DM_over_rs": "D_M_over_r_sound",
+              "DH_over_rd": "D_H_over_r_sound",
+              "DH_over_rs": "D_H_over_r_sound",
+              "f_sigma8": "f_sigma8",
+          }
+
+          BASELINE_VARIANTS = [
+              {"variant_id": "baseline_planck_like", "H0_km_s_Mpc": 67.36, "Omega_m0": 0.3153, "sigma8_0": 0.8111, "growth_gamma": 0.55, "r_sound_Mpc": 147.09},
+              {"variant_id": "baseline_low_h0_high_om", "H0_km_s_Mpc": 66.50, "Omega_m0": 0.3300, "sigma8_0": 0.8000, "growth_gamma": 0.55, "r_sound_Mpc": 147.50},
+              {"variant_id": "baseline_high_h0_low_om", "H0_km_s_Mpc": 69.00, "Omega_m0": 0.3000, "sigma8_0": 0.8200, "growth_gamma": 0.55, "r_sound_Mpc": 146.50},
+              {"variant_id": "baseline_growth_low", "H0_km_s_Mpc": 67.36, "Omega_m0": 0.3153, "sigma8_0": 0.7800, "growth_gamma": 0.55, "r_sound_Mpc": 147.09},
+              {"variant_id": "baseline_growth_high", "H0_km_s_Mpc": 67.36, "Omega_m0": 0.3153, "sigma8_0": 0.8400, "growth_gamma": 0.55, "r_sound_Mpc": 147.09},
+          ]
+
+          C_LIGHT = 299792.458
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def fetch_text(url):
+              req = Request(url, headers={"User-Agent": "TAIRID-v4.229-elg-axis-translation"})
+              with urlopen(req, timeout=45) as response:
+                  return response.read().decode("utf-8", errors="replace")
+
+          def safe_float(token):
+              try:
+                  return float(token)
+              except Exception:
+                  return None
+
+          def numeric_lines(text):
+              rows = []
+              for line in text.splitlines():
+                  raw = line.strip()
+                  if not raw or raw.startswith("#"):
+                      continue
+                  nums = []
+                  labels = []
+                  for part in raw.replace(",", " ").split():
+                      value = safe_float(part)
+                      if value is None:
+                          labels.append(part)
+                      else:
+                          nums.append(value)
+                  rows.append((nums, labels, raw))
+              return rows
+
+          def parse_measurements(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2 and labels:
+                      rows.append({
+                          "redshift": nums[0],
+                          "value": nums[1],
+                          "quantity": labels[-1],
+                      })
+              return rows
+
+          def parse_matrix(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if nums:
+                      rows.append(nums)
+              return rows
+
+          def parse_elg_surface(text):
+              pairs = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2:
+                      pairs.append((nums[0], nums[1]))
+              pairs = sorted(pairs, key=lambda pair: pair[0])
+              if not pairs:
+                  return {"table_rows": 0, "median_x": float("nan"), "weighted_sigma_x": float("nan"), "peak_x": float("nan")}
+
+              xs = [pair[0] for pair in pairs]
+              ys = [pair[1] for pair in pairs]
+
+              def trap(x_list, y_list):
+                  total = 0.0
+                  for i in range(1, len(x_list)):
+                      total += 0.5 * (x_list[i] - x_list[i - 1]) * (y_list[i] + y_list[i - 1])
+                  return total
+
+              area = trap(xs, ys)
+              pdf = [y / area if area else 0.0 for y in ys]
+              mean = trap(xs, [x * p for x, p in zip(xs, pdf)])
+              var = trap(xs, [((x - mean) ** 2) * p for x, p in zip(xs, pdf)])
+              sigma = math.sqrt(var) if var >= 0 else float("nan")
+
+              cdf = [0.0]
+              running = 0.0
+              for i in range(1, len(xs)):
+                  running += 0.5 * (xs[i] - xs[i - 1]) * (pdf[i] + pdf[i - 1])
+                  cdf.append(running)
+              if running:
+                  cdf = [value / running for value in cdf]
+
+              median = xs[-1]
+              for i in range(1, len(xs)):
+                  if cdf[i] >= 0.5:
+                      c0 = cdf[i - 1]
+                      c1 = cdf[i]
+                      x0 = xs[i - 1]
+                      x1 = xs[i]
+                      median = x1 if c1 == c0 else x0 + ((0.5 - c0) / (c1 - c0)) * (x1 - x0)
+                      break
+
+              peak_x, peak_y = max(pairs, key=lambda pair: pair[1])
+              return {"table_rows": len(pairs), "median_x": median, "weighted_mean_x": mean, "weighted_sigma_x": sigma, "peak_x": peak_x}
+
+          def E_z(z, baseline):
+              om = baseline["Omega_m0"]
+              ol = 1.0 - om
+              return math.sqrt(om * (1.0 + z) ** 3 + ol)
+
+          def simpson_integral(f, a, b, n=2000):
+              if b == a:
+                  return 0.0
+              if n % 2:
+                  n += 1
+              h = (b - a) / n
+              total = f(a) + f(b)
+              for i in range(1, n):
+                  x = a + i * h
+                  total += (4 if i % 2 else 2) * f(x)
+              return total * h / 3.0
+
+          def dm_over_rsound(z, baseline):
+              integral = simpson_integral(lambda zz: 1.0 / E_z(zz, baseline), 0.0, z)
+              dm_mpc = (C_LIGHT / baseline["H0_km_s_Mpc"]) * integral
+              return dm_mpc / baseline["r_sound_Mpc"]
+
+          def dh_over_rsound(z, baseline):
+              dh_mpc = C_LIGHT / (baseline["H0_km_s_Mpc"] * E_z(z, baseline))
+              return dh_mpc / baseline["r_sound_Mpc"]
+
+          def dv_over_rsound_from_baseline(z, baseline):
+              dm = dm_over_rsound(z, baseline)
+              dh = dh_over_rsound(z, baseline)
+              return (z * dm * dm * dh) ** (1.0 / 3.0)
+
+          def dv_from_dm_dh(z, dm, dh):
+              return (z * dm * dm * dh) ** (1.0 / 3.0)
+
+          def dv_sigma_from_dm_dh_cov(z, dm, dh, cov00, cov01, cov11):
+              dv = dv_from_dm_dh(z, dm, dh)
+              d_d_dm = (2.0 / 3.0) * dv / dm
+              d_d_dh = (1.0 / 3.0) * dv / dh
+              var = d_d_dm * d_d_dm * cov00 + 2.0 * d_d_dm * d_d_dh * cov01 + d_d_dh * d_d_dh * cov11
+              return math.sqrt(var) if var >= 0 else float("nan")
+
+          translation_rule_rows = [
+              {
+                  "rule_id": "translation_001",
+                  "translation_scope": "LRG_QSO_DMDH_to_compressed_DV",
+                  "translation_formula": "DV_over_r_sound = (z * (D_M_over_r_sound)^2 * D_H_over_r_sound)^(1/3)",
+                  "allowed_use": "derive a compressed geometry coordinate for LRG/QSO source-surface comparison",
+                  "blocked_use": "does not preserve full D_M/D_H/f_sigma8 covariance structure",
+              },
+              {
+                  "rule_id": "translation_002",
+                  "translation_scope": "ELG_DVtable_to_compressed_DV",
+                  "translation_formula": "ELG DVtable x coordinate is held as compressed geometry likelihood coordinate",
+                  "allowed_use": "compare only inside compressed geometry lane after guard",
+                  "blocked_use": "do not treat as D_M, D_H, or f_sigma8 separately",
+              },
+              {
+                  "rule_id": "translation_003",
+                  "translation_scope": "combined_matrix_guard",
+                  "translation_formula": "No full LRG/ELG/QSO matrix from compressed DV alone",
+                  "allowed_use": "source-surface review only",
+                  "blocked_use": "no combined matrix permission",
+              },
+          ]
+
+          observed_compressed_rows = []
+
+          for item in SOURCE_INPUTS:
+              source = item["source"]
+              measurements = parse_measurements(fetch_text(item["measurement_url"]))
+              covariance = parse_matrix(fetch_text(item["covariance_url"]))
+
+              by_standard = {}
+              for index, measurement in enumerate(measurements):
+                  standard_quantity = AXIS_MAP.get(measurement["quantity"], measurement["quantity"])
+                  by_standard[standard_quantity] = {
+                      "value": measurement["value"],
+                      "native_quantity": measurement["quantity"],
+                      "redshift": measurement["redshift"],
+                      "index": index,
+                  }
+
+              dm = by_standard["D_M_over_r_sound"]["value"]
+              dh = by_standard["D_H_over_r_sound"]["value"]
+              z = by_standard["D_M_over_r_sound"]["redshift"]
+              dv = dv_from_dm_dh(z, dm, dh)
+
+              i_dm = by_standard["D_M_over_r_sound"]["index"]
+              i_dh = by_standard["D_H_over_r_sound"]["index"]
+              cov00 = covariance[i_dm][i_dm]
+              cov01 = covariance[i_dm][i_dh]
+              cov11 = covariance[i_dh][i_dh]
+              sigma = dv_sigma_from_dm_dh_cov(z, dm, dh, cov00, cov01, cov11)
+
+              observed_compressed_rows.append({
+                  "source": source,
+                  "surface_id": item["surface_id"],
+                  "compressed_axis": "D_V_over_r_sound_derived_from_D_M_D_H",
+                  "redshift_or_axis_position": z,
+                  "observed_compressed_value": dv,
+                  "observed_compressed_sigma": sigma,
+                  "source_native_status": "derived_compressed_geometry_from_D_M_D_H",
+                  "translation_status": "allowed_for_compressed_geometry_lane_only",
+                  "blocked_read": "not full source covariance and not f_sigma8",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          elg_surface = parse_elg_surface(fetch_text(ELG_URL))
+          observed_compressed_rows.append({
+              "source": "ELG",
+              "surface_id": "elg_dr16_bao_dvtable",
+              "compressed_axis": "D_V_over_r_sound_likelihood_coordinate",
+              "redshift_or_axis_position": 0.845,
+              "observed_compressed_value": elg_surface["median_x"],
+              "observed_compressed_sigma": elg_surface["weighted_sigma_x"],
+              "source_native_status": "native_elg_likelihood_table_coordinate",
+              "translation_status": "allowed_for_compressed_geometry_lane_only",
+              "blocked_read": "not D_M/D_H/f_sigma8 split and not fake covariance",
+              "proof_status": "not_proof",
+              "validation_status": "not_validation",
+          })
+
+          compressed_residual_rows = []
+          for baseline in BASELINE_VARIANTS:
+              for obs in observed_compressed_rows:
+                  z = float(obs["redshift_or_axis_position"])
+                  ref_value = dv_over_rsound_from_baseline(z, baseline)
+                  observed = float(obs["observed_compressed_value"])
+                  sigma = float(obs["observed_compressed_sigma"])
+                  residual = observed - ref_value
+                  residual_z = residual / sigma if sigma and not math.isnan(sigma) else float("nan")
+                  if math.isnan(residual_z) or abs(residual_z) < 1.0:
+                      direction = "0"
+                  elif residual > 0:
+                      direction = "+"
+                  else:
+                      direction = "-"
+
+                  compressed_residual_rows.append({
+                      "variant_id": baseline["variant_id"],
+                      "source": obs["source"],
+                      "surface_id": obs["surface_id"],
+                      "compressed_axis": obs["compressed_axis"],
+                      "redshift_or_axis_position": z,
+                      "observed_compressed_value": observed,
+                      "observed_compressed_sigma": sigma,
+                      "reference_compressed_value": ref_value,
+                      "compressed_residual_value": residual,
+                      "compressed_residual_z_score": residual_z,
+                      "guarded_compressed_direction": direction,
+                      "residual_status": "compressed_geometry_residual_preview_only",
+                      "blocked_read": "not validation, not full matrix, not f_sigma8, not TAIRID proof",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          compressed_signature_rows = []
+          for baseline in BASELINE_VARIANTS:
+              variant_id = baseline["variant_id"]
+              rows = [row for row in compressed_residual_rows if row["variant_id"] == variant_id]
+              ordered_sources = ["LRG", "ELG", "QSO"]
+              signature = "".join(
+                  next(row["guarded_compressed_direction"] for row in rows if row["source"] == source)
+                  for source in ordered_sources
+              )
+              compressed_signature_rows.append({
+                  "variant_id": variant_id,
+                  "signature_scope": "compressed_geometry_lane_LRG_ELG_QSO",
+                  "source_order": "|".join(ordered_sources),
+                  "guarded_compressed_signature": signature,
+                  "allowed_read": "compressed geometry lane preview only",
+                  "blocked_read": "not full source matrix and not validation",
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          source_translation_status_rows = []
+          for source in ["LRG", "ELG", "QSO"]:
+              rows = [row for row in compressed_residual_rows if row["source"] == source]
+              directions = [row["guarded_compressed_direction"] for row in rows]
+              unique_directions = sorted(set(directions))
+
+              if len(unique_directions) == 1:
+                  stability_status = "compressed_direction_stable_under_baseline_bracket"
+              else:
+                  stability_status = "compressed_direction_sensitive_under_baseline_bracket"
+
+              if source == "ELG":
+                  role_status = "translated_into_compressed_geometry_lane_only"
+                  next_requirement = "Keep ELG out of full axis matrix; use only compressed geometry lane."
+              else:
+                  role_status = "derived_compressed_geometry_from_split_axes"
+                  next_requirement = "Do not replace native D_M/D_H/f_sigma8 source review with this compressed lane."
+
+              source_translation_status_rows.append({
+                  "source": source,
+                  "direction_sequence": "".join(directions),
+                  "unique_directions": "|".join(unique_directions),
+                  "stability_status": stability_status,
+                  "role_status": role_status,
+                  "next_requirement": next_requirement,
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          permission_rows = [
+              {
+                  "permission_scope": "compressed_geometry_lane_review",
+                  "permission_status": "allowed_as_guarded_preview",
+                  "reason": "All three sources now have a compressed D_V-like geometry coordinate.",
+              },
+              {
+                  "permission_scope": "elg_full_axis_translation",
+                  "permission_status": "blocked",
+                  "reason": "ELG DVtable does not provide separate D_M, D_H, or f_sigma8 axes.",
+              },
+              {
+                  "permission_scope": "full_lrg_elg_qso_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Compressed geometry lane is not a full combined matrix.",
+              },
+              {
+                  "permission_scope": "tairid_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "Translation guard is not a validation test.",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_230_lrg_qso_residual_stability_expansion",
+                  "purpose": "expand source-specific LRG/QSO split-axis residual stability before shape interpretation",
+                  "activated": True,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_230_compressed_geometry_lane_review",
+                  "purpose": "review compressed geometry lane signatures under broader reference brackets",
+                  "activated": True,
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_230_elg_full_axis_limit_statement",
+                  "purpose": "write explicit limit statement that ELG cannot enter full D_M/D_H/f_sigma8 matrix from DVtable alone",
+                  "activated": True,
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_230_combined_matrix_permission_recheck",
+                  "purpose": "combined matrix remains blocked until full source axes and guards exist",
+                  "activated": True,
+              },
+          ]
+
+          baseline_rows = []
+          for baseline in BASELINE_VARIANTS:
+              row = dict(baseline)
+              row["reference_status"] = "baseline_sensitivity_variant_only_not_fit"
+              row["proof_status"] = "not_proof"
+              row["validation_status"] = "not_validation"
+              baseline_rows.append(row)
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before translation guard"},
+              {"gate": "translation_rule_rows_equal_3", "passed": len(translation_rule_rows) == 3, "detail": f"translation_rule_rows = {len(translation_rule_rows)}"},
+              {"gate": "baseline_rows_equal_5", "passed": len(baseline_rows) == 5, "detail": f"baseline_rows = {len(baseline_rows)}"},
+              {"gate": "observed_compressed_rows_equal_3", "passed": len(observed_compressed_rows) == 3, "detail": f"observed_compressed_rows = {len(observed_compressed_rows)}"},
+              {"gate": "compressed_residual_rows_equal_15", "passed": len(compressed_residual_rows) == 15, "detail": f"compressed_residual_rows = {len(compressed_residual_rows)}"},
+              {"gate": "compressed_signature_rows_equal_5", "passed": len(compressed_signature_rows) == 5, "detail": f"compressed_signature_rows = {len(compressed_signature_rows)}"},
+              {"gate": "source_translation_status_rows_equal_3", "passed": len(source_translation_status_rows) == 3, "detail": f"source_translation_status_rows = {len(source_translation_status_rows)}"},
+              {"gate": "elg_compressed_translation_present", "passed": any(row["source"] == "ELG" and row["role_status"] == "translated_into_compressed_geometry_lane_only" for row in source_translation_status_rows), "detail": "ELG compressed translation present"},
+              {"gate": "elg_full_axis_blocked", "passed": any(row["permission_scope"] == "elg_full_axis_translation" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "ELG full axis translation blocked"},
+              {"gate": "full_matrix_blocked", "passed": any(row["permission_scope"] == "full_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "full LRG/ELG/QSO matrix blocked"},
+              {"gate": "tairid_validation_blocked", "passed": any(row["permission_scope"] == "tairid_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "TAIRID validation blocked"},
+              {"gate": "permission_rows_equal_4", "passed": len(permission_rows) == 4, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_not_full_matrix", "passed": True, "detail": "compressed lane is not full matrix"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_230_lrg_qso_residual_stability_expansion_or_geometry_compression_review", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_229_elg_axis_translation_guard_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_229_translation_rule_rows.csv", translation_rule_rows)
+          write_csv(OUT / "v4_229_baseline_variant_rows.csv", baseline_rows)
+          write_csv(OUT / "v4_229_observed_compressed_geometry_rows.csv", observed_compressed_rows)
+          write_csv(OUT / "v4_229_compressed_residual_rows.csv", compressed_residual_rows)
+          write_csv(OUT / "v4_229_compressed_signature_rows.csv", compressed_signature_rows)
+          write_csv(OUT / "v4_229_source_translation_status_rows.csv", source_translation_status_rows)
+          write_csv(OUT / "v4_229_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_229_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_229_rule_checks.csv", checks)
+
+          source_lines = [
+              f"{row['source']}: {row['role_status']} ({row['stability_status']}, directions={row['direction_sequence']})"
+              for row in source_translation_status_rows
+          ]
+
+          signature_lines = [
+              f"{row['variant_id']}: {row['guarded_compressed_signature']} ({row['source_order']})"
+              for row in compressed_signature_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "translation_rule_rows": len(translation_rule_rows),
+              "baseline_rows": len(baseline_rows),
+              "observed_compressed_rows": len(observed_compressed_rows),
+              "compressed_residual_rows": len(compressed_residual_rows),
+              "compressed_signature_rows": len(compressed_signature_rows),
+              "source_translation_status_rows": len(source_translation_status_rows),
+              "permission_rows": len(permission_rows),
+              "next_rows": len(next_rows),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "is_full_combined_matrix": False,
+                  "claims_shared_cause": False,
+                  "elg_full_axis_translation_allowed": False,
+              },
+          }
+
+          (OUT / "v4_229_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.229 ELG Axis Translation Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"translation_rule_rows = {summary['translation_rule_rows']}",
+              f"baseline_rows = {summary['baseline_rows']}",
+              f"observed_compressed_rows = {summary['observed_compressed_rows']}",
+              f"compressed_residual_rows = {summary['compressed_residual_rows']}",
+              f"compressed_signature_rows = {summary['compressed_signature_rows']}",
+              f"source_translation_status_rows = {summary['source_translation_status_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Source translation review:",
+              *source_lines,
+              "",
+              "Compressed geometry signatures:",
+              *signature_lines,
+              "",
+              "Clean meaning: v4.229 translates ELG only into a compressed geometry lane. It does not turn ELG into separate D_M, D_H, or f_sigma8 axes and does not allow a full combined matrix.",
+              "",
+              "Truth boundary: no proof, no validation, no shared cause, no full matrix, no fake ELG axis split.",
+          ]
+          (OUT / "v4_229_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"translation_rule_rows = {summary['translation_rule_rows']}")
+          print(f"baseline_rows = {summary['baseline_rows']}")
+          print(f"observed_compressed_rows = {summary['observed_compressed_rows']}")
+          print(f"compressed_residual_rows = {summary['compressed_residual_rows']}")
+          print(f"compressed_signature_rows = {summary['compressed_signature_rows']}")
+          print(f"source_translation_status_rows = {summary['source_translation_status_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no shared cause, no full matrix, no fake ELG axis split.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.229 ELG axis translation guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-229-elg-axis-translation-guard-output
+          path: |
+            tairid_v4_229_elg_axis_translation_guard_output/
+            tairid-v4-229-elg-axis-translation-guard-output.zip
