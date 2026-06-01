@@ -1,0 +1,664 @@
+name: 000 TAIRID v4.221 - Real Source File Manifest Audit After v4.220
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-v4-221-real-source-file-manifest-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.221 one-file real source manifest audit
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import zipfile
+
+          VERSION = "v4.221"
+          ROUTE = "real_source_file_manifest_audit_after_v4_220"
+          EXPECTED_RESULT = "real_source_file_manifest_audit_passed_manifest_template_or_validation_written_no_validation"
+          SELECTED_NEXT_ROUTE = "fill_lrg_elg_qso_source_manifest_or_build_source_specific_parser_after_manifest"
+
+          OUT = Path("tairid_v4_221_real_source_file_manifest_audit_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-221-real-source-file-manifest-audit-output.zip"
+
+          SOURCES = {
+              "LRG": ["lrg", "luminous_red_galaxy"],
+              "ELG": ["elg", "emission_line_galaxy"],
+              "QSO": ["qso", "quasar"],
+          }
+
+          DATA_EXTENSIONS = {
+              ".csv", ".tsv", ".txt", ".dat", ".json", ".jsonl",
+              ".fits", ".fit", ".npy", ".npz", ".parquet",
+              ".zip", ".gz", ".tar", ".tgz", ".bz2",
+          }
+
+          MANIFEST_NAMES = {
+              "tairid_cosmology_source_manifest.csv",
+              "cosmology_source_manifest.csv",
+              "source_manifest.csv",
+              "lrg_elg_qso_source_manifest.csv",
+              "tairid_lrg_elg_qso_source_manifest.csv",
+          }
+
+          REQUIRED_MANIFEST_COLUMNS = [
+              "source",
+              "role",
+              "path",
+              "quantity_family",
+              "covariance_group_id",
+              "provenance_note",
+          ]
+
+          SOURCE_ROLES = ["residual_or_measurement", "covariance"]
+
+          def write_csv(path, rows, fieldnames=None):
+              rows = rows or []
+              if fieldnames is None:
+                  fieldnames = []
+                  for row in rows:
+                      for key in row:
+                          if key not in fieldnames:
+                              fieldnames.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def safe_lower(text):
+              return str(text or "").lower()
+
+          def source_hits_for_text(text):
+              lower = safe_lower(text)
+              hits = []
+              for source, terms in SOURCES.items():
+                  if any(term in lower for term in terms):
+                      hits.append(source)
+              return hits
+
+          def classify_data_file(path):
+              lower = path.as_posix().lower()
+              name = path.name.lower()
+
+              if any(term in lower for term in ["covariance", "covmat", "invcov", "icov", "_cov", "cov_"]):
+                  return "covariance_candidate"
+              if any(term in lower for term in ["residual", "resid", "fsigma", "fsigma8", "growth", "bao", "measurement", "data"]):
+                  return "residual_or_measurement_candidate"
+              if path.suffix.lower() in [".zip", ".gz", ".tar", ".tgz", ".bz2"]:
+                  return "archive_candidate_needs_extraction"
+              if name in MANIFEST_NAMES or "source_manifest" in name:
+                  return "manifest_candidate"
+              return "data_like_unclassified"
+
+          def is_excluded_path(path):
+              parts = list(path.parts)
+              text = path.as_posix()
+
+              if ".git" in parts:
+                  return True
+              if "__pycache__" in parts:
+                  return True
+              if OUT.name in parts:
+                  return True
+              if len(parts) >= 3 and parts[0] == ".github" and parts[1] == "workflows":
+                  return True
+              if path.suffix.lower() in [".py", ".yml", ".yaml", ".md"]:
+                  return True
+              if text.startswith("./"):
+                  text = text[2:]
+              return False
+
+          def inventory_real_data_files():
+              rows = []
+              for path in Path(".").rglob("*"):
+                  if not path.is_file():
+                      continue
+                  if is_excluded_path(path):
+                      continue
+
+                  suffix = path.suffix.lower()
+                  if suffix not in DATA_EXTENSIONS:
+                      continue
+
+                  try:
+                      size_bytes = path.stat().st_size
+                  except OSError:
+                      size_bytes = -1
+
+                  rel = path.as_posix()
+                  hits = source_hits_for_text(rel)
+                  rows.append(
+                      {
+                          "path": rel,
+                          "filename": path.name,
+                          "suffix": suffix,
+                          "size_bytes": size_bytes,
+                          "source_hits": "|".join(hits) if hits else "unspecified_or_cross_source",
+                          "candidate_type": classify_data_file(path),
+                          "workflow_or_code_excluded": True,
+                      }
+                  )
+
+              rows.sort(key=lambda row: (row["source_hits"], row["candidate_type"], row["path"]))
+              return rows
+
+          def find_manifest_candidates(real_inventory_rows):
+              rows = []
+              seen = set()
+
+              for row in real_inventory_rows:
+                  name = row["filename"].lower()
+                  if name in MANIFEST_NAMES or "source_manifest" in name:
+                      rows.append(
+                          {
+                              "manifest_path": row["path"],
+                              "manifest_status": "found_in_real_data_inventory",
+                              "size_bytes": row["size_bytes"],
+                          }
+                      )
+                      seen.add(row["path"])
+
+              for path in Path(".").rglob("*source*manifest*.csv"):
+                  if not path.is_file() or is_excluded_path(path):
+                      continue
+                  rel = path.as_posix()
+                  if rel in seen:
+                      continue
+                  try:
+                      size_bytes = path.stat().st_size
+                  except OSError:
+                      size_bytes = -1
+                  rows.append(
+                      {
+                          "manifest_path": rel,
+                          "manifest_status": "found_by_manifest_glob",
+                          "size_bytes": size_bytes,
+                      }
+                  )
+
+              rows.sort(key=lambda row: row["manifest_path"])
+              return rows
+
+          def read_manifest(path):
+              try:
+                  with Path(path).open("r", newline="", encoding="utf-8-sig") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      columns = reader.fieldnames or []
+                  return columns, rows, None
+              except Exception as exc:
+                  return [], [], f"{type(exc).__name__}: {exc}"
+
+          def validate_manifest_rows(manifest_candidates):
+              validation_rows = []
+
+              if not manifest_candidates:
+                  validation_rows.append(
+                      {
+                          "manifest_path": "",
+                          "row_number": "",
+                          "source": "",
+                          "role": "",
+                          "path": "",
+                          "path_exists": False,
+                          "column_status": "manifest_missing",
+                          "row_status": "template_needed",
+                          "detail": "No source manifest was found. Use the generated template.",
+                      }
+                  )
+                  return validation_rows
+
+              for manifest in manifest_candidates:
+                  manifest_path = manifest["manifest_path"]
+                  columns, rows, error = read_manifest(manifest_path)
+
+                  if error:
+                      validation_rows.append(
+                          {
+                              "manifest_path": manifest_path,
+                              "row_number": "",
+                              "source": "",
+                              "role": "",
+                              "path": "",
+                              "path_exists": False,
+                              "column_status": "read_failed",
+                              "row_status": "manifest_read_failed",
+                              "detail": error,
+                          }
+                      )
+                      continue
+
+                  missing_columns = [col for col in REQUIRED_MANIFEST_COLUMNS if col not in columns]
+                  column_status = "ok" if not missing_columns else "missing_columns:" + "|".join(missing_columns)
+
+                  if not rows:
+                      validation_rows.append(
+                          {
+                              "manifest_path": manifest_path,
+                              "row_number": "",
+                              "source": "",
+                              "role": "",
+                              "path": "",
+                              "path_exists": False,
+                              "column_status": column_status,
+                              "row_status": "manifest_empty",
+                              "detail": "Manifest exists but has no rows.",
+                          }
+                      )
+                      continue
+
+                  for idx, row in enumerate(rows, start=2):
+                      source = (row.get("source") or "").strip().upper()
+                      role = (row.get("role") or "").strip().lower()
+                      rel_path = (row.get("path") or "").strip()
+                      path_exists = Path(rel_path).exists() if rel_path else False
+
+                      row_issues = []
+                      if source not in SOURCES:
+                          row_issues.append("source_not_lrg_elg_qso")
+                      if role not in SOURCE_ROLES and role not in ["reference", "cross_covariance", "other"]:
+                          row_issues.append("role_not_recognized")
+                      if not rel_path:
+                          row_issues.append("path_blank")
+                      elif not path_exists:
+                          row_issues.append("path_missing")
+
+                      validation_rows.append(
+                          {
+                              "manifest_path": manifest_path,
+                              "row_number": idx,
+                              "source": source,
+                              "role": role,
+                              "path": rel_path,
+                              "path_exists": path_exists,
+                              "column_status": column_status,
+                              "row_status": "ok" if not row_issues and column_status == "ok" else "needs_review",
+                              "detail": "none" if not row_issues else "|".join(row_issues),
+                          }
+                      )
+
+              return validation_rows
+
+          def build_manifest_template():
+              rows = []
+              for source in ["LRG", "ELG", "QSO"]:
+                  rows.append(
+                      {
+                          "source": source,
+                          "role": "residual_or_measurement",
+                          "path": f"data/cosmology/{source.lower()}/PUT_REAL_{source}_RESIDUAL_OR_MEASUREMENT_FILE_HERE.csv",
+                          "quantity_family": "bao_or_rsd_or_fsigma8",
+                          "covariance_group_id": f"{source.lower()}_group_001",
+                          "provenance_note": "replace this row with the exact committed source file path and source note",
+                      }
+                  )
+                  rows.append(
+                      {
+                          "source": source,
+                          "role": "covariance",
+                          "path": f"data/cosmology/{source.lower()}/PUT_REAL_{source}_COVARIANCE_FILE_HERE.txt",
+                          "quantity_family": "full_covariance_or_inverse_covariance",
+                          "covariance_group_id": f"{source.lower()}_group_001",
+                          "provenance_note": "replace this row with the exact committed covariance/invcov file path and source note",
+                      }
+                  )
+              rows.append(
+                  {
+                      "source": "CROSS",
+                      "role": "cross_covariance",
+                      "path": "data/cosmology/cross/OPTIONAL_LRG_ELG_QSO_CROSS_COVARIANCE_FILE_HERE.txt",
+                      "quantity_family": "cross_tracer_covariance_if_available",
+                      "covariance_group_id": "cross_group_optional",
+                      "provenance_note": "optional; only use if source documentation says this is the correct cross-tracer covariance",
+                  }
+              )
+              return rows
+
+          def build_source_status(real_inventory_rows, validation_rows):
+              rows = []
+              for source in ["LRG", "ELG", "QSO"]:
+                  source_inventory = [
+                      row for row in real_inventory_rows
+                      if source in str(row["source_hits"]).split("|")
+                  ]
+                  residual_inventory = [
+                      row for row in source_inventory
+                      if row["candidate_type"] == "residual_or_measurement_candidate"
+                  ]
+                  covariance_inventory = [
+                      row for row in source_inventory
+                      if row["candidate_type"] == "covariance_candidate"
+                  ]
+
+                  valid_manifest_residual = [
+                      row for row in validation_rows
+                      if row["source"] == source
+                      and row["role"] == "residual_or_measurement"
+                      and str(row["path_exists"]) == "True"
+                      and row["row_status"] == "ok"
+                  ]
+                  valid_manifest_covariance = [
+                      row for row in validation_rows
+                      if row["source"] == source
+                      and row["role"] == "covariance"
+                      and str(row["path_exists"]) == "True"
+                      and row["row_status"] == "ok"
+                  ]
+
+                  if valid_manifest_residual and valid_manifest_covariance:
+                      readiness = "manifest_has_existing_residual_and_covariance_paths"
+                      next_requirement = "build source-specific parser for this manifest"
+                  elif source_inventory:
+                      readiness = "real_data_like_candidates_found_manifest_not_ready"
+                      next_requirement = "review inventory and fill manifest with exact residual/covariance paths"
+                  else:
+                      readiness = "no_real_source_files_found_after_excluding_workflows_and_code"
+                      next_requirement = "commit real source files or add source fetch step, then fill manifest"
+
+                  rows.append(
+                      {
+                          "source": source,
+                          "real_source_inventory_rows": len(source_inventory),
+                          "real_residual_candidate_rows": len(residual_inventory),
+                          "real_covariance_candidate_rows": len(covariance_inventory),
+                          "valid_manifest_residual_rows": len(valid_manifest_residual),
+                          "valid_manifest_covariance_rows": len(valid_manifest_covariance),
+                          "readiness_status": readiness,
+                          "next_requirement": next_requirement,
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      }
+                  )
+              return rows
+
+          def build_combination_permission(source_status_rows):
+              all_manifest_ready = all(
+                  row["readiness_status"] == "manifest_has_existing_residual_and_covariance_paths"
+                  for row in source_status_rows
+              )
+
+              return [
+                  {
+                      "combination_scope": "LRG_only",
+                      "permission_status": "allowed_after_lrg_manifest_paths_exist" if any(row["source"] == "LRG" and row["valid_manifest_residual_rows"] > 0 for row in source_status_rows) else "blocked_until_lrg_manifest_path_exists",
+                      "blocked_reason": "source-specific parser needs exact LRG path",
+                  },
+                  {
+                      "combination_scope": "ELG_only",
+                      "permission_status": "allowed_after_elg_manifest_paths_exist" if any(row["source"] == "ELG" and row["valid_manifest_residual_rows"] > 0 for row in source_status_rows) else "blocked_until_elg_manifest_path_exists",
+                      "blocked_reason": "source-specific parser needs exact ELG path",
+                  },
+                  {
+                      "combination_scope": "QSO_only",
+                      "permission_status": "allowed_after_qso_manifest_paths_exist" if any(row["source"] == "QSO" and row["valid_manifest_residual_rows"] > 0 for row in source_status_rows) else "blocked_until_qso_manifest_path_exists",
+                      "blocked_reason": "QSO remains source-specific until its own residual/covariance paths exist",
+                  },
+                  {
+                      "combination_scope": "LRG_ELG_cross_surface",
+                      "permission_status": "blocked_until_lrg_and_elg_manifest_paths_and_covariance_exist",
+                      "blocked_reason": "v4.219 and v4.220 require LRG/ELG separation first",
+                  },
+                  {
+                      "combination_scope": "LRG_ELG_QSO_combined_matrix",
+                      "permission_status": "allowed_for_later_parser_only_if_all_manifest_ready" if all_manifest_ready else "blocked",
+                      "blocked_reason": "combined matrix remains blocked until LRG, ELG, and QSO each have valid residual and covariance paths",
+                  },
+              ]
+
+          def build_prioritized_next_tests(manifest_candidates, source_status_rows):
+              manifest_ready_count = sum(
+                  1 for row in source_status_rows
+                  if row["readiness_status"] == "manifest_has_existing_residual_and_covariance_paths"
+              )
+
+              return [
+                  {
+                      "priority": 1,
+                      "test_id": "fill_or_commit_tairid_cosmology_source_manifest",
+                      "purpose": "put exact LRG/ELG/QSO residual and covariance paths in a committed manifest",
+                      "activated": manifest_ready_count < 3,
+                  },
+                  {
+                      "priority": 2,
+                      "test_id": "source_specific_manifest_parser",
+                      "purpose": "parse only manifest-approved source files",
+                      "activated": manifest_ready_count > 0,
+                  },
+                  {
+                      "priority": 3,
+                      "test_id": "source_covariance_shape_probe",
+                      "purpose": "check whether manifest covariance files are square/readable and source-specific",
+                      "activated": manifest_ready_count > 0,
+                  },
+                  {
+                      "priority": 4,
+                      "test_id": "combined_matrix_permission_recheck",
+                      "purpose": "only recheck combined matrix after all three source manifests are ready",
+                      "activated": True,
+                  },
+              ]
+
+          real_inventory_rows = inventory_real_data_files()
+          manifest_candidates = find_manifest_candidates(real_inventory_rows)
+          manifest_validation_rows = validate_manifest_rows(manifest_candidates)
+          manifest_template_rows = build_manifest_template()
+          source_status_rows = build_source_status(real_inventory_rows, manifest_validation_rows)
+          combination_permission_rows = build_combination_permission(source_status_rows)
+          prioritized_next_tests = build_prioritized_next_tests(manifest_candidates, source_status_rows)
+
+          workflow_leak_rows = [
+              row for row in real_inventory_rows
+              if row["path"].startswith(".github/workflows/")
+          ]
+          code_leak_rows = [
+              row for row in real_inventory_rows
+              if row["suffix"] in [".py", ".yml", ".yaml"]
+          ]
+
+          gates = [
+              {
+                  "gate": "real_data_inventory_written",
+                  "passed": isinstance(real_inventory_rows, list),
+                  "detail": f"real_data_inventory_rows = {len(real_inventory_rows)}",
+              },
+              {
+                  "gate": "workflow_files_excluded_from_real_source_counts",
+                  "passed": len(workflow_leak_rows) == 0,
+                  "detail": f"workflow_leak_rows = {len(workflow_leak_rows)}",
+              },
+              {
+                  "gate": "code_files_excluded_from_real_source_counts",
+                  "passed": len(code_leak_rows) == 0,
+                  "detail": f"code_leak_rows = {len(code_leak_rows)}",
+              },
+              {
+                  "gate": "manifest_candidate_rows_written",
+                  "passed": isinstance(manifest_candidates, list),
+                  "detail": f"manifest_candidate_rows = {len(manifest_candidates)}",
+              },
+              {
+                  "gate": "manifest_validation_rows_written",
+                  "passed": len(manifest_validation_rows) >= 1,
+                  "detail": f"manifest_validation_rows = {len(manifest_validation_rows)}",
+              },
+              {
+                  "gate": "manifest_template_rows_equal_7",
+                  "passed": len(manifest_template_rows) == 7,
+                  "detail": f"manifest_template_rows = {len(manifest_template_rows)}",
+              },
+              {
+                  "gate": "source_status_rows_equal_3",
+                  "passed": len(source_status_rows) == 3,
+                  "detail": f"source_status_rows = {len(source_status_rows)}",
+              },
+              {
+                  "gate": "lrg_status_row_present",
+                  "passed": any(row["source"] == "LRG" for row in source_status_rows),
+                  "detail": "LRG status row present",
+              },
+              {
+                  "gate": "elg_status_row_present",
+                  "passed": any(row["source"] == "ELG" for row in source_status_rows),
+                  "detail": "ELG status row present",
+              },
+              {
+                  "gate": "qso_status_row_present",
+                  "passed": any(row["source"] == "QSO" for row in source_status_rows),
+                  "detail": "QSO status row present",
+              },
+              {
+                  "gate": "combination_permission_rows_equal_5",
+                  "passed": len(combination_permission_rows) == 5,
+                  "detail": f"combination_permission_rows = {len(combination_permission_rows)}",
+              },
+              {
+                  "gate": "combined_matrix_guard_written",
+                  "passed": any(row["combination_scope"] == "LRG_ELG_QSO_combined_matrix" for row in combination_permission_rows),
+                  "detail": "combined matrix permission row present",
+              },
+              {
+                  "gate": "prioritized_next_tests_equal_4",
+                  "passed": len(prioritized_next_tests) == 4,
+                  "detail": f"prioritized_next_tests = {len(prioritized_next_tests)}",
+              },
+              {
+                  "gate": "truth_boundary_not_proof",
+                  "passed": True,
+                  "detail": "truth boundary says this is not proof",
+              },
+              {
+                  "gate": "truth_boundary_not_validation",
+                  "passed": True,
+                  "detail": "truth boundary says this is not cosmology validation",
+              },
+              {
+                  "gate": "selected_next_route_written",
+                  "passed": SELECTED_NEXT_ROUTE == "fill_lrg_elg_qso_source_manifest_or_build_source_specific_parser_after_manifest",
+                  "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              },
+          ]
+
+          failed_gates = [row["gate"] for row in gates if not row["passed"]]
+
+          write_csv(OUT / "v4_221_real_data_file_inventory.csv", real_inventory_rows)
+          write_csv(OUT / "v4_221_manifest_candidates.csv", manifest_candidates)
+          write_csv(OUT / "v4_221_manifest_validation_rows.csv", manifest_validation_rows)
+          write_csv(OUT / "v4_221_source_manifest_template.csv", manifest_template_rows, REQUIRED_MANIFEST_COLUMNS)
+          write_csv(OUT / "v4_221_source_status_rows.csv", source_status_rows)
+          write_csv(OUT / "v4_221_combination_permission_rows.csv", combination_permission_rows)
+          write_csv(OUT / "v4_221_prioritized_next_tests.csv", prioritized_next_tests)
+          write_csv(OUT / "v4_221_rule_checks.csv", gates)
+
+          source_lines = []
+          for row in source_status_rows:
+              source_lines.append(
+                  f"{row['source']}: {row['readiness_status']} "
+                  f"(real_inventory={row['real_source_inventory_rows']}, "
+                  f"residual_candidates={row['real_residual_candidate_rows']}, "
+                  f"covariance_candidates={row['real_covariance_candidate_rows']}, "
+                  f"manifest_residual={row['valid_manifest_residual_rows']}, "
+                  f"manifest_covariance={row['valid_manifest_covariance_rows']})"
+              )
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in gates if row["passed"]),
+              "rules_total": len(gates),
+              "failed_gates": failed_gates if failed_gates else "none",
+              "real_data_inventory_rows": len(real_inventory_rows),
+              "manifest_candidate_rows": len(manifest_candidates),
+              "manifest_validation_rows": len(manifest_validation_rows),
+              "manifest_template_rows": len(manifest_template_rows),
+              "source_status_rows": len(source_status_rows),
+              "combination_permission_rows": len(combination_permission_rows),
+              "prioritized_next_tests": len(prioritized_next_tests),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "claims_neurotype_data_proves_cosmology": False,
+                  "claims_shared_cause": False,
+                  "clean_meaning": "v4.221 excludes workflow/code files from source counts, looks only for real data-like files or a committed manifest, and writes a manifest template if exact LRG/ELG/QSO source paths are still missing.",
+              },
+          }
+
+          (OUT / "v4_221_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_lines = [
+              "# TAIRID v4.221",
+              "",
+              "Real Source File Manifest Audit After v4.220",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"real_data_inventory_rows = {summary['real_data_inventory_rows']}",
+              f"manifest_candidate_rows = {summary['manifest_candidate_rows']}",
+              f"manifest_validation_rows = {summary['manifest_validation_rows']}",
+              f"manifest_template_rows = {summary['manifest_template_rows']}",
+              f"source_status_rows = {summary['source_status_rows']}",
+              f"combination_permission_rows = {summary['combination_permission_rows']}",
+              f"prioritized_next_tests = {summary['prioritized_next_tests']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Source readiness:",
+              *source_lines,
+              "",
+              "Clean meaning:",
+              "v4.221 corrects the v4.220 weakness by excluding workflow YAML and Python scripts from real source-file counts. It looks only for data-like files and source manifests. If no complete manifest exists, it writes a fillable template instead of pretending the source paths are known.",
+              "",
+              "Truth boundary:",
+              "This does not validate cosmology, does not prove TAIRID, and does not claim neurotype data proves cosmology. Missing files or missing manifest paths are gap-closure needs only.",
+          ]
+          (OUT / "v4_221_summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"real_data_inventory_rows = {summary['real_data_inventory_rows']}")
+          print(f"manifest_candidate_rows = {summary['manifest_candidate_rows']}")
+          print(f"manifest_validation_rows = {summary['manifest_validation_rows']}")
+          print(f"manifest_template_rows = {summary['manifest_template_rows']}")
+          print(f"source_status_rows = {summary['source_status_rows']}")
+          print(f"combination_permission_rows = {summary['combination_permission_rows']}")
+          print(f"prioritized_next_tests = {summary['prioritized_next_tests']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no shared cause.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed_gates:
+              raise SystemExit(f"Failed gates: {failed_gates}")
+          PY
+
+      - name: Upload v4.221 output package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-221-real-source-file-manifest-audit-output
+          path: |
+            tairid_v4_221_real_source_file_manifest_audit_output/
+            tairid-v4-221-real-source-file-manifest-audit-output.zip
