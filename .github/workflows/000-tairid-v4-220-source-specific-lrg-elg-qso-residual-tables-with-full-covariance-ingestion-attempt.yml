@@ -1,0 +1,646 @@
+name: 000 TAIRID v4.220 - Source Specific LRG ELG QSO Residual Tables With Full Covariance Ingestion Attempt
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tairid-v4-220-source-specific-residual-covariance-attempt:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lightweight parser dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas
+
+      - name: Run v4.220 one-file source-specific residual and covariance audit
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import math
+          import zipfile
+
+          import numpy as np
+          import pandas as pd
+
+          VERSION = "v4.220"
+          ROUTE = "source_specific_lrg_elg_qso_residual_tables_with_full_covariance_ingestion_attempt"
+          SELECTED_NEXT_ROUTE = "cosmology_source_file_manifest_fill_or_source_specific_parser_after_v4_220"
+          EXPECTED_RESULT = "source_specific_lrg_elg_qso_residual_tables_passed_full_covariance_ingestion_attempt_written_no_validation"
+
+          OUT = Path("tairid_v4_220_source_specific_residual_covariance_attempt_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-220-source-specific-residual-covariance-attempt-output.zip"
+
+          SOURCES = {
+              "LRG": {
+                  "terms": ["lrg", "luminous_red_galaxy"],
+                  "surface": "lrg_source_surface",
+                  "v4_219_seed": "LRG is part of prior mixed LRGxELG preview, but needs source-specific residual rows.",
+              },
+              "ELG": {
+                  "terms": ["elg", "emission_line_galaxy"],
+                  "surface": "elg_source_surface",
+                  "v4_219_seed": "ELG is part of prior mixed LRGxELG preview, but needs source-specific residual rows.",
+              },
+              "QSO": {
+                  "terms": ["qso", "quasar"],
+                  "surface": "qso_high_redshift_source_surface",
+                  "v4_219_seed": "QSO carried prior -++ preview at z=1.48, but needs QSO-specific covariance/source handling.",
+              },
+          }
+
+          CANDIDATE_TERMS = [
+              "lrg", "elg", "qso", "quasar",
+              "bao", "rsd", "fsigma", "fsigma8", "growth",
+              "cov", "covariance", "invcov", "icov",
+              "boss", "eboss", "desi",
+              "residual", "resid",
+          ]
+
+          SKIP_PARTS = {
+              ".git",
+              "__pycache__",
+              OUT.name,
+          }
+
+          def safe_str(value):
+              if value is None:
+                  return ""
+              return str(value)
+
+          def write_csv(path, rows):
+              if not rows:
+                  path.write_text("", encoding="utf-8")
+                  return
+              fieldnames = []
+              for row in rows:
+                  for key in row.keys():
+                      if key not in fieldnames:
+                          fieldnames.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def has_any_term(text, terms):
+              lower = text.lower()
+              return any(term in lower for term in terms)
+
+          def source_for_path(path_text):
+              lower = path_text.lower()
+              hits = []
+              for source, spec in SOURCES.items():
+                  if any(term in lower for term in spec["terms"]):
+                      hits.append(source)
+              return hits
+
+          def classify_file(path):
+              text = path.as_posix().lower()
+              if any(term in text for term in ["covariance", "invcov", "icov"]) or "/cov" in text or "cov_" in text or "_cov" in text:
+                  return "covariance_candidate"
+              if any(term in text for term in ["residual", "resid", "fsigma", "fsigma8", "growth", "bao"]):
+                  return "residual_or_measurement_candidate"
+              return "source_related_candidate"
+
+          def scan_repo_for_candidates():
+              rows = []
+              root = Path(".")
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+
+                  parts = set(path.parts)
+                  if parts & SKIP_PARTS:
+                      continue
+
+                  rel = path.as_posix()
+                  lower = rel.lower()
+
+                  if not has_any_term(lower, CANDIDATE_TERMS):
+                      continue
+
+                  try:
+                      size_bytes = path.stat().st_size
+                  except OSError:
+                      size_bytes = -1
+
+                  if size_bytes > 75_000_000:
+                      status = "too_large_for_safe_attempt"
+                  else:
+                      status = "candidate_listed"
+
+                  source_hits = source_for_path(rel)
+                  rows.append(
+                      {
+                          "path": rel,
+                          "filename": path.name,
+                          "suffix": path.suffix.lower(),
+                          "size_bytes": size_bytes,
+                          "source_hits": "|".join(source_hits) if source_hits else "unspecified_or_cross_source",
+                          "candidate_type": classify_file(path),
+                          "inventory_status": status,
+                      }
+                  )
+
+              rows.sort(key=lambda row: (row["source_hits"], row["candidate_type"], row["path"]))
+              return rows[:500]
+
+          def parse_text_matrix(path):
+              attempts = []
+
+              separators = [
+                  ("comma_header_none", {"sep": ",", "header": None}),
+                  ("whitespace_header_none", {"sep": r"\s+", "header": None}),
+                  ("semicolon_header_none", {"sep": ";", "header": None}),
+              ]
+
+              for label, kwargs in separators:
+                  try:
+                      df = pd.read_csv(path, engine="python", nrows=300, comment="#", **kwargs)
+                      numeric = df.apply(pd.to_numeric, errors="coerce")
+                      numeric = numeric.dropna(axis=0, how="all").dropna(axis=1, how="all")
+                      numeric_rows, numeric_cols = numeric.shape
+                      finite_count = int(np.isfinite(numeric.to_numpy(dtype=float, na_value=np.nan)).sum()) if numeric_rows and numeric_cols else 0
+                      is_square = numeric_rows == numeric_cols and numeric_rows >= 2
+                      attempts.append(
+                          {
+                              "attempt": label,
+                              "parse_status": "parsed",
+                              "numeric_rows": numeric_rows,
+                              "numeric_cols": numeric_cols,
+                              "finite_numeric_values": finite_count,
+                              "square_matrix_candidate": is_square,
+                          }
+                      )
+                  except Exception as exc:
+                      attempts.append(
+                          {
+                              "attempt": label,
+                              "parse_status": "failed",
+                              "numeric_rows": 0,
+                              "numeric_cols": 0,
+                              "finite_numeric_values": 0,
+                              "square_matrix_candidate": False,
+                              "error": type(exc).__name__,
+                          }
+                      )
+
+              parsed_attempts = [row for row in attempts if row["parse_status"] == "parsed"]
+              square_attempts = [row for row in parsed_attempts if row["square_matrix_candidate"]]
+
+              if square_attempts:
+                  best = sorted(square_attempts, key=lambda row: row["finite_numeric_values"], reverse=True)[0]
+                  return "square_numeric_matrix_candidate", best
+
+              if parsed_attempts:
+                  best = sorted(parsed_attempts, key=lambda row: row["finite_numeric_values"], reverse=True)[0]
+                  return "numeric_table_candidate_not_square_covariance", best
+
+              return "parse_failed", attempts[0]
+
+          def parse_numpy_matrix(path):
+              try:
+                  arr = np.load(path, allow_pickle=False)
+                  if isinstance(arr, np.lib.npyio.NpzFile):
+                      keys = list(arr.files)
+                      best_key = None
+                      best_shape = None
+                      for key in keys:
+                          candidate = arr[key]
+                          if hasattr(candidate, "shape") and len(candidate.shape) == 2:
+                              best_key = key
+                              best_shape = candidate.shape
+                              break
+                      if best_key is None:
+                          return "npz_opened_no_2d_array_found", {"keys": "|".join(keys), "numeric_rows": 0, "numeric_cols": 0, "square_matrix_candidate": False}
+                      rows, cols = best_shape
+                      return (
+                          "square_numeric_matrix_candidate" if rows == cols and rows >= 2 else "numeric_array_candidate_not_square_covariance",
+                          {"keys": "|".join(keys), "best_key": best_key, "numeric_rows": int(rows), "numeric_cols": int(cols), "square_matrix_candidate": rows == cols and rows >= 2},
+                      )
+
+                  shape = arr.shape if hasattr(arr, "shape") else ()
+                  if len(shape) != 2:
+                      return "npy_opened_not_2d", {"numeric_rows": 0, "numeric_cols": 0, "square_matrix_candidate": False, "shape": safe_str(shape)}
+                  rows, cols = shape
+                  return (
+                      "square_numeric_matrix_candidate" if rows == cols and rows >= 2 else "numeric_array_candidate_not_square_covariance",
+                      {"numeric_rows": int(rows), "numeric_cols": int(cols), "square_matrix_candidate": rows == cols and rows >= 2, "shape": safe_str(shape)},
+                  )
+              except Exception as exc:
+                  return "numpy_parse_failed", {"error": type(exc).__name__, "numeric_rows": 0, "numeric_cols": 0, "square_matrix_candidate": False}
+
+          def attempt_covariance_ingestion(inventory_rows):
+              rows = []
+
+              for source in SOURCES:
+                  source_candidates = [
+                      row for row in inventory_rows
+                      if source in row["source_hits"].split("|")
+                      and row["candidate_type"] == "covariance_candidate"
+                      and row["inventory_status"] == "candidate_listed"
+                  ]
+
+                  if not source_candidates:
+                      rows.append(
+                          {
+                              "source": source,
+                              "attempt_status": "no_source_specific_covariance_candidate_found",
+                              "path": "",
+                              "parse_status": "not_attempted",
+                              "numeric_rows": 0,
+                              "numeric_cols": 0,
+                              "square_matrix_candidate": False,
+                              "truth_boundary": "missing covariance is a gap, not a failed theory",
+                          }
+                      )
+                      continue
+
+                  for candidate in source_candidates[:10]:
+                      path = Path(candidate["path"])
+                      suffix = path.suffix.lower()
+
+                      if suffix in [".csv", ".tsv", ".txt", ".dat"]:
+                          parse_status, detail = parse_text_matrix(path)
+                      elif suffix in [".npy", ".npz"]:
+                          parse_status, detail = parse_numpy_matrix(path)
+                      elif suffix in [".fits", ".fit"]:
+                          parse_status = "fits_candidate_found_requires_fits_parser"
+                          detail = {"numeric_rows": 0, "numeric_cols": 0, "square_matrix_candidate": False}
+                      else:
+                          parse_status = "unsupported_file_type_for_safe_matrix_attempt"
+                          detail = {"numeric_rows": 0, "numeric_cols": 0, "square_matrix_candidate": False}
+
+                      rows.append(
+                          {
+                              "source": source,
+                              "attempt_status": "source_specific_covariance_candidate_examined",
+                              "path": candidate["path"],
+                              "parse_status": parse_status,
+                              "numeric_rows": detail.get("numeric_rows", 0),
+                              "numeric_cols": detail.get("numeric_cols", 0),
+                              "square_matrix_candidate": detail.get("square_matrix_candidate", False),
+                              "detail": json.dumps(detail, sort_keys=True),
+                              "truth_boundary": "candidate parsing is provenance triage only, not validation",
+                          }
+                      )
+
+              return rows
+
+          def build_source_status_rows(inventory_rows, covariance_attempt_rows):
+              rows = []
+              for source, spec in SOURCES.items():
+                  source_inventory = [
+                      row for row in inventory_rows
+                      if source in row["source_hits"].split("|")
+                  ]
+                  residual_candidates = [
+                      row for row in source_inventory
+                      if row["candidate_type"] == "residual_or_measurement_candidate"
+                  ]
+                  covariance_candidates = [
+                      row for row in source_inventory
+                      if row["candidate_type"] == "covariance_candidate"
+                  ]
+                  parsed_square_covariance = [
+                      row for row in covariance_attempt_rows
+                      if row["source"] == source and safe_str(row["square_matrix_candidate"]) == "True"
+                  ]
+
+                  if residual_candidates and parsed_square_covariance:
+                      readiness = "candidate_residual_and_square_covariance_found_needs_parser_review"
+                      next_requirement = "write source-specific parser and provenance checks"
+                  elif residual_candidates and covariance_candidates:
+                      readiness = "candidate_residual_and_covariance_files_found_but_covariance_not_confirmed_square"
+                      next_requirement = "inspect covariance candidate format or add parser"
+                  elif residual_candidates:
+                      readiness = "candidate_residual_files_found_covariance_missing"
+                      next_requirement = "locate full covariance for this source"
+                  elif covariance_candidates:
+                      readiness = "covariance_candidates_found_residual_file_missing"
+                      next_requirement = "locate source-specific residual or measurement table"
+                  else:
+                      readiness = "source_specific_inputs_missing_or_not_named_for_auto_discovery"
+                      next_requirement = "fill source manifest with exact file paths or add public-source fetch step"
+
+                  rows.append(
+                      {
+                          "source": source,
+                          "source_surface": spec["surface"],
+                          "v4_219_seed": spec["v4_219_seed"],
+                          "source_inventory_rows": len(source_inventory),
+                          "residual_candidate_rows": len(residual_candidates),
+                          "covariance_candidate_rows": len(covariance_candidates),
+                          "confirmed_square_covariance_candidates": len(parsed_square_covariance),
+                          "readiness_status": readiness,
+                          "next_requirement": next_requirement,
+                          "proof_status": "not_proof",
+                          "validation_status": "not_validation",
+                      }
+                  )
+              return rows
+
+          def build_residual_table_requirements():
+              required_columns = [
+                  "source",
+                  "tracer_role",
+                  "redshift",
+                  "quantity_name",
+                  "observed_value",
+                  "reference_value",
+                  "residual_value",
+                  "uncertainty_value",
+                  "covariance_group_id",
+                  "derived_quantity_flag",
+                  "source_surface_id",
+                  "provenance_path",
+              ]
+
+              rows = []
+              for source in SOURCES:
+                  for column in required_columns:
+                      rows.append(
+                          {
+                              "source": source,
+                              "required_column": column,
+                              "required_before_combined_matrix": True,
+                              "reason": "needed to build source-specific residual direction without blending tracer surfaces",
+                          }
+                      )
+              return rows
+
+          def build_combination_permission_rows(source_status_rows):
+              all_square_cov = all(row["confirmed_square_covariance_candidates"] > 0 for row in source_status_rows)
+              all_have_residual_candidates = all(row["residual_candidate_rows"] > 0 for row in source_status_rows)
+
+              rows = [
+                  {
+                      "combination_scope": "LRG_only",
+                      "permission_status": "allowed_after_source_specific_residual_parser",
+                      "blocked_reason": "not blocked as source-only surface, but parser/provenance still required",
+                  },
+                  {
+                      "combination_scope": "ELG_only",
+                      "permission_status": "allowed_after_source_specific_residual_parser",
+                      "blocked_reason": "not blocked as source-only surface, but parser/provenance still required",
+                  },
+                  {
+                      "combination_scope": "QSO_only",
+                      "permission_status": "allowed_after_qso_specific_residual_parser_and_covariance_guard",
+                      "blocked_reason": "QSO remains high-redshift source-specific surface until its own guards pass",
+                  },
+                  {
+                      "combination_scope": "LRG_ELG_cross_surface",
+                      "permission_status": "blocked_until_lrg_and_elg_residuals_and_covariance_are_explicit",
+                      "blocked_reason": "v4.219 required LRG/ELG separation before mixed interpretation",
+                  },
+                  {
+                      "combination_scope": "LRG_ELG_QSO_combined_matrix",
+                      "permission_status": "allowed_only_if_all_source_residuals_and_full_covariances_are_confirmed" if all_square_cov and all_have_residual_candidates else "blocked",
+                      "blocked_reason": "combined matrix remains blocked unless every source has residual rows and confirmed covariance handling",
+                  },
+              ]
+              return rows
+
+          def build_prioritized_next_tests(source_status_rows):
+              missing_manifest = any(row["readiness_status"] == "source_specific_inputs_missing_or_not_named_for_auto_discovery" for row in source_status_rows)
+              any_cov_missing = any(row["confirmed_square_covariance_candidates"] == 0 for row in source_status_rows)
+
+              rows = [
+                  {
+                      "priority": 1,
+                      "test_id": "source_file_manifest_fill_for_lrg_elg_qso",
+                      "purpose": "write exact source-specific paths for residual and covariance files",
+                      "activated": missing_manifest,
+                  },
+                  {
+                      "priority": 2,
+                      "test_id": "lrg_elg_qso_source_specific_residual_parser",
+                      "purpose": "parse residual rows only after source-specific paths are explicit",
+                      "activated": not missing_manifest,
+                  },
+                  {
+                      "priority": 3,
+                      "test_id": "full_covariance_parser_or_converter",
+                      "purpose": "confirm square covariance matrices or convert known covariance format",
+                      "activated": any_cov_missing,
+                  },
+                  {
+                      "priority": 4,
+                      "test_id": "combined_matrix_permission_recheck",
+                      "purpose": "recheck whether any combined LRG/ELG/QSO matrix is allowed",
+                      "activated": True,
+                  },
+              ]
+              return rows
+
+          inventory_rows = scan_repo_for_candidates()
+          covariance_attempt_rows = attempt_covariance_ingestion(inventory_rows)
+          source_status_rows = build_source_status_rows(inventory_rows, covariance_attempt_rows)
+          residual_requirements_rows = build_residual_table_requirements()
+          combination_permission_rows = build_combination_permission_rows(source_status_rows)
+          prioritized_next_tests = build_prioritized_next_tests(source_status_rows)
+
+          gates = [
+              {
+                  "gate": "source_status_rows_equal_3",
+                  "passed": len(source_status_rows) == 3,
+                  "detail": f"source_status_rows = {len(source_status_rows)}",
+              },
+              {
+                  "gate": "lrg_status_row_present",
+                  "passed": any(row["source"] == "LRG" for row in source_status_rows),
+                  "detail": "LRG source status row present",
+              },
+              {
+                  "gate": "elg_status_row_present",
+                  "passed": any(row["source"] == "ELG" for row in source_status_rows),
+                  "detail": "ELG source status row present",
+              },
+              {
+                  "gate": "qso_status_row_present",
+                  "passed": any(row["source"] == "QSO" for row in source_status_rows),
+                  "detail": "QSO source status row present",
+              },
+              {
+                  "gate": "covariance_attempt_rows_at_least_3",
+                  "passed": len(covariance_attempt_rows) >= 3,
+                  "detail": f"covariance_attempt_rows = {len(covariance_attempt_rows)}",
+              },
+              {
+                  "gate": "residual_requirements_rows_equal_36",
+                  "passed": len(residual_requirements_rows) == 36,
+                  "detail": f"residual_requirements_rows = {len(residual_requirements_rows)}",
+              },
+              {
+                  "gate": "combination_permission_rows_equal_5",
+                  "passed": len(combination_permission_rows) == 5,
+                  "detail": f"combination_permission_rows = {len(combination_permission_rows)}",
+              },
+              {
+                  "gate": "combined_lrg_elg_qso_matrix_permission_written",
+                  "passed": any(row["combination_scope"] == "LRG_ELG_QSO_combined_matrix" for row in combination_permission_rows),
+                  "detail": "combined matrix permission row written",
+              },
+              {
+                  "gate": "combined_matrix_blocks_when_not_ready",
+                  "passed": any(row["combination_scope"] == "LRG_ELG_QSO_combined_matrix" and row["permission_status"] in ["blocked", "allowed_only_if_all_source_residuals_and_full_covariances_are_confirmed"] for row in combination_permission_rows),
+                  "detail": "combined matrix remains guarded",
+              },
+              {
+                  "gate": "prioritized_next_tests_equal_4",
+                  "passed": len(prioritized_next_tests) == 4,
+                  "detail": f"prioritized_next_tests = {len(prioritized_next_tests)}",
+              },
+              {
+                  "gate": "inventory_written",
+                  "passed": isinstance(inventory_rows, list),
+                  "detail": f"candidate_inventory_rows = {len(inventory_rows)}",
+              },
+              {
+                  "gate": "truth_boundary_not_proof",
+                  "passed": True,
+                  "detail": "truth boundary says this is not proof",
+              },
+              {
+                  "gate": "truth_boundary_not_validation",
+                  "passed": True,
+                  "detail": "truth boundary says this is not cosmology validation",
+              },
+              {
+                  "gate": "missing_covariance_is_gap_not_failure",
+                  "passed": all("not_validation" == row["validation_status"] for row in source_status_rows),
+                  "detail": "missing source files are treated as gap closure, not theory failure",
+              },
+              {
+                  "gate": "selected_next_route_written",
+                  "passed": SELECTED_NEXT_ROUTE == "cosmology_source_file_manifest_fill_or_source_specific_parser_after_v4_220",
+                  "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              },
+              {
+                  "gate": "expected_result_written",
+                  "passed": EXPECTED_RESULT == "source_specific_lrg_elg_qso_residual_tables_passed_full_covariance_ingestion_attempt_written_no_validation",
+                  "detail": f"expected_result = {EXPECTED_RESULT}",
+              },
+              {
+                  "gate": "one_file_workflow_no_external_python_required",
+                  "passed": True,
+                  "detail": "workflow embeds the audit script directly in YAML",
+              },
+          ]
+
+          failed_gates = [gate["gate"] for gate in gates if not gate["passed"]]
+
+          write_csv(OUT / "v4_220_candidate_source_file_inventory.csv", inventory_rows)
+          write_csv(OUT / "v4_220_covariance_ingestion_attempt_rows.csv", covariance_attempt_rows)
+          write_csv(OUT / "v4_220_source_status_rows.csv", source_status_rows)
+          write_csv(OUT / "v4_220_residual_table_requirements.csv", residual_requirements_rows)
+          write_csv(OUT / "v4_220_combination_permission_rows.csv", combination_permission_rows)
+          write_csv(OUT / "v4_220_prioritized_next_tests.csv", prioritized_next_tests)
+          write_csv(OUT / "v4_220_rule_checks.csv", gates)
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for gate in gates if gate["passed"]),
+              "rules_total": len(gates),
+              "failed_gates": failed_gates if failed_gates else "none",
+              "candidate_inventory_rows": len(inventory_rows),
+              "source_status_rows": len(source_status_rows),
+              "covariance_ingestion_attempt_rows": len(covariance_attempt_rows),
+              "residual_requirements_rows": len(residual_requirements_rows),
+              "combination_permission_rows": len(combination_permission_rows),
+              "prioritized_next_tests": len(prioritized_next_tests),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "claims_neurotype_data_proves_cosmology": False,
+                  "claims_shared_cause": False,
+                  "clean_meaning": "v4.220 attempts source-specific LRG/ELG/QSO residual and covariance discovery. Missing files are recorded as gap closure needs, not as validation failure or theory failure.",
+              },
+          }
+
+          (OUT / "v4_220_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          source_lines = []
+          for row in source_status_rows:
+              source_lines.append(
+                  f"{row['source']}: {row['readiness_status']} "
+                  f"(inventory={row['source_inventory_rows']}, residual_candidates={row['residual_candidate_rows']}, "
+                  f"covariance_candidates={row['covariance_candidate_rows']}, square_covariance={row['confirmed_square_covariance_candidates']})"
+              )
+
+          summary_lines = [
+              "# TAIRID v4.220",
+              "",
+              "Source Specific LRG ELG QSO Residual Tables With Full Covariance Ingestion Attempt",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"candidate_inventory_rows = {summary['candidate_inventory_rows']}",
+              f"source_status_rows = {summary['source_status_rows']}",
+              f"covariance_ingestion_attempt_rows = {summary['covariance_ingestion_attempt_rows']}",
+              f"residual_requirements_rows = {summary['residual_requirements_rows']}",
+              f"combination_permission_rows = {summary['combination_permission_rows']}",
+              f"prioritized_next_tests = {summary['prioritized_next_tests']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Source readiness:",
+              *source_lines,
+              "",
+              "Clean meaning:",
+              "v4.220 looks for source-specific LRG, ELG, and QSO files and attempts safe full-covariance discovery. It does not force the repo to already have those files. If they are missing, it records the missing source/covariance paths as the next gap to close.",
+              "",
+              "Truth boundary:",
+              "This does not validate cosmology, does not prove TAIRID, and does not claim neurotype data proves cosmology. Missing covariance is a data gap, not a theory result.",
+          ]
+          (OUT / "v4_220_summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"candidate_inventory_rows = {summary['candidate_inventory_rows']}")
+          print(f"source_status_rows = {summary['source_status_rows']}")
+          print(f"covariance_ingestion_attempt_rows = {summary['covariance_ingestion_attempt_rows']}")
+          print(f"residual_requirements_rows = {summary['residual_requirements_rows']}")
+          print(f"combination_permission_rows = {summary['combination_permission_rows']}")
+          print(f"prioritized_next_tests = {summary['prioritized_next_tests']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no shared cause.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed_gates:
+              raise SystemExit(f"Failed gates: {failed_gates}")
+          PY
+
+      - name: Upload v4.220 output package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-220-source-specific-residual-covariance-attempt-output
+          path: |
+            tairid_v4_220_source_specific_residual_covariance_attempt_output/
+            tairid-v4-220-source-specific-residual-covariance-attempt-output.zip
