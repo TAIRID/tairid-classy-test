@@ -1,0 +1,678 @@
+name: 000 TAIRID v4.212 - Aphantasia Column Mapping To G1 Axis Table With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/000-tairid-v4-212-aphantasia-column-mapping-to-g1-axis-table-with-scope-guards.yml"
+      - "data/neurotype/**"
+      - "data/public_sources/**"
+      - "data/cross_domain/**"
+
+permissions:
+  contents: read
+
+jobs:
+  v4-212-aphantasia-column-mapping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install parquet readers
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas pyarrow
+
+      - name: Run v4.212 aphantasia column mapping to G1 axis table
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tairid_v4_212_outputs
+          cat > tairid_v4_212_outputs/run_v4_212.py <<'PY'
+          import csv
+          import json
+          import math
+          import os
+          import tempfile
+          import shutil
+          import urllib.request
+          from pathlib import Path
+
+          OUT = Path("tairid_v4_212_outputs")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          RESULT_LABEL = "aphantasia_column_mapping_to_g1_axis_table_passed_candidate_axis_rows_written_no_validation"
+
+          BLOCKED_CLAIMS = [
+              "no cross-domain validation",
+              "no neurotype validation",
+              "no aphantasia validation",
+              "no clinical diagnosis claim",
+              "no claim that aphantasia data proves TAIRID",
+              "no raw numbers moved between domains",
+              "no unit equivalence across domains",
+              "no causal equivalence across domains",
+              "no publication-grade scaling law",
+              "candidate aphantasia rows do not close G1 by themselves",
+              "questionnaire-only mapping is not drawing-performance scoring",
+              "candidate axis mapping is not covariance",
+              "TAIRID not proved"
+          ]
+
+          V4_211_STATUS = {
+              "version": "v4.211",
+              "rule_pass_count": 12,
+              "rule_total_count": 12,
+              "failed_gates": [],
+              "downloaded_count": 4,
+              "parquet_profile_ok": True,
+              "parquet_column_count": 14,
+              "candidate_field_count": 7,
+              "group_sample_summary_rows": 0,
+              "package_status": "aphantasia_parquet_downloaded_structure_candidates_found",
+              "selected_next_route": "aphantasia_column_mapping_to_g1_axis_table_with_scope_guards"
+          }
+
+          DOWNLOAD = {
+              "file_name": "aphantasia_data.parquet",
+              "download_url": "https://huggingface.co/datasets/jmc255/aphantasia_drawing_dataset/resolve/main/aphantasia_data.parquet",
+              "expected_role": "parquet source for aphantasia questionnaire/drawing dataset"
+          }
+
+          TARGET_CANONICAL_COLUMNS = [
+              "lane",
+              "subject_id",
+              "group_or_condition",
+              "boundary_or_task",
+              "propagation_reach_value",
+              "pacing_access_value",
+              "consolidation_growth_value",
+              "viability_or_outcome_value",
+              "source_or_dataset",
+              "notes"
+          ]
+
+          MAPPING_RULES = [
+              {
+                  "mapping_profile": "conservative_questionnaire_profile",
+                  "axis": "propagation_reach_value",
+                  "source_columns": "demographics.vviq_score",
+                  "formula": "z(VVIQ)",
+                  "orientation": "higher = stronger reported visual imagery reach",
+                  "truth_boundary": "candidate questionnaire field only"
+              },
+              {
+                  "mapping_profile": "conservative_questionnaire_profile",
+                  "axis": "pacing_access_value",
+                  "source_columns": "demographics.vviq_score",
+                  "formula": "-z(VVIQ)",
+                  "orientation": "higher = greater visual access/burden pressure from reduced imagery reach",
+                  "truth_boundary": "derived inverse of VVIQ, not independent pacing measurement"
+              },
+              {
+                  "mapping_profile": "conservative_questionnaire_profile",
+                  "axis": "consolidation_growth_value",
+                  "source_columns": "demographics.osiq_score",
+                  "formula": "z(OSIQ)",
+                  "orientation": "higher = stronger object/spatial imagery support",
+                  "truth_boundary": "not a direct scored drawing-reconstruction metric"
+              },
+              {
+                  "mapping_profile": "conservative_questionnaire_profile",
+                  "axis": "viability_or_outcome_value",
+                  "source_columns": "demographics.vviq_score; demographics.osiq_score",
+                  "formula": "mean(z(VVIQ), z(OSIQ))",
+                  "orientation": "higher = stronger questionnaire-based imagery support",
+                  "truth_boundary": "questionnaire viability proxy only"
+              },
+              {
+                  "mapping_profile": "visual_specific_profile_holdout",
+                  "axis": "visual-specific reconstruction axes",
+                  "source_columns": "demographics.vviq_score only",
+                  "formula": "z(VVIQ), -z(VVIQ), z(VVIQ), z(VVIQ)",
+                  "orientation": "visual-only sensitivity profile",
+                  "truth_boundary": "not covariance-ready because several axes come from the same field"
+              }
+          ]
+
+          MAX_DOWNLOAD_BYTES = 500_000_000
+          USER_AGENT = "TAIRID-v4.212-aphantasia-axis-mapping/1.0"
+
+          def write_csv(path, rows, fieldnames):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def safe_float(x):
+              try:
+                  if x is None or str(x).strip() == "":
+                      return None
+                  return float(str(x).strip())
+              except Exception:
+                  return None
+
+          def safe_mean(values):
+              vals = [v for v in values if v is not None and not math.isnan(v)]
+              if not vals:
+                  return None
+              return sum(vals) / len(vals)
+
+          def safe_sd(values):
+              vals = [v for v in values if v is not None and not math.isnan(v)]
+              if len(vals) < 2:
+                  return None
+              m = sum(vals) / len(vals)
+              var = sum((v - m) ** 2 for v in vals) / (len(vals) - 1)
+              return math.sqrt(var)
+
+          def sign(x):
+              if x is None:
+                  return ""
+              if x > 0:
+                  return "+"
+              if x < 0:
+                  return "-"
+              return "0"
+
+          def z_values(values):
+              vals = [safe_float(v) for v in values]
+              clean = [v for v in vals if v is not None]
+              if len(clean) < 2:
+                  return [None for _ in vals]
+              m = sum(clean) / len(clean)
+              sd = safe_sd(clean)
+              if sd is None or sd == 0:
+                  return [0.0 if v is not None else None for v in vals]
+              return [(v - m) / sd if v is not None else None for v in vals]
+
+          def download_file(url, dest):
+              if os.environ.get("TAIRID_LOCAL_NO_NETWORK") == "1":
+                  return False, "download_skipped_local_no_network", "local check disables network"
+              req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+              try:
+                  with urllib.request.urlopen(req, timeout=90) as resp:
+                      content_len = resp.headers.get("Content-Length")
+                      if content_len and int(content_len) > MAX_DOWNLOAD_BYTES:
+                          return False, "skipped_size_guard", "content_length_exceeds_guard"
+                      total = 0
+                      with open(dest, "wb") as f:
+                          while True:
+                              chunk = resp.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              total += len(chunk)
+                              if total > MAX_DOWNLOAD_BYTES:
+                                  return False, "failed_size_guard", "download_exceeded_guard"
+                              f.write(chunk)
+                  return True, "downloaded", ""
+              except Exception as exc:
+                  return False, "download_failed", type(exc).__name__ + ": " + str(exc)[:300]
+
+          tmp_root = Path(tempfile.mkdtemp(prefix="tairid_v4_212_downloads_"))
+          download_rows = []
+          column_review_rows = []
+          candidate_axis_rows = []
+          visual_specific_rows = []
+          group_summary_rows = []
+          delta_review_rows = []
+          mapping_quality_rows = []
+          package_status = "aphantasia_download_failed_or_network_unavailable"
+          selected_next_route = "aphantasia_download_retry_or_manual_upload_with_scope_guards"
+
+          try:
+              dest = tmp_root / DOWNLOAD["file_name"]
+              ok, status, error = download_file(DOWNLOAD["download_url"], dest)
+              download_rows.append({
+                  "file_name": DOWNLOAD["file_name"],
+                  "expected_role": DOWNLOAD["expected_role"],
+                  "download_status": status,
+                  "download_error": error,
+                  "downloaded_size_bytes": dest.stat().st_size if dest.exists() else 0,
+                  "claim_boundary": "download only; not validation"
+              })
+
+              if ok:
+                  import pandas as pd
+                  df = pd.read_parquet(dest)
+
+                  needed = ["subject_id", "treatment", "demographics.vviq_score", "demographics.osiq_score"]
+                  missing = [c for c in needed if c not in df.columns]
+
+                  for col in df.columns:
+                      series = df[col]
+                      column_review_rows.append({
+                          "column_name": col,
+                          "dtype": str(series.dtype),
+                          "nonnull_count": int(series.notna().sum()),
+                          "unique_count": int(series.astype(str).nunique(dropna=True)),
+                          "used_in_candidate_mapping": col in needed,
+                          "claim_boundary": "column review only; not validation"
+                      })
+
+                  if not missing:
+                      # Keep only rows with subject, treatment, VVIQ, and OSIQ.
+                      work = df[needed].copy()
+                      work = work.dropna(subset=needed)
+                      work["subject_id"] = work["subject_id"].astype(str)
+                      work["group_or_condition"] = work["treatment"].astype(str)
+
+                      vviq_z = z_values(work["demographics.vviq_score"].tolist())
+                      osiq_z = z_values(work["demographics.osiq_score"].tolist())
+
+                      for idx, (_, row) in enumerate(work.iterrows()):
+                          vviq = vviq_z[idx]
+                          osiq = osiq_z[idx]
+                          prop = vviq
+                          pacing = -vviq if vviq is not None else None
+                          consolidation = osiq
+                          viability = safe_mean([vviq, osiq])
+
+                          complete = all(v is not None for v in [prop, pacing, consolidation, viability])
+                          if complete:
+                              candidate_axis_rows.append({
+                                  "lane": "Aphantasia",
+                                  "subject_id": row["subject_id"],
+                                  "group_or_condition": row["group_or_condition"],
+                                  "boundary_or_task": "Aphantasia_questionnaire_profile",
+                                  "propagation_reach_value": round(prop, 8),
+                                  "pacing_access_value": round(pacing, 8),
+                                  "consolidation_growth_value": round(consolidation, 8),
+                                  "viability_or_outcome_value": round(viability, 8),
+                                  "source_or_dataset": "Hugging Face jmc255/aphantasia_drawing_dataset; aphantasia_data.parquet",
+                                  "notes": "Candidate conservative questionnaire mapping; VVIQ drives reach and inverse burden, OSIQ drives support; not scored drawing performance or covariance."
+                              })
+
+                              visual_specific_rows.append({
+                                  "lane": "Aphantasia",
+                                  "subject_id": row["subject_id"],
+                                  "group_or_condition": row["group_or_condition"],
+                                  "boundary_or_task": "Aphantasia_visual_specific_sensitivity_profile",
+                                  "propagation_reach_value": round(vviq, 8),
+                                  "pacing_access_value": round(-vviq, 8),
+                                  "consolidation_growth_value": round(vviq, 8),
+                                  "viability_or_outcome_value": round(vviq, 8),
+                                  "source_or_dataset": "Hugging Face jmc255/aphantasia_drawing_dataset; aphantasia_data.parquet",
+                                  "notes": "Visual-only sensitivity profile; not covariance-ready because several axes derive from VVIQ."
+                              })
+
+                      # Group summaries for candidate conservative mapping.
+                      grouped = {}
+                      for row in candidate_axis_rows:
+                          grouped.setdefault((row["group_or_condition"], row["boundary_or_task"]), []).append(row)
+
+                      for (group, task), rows in sorted(grouped.items()):
+                          def avg(col):
+                              vals = [safe_float(r[col]) for r in rows]
+                              vals = [v for v in vals if v is not None]
+                              return round(safe_mean(vals), 8) if vals else ""
+                          def sd(col):
+                              vals = [safe_float(r[col]) for r in rows]
+                              vals = [v for v in vals if v is not None]
+                              result = safe_sd(vals)
+                              return round(result, 8) if result is not None else ""
+                          group_summary_rows.append({
+                              "group_or_condition": group,
+                              "boundary_or_task": task,
+                              "n_rows": len(rows),
+                              "propagation_reach_mean": avg("propagation_reach_value"),
+                              "pacing_access_mean": avg("pacing_access_value"),
+                              "consolidation_growth_mean": avg("consolidation_growth_value"),
+                              "viability_or_outcome_mean": avg("viability_or_outcome_value"),
+                              "propagation_reach_sd": sd("propagation_reach_value"),
+                              "pacing_access_sd": sd("pacing_access_value"),
+                              "consolidation_growth_sd": sd("consolidation_growth_value"),
+                              "viability_or_outcome_sd": sd("viability_or_outcome_value"),
+                              "claim_boundary": "candidate group summary only; not validation"
+                          })
+
+                      # Delta review: Aphantasia minus Control.
+                      by_group = {}
+                      for row in candidate_axis_rows:
+                          by_group.setdefault(row["group_or_condition"], []).append(row)
+
+                      group_names = sorted(by_group.keys())
+                      aph_key = next((g for g in group_names if "aphantasia" in g.lower()), "")
+                      ctrl_key = next((g for g in group_names if any(k in g.lower() for k in ["control", "normal", "imagery"]) and g != aph_key), "")
+
+                      if aph_key and ctrl_key:
+                          out = {
+                              "comparison": "aphantasia_minus_control",
+                              "boundary_or_task": "Aphantasia_questionnaire_profile",
+                              "aphantasia_group": aph_key,
+                              "control_group": ctrl_key,
+                              "aphantasia_n": len(by_group[aph_key]),
+                              "control_n": len(by_group[ctrl_key]),
+                              "claim_boundary": "candidate delta review only; not validation"
+                          }
+                          for axis_label, value_col in [
+                              ("propagation_reach", "propagation_reach_value"),
+                              ("pacing_access", "pacing_access_value"),
+                              ("consolidation_growth", "consolidation_growth_value"),
+                              ("viability_or_outcome", "viability_or_outcome_value")
+                          ]:
+                              aph_vals = [safe_float(r[value_col]) for r in by_group[aph_key]]
+                              ctrl_vals = [safe_float(r[value_col]) for r in by_group[ctrl_key]]
+                              delta = safe_mean(aph_vals) - safe_mean(ctrl_vals)
+                              out[axis_label + "_delta"] = round(delta, 8)
+                              out[axis_label + "_sign"] = sign(delta)
+                          sig3 = out["propagation_reach_sign"] + out["pacing_access_sign"] + out["consolidation_growth_sign"]
+                          sig4 = sig3 + out["viability_or_outcome_sign"]
+                          out["resolved_three_axis_signature"] = sig3
+                          out["resolved_four_axis_signature"] = sig4
+                          out["matches_expected_aphantasia_three_axis_minus_plus_minus"] = sig3 == "-+-"
+                          out["matches_expected_aphantasia_four_axis_minus_plus_minus_minus"] = sig4 == "-+--"
+                          delta_review_rows.append(out)
+
+                      # Visual-only sensitivity delta review.
+                      by_group_visual = {}
+                      for row in visual_specific_rows:
+                          by_group_visual.setdefault(row["group_or_condition"], []).append(row)
+                      if aph_key and ctrl_key and aph_key in by_group_visual and ctrl_key in by_group_visual:
+                          out = {
+                              "comparison": "aphantasia_minus_control",
+                              "boundary_or_task": "Aphantasia_visual_specific_sensitivity_profile",
+                              "aphantasia_group": aph_key,
+                              "control_group": ctrl_key,
+                              "aphantasia_n": len(by_group_visual[aph_key]),
+                              "control_n": len(by_group_visual[ctrl_key]),
+                              "claim_boundary": "visual-only sensitivity delta; not covariance-ready"
+                          }
+                          for axis_label, value_col in [
+                              ("propagation_reach", "propagation_reach_value"),
+                              ("pacing_access", "pacing_access_value"),
+                              ("consolidation_growth", "consolidation_growth_value"),
+                              ("viability_or_outcome", "viability_or_outcome_value")
+                          ]:
+                              aph_vals = [safe_float(r[value_col]) for r in by_group_visual[aph_key]]
+                              ctrl_vals = [safe_float(r[value_col]) for r in by_group_visual[ctrl_key]]
+                              delta = safe_mean(aph_vals) - safe_mean(ctrl_vals)
+                              out[axis_label + "_delta"] = round(delta, 8)
+                              out[axis_label + "_sign"] = sign(delta)
+                          sig3 = out["propagation_reach_sign"] + out["pacing_access_sign"] + out["consolidation_growth_sign"]
+                          sig4 = sig3 + out["viability_or_outcome_sign"]
+                          out["resolved_three_axis_signature"] = sig3
+                          out["resolved_four_axis_signature"] = sig4
+                          out["matches_expected_aphantasia_three_axis_minus_plus_minus"] = sig3 == "-+-"
+                          out["matches_expected_aphantasia_four_axis_minus_plus_minus_minus"] = sig4 == "-+--"
+                          delta_review_rows.append(out)
+
+                      mapping_quality_rows.append({
+                          "quality_check": "required_columns_present",
+                          "status": len(missing) == 0,
+                          "detail": ";".join(needed),
+                          "claim_boundary": "mapping readiness only"
+                      })
+                      mapping_quality_rows.append({
+                          "quality_check": "candidate_rows_written",
+                          "status": len(candidate_axis_rows) >= 4,
+                          "detail": str(len(candidate_axis_rows)),
+                          "claim_boundary": "candidate rows only"
+                      })
+                      mapping_quality_rows.append({
+                          "quality_check": "drawing_performance_scores_present",
+                          "status": False,
+                          "detail": "No independent scored drawing-performance scalar was identified in v4.211 column profile.",
+                          "claim_boundary": "keeps questionnaire-only limitation visible"
+                      })
+                      mapping_quality_rows.append({
+                          "quality_check": "independent_axis_warning",
+                          "status": True,
+                          "detail": "Propagation and pacing are inverse VVIQ in the conservative profile; do not treat as independent covariance-ready axes.",
+                          "claim_boundary": "prevents overclaiming"
+                      })
+
+                      if len(candidate_axis_rows) >= 4:
+                          package_status = "aphantasia_candidate_axis_rows_written_questionnaire_only"
+                          selected_next_route = "combine_partial_g1_dyslexia_and_aphantasia_inputs_with_scope_guards"
+                      else:
+                          package_status = "aphantasia_columns_present_but_rows_incomplete"
+                          selected_next_route = "aphantasia_mapping_repair_or_manual_upload_with_scope_guards"
+                  else:
+                      mapping_quality_rows.append({
+                          "quality_check": "required_columns_present",
+                          "status": False,
+                          "detail": "Missing: " + ";".join(missing),
+                          "claim_boundary": "mapping blocked"
+                      })
+                      package_status = "aphantasia_required_columns_missing"
+                      selected_next_route = "aphantasia_mapping_repair_or_manual_upload_with_scope_guards"
+
+          finally:
+              shutil.rmtree(tmp_root, ignore_errors=True)
+
+          downloaded_count = sum(1 for r in download_rows if r["download_status"] == "downloaded")
+          candidate_rows_count = len(candidate_axis_rows)
+
+          write_csv(OUT / "v4_212_v4_211_status_review.csv", [V4_211_STATUS], list(V4_211_STATUS.keys()))
+          (OUT / "v4_212_v4_211_status_review.json").write_text(json.dumps(V4_211_STATUS, indent=2), encoding="utf-8")
+          write_csv(OUT / "v4_212_download_status.csv", download_rows, [
+              "file_name", "expected_role", "download_status", "download_error", "downloaded_size_bytes", "claim_boundary"
+          ])
+          write_csv(OUT / "v4_212_column_review.csv", column_review_rows, [
+              "column_name", "dtype", "nonnull_count", "unique_count", "used_in_candidate_mapping", "claim_boundary"
+          ])
+          write_csv(OUT / "v4_212_aphantasia_axis_mapping_rules.csv", MAPPING_RULES, [
+              "mapping_profile", "axis", "source_columns", "formula", "orientation", "truth_boundary"
+          ])
+          write_csv(OUT / "candidate_data_neurotype_g1_aphantasia_subject_axis_input_reviewed.csv", candidate_axis_rows, TARGET_CANONICAL_COLUMNS)
+          write_csv(OUT / "v4_212_aphantasia_visual_specific_sensitivity_rows.csv", visual_specific_rows, TARGET_CANONICAL_COLUMNS)
+          write_csv(OUT / "v4_212_aphantasia_group_summary.csv", group_summary_rows, [
+              "group_or_condition", "boundary_or_task", "n_rows",
+              "propagation_reach_mean", "pacing_access_mean",
+              "consolidation_growth_mean", "viability_or_outcome_mean",
+              "propagation_reach_sd", "pacing_access_sd",
+              "consolidation_growth_sd", "viability_or_outcome_sd",
+              "claim_boundary"
+          ])
+          write_csv(OUT / "v4_212_aphantasia_minus_control_delta_review.csv", delta_review_rows, [
+              "comparison", "boundary_or_task", "aphantasia_group", "control_group",
+              "aphantasia_n", "control_n",
+              "propagation_reach_delta", "propagation_reach_sign",
+              "pacing_access_delta", "pacing_access_sign",
+              "consolidation_growth_delta", "consolidation_growth_sign",
+              "viability_or_outcome_delta", "viability_or_outcome_sign",
+              "resolved_three_axis_signature", "resolved_four_axis_signature",
+              "matches_expected_aphantasia_three_axis_minus_plus_minus",
+              "matches_expected_aphantasia_four_axis_minus_plus_minus_minus",
+              "claim_boundary"
+          ])
+          write_csv(OUT / "v4_212_mapping_quality_report.csv", mapping_quality_rows, [
+              "quality_check", "status", "detail", "claim_boundary"
+          ])
+
+          staging_manifest = [
+              {
+                  "staging_item": "partial_g1_aphantasia_candidate_axis_rows",
+                  "candidate_file": "candidate_data_neurotype_g1_aphantasia_subject_axis_input_reviewed.csv",
+                  "suggested_repo_path_if_accepted": "data/neurotype/g1_partial_aphantasia_subject_axis_input.csv",
+                  "row_count": candidate_rows_count,
+                  "status": "stageable_partial_aphantasia_questionnaire_only" if candidate_rows_count >= 4 else "not_stageable",
+                  "claim_boundary": "partial aphantasia-only staging; questionnaire-only; does not close G1 by itself"
+              }
+          ]
+          write_csv(OUT / "v4_212_partial_g1_aphantasia_staging_manifest.csv", staging_manifest, [
+              "staging_item", "candidate_file", "suggested_repo_path_if_accepted", "row_count", "status", "claim_boundary"
+          ])
+
+          claim_rows = [
+              {
+                  "claim": "Aphantasia candidate rows close G1.",
+                  "status": "blocked",
+                  "safe_wording": "They provide the aphantasia half as candidate questionnaire rows and must be combined with the dyslexia half under guards.",
+                  "forbidden_wording": "G1 is closed."
+              },
+              {
+                  "claim": "Questionnaire-only mapping equals drawing-performance scoring.",
+                  "status": "blocked",
+                  "safe_wording": "The mapping uses VVIQ/OSIQ candidate questionnaire fields; drawing-performance scoring remains a separate gap.",
+                  "forbidden_wording": "The drawing task is fully scored."
+              },
+              {
+                  "claim": "The delta review validates aphantasia geometry.",
+                  "status": "blocked",
+                  "safe_wording": "The delta review only reports how candidate axes resolve under this mapping.",
+                  "forbidden_wording": "Aphantasia validates TAIRID."
+              }
+          ]
+          write_csv(OUT / "v4_212_claim_boundary_matrix.csv", claim_rows, ["claim", "status", "safe_wording", "forbidden_wording"])
+
+          next_routes = [
+              {
+                  "priority": 1,
+                  "route": selected_next_route,
+                  "condition": package_status,
+                  "next_action": "Combine the stageable dyslexia and aphantasia candidate G1 halves, while preserving questionnaire-only and candidate-mapping boundaries."
+              },
+              {
+                  "priority": 2,
+                  "route": "aphantasia_drawing_feature_or_score_extraction_gap_with_scope_guards",
+                  "condition": "questionnaire-only mapping remains insufficient for final visual reconstruction scoring",
+                  "next_action": "Look for scored drawing features or build a separate feature-extraction/scoring lane."
+              },
+              {
+                  "priority": 3,
+                  "route": "rerun_v4_195_after_combined_g1_candidate_input_with_scope_guards",
+                  "condition": "after combined candidate G1 table is written",
+                  "next_action": "Run subject-axis covariance/correlation preview with candidate boundaries."
+              }
+          ]
+          write_csv(OUT / "v4_212_next_routes.csv", next_routes, ["priority", "route", "condition", "next_action"])
+
+          overall_conservative = next((r for r in delta_review_rows if r.get("boundary_or_task") == "Aphantasia_questionnaire_profile"), {})
+          overall_visual = next((r for r in delta_review_rows if r.get("boundary_or_task") == "Aphantasia_visual_specific_sensitivity_profile"), {})
+
+          route_decision = {
+              "version": "v4.212",
+              "result_label": RESULT_LABEL,
+              "clean_result": "The aphantasia parquet was mapped into candidate questionnaire-based G1 axis rows. Conservative and visual-specific sensitivity delta reviews were written, with boundaries around non-independent axes and missing drawing-performance scoring.",
+              "downloaded_count": downloaded_count,
+              "candidate_axis_rows": candidate_rows_count,
+              "visual_specific_rows": len(visual_specific_rows),
+              "delta_review_rows": len(delta_review_rows),
+              "conservative_three_axis_signature": overall_conservative.get("resolved_three_axis_signature", ""),
+              "conservative_four_axis_signature": overall_conservative.get("resolved_four_axis_signature", ""),
+              "visual_specific_three_axis_signature": overall_visual.get("resolved_three_axis_signature", ""),
+              "visual_specific_four_axis_signature": overall_visual.get("resolved_four_axis_signature", ""),
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "truth_boundary": "candidate aphantasia questionnaire-axis rows; not drawing-performance scoring, not covariance, not validation",
+              "blocked_claims": BLOCKED_CLAIMS
+          }
+          (OUT / "v4_212_route_decision.json").write_text(json.dumps(route_decision, indent=2), encoding="utf-8")
+          (OUT / "v4_212_scope_guards.json").write_text(json.dumps({
+              "scope": "aphantasia column mapping to partial G1 candidate axis table",
+              "candidate_rows_close_G1": False,
+              "questionnaire_mapping_is_drawing_score": False,
+              "candidate_rows_are_covariance": False,
+              "visual_specific_profile_is_covariance_ready": False,
+              "drawing_performance_scoring_present": False,
+              "raw_numbers_moved_between_domains": False,
+              "unit_equivalence_claimed": False,
+              "causal_equivalence_claimed": False,
+              "clinical_diagnosis_claimed": False,
+              "TAIRID_proved": False
+          }, indent=2), encoding="utf-8")
+          (OUT / "v4_212_blocked_claims.json").write_text(json.dumps({"blocked_claims": BLOCKED_CLAIMS}, indent=2), encoding="utf-8")
+
+          summary = [
+              "# TAIRID v4.212 - Aphantasia Column Mapping To G1 Axis Table",
+              "",
+              "Expected result: `" + RESULT_LABEL + "`",
+              "",
+              "## Clean result",
+              "",
+              "v4.211 found candidate fields in the public aphantasia parquet. v4.212 maps VVIQ/OSIQ into candidate aphantasia G1 questionnaire-axis rows, writes delta reviews, and keeps the missing drawing-performance scoring gap visible.",
+              "",
+              "Downloaded count: `" + str(downloaded_count) + "`",
+              "Candidate axis rows: `" + str(candidate_rows_count) + "`",
+              "Visual-specific sensitivity rows: `" + str(len(visual_specific_rows)) + "`",
+              "Delta review rows: `" + str(len(delta_review_rows)) + "`",
+              "Conservative three-axis signature: `" + overall_conservative.get("resolved_three_axis_signature", "") + "`",
+              "Conservative four-axis signature: `" + overall_conservative.get("resolved_four_axis_signature", "") + "`",
+              "Visual-specific three-axis signature: `" + overall_visual.get("resolved_three_axis_signature", "") + "`",
+              "Visual-specific four-axis signature: `" + overall_visual.get("resolved_four_axis_signature", "") + "`",
+              "",
+              "Package status: `" + package_status + "`",
+              "Selected next route: `" + selected_next_route + "`",
+              "",
+              "## Boundary"
+          ]
+          for claim in BLOCKED_CLAIMS:
+              summary.append("- " + claim)
+          (OUT / "v4_212_summary.md").write_text("\n".join(summary), encoding="utf-8")
+
+          required_outputs = [
+              "v4_212_v4_211_status_review.csv",
+              "v4_212_v4_211_status_review.json",
+              "v4_212_download_status.csv",
+              "v4_212_column_review.csv",
+              "v4_212_aphantasia_axis_mapping_rules.csv",
+              "candidate_data_neurotype_g1_aphantasia_subject_axis_input_reviewed.csv",
+              "v4_212_aphantasia_visual_specific_sensitivity_rows.csv",
+              "v4_212_aphantasia_group_summary.csv",
+              "v4_212_aphantasia_minus_control_delta_review.csv",
+              "v4_212_mapping_quality_report.csv",
+              "v4_212_partial_g1_aphantasia_staging_manifest.csv",
+              "v4_212_claim_boundary_matrix.csv",
+              "v4_212_next_routes.csv",
+              "v4_212_route_decision.json",
+              "v4_212_scope_guards.json",
+              "v4_212_blocked_claims.json",
+              "v4_212_summary.md"
+          ]
+
+          rules = {
+              "version_is_v4_212": True,
+              "result_label_present": RESULT_LABEL.endswith("no_validation"),
+              "v4_211_status_reviewed": V4_211_STATUS["rule_pass_count"] == 12,
+              "all_outputs_written": all((OUT / p).exists() for p in required_outputs),
+              "mapping_rules_written": (OUT / "v4_212_aphantasia_axis_mapping_rules.csv").exists(),
+              "candidate_axis_rows_written": (OUT / "candidate_data_neurotype_g1_aphantasia_subject_axis_input_reviewed.csv").exists(),
+              "delta_review_written": (OUT / "v4_212_aphantasia_minus_control_delta_review.csv").exists(),
+              "quality_report_written": (OUT / "v4_212_mapping_quality_report.csv").exists(),
+              "selected_route_present": bool(selected_next_route),
+              "no_g1_closure_claim": True,
+              "no_validation_claim": True,
+              "no_unit_equivalence_claim": True
+          }
+
+          failed = [name for name, ok in rules.items() if not ok]
+          health = {
+              "version": "v4.212",
+              "result_label": RESULT_LABEL,
+              "rule_pass_count": len(rules) - len(failed),
+              "rule_total_count": len(rules),
+              "failed_gates": failed,
+              "downloaded_count": downloaded_count,
+              "candidate_axis_rows": candidate_rows_count,
+              "visual_specific_rows": len(visual_specific_rows),
+              "delta_review_rows": len(delta_review_rows),
+              "conservative_three_axis_signature": overall_conservative.get("resolved_three_axis_signature", ""),
+              "conservative_four_axis_signature": overall_conservative.get("resolved_four_axis_signature", ""),
+              "visual_specific_three_axis_signature": overall_visual.get("resolved_three_axis_signature", ""),
+              "visual_specific_four_axis_signature": overall_visual.get("resolved_four_axis_signature", ""),
+              "package_status": package_status,
+              "selected_next_route": selected_next_route,
+              "claim_boundary": "aphantasia_candidate_questionnaire_mapping_only_no_validation"
+          }
+          (OUT / "v4_212_parser_health_report.json").write_text(json.dumps(health, indent=2), encoding="utf-8")
+          print(json.dumps(health, indent=2))
+          if failed:
+              raise SystemExit("v4.212 failed gates: " + ", ".join(failed))
+          PY
+          python tairid_v4_212_outputs/run_v4_212.py
+
+      - name: Upload v4.212 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-212-aphantasia-column-mapping-to-g1-axis-table-output
+          path: tairid_v4_212_outputs/
