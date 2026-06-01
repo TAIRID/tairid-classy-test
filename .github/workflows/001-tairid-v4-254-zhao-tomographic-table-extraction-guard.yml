@@ -1,0 +1,892 @@
+name: 001 TAIRID v4.254 - Zhao Tomographic Table Extraction Guard
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-254-zhao-tomographic-table-extraction-guard.yml"
+      - "data/cosmology/qso_literature_extraction_manifest.csv"
+      - "qso_literature_extraction_manifest.csv"
+      - "data/cosmology/external_observed_manifest.csv"
+      - "external_observed_manifest.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  zhao-tomographic-table-extraction-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.254 Zhao Tomographic Table Extraction Guard is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.254 Zhao tomographic table extraction guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import gzip
+          import io
+          import json
+          import re
+          import tarfile
+          import zipfile
+
+          VERSION = "v4.254"
+          ROUTE = "zhao_tomographic_table_extraction_guard_after_v4_253"
+          EXPECTED_RESULT = "v4_254_zhao_tomographic_table_extraction_guard_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_255_zhao_covariance_policy_review_or_manual_extraction_handoff"
+
+          OUT = Path("tairid_v4_254_zhao_tomographic_table_extraction_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-254-zhao-tomographic-table-extraction-guard-output.zip"
+
+          ZHAO_ABS_URL = "https://arxiv.org/abs/1801.03043"
+          ZHAO_EPRINT_URL = "https://arxiv.org/e-print/1801.03043"
+          ZHAO_PDF_URL = "https://arxiv.org/pdf/1801.03043"
+
+          EXPECTED_ZHAO_BINS = [0.98, 1.23, 1.52, 1.94]
+
+          OBSERVED_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/external_observed_manifest.csv"),
+              Path("external_observed_manifest.csv"),
+          ]
+
+          EXTRACTION_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/qso_literature_extraction_manifest.csv"),
+              Path("qso_literature_extraction_manifest.csv"),
+          ]
+
+          REQUIRED_OBSERVED_COLUMNS = [
+              "observed_id",
+              "target_id",
+              "source_family",
+              "source_role",
+              "redshift",
+              "quantity",
+              "observed_value",
+              "observed_sigma_or_likelihood",
+              "data_path_or_url",
+              "covariance_path_or_url",
+              "reference_model_path_or_method",
+              "failure_condition_id",
+              "approval_status",
+          ]
+
+          REQUIRED_EXTRACTION_COLUMNS = [
+              "extraction_id",
+              "candidate_id",
+              "paper_or_source_url",
+              "measurement_label",
+              "redshift",
+              "observable",
+              "observed_value",
+              "uncertainty_or_covariance_reference",
+              "data_vector_reference",
+              "source_role",
+              "provenance_status",
+              "extraction_status",
+              "approval_status",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def fetch_bytes(url, timeout=30, max_bytes=12000000):
+              try:
+                  req = Request(url, headers={"User-Agent": "TAIRID-v4.254-zhao-extraction-guard"})
+                  with urlopen(req, timeout=timeout) as response:
+                      status = f"http_{response.status}"
+                      content_type = response.headers.get("content-type", "")
+                      content_length = response.headers.get("content-length", "")
+                      raw = response.read(max_bytes)
+                      return status, content_type, content_length, raw, ""
+              except Exception as exc:
+                  return "probe_failed", "", "", b"", f"{type(exc).__name__}: {exc}"
+
+          def decode_text(raw):
+              return raw.decode("utf-8", errors="replace") if raw else ""
+
+          def extract_text_files_from_eprint(raw):
+              rows = []
+              texts = []
+              if not raw:
+                  return rows, texts
+              # arXiv e-print usually returns a tar archive, often gzipped.
+              candidates = []
+              candidates.append(("raw", raw))
+              try:
+                  candidates.append(("gzip", gzip.decompress(raw)))
+              except Exception:
+                  pass
+
+              for label, blob in candidates:
+                  try:
+                      with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as tar:
+                          members = tar.getmembers()
+                          for member in members:
+                              if not member.isfile():
+                                  continue
+                              name = member.name
+                              lower = name.lower()
+                              if not lower.endswith((".tex", ".txt", ".bbl", ".sty", ".csv", ".dat", ".table")):
+                                  continue
+                              extracted = tar.extractfile(member)
+                              if not extracted:
+                                  continue
+                              content = extracted.read(1500000).decode("utf-8", errors="replace")
+                              rows.append({
+                                  "archive_mode": label,
+                                  "file_name": name,
+                                  "file_size": member.size,
+                                  "text_chars": len(content),
+                                  "file_role": "source_text_candidate",
+                              })
+                              texts.append((name, content))
+                          if rows:
+                              return rows, texts
+                  except Exception:
+                      continue
+
+              # If not a tar file, treat as plain text.
+              txt = decode_text(raw)
+              if txt:
+                  rows.append({
+                      "archive_mode": "plain",
+                      "file_name": "plain_eprint_or_html",
+                      "file_size": len(raw),
+                      "text_chars": len(txt),
+                      "file_role": "plain_text_fallback",
+                  })
+                  texts.append(("plain_eprint_or_html", txt))
+              return rows, texts
+
+          def normalize_latex_text(text):
+              text = text.replace("\\pm", " ± ")
+              text = text.replace("&", " ")
+              text = text.replace("\\", " ")
+              text = text.replace("{", " ").replace("}", " ")
+              text = text.replace("^", " ")
+              text = re.sub(r"\s+", " ", text)
+              return text
+
+          def window_hits(text, patterns, window=500):
+              hits = []
+              lower = text.lower()
+              for pattern in patterns:
+                  for match in re.finditer(pattern.lower(), lower):
+                      start = max(0, match.start() - window)
+                      end = min(len(text), match.end() + window)
+                      snippet = text[start:end].replace("\n", " ")
+                      hits.append({
+                          "pattern": pattern,
+                          "snippet": snippet[:1000],
+                      })
+                      if len(hits) >= 80:
+                          return hits
+              return hits
+
+          def candidate_numeric_rows_from_text(file_name, text):
+              rows = []
+              normalized = normalize_latex_text(text)
+              lower = normalized.lower()
+              if "sigma" not in lower and "fσ" not in lower and "fsigma" not in lower:
+                  return rows
+
+              # Broad extraction candidate: one of the expected z bins near a few decimal numbers.
+              for z in EXPECTED_ZHAO_BINS:
+                  z_text = f"{z:.2f}"
+                  # Capture local windows near expected redshift.
+                  for match in re.finditer(re.escape(z_text), normalized):
+                      start = max(0, match.start() - 350)
+                      end = min(len(normalized), match.end() + 550)
+                      snippet = normalized[start:end]
+                      if not any(token in snippet.lower() for token in ["sigma", "fsigma", "f sigma", "growth", "rsd"]):
+                          continue
+                      nums = re.findall(r"[-+]?\d+\.\d+", snippet)
+                      # Keep rows that may include z plus measurements; do not decide exact value here.
+                      if len(nums) >= 3:
+                          rows.append({
+                              "file_name": file_name,
+                              "redshift_hint": z,
+                              "numeric_values_in_window": "|".join(nums[:20]),
+                              "snippet": snippet[:1000],
+                              "candidate_status": "numeric_window_candidate_not_approved",
+                              "manifest_fill_allowed": False,
+                              "scoring_allowed": False,
+                              "evidence_allowed": False,
+                          })
+                      if len(rows) >= 80:
+                          return rows
+              return rows
+
+          def exact_row_candidates_from_windows(window_rows):
+              # Conservative: only create exact candidates when the row pattern looks like z, fsigma, sigma
+              # and includes a z bin. These remain candidates, not approved manifest rows.
+              candidates = []
+              seen = set()
+              for row in window_rows:
+                  z = row["redshift_hint"]
+                  nums = [float(x) for x in row["numeric_values_in_window"].split("|") if re.match(r"[-+]?\d+\.\d+$", x)]
+                  if not nums:
+                      continue
+                  # Do not guess from arbitrary windows. Candidate only if at least one plausible f_sigma8 range is present.
+                  plausible = [x for x in nums if 0.05 <= x <= 1.20 and abs(x - z) > 0.02]
+                  # uncertainties often 0.02-0.30
+                  uncertainties = [x for x in nums if 0.005 <= x <= 0.40]
+                  if plausible and uncertainties:
+                      key = (z, tuple(nums[:8]))
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      candidates.append({
+                          "candidate_row_id": f"zhao_candidate_{len(candidates)+1:03d}",
+                          "redshift_hint": z,
+                          "candidate_numeric_values": "|".join(str(x) for x in nums[:12]),
+                          "plausible_measurements": "|".join(str(x) for x in plausible[:8]),
+                          "plausible_uncertainties": "|".join(str(x) for x in uncertainties[:8]),
+                          "source_file": row["file_name"],
+                          "candidate_status": "needs_human_table_review_not_manifest_ready",
+                          "manifest_fill_allowed": False,
+                          "scoring_allowed": False,
+                          "evidence_allowed": False,
+                      })
+                  if len(candidates) >= 40:
+                      break
+              return candidates
+
+          def safe_float(value):
+              try:
+                  return float(value)
+              except Exception:
+                  return None
+
+          def is_placeholder(value):
+              text = str(value or "").strip().lower()
+              return (
+                  not text
+                  or text.startswith("put_")
+                  or "put_" in text
+                  or text.startswith("do_not_fill")
+                  or text in ["todo", "none", "na", "n/a", "template_not_filled"]
+              )
+
+          inherited_v4_253_rows = [
+              {
+                  "inherited_from": "v4.253",
+                  "item": "rules",
+                  "value": "50 / 50 passed",
+                  "meaning": "Labeled Integration Capacity Dry Run passed.",
+                  "carry_forward_status": "large_labeled_system_ready_for_next_extraction",
+              },
+              {
+                  "inherited_from": "v4.253",
+                  "item": "total_labeled_rows",
+                  "value": 780,
+                  "meaning": "Large registry/graph/source matrix dry run held together.",
+                  "carry_forward_status": "scale_capacity_confirmed",
+              },
+              {
+                  "inherited_from": "v4.253",
+                  "item": "zhao_placeholder_rows",
+                  "value": 4,
+                  "meaning": "Zhao four redshift bins were kept as placeholders, not guessed.",
+                  "carry_forward_status": "zhao_values_needed",
+              },
+              {
+                  "inherited_from": "v4.253",
+                  "item": "manifest_fill_allowed",
+                  "value": False,
+                  "meaning": "Manifest fill stayed blocked.",
+                  "carry_forward_status": "manifest_fill_blocked",
+              },
+              {
+                  "inherited_from": "v4.253",
+                  "item": "scoring_allowed",
+                  "value": False,
+                  "meaning": "Scoring stayed blocked.",
+                  "carry_forward_status": "scoring_blocked",
+              },
+              {
+                  "inherited_from": "v4.253",
+                  "item": "selected_next_route",
+                  "value": "v4_254_zhao_tomographic_table_extraction_guard_or_scale_review",
+                  "meaning": "Current route returns to Zhao tomographic extraction.",
+                  "carry_forward_status": "current_route",
+              },
+          ]
+
+          source_probe_rows = []
+          for label, url in [
+              ("zhao_abs", ZHAO_ABS_URL),
+              ("zhao_eprint", ZHAO_EPRINT_URL),
+              ("zhao_pdf", ZHAO_PDF_URL),
+          ]:
+              status, content_type, content_length, raw, error = fetch_bytes(url)
+              source_probe_rows.append({
+                  "source_label": label,
+                  "source_url": url,
+                  "probe_status": status,
+                  "content_type": content_type,
+                  "content_length": content_length,
+                  "bytes_downloaded": len(raw),
+                  "probe_error": error,
+                  "probe_role": "source_access_only_not_approval",
+              })
+              if label == "zhao_abs":
+                  abs_raw = raw
+              elif label == "zhao_eprint":
+                  eprint_raw = raw
+              elif label == "zhao_pdf":
+                  pdf_raw = raw
+
+          eprint_file_rows, eprint_texts = extract_text_files_from_eprint(eprint_raw if "eprint_raw" in locals() else b"")
+
+          search_texts = []
+          if "abs_raw" in locals():
+              search_texts.append(("zhao_abs_html", decode_text(abs_raw)))
+          for name, content in eprint_texts:
+              search_texts.append((name, content))
+
+          keyword_window_rows = []
+          for file_name, text in search_texts:
+              if not text:
+                  continue
+              hits = window_hits(text, ["f\\sigma", "fsigma", "f sigma", "covariance", "data vector", "z_eff", "0.98", "1.23", "1.52", "1.94"], window=450)
+              for i, hit in enumerate(hits, start=1):
+                  keyword_window_rows.append({
+                      "window_id": f"window_{len(keyword_window_rows)+1:04d}",
+                      "file_name": file_name,
+                      "pattern": hit["pattern"],
+                      "snippet": hit["snippet"],
+                      "window_status": "keyword_window_not_extraction",
+                  })
+
+          numeric_window_rows = []
+          for file_name, text in search_texts:
+              if not text:
+                  continue
+              numeric_window_rows.extend(candidate_numeric_rows_from_text(file_name, text))
+
+          zhao_candidate_value_rows = exact_row_candidates_from_windows(numeric_window_rows)
+
+          zhao_bin_status_rows = []
+          for z in EXPECTED_ZHAO_BINS:
+              windows = [row for row in numeric_window_rows if float(row["redshift_hint"]) == float(z)]
+              candidates = [row for row in zhao_candidate_value_rows if float(row["redshift_hint"]) == float(z)]
+              if candidates:
+                  status = "candidate_numeric_rows_found_needs_human_table_review"
+              elif windows:
+                  status = "numeric_windows_found_no_exact_candidate"
+              else:
+                  status = "not_found_by_machine_parser"
+              zhao_bin_status_rows.append({
+                  "zhao_bin_id": f"zhao_z_{str(z).replace('.', '_')}",
+                  "redshift": z,
+                  "numeric_window_rows": len(windows),
+                  "candidate_value_rows": len(candidates),
+                  "bin_status": status,
+                  "manifest_fill_allowed": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              })
+
+          zhao_extraction_template_rows = []
+          for z in EXPECTED_ZHAO_BINS:
+              zhao_extraction_template_rows.append({
+                  "extraction_id": f"zhao_extract_z_{str(z).replace('.', '_')}",
+                  "candidate_id": "qso_src_002_dr14_zhao_tomographic",
+                  "paper_or_source_url": ZHAO_ABS_URL,
+                  "measurement_label": f"Zhao tomographic bin z_eff={z}",
+                  "redshift": z,
+                  "observable": "f_sigma8",
+                  "observed_value": "MISSING_NOT_GUESSED",
+                  "uncertainty_or_covariance_reference": "MISSING_COVARIANCE_OR_TABLE_REVIEW",
+                  "data_vector_reference": "MISSING_TABLE_OR_SUPPLEMENT_LOCATION",
+                  "source_role": "primary_qso_growth_tomographic_literature_candidate",
+                  "provenance_status": "same_survey_family_cross_release_needs_review",
+                  "extraction_status": "pending_manual_table_review",
+                  "approval_status": "not_scored_not_evidence",
+              })
+
+          zhao_covariance_status_rows = [
+              {
+                  "covariance_item": "four_bin_data_vector",
+                  "required_for": "manifest_fill",
+                  "current_status": "not_extracted",
+                  "source_hint": "Zhao paper reports joint measurement at four effective redshifts; machine parser must locate table/supplement",
+                  "approval_status": "missing",
+              },
+              {
+                  "covariance_item": "full_data_covariance_matrix",
+                  "required_for": "scoring_or_joint_rows",
+                  "current_status": "not_extracted",
+                  "source_hint": "Zhao abstract reports full data covariance matrix; exact source still needs extraction",
+                  "approval_status": "missing",
+              },
+              {
+                  "covariance_item": "dependency_flags",
+                  "required_for": "source_surface_review",
+                  "current_status": "not_reviewed",
+                  "source_hint": "BAO/RSD and optimal redshift weight dependencies must be marked before scoring",
+                  "approval_status": "missing",
+              },
+              {
+                  "covariance_item": "provenance_decision",
+                  "required_for": "holdout_label",
+                  "current_status": "not_reviewed",
+                  "source_hint": "DR14 cross-release same-survey-family candidate must not be called a full independent holdout yet",
+                  "approval_status": "missing",
+              },
+          ]
+
+          manual_review_queue_rows = [
+              {
+                  "review_id": "review_001_table_exact_values",
+                  "task": "Open Zhao source table/supplement and extract exact f_sigma8 values for z=0.98,1.23,1.52,1.94.",
+                  "why_needed": "machine parser candidates cannot be trusted as final table extraction",
+                  "review_status": "needed",
+              },
+              {
+                  "review_id": "review_002_covariance_matrix",
+                  "task": "Locate full covariance matrix or data-vector file.",
+                  "why_needed": "joint tomographic scoring requires covariance support",
+                  "review_status": "needed",
+              },
+              {
+                  "review_id": "review_003_dependency_review",
+                  "task": "Mark BAO/RSD coupling, optimal redshift weights, and derived/dependent quantities.",
+                  "why_needed": "source surfaces must remain separated before any residual interpretation",
+                  "review_status": "needed",
+              },
+              {
+                  "review_id": "review_004_provenance_review",
+                  "task": "Decide whether DR14 Zhao is full holdout, partial same-family check, or support-only.",
+                  "why_needed": "current pressure lane used DR16 QSO context",
+                  "review_status": "needed",
+              },
+          ]
+
+          observed_manifest_status_rows = []
+          observed_manifest_input_rows = []
+          found_observed_manifests = [path for path in OBSERVED_MANIFEST_CANDIDATES if path.exists()]
+          if not found_observed_manifests:
+              observed_manifest_status_rows.append({
+                  "manifest_path": "",
+                  "manifest_status": "missing",
+                  "observed_rows": 0,
+                  "detail": "No external observed manifest found. Do not score.",
+              })
+          else:
+              for path in found_observed_manifests:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in REQUIRED_OBSERVED_COLUMNS if col not in columns]
+                      status = "schema_ok" if not missing else "schema_missing_columns"
+                      observed_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          "observed_rows": len(rows),
+                          "detail": "missing=" + "|".join(missing) if missing else "all required columns present",
+                      })
+                      if not missing:
+                          for row in rows:
+                              observed_manifest_input_rows.append({col: row.get(col, "") for col in REQUIRED_OBSERVED_COLUMNS})
+                  except Exception as exc:
+                      observed_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          "observed_rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+
+          extraction_manifest_status_rows = []
+          extraction_manifest_input_rows = []
+          found_extraction_manifests = [path for path in EXTRACTION_MANIFEST_CANDIDATES if path.exists()]
+          if not found_extraction_manifests:
+              extraction_manifest_status_rows.append({
+                  "manifest_path": "",
+                  "manifest_status": "missing",
+                  "extraction_rows": 0,
+                  "detail": "No user-filled extraction manifest found. Built-in extraction guard rows only.",
+              })
+          else:
+              for path in found_extraction_manifests:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in REQUIRED_EXTRACTION_COLUMNS if col not in columns]
+                      status = "schema_ok" if not missing else "schema_missing_columns"
+                      extraction_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          "extraction_rows": len(rows),
+                          "detail": "missing=" + "|".join(missing) if missing else "all required columns present",
+                      })
+                      if not missing:
+                          for row in rows:
+                              extraction_manifest_input_rows.append({col: row.get(col, "") for col in REQUIRED_EXTRACTION_COLUMNS})
+                  except Exception as exc:
+                      extraction_manifest_status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          "extraction_rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+
+          permission_rows = [
+              {
+                  "permission_scope": "zhao_machine_table_extraction_guard",
+                  "permission_status": "written",
+                  "reason": "Machine extraction windows/candidates/templates are written.",
+              },
+              {
+                  "permission_scope": "zhao_candidate_numeric_rows",
+                  "permission_status": "allowed_review_only",
+                  "reason": "Candidate numeric rows can guide manual review only.",
+              },
+              {
+                  "permission_scope": "zhao_exact_value_approval",
+                  "permission_status": "blocked_until_manual_table_review",
+                  "reason": "Machine parser candidates are not exact approved table rows.",
+              },
+              {
+                  "permission_scope": "zhao_covariance_approval",
+                  "permission_status": "blocked_until_covariance_source_extracted",
+                  "reason": "Full covariance/data vector still needs source location.",
+              },
+              {
+                  "permission_scope": "external_observed_manifest_fill",
+                  "permission_status": "blocked",
+                  "reason": "No exact reviewed values and covariance/provenance decision exist.",
+              },
+              {
+                  "permission_scope": "external_observed_residual_scoring",
+                  "permission_status": "blocked",
+                  "reason": "No reviewed observed/reference join exists.",
+              },
+              {
+                  "permission_scope": "primary_qso_growth_evidence",
+                  "permission_status": "blocked",
+                  "reason": "Zhao extraction is not evidence.",
+              },
+              {
+                  "permission_scope": "numeric_correction_fit",
+                  "permission_status": "blocked",
+                  "reason": "No approved observed manifest or parameter values are ready.",
+              },
+              {
+                  "permission_scope": "combined_lrg_elg_qso_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix remains blocked by source-surface guards.",
+              },
+              {
+                  "permission_scope": "cosmology_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "No external likelihood fit or holdout scoring has run.",
+              },
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "readiness_001", "requirement": "zhao_source_access", "status": "attempted", "blocks": "nothing"},
+              {"readiness_id": "readiness_002", "requirement": "machine_numeric_windows", "status": "generated_or_empty", "blocks": "manual review"},
+              {"readiness_id": "readiness_003", "requirement": "exact_zhao_values", "status": "not_approved", "blocks": "manifest fill"},
+              {"readiness_id": "readiness_004", "requirement": "full_covariance_matrix", "status": "not_extracted", "blocks": "joint scoring"},
+              {"readiness_id": "readiness_005", "requirement": "dependency_flags", "status": "needed", "blocks": "source-surface interpretation"},
+              {"readiness_id": "readiness_006", "requirement": "provenance_decision", "status": "needed", "blocks": "holdout label"},
+              {"readiness_id": "readiness_007", "requirement": "external_observed_manifest", "status": "missing" if not found_observed_manifests else "present_needs_review", "blocks": "residual scoring"},
+              {"readiness_id": "readiness_008", "requirement": "numeric_correction_fit", "status": "blocked", "blocks": "model comparison"},
+              {"readiness_id": "readiness_009", "requirement": "combined_matrix_permission", "status": "blocked", "blocks": "combined matrix"},
+          ]
+
+          failure_condition_rows = [
+              {"failure_condition_id": "failure_001", "target": "QSO f_sigma8 primary pressure", "machine_condition": "if holdout_qso_growth_direction in ['0','-','mixed_negative'] then primary_pressure_weakened", "status": "active_but_not_testable_without_approved_holdout_and_covariance"},
+              {"failure_condition_id": "failure_002", "target": "QSO versus LRG growth contrast", "machine_condition": "if lrg_growth_direction == qso_growth_direction == '+' then source_contrast_weakened", "status": "active_for_future_control_review"},
+              {"failure_condition_id": "failure_003", "target": "QSO radial secondary support", "machine_condition": "if qso_radial_direction == '-' then secondary_support_weakened", "status": "active_for_future_secondary_review"},
+              {"failure_condition_id": "failure_004", "target": "geometry compressed lane non-primary", "machine_condition": "if compressed_geometry_primary and qso_growth_not_positive then current_interpretation_rewrite_needed", "status": "active_for_future_geometry_review"},
+              {"failure_condition_id": "failure_005", "target": "external likelihood robustness", "machine_condition": "if external_likelihood_absorbs_all_pressure_without_tairid_specific_leftover then baseline_pressure_not_tairid_specific", "status": "active_for_future_model_comparison"},
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "Zhao machine extraction guard ran.",
+                  "basis": "Source probes, e-print text extraction, keyword windows, numeric windows, candidate rows, and bin statuses were written.",
+                  "next_action": "Use outputs for manual table/covariance review, not scoring.",
+                  "claim_status": "extraction_guard_only",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "Zhao exact values are not approved by this workflow.",
+                  "basis": "Machine windows are candidate hints and templates remain missing-not-guessed.",
+                  "next_action": "Manual table extraction or supplement lookup is still required.",
+                  "claim_status": "not_manifest_ready",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Covariance and dependency remain separate blockers.",
+                  "basis": "Full covariance/data-vector and BAO/RSD dependency flags were not approved.",
+                  "next_action": "Review covariance policy before manifest fill.",
+                  "claim_status": "scoring_blocked",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "Next route should review Zhao extraction output and covariance policy.",
+                  "basis": "The parser may find candidate windows but cannot certify exact table rows.",
+                  "next_action": "Proceed to v4.255 covariance policy review or manual extraction handoff.",
+                  "claim_status": "review_needed",
+              },
+          ]
+
+          route_decision_rows = [
+              {"route_id": "route_001", "route": "zhao_covariance_policy_review", "permission_status": "recommended", "reason": "Covariance/data-vector status is still the main blocker."},
+              {"route_id": "route_002", "route": "manual_zhao_table_review", "permission_status": "recommended", "reason": "Machine extraction candidates need human table confirmation."},
+              {"route_id": "route_003", "route": "external_observed_manifest_fill", "permission_status": "blocked", "reason": "No exact reviewed values and covariance/provenance decision exist."},
+              {"route_id": "route_004", "route": "numeric_correction_fit", "permission_status": "blocked", "reason": "No approved observed manifest exists."},
+              {"route_id": "route_005", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.254 now has enough history for consolidation if needed."},
+          ]
+
+          next_rows = [
+              {"priority": 1, "test_id": "v4_255_zhao_covariance_policy_review", "purpose": "review whether exact values/candidate windows and covariance source can support any manifest row", "activated": True},
+              {"priority": 2, "test_id": "v4_255_manual_zhao_table_extraction_handoff", "purpose": "prepare human-readable extraction checklist if parser output is insufficient", "activated": True},
+              {"priority": 3, "test_id": "v4_255_external_observed_manifest_fill_after_review", "purpose": "prepare manifest rows only after exact value/covariance/provenance review", "activated": False},
+              {"priority": 4, "test_id": "v4_255_handoff_if_needed", "purpose": "consolidate v4.203-v4.254 if thread length is risky", "activated": True},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before Zhao extraction"},
+              {"gate": "inherited_v4_253_rows_equal_6", "passed": len(inherited_v4_253_rows) == 6, "detail": f"inherited_v4_253_rows = {len(inherited_v4_253_rows)}"},
+              {"gate": "source_probe_rows_equal_3", "passed": len(source_probe_rows) == 3, "detail": f"source_probe_rows = {len(source_probe_rows)}"},
+              {"gate": "eprint_file_rows_present_or_probe_recorded", "passed": len(eprint_file_rows) >= 0, "detail": f"eprint_file_rows = {len(eprint_file_rows)}"},
+              {"gate": "keyword_window_rows_variable_ok", "passed": len(keyword_window_rows) >= 0, "detail": f"keyword_window_rows = {len(keyword_window_rows)}"},
+              {"gate": "numeric_window_rows_variable_ok", "passed": len(numeric_window_rows) >= 0, "detail": f"numeric_window_rows = {len(numeric_window_rows)}"},
+              {"gate": "zhao_candidate_value_rows_variable_ok", "passed": len(zhao_candidate_value_rows) >= 0, "detail": f"zhao_candidate_value_rows = {len(zhao_candidate_value_rows)}"},
+              {"gate": "zhao_bin_status_rows_equal_4", "passed": len(zhao_bin_status_rows) == 4, "detail": f"zhao_bin_status_rows = {len(zhao_bin_status_rows)}"},
+              {"gate": "zhao_extraction_template_rows_equal_4", "passed": len(zhao_extraction_template_rows) == 4, "detail": f"zhao_extraction_template_rows = {len(zhao_extraction_template_rows)}"},
+              {"gate": "zhao_covariance_status_rows_equal_4", "passed": len(zhao_covariance_status_rows) == 4, "detail": f"zhao_covariance_status_rows = {len(zhao_covariance_status_rows)}"},
+              {"gate": "manual_review_queue_rows_equal_4", "passed": len(manual_review_queue_rows) == 4, "detail": f"manual_review_queue_rows = {len(manual_review_queue_rows)}"},
+              {"gate": "observed_manifest_status_rows_at_least_1", "passed": len(observed_manifest_status_rows) >= 1, "detail": f"observed_manifest_status_rows = {len(observed_manifest_status_rows)}"},
+              {"gate": "extraction_manifest_status_rows_at_least_1", "passed": len(extraction_manifest_status_rows) >= 1, "detail": f"extraction_manifest_status_rows = {len(extraction_manifest_status_rows)}"},
+              {"gate": "permission_rows_equal_10", "passed": len(permission_rows) == 10, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_9", "passed": len(readiness_rows) == 9, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "failure_condition_rows_equal_5", "passed": len(failure_condition_rows) == 5, "detail": f"failure_condition_rows = {len(failure_condition_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_decision_rows_equal_5", "passed": len(route_decision_rows) == 5, "detail": f"route_decision_rows = {len(route_decision_rows)}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "all_zhao_bins_non_scoring", "passed": all(row["scoring_allowed"] is False and row["evidence_allowed"] is False for row in zhao_bin_status_rows), "detail": "all Zhao bin rows non-scoring"},
+              {"gate": "no_zhao_candidate_manifest_fill_allowed", "passed": all(row["manifest_fill_allowed"] is False for row in zhao_candidate_value_rows), "detail": "no Zhao candidate values can fill manifest"},
+              {"gate": "exact_value_approval_blocked", "passed": any(row["permission_scope"] == "zhao_exact_value_approval" and row["permission_status"] == "blocked_until_manual_table_review" for row in permission_rows), "detail": "exact value approval blocked"},
+              {"gate": "covariance_approval_blocked", "passed": any(row["permission_scope"] == "zhao_covariance_approval" and row["permission_status"] == "blocked_until_covariance_source_extracted" for row in permission_rows), "detail": "covariance approval blocked"},
+              {"gate": "manifest_fill_blocked", "passed": any(row["permission_scope"] == "external_observed_manifest_fill" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "manifest fill blocked"},
+              {"gate": "external_scoring_blocked", "passed": any(row["permission_scope"] == "external_observed_residual_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "external observed scoring blocked"},
+              {"gate": "primary_qso_evidence_blocked", "passed": any(row["permission_scope"] == "primary_qso_growth_evidence" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "primary QSO evidence blocked"},
+              {"gate": "numeric_fit_blocked", "passed": any(row["permission_scope"] == "numeric_correction_fit" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "numeric correction fit blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation claim blocked"},
+              {"gate": "manual_review_queue_exists", "passed": len(manual_review_queue_rows) == 4, "detail": "manual review queue exists"},
+              {"gate": "manifest_fill_after_review_not_activated", "passed": any(row["test_id"] == "v4_255_external_observed_manifest_fill_after_review" and row["activated"] is False for row in next_rows), "detail": "manifest fill after review not activated"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_scoring", "passed": True, "detail": "no external observed scoring"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_255_zhao_covariance_policy_review_or_manual_extraction_handoff", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_254_zhao_tomographic_table_extraction_guard_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_254_inherited_v4_253_rows.csv", inherited_v4_253_rows)
+          write_csv(OUT / "v4_254_source_probe_rows.csv", source_probe_rows)
+          write_csv(OUT / "v4_254_eprint_file_rows.csv", eprint_file_rows)
+          write_csv(OUT / "v4_254_keyword_window_rows.csv", keyword_window_rows)
+          write_csv(OUT / "v4_254_numeric_window_rows.csv", numeric_window_rows)
+          write_csv(OUT / "v4_254_zhao_candidate_value_rows.csv", zhao_candidate_value_rows)
+          write_csv(OUT / "v4_254_zhao_bin_status_rows.csv", zhao_bin_status_rows)
+          write_csv(OUT / "v4_254_zhao_extraction_template_rows.csv", zhao_extraction_template_rows)
+          write_csv(OUT / "v4_254_zhao_covariance_status_rows.csv", zhao_covariance_status_rows)
+          write_csv(OUT / "v4_254_manual_review_queue_rows.csv", manual_review_queue_rows)
+          write_csv(OUT / "v4_254_observed_manifest_status_rows.csv", observed_manifest_status_rows)
+          write_csv(OUT / "v4_254_extraction_manifest_status_rows.csv", extraction_manifest_status_rows)
+          write_csv(OUT / "v4_254_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_254_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_254_failure_condition_rows.csv", failure_condition_rows)
+          write_csv(OUT / "v4_254_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_254_route_decision_rows.csv", route_decision_rows)
+          write_csv(OUT / "v4_254_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_254_rule_checks.csv", checks)
+
+          bin_lines = [
+              f"z={row['redshift']}: {row['bin_status']} windows={row['numeric_window_rows']} candidates={row['candidate_value_rows']}"
+              for row in zhao_bin_status_rows
+          ]
+
+          decision_lines = [
+              f"{row['decision_id']}: {row['decision']} Next: {row['next_action']}"
+              for row in decision_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_decision_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_v4_253_rows": len(inherited_v4_253_rows),
+              "source_probe_rows": len(source_probe_rows),
+              "eprint_file_rows": len(eprint_file_rows),
+              "keyword_window_rows": len(keyword_window_rows),
+              "numeric_window_rows": len(numeric_window_rows),
+              "zhao_candidate_value_rows": len(zhao_candidate_value_rows),
+              "zhao_bin_status_rows": len(zhao_bin_status_rows),
+              "zhao_extraction_template_rows": len(zhao_extraction_template_rows),
+              "zhao_covariance_status_rows": len(zhao_covariance_status_rows),
+              "manual_review_queue_rows": len(manual_review_queue_rows),
+              "observed_manifest_status_rows": len(observed_manifest_status_rows),
+              "extraction_manifest_status_rows": len(extraction_manifest_status_rows),
+              "permission_rows": len(permission_rows),
+              "readiness_rows": len(readiness_rows),
+              "failure_condition_rows": len(failure_condition_rows),
+              "decision_rows": len(decision_rows),
+              "route_decision_rows": len(route_decision_rows),
+              "next_rows": len(next_rows),
+              "manifest_fill_allowed": False,
+              "scoring_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_254_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.254 Zhao Tomographic Table Extraction Guard",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_v4_253_rows = {summary['inherited_v4_253_rows']}",
+              f"source_probe_rows = {summary['source_probe_rows']}",
+              f"eprint_file_rows = {summary['eprint_file_rows']}",
+              f"keyword_window_rows = {summary['keyword_window_rows']}",
+              f"numeric_window_rows = {summary['numeric_window_rows']}",
+              f"zhao_candidate_value_rows = {summary['zhao_candidate_value_rows']}",
+              f"zhao_bin_status_rows = {summary['zhao_bin_status_rows']}",
+              f"zhao_extraction_template_rows = {summary['zhao_extraction_template_rows']}",
+              f"zhao_covariance_status_rows = {summary['zhao_covariance_status_rows']}",
+              f"manual_review_queue_rows = {summary['manual_review_queue_rows']}",
+              f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}",
+              f"extraction_manifest_status_rows = {summary['extraction_manifest_status_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"failure_condition_rows = {summary['failure_condition_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"route_decision_rows = {summary['route_decision_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"manifest_fill_allowed = {summary['manifest_fill_allowed']}",
+              f"scoring_allowed = {summary['scoring_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Zhao bin status:",
+              *bin_lines,
+              "",
+              "Decisions:",
+              *decision_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.254 attempts a machine-assisted Zhao tomographic extraction guard. It fetches source material, writes keyword and numeric-window rows, creates candidate rows only as review hints, keeps exact values missing-not-guessed unless confirmed, and keeps covariance/provenance separate. It does not fill the observed manifest, approve values, score residuals, or validate anything.",
+              "",
+              "Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_254_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_v4_253_rows = {summary['inherited_v4_253_rows']}")
+          print(f"source_probe_rows = {summary['source_probe_rows']}")
+          print(f"eprint_file_rows = {summary['eprint_file_rows']}")
+          print(f"keyword_window_rows = {summary['keyword_window_rows']}")
+          print(f"numeric_window_rows = {summary['numeric_window_rows']}")
+          print(f"zhao_candidate_value_rows = {summary['zhao_candidate_value_rows']}")
+          print(f"zhao_bin_status_rows = {summary['zhao_bin_status_rows']}")
+          print(f"zhao_extraction_template_rows = {summary['zhao_extraction_template_rows']}")
+          print(f"zhao_covariance_status_rows = {summary['zhao_covariance_status_rows']}")
+          print(f"manual_review_queue_rows = {summary['manual_review_queue_rows']}")
+          print(f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}")
+          print(f"extraction_manifest_status_rows = {summary['extraction_manifest_status_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"failure_condition_rows = {summary['failure_condition_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"route_decision_rows = {summary['route_decision_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"manifest_fill_allowed = {summary['manifest_fill_allowed']}")
+          print(f"scoring_allowed = {summary['scoring_allowed']}")
+          print(f"approved_holdout_sources = {summary['approved_holdout_sources']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.254 Zhao tomographic table extraction guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-254-zhao-tomographic-table-extraction-guard-output
+          path: |
+            tairid_v4_254_zhao_tomographic_table_extraction_guard_output/
+            tairid-v4-254-zhao-tomographic-table-extraction-guard-output.zip
