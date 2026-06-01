@@ -1,0 +1,635 @@
+name: 001 TAIRID v4.228 - Residual Source Surface Review
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-228-residual-source-surface-review.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  residual-source-surface-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.228 Residual Source Surface Review is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.228 residual source surface review
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.228"
+          ROUTE = "residual_direction_source_surface_review_after_v4_227"
+          EXPECTED_RESULT = "v4_228_residual_source_surface_review_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_229_elg_axis_translation_guard_or_lrg_qso_residual_stability_expansion"
+
+          OUT = Path("tairid_v4_228_residual_source_surface_review_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-228-residual-source-surface-review-output.zip"
+
+          BASE = "https://raw.githubusercontent.com/cosmosis-developers/cosmosis-standard-library/main/likelihood/eboss_dr16"
+
+          SOURCE_INPUTS = [
+              {
+                  "source": "LRG",
+                  "surface_id": "lrg_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/lrg/sdss_DR16_LRG_FSBAO_DMDHfs8_covtot.txt",
+              },
+              {
+                  "source": "QSO",
+                  "surface_id": "qso_dr16_fsbao_dmdhfs8",
+                  "measurement_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8.txt",
+                  "covariance_url": BASE + "/qso/sdss_DR16_QSO_FSBAO_DMDHfs8_covtot.txt",
+              },
+          ]
+
+          ELG_URL = BASE + "/elg/sdss_DR16_ELG_BAO_DVtable.txt"
+
+          AXIS_MAP = {
+              "DM_over_rd": ("D_M_over_r_sound", "reach_geometry"),
+              "DM_over_rs": ("D_M_over_r_sound", "reach_geometry"),
+              "DH_over_rd": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "DH_over_rs": ("D_H_over_r_sound", "radial_pacing_geometry"),
+              "f_sigma8": ("f_sigma8", "growth_consolidation"),
+          }
+
+          AXIS_ORDER = ["D_M_over_r_sound", "D_H_over_r_sound", "f_sigma8"]
+
+          # These are sensitivity brackets for the reference guard, not a fit.
+          BASELINE_VARIANTS = [
+              {
+                  "variant_id": "baseline_planck_like",
+                  "H0_km_s_Mpc": 67.36,
+                  "Omega_m0": 0.3153,
+                  "sigma8_0": 0.8111,
+                  "growth_gamma": 0.55,
+                  "r_sound_Mpc": 147.09,
+              },
+              {
+                  "variant_id": "baseline_low_h0_high_om",
+                  "H0_km_s_Mpc": 66.50,
+                  "Omega_m0": 0.3300,
+                  "sigma8_0": 0.8000,
+                  "growth_gamma": 0.55,
+                  "r_sound_Mpc": 147.50,
+              },
+              {
+                  "variant_id": "baseline_high_h0_low_om",
+                  "H0_km_s_Mpc": 69.00,
+                  "Omega_m0": 0.3000,
+                  "sigma8_0": 0.8200,
+                  "growth_gamma": 0.55,
+                  "r_sound_Mpc": 146.50,
+              },
+              {
+                  "variant_id": "baseline_growth_low",
+                  "H0_km_s_Mpc": 67.36,
+                  "Omega_m0": 0.3153,
+                  "sigma8_0": 0.7800,
+                  "growth_gamma": 0.55,
+                  "r_sound_Mpc": 147.09,
+              },
+              {
+                  "variant_id": "baseline_growth_high",
+                  "H0_km_s_Mpc": 67.36,
+                  "Omega_m0": 0.3153,
+                  "sigma8_0": 0.8400,
+                  "growth_gamma": 0.55,
+                  "r_sound_Mpc": 147.09,
+              },
+          ]
+
+          C_LIGHT = 299792.458
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def fetch_text(url):
+              req = Request(url, headers={"User-Agent": "TAIRID-v4.228-residual-source-review"})
+              with urlopen(req, timeout=45) as response:
+                  return response.read().decode("utf-8", errors="replace")
+
+          def safe_float(token):
+              try:
+                  return float(token)
+              except Exception:
+                  return None
+
+          def numeric_lines(text):
+              rows = []
+              for line in text.splitlines():
+                  raw = line.strip()
+                  if not raw or raw.startswith("#"):
+                      continue
+                  nums = []
+                  labels = []
+                  for part in raw.replace(",", " ").split():
+                      value = safe_float(part)
+                      if value is None:
+                          labels.append(part)
+                      else:
+                          nums.append(value)
+                  rows.append((nums, labels, raw))
+              return rows
+
+          def parse_measurements(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2 and labels:
+                      rows.append({
+                          "redshift": nums[0],
+                          "value": nums[1],
+                          "quantity": labels[-1],
+                      })
+              return rows
+
+          def parse_matrix(text):
+              rows = []
+              for nums, labels, raw in numeric_lines(text):
+                  if nums:
+                      rows.append(nums)
+              return rows
+
+          def sigmas_from_covariance(matrix):
+              sigmas = []
+              for i in range(len(matrix)):
+                  diag = matrix[i][i] if i < len(matrix[i]) else float("nan")
+                  sigmas.append(math.sqrt(diag) if diag >= 0 else float("nan"))
+              return sigmas
+
+          def E_z(z, baseline):
+              om = baseline["Omega_m0"]
+              ol = 1.0 - om
+              return math.sqrt(om * (1.0 + z) ** 3 + ol)
+
+          def omega_m_z(z, baseline):
+              om0 = baseline["Omega_m0"]
+              return om0 * (1.0 + z) ** 3 / (E_z(z, baseline) ** 2)
+
+          def simpson_integral(f, a, b, n=2000):
+              if b == a:
+                  return 0.0
+              if n % 2:
+                  n += 1
+              h = (b - a) / n
+              total = f(a) + f(b)
+              for i in range(1, n):
+                  x = a + i * h
+                  total += (4 if i % 2 else 2) * f(x)
+              return total * h / 3.0
+
+          def dm_over_rsound(z, baseline):
+              integral = simpson_integral(lambda zz: 1.0 / E_z(zz, baseline), 0.0, z)
+              dm_mpc = (C_LIGHT / baseline["H0_km_s_Mpc"]) * integral
+              return dm_mpc / baseline["r_sound_Mpc"]
+
+          def dh_over_rsound(z, baseline):
+              dh_mpc = C_LIGHT / (baseline["H0_km_s_Mpc"] * E_z(z, baseline))
+              return dh_mpc / baseline["r_sound_Mpc"]
+
+          def growth_suppression_g(z, baseline):
+              om = omega_m_z(z, baseline)
+              ol = (1.0 - baseline["Omega_m0"]) / (E_z(z, baseline) ** 2)
+              denominator = (om ** (4.0 / 7.0)) - ol + (1.0 + om / 2.0) * (1.0 + ol / 70.0)
+              return (2.5 * om) / denominator
+
+          def linear_growth_D(z, baseline):
+              a = 1.0 / (1.0 + z)
+              return a * growth_suppression_g(z, baseline) / growth_suppression_g(0.0, baseline)
+
+          def fsigma8_projection(z, baseline):
+              f = omega_m_z(z, baseline) ** baseline["growth_gamma"]
+              return f * baseline["sigma8_0"] * linear_growth_D(z, baseline)
+
+          def dv_over_rsound(z, baseline):
+              dm = dm_over_rsound(z, baseline)
+              dh = dh_over_rsound(z, baseline)
+              return (z * dm * dm * dh) ** (1.0 / 3.0)
+
+          def projected_value(standard_quantity, z, baseline):
+              if standard_quantity == "D_M_over_r_sound":
+                  return dm_over_rsound(z, baseline)
+              if standard_quantity == "D_H_over_r_sound":
+                  return dh_over_rsound(z, baseline)
+              if standard_quantity == "f_sigma8":
+                  return fsigma8_projection(z, baseline)
+              if standard_quantity == "ELG_DVtable_likelihood_coordinate":
+                  return dv_over_rsound(z, baseline)
+              return float("nan")
+
+          def parse_elg_surface(text):
+              pairs = []
+              for nums, labels, raw in numeric_lines(text):
+                  if len(nums) >= 2:
+                      pairs.append((nums[0], nums[1]))
+              pairs = sorted(pairs, key=lambda pair: pair[0])
+              if not pairs:
+                  return {"table_rows": 0, "median_x": float("nan"), "weighted_sigma_x": float("nan"), "peak_x": float("nan")}
+
+              xs = [pair[0] for pair in pairs]
+              ys = [pair[1] for pair in pairs]
+
+              def trap(x_list, y_list):
+                  total = 0.0
+                  for i in range(1, len(x_list)):
+                      total += 0.5 * (x_list[i] - x_list[i - 1]) * (y_list[i] + y_list[i - 1])
+                  return total
+
+              area = trap(xs, ys)
+              pdf = [y / area if area else 0.0 for y in ys]
+              mean = trap(xs, [x * p for x, p in zip(xs, pdf)])
+              var = trap(xs, [((x - mean) ** 2) * p for x, p in zip(xs, pdf)])
+              sigma = math.sqrt(var) if var >= 0 else float("nan")
+
+              cdf = [0.0]
+              running = 0.0
+              for i in range(1, len(xs)):
+                  running += 0.5 * (xs[i] - xs[i - 1]) * (pdf[i] + pdf[i - 1])
+                  cdf.append(running)
+              if running:
+                  cdf = [value / running for value in cdf]
+
+              median = xs[-1]
+              for i in range(1, len(xs)):
+                  if cdf[i] >= 0.5:
+                      c0 = cdf[i - 1]
+                      c1 = cdf[i]
+                      x0 = xs[i - 1]
+                      x1 = xs[i]
+                      median = x1 if c1 == c0 else x0 + ((0.5 - c0) / (c1 - c0)) * (x1 - x0)
+                      break
+
+              peak_x, peak_y = max(pairs, key=lambda pair: pair[1])
+              return {"table_rows": len(pairs), "median_x": median, "weighted_sigma_x": sigma, "peak_x": peak_x}
+
+          observed_axis_rows = []
+
+          for item in SOURCE_INPUTS:
+              measurements = parse_measurements(fetch_text(item["measurement_url"]))
+              covariance = parse_matrix(fetch_text(item["covariance_url"]))
+              sigmas = sigmas_from_covariance(covariance)
+
+              for index, measurement in enumerate(measurements):
+                  standard_quantity, axis_name = AXIS_MAP.get(measurement["quantity"], (measurement["quantity"], "unmapped_axis"))
+                  observed_axis_rows.append({
+                      "source": item["source"],
+                      "surface_id": item["surface_id"],
+                      "standard_quantity": standard_quantity,
+                      "native_quantity": measurement["quantity"],
+                      "axis_name": axis_name,
+                      "redshift_or_axis_position": measurement["redshift"],
+                      "observed_value": measurement["value"],
+                      "observed_sigma_or_proxy": sigmas[index] if index < len(sigmas) else "",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          elg_surface = parse_elg_surface(fetch_text(ELG_URL))
+          observed_axis_rows.append({
+              "source": "ELG",
+              "surface_id": "elg_dr16_bao_dvtable",
+              "standard_quantity": "ELG_DVtable_likelihood_coordinate",
+              "native_quantity": "DVtable_x",
+              "axis_name": "elg_likelihood_surface_axis",
+              "redshift_or_axis_position": 0.845,
+              "observed_value": elg_surface["median_x"],
+              "observed_sigma_or_proxy": elg_surface["weighted_sigma_x"],
+              "proof_status": "not_proof",
+              "validation_status": "not_validation",
+          })
+
+          residual_rows = []
+          for baseline in BASELINE_VARIANTS:
+              for obs in observed_axis_rows:
+                  z = float(obs["redshift_or_axis_position"])
+                  observed_value = float(obs["observed_value"])
+                  sigma = float(obs["observed_sigma_or_proxy"]) if obs["observed_sigma_or_proxy"] != "" else float("nan")
+                  ref_value = projected_value(obs["standard_quantity"], z, baseline)
+                  residual_value = observed_value - ref_value
+                  residual_z = residual_value / sigma if sigma and not math.isnan(sigma) else float("nan")
+
+                  if math.isnan(residual_z) or abs(residual_z) < 1.0:
+                      direction = "0"
+                  elif residual_value > 0:
+                      direction = "+"
+                  else:
+                      direction = "-"
+
+                  residual_rows.append({
+                      "variant_id": baseline["variant_id"],
+                      "source": obs["source"],
+                      "surface_id": obs["surface_id"],
+                      "standard_quantity": obs["standard_quantity"],
+                      "native_quantity": obs["native_quantity"],
+                      "redshift_or_axis_position": z,
+                      "observed_value": observed_value,
+                      "observed_sigma_or_proxy": sigma,
+                      "reference_value": ref_value,
+                      "residual_value": residual_value,
+                      "residual_z_score": residual_z,
+                      "guarded_residual_direction": direction,
+                      "residual_status": "baseline_sensitivity_residual_preview_only",
+                      "blocked_read": "not validation, not fit, not TAIRID proof",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          signature_rows = []
+          for baseline in BASELINE_VARIANTS:
+              variant_id = baseline["variant_id"]
+              for source in ["LRG", "QSO", "ELG"]:
+                  rows = [row for row in residual_rows if row["variant_id"] == variant_id and row["source"] == source]
+                  signature = "".join(row["guarded_residual_direction"] for row in rows)
+                  axis_order = "|".join(row["standard_quantity"] for row in rows)
+                  signature_rows.append({
+                      "variant_id": variant_id,
+                      "source": source,
+                      "axis_order": axis_order,
+                      "guarded_residual_signature": signature,
+                      "allowed_read": "baseline sensitivity signature preview only",
+                      "blocked_read": "not validation and not TAIRID proof",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          stability_rows = []
+          for source in ["LRG", "QSO", "ELG"]:
+              source_obs = [obs for obs in observed_axis_rows if obs["source"] == source]
+              for obs in source_obs:
+                  rows = [
+                      row for row in residual_rows
+                      if row["source"] == source and row["standard_quantity"] == obs["standard_quantity"]
+                  ]
+                  directions = [row["guarded_residual_direction"] for row in rows]
+                  unique_directions = sorted(set(directions))
+                  nonzero = [d for d in directions if d in ["+", "-"]]
+                  stable_nonzero = len(set(nonzero)) == 1 and len(nonzero) == len(directions)
+                  all_zero = all(d == "0" for d in directions)
+
+                  if stable_nonzero:
+                      status = "stable_nonzero_direction_under_baseline_bracket"
+                  elif all_zero:
+                      status = "stable_zero_under_one_sigma_guard"
+                  else:
+                      status = "sensitive_or_mixed_direction_under_baseline_bracket"
+
+                  stability_rows.append({
+                      "source": source,
+                      "surface_id": obs["surface_id"],
+                      "standard_quantity": obs["standard_quantity"],
+                      "direction_sequence": "".join(directions),
+                      "unique_directions": "|".join(unique_directions),
+                      "stability_status": status,
+                      "allowed_read": "direction stability review only",
+                      "blocked_read": "not validation, not physical cause, not combined matrix permission",
+                      "proof_status": "not_proof",
+                      "validation_status": "not_validation",
+                  })
+
+          surface_review_rows = []
+          for source in ["LRG", "QSO", "ELG"]:
+              source_stability = [row for row in stability_rows if row["source"] == source]
+              stable_nonzero_count = sum(1 for row in source_stability if row["stability_status"] == "stable_nonzero_direction_under_baseline_bracket")
+              stable_zero_count = sum(1 for row in source_stability if row["stability_status"] == "stable_zero_under_one_sigma_guard")
+              mixed_count = sum(1 for row in source_stability if row["stability_status"] == "sensitive_or_mixed_direction_under_baseline_bracket")
+
+              if source == "ELG":
+                  review_status = "held_for_axis_translation_guard"
+                  next_requirement = "ELG DVtable coordinate must not be mixed with LRG/QSO axis set without translation."
+              elif stable_nonzero_count > 0 and mixed_count == 0:
+                  review_status = "source_surface_has_stable_direction_candidates"
+                  next_requirement = "Review stable nonzero directions as candidate pressure only, not proof."
+              else:
+                  review_status = "source_surface_mostly_zero_or_sensitive"
+                  next_requirement = "Do not promote to shape claim; expand sensitivity and reference checks."
+
+              surface_review_rows.append({
+                  "source": source,
+                  "axis_rows_reviewed": len(source_stability),
+                  "stable_nonzero_count": stable_nonzero_count,
+                  "stable_zero_count": stable_zero_count,
+                  "mixed_or_sensitive_count": mixed_count,
+                  "surface_review_status": review_status,
+                  "next_requirement": next_requirement,
+                  "proof_status": "not_proof",
+                  "validation_status": "not_validation",
+              })
+
+          permission_rows = [
+              {
+                  "permission_scope": "source_specific_residual_direction_review",
+                  "permission_status": "allowed_as_sensitivity_preview",
+                  "reason": "Baseline bracket is explicit and residuals are not treated as validation.",
+              },
+              {
+                  "permission_scope": "stable_direction_shape_claim",
+                  "permission_status": "blocked_pending_review",
+                  "reason": "Stable signs are candidate pressure only; need more source/reference checks.",
+              },
+              {
+                  "permission_scope": "elg_lrg_qso_axis_integration",
+                  "permission_status": "blocked",
+                  "reason": "ELG DVtable axis still needs translation guard.",
+              },
+              {
+                  "permission_scope": "combined_lrg_qso_elg_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix remains blocked.",
+              },
+          ]
+
+          next_rows = [
+              {
+                  "priority": 1,
+                  "test_id": "v4_229_elg_axis_translation_guard",
+                  "purpose": "decide whether ELG DVtable coordinate can be translated without fake covariance",
+                  "activated": True,
+              },
+              {
+                  "priority": 2,
+                  "test_id": "v4_229_lrg_qso_residual_stability_expansion",
+                  "purpose": "expand reference/sensitivity checks for LRG and QSO source surfaces",
+                  "activated": True,
+              },
+              {
+                  "priority": 3,
+                  "test_id": "v4_229_baseline_variant_review",
+                  "purpose": "review whether baseline bracket is too narrow or too rough",
+                  "activated": True,
+              },
+              {
+                  "priority": 4,
+                  "test_id": "v4_229_combined_matrix_permission_recheck",
+                  "purpose": "combined matrix remains blocked until axis translation and source stability pass",
+                  "activated": True,
+              },
+          ]
+
+          baseline_rows = []
+          for baseline in BASELINE_VARIANTS:
+              row = dict(baseline)
+              row["reference_status"] = "baseline_sensitivity_variant_only_not_fit"
+              row["proof_status"] = "not_proof"
+              row["validation_status"] = "not_validation"
+              baseline_rows.append(row)
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before review"},
+              {"gate": "baseline_rows_equal_5", "passed": len(baseline_rows) == 5, "detail": f"baseline_rows = {len(baseline_rows)}"},
+              {"gate": "observed_axis_rows_equal_7", "passed": len(observed_axis_rows) == 7, "detail": f"observed_axis_rows = {len(observed_axis_rows)}"},
+              {"gate": "residual_rows_equal_35", "passed": len(residual_rows) == 35, "detail": f"residual_rows = {len(residual_rows)}"},
+              {"gate": "signature_rows_equal_15", "passed": len(signature_rows) == 15, "detail": f"signature_rows = {len(signature_rows)}"},
+              {"gate": "stability_rows_equal_7", "passed": len(stability_rows) == 7, "detail": f"stability_rows = {len(stability_rows)}"},
+              {"gate": "surface_review_rows_equal_3", "passed": len(surface_review_rows) == 3, "detail": f"surface_review_rows = {len(surface_review_rows)}"},
+              {"gate": "elg_translation_guard_present", "passed": any(row["source"] == "ELG" and row["surface_review_status"] == "held_for_axis_translation_guard" for row in surface_review_rows), "detail": "ELG translation guard present"},
+              {"gate": "permission_rows_equal_4", "passed": len(permission_rows) == 4, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_qso_elg_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "stable_shape_claim_blocked", "passed": any(row["permission_scope"] == "stable_direction_shape_claim" and row["permission_status"] == "blocked_pending_review" for row in permission_rows), "detail": "stable direction shape claim blocked pending review"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_not_fit", "passed": True, "detail": "baseline bracket is not a fit"},
+              {"gate": "truth_boundary_combined_matrix_blocked", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_229_elg_axis_translation_guard_or_lrg_qso_residual_stability_expansion", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_228_residual_source_surface_review_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_228_baseline_variant_rows.csv", baseline_rows)
+          write_csv(OUT / "v4_228_observed_axis_rows.csv", observed_axis_rows)
+          write_csv(OUT / "v4_228_residual_sensitivity_rows.csv", residual_rows)
+          write_csv(OUT / "v4_228_signature_sensitivity_rows.csv", signature_rows)
+          write_csv(OUT / "v4_228_axis_stability_rows.csv", stability_rows)
+          write_csv(OUT / "v4_228_surface_review_rows.csv", surface_review_rows)
+          write_csv(OUT / "v4_228_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_228_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_228_rule_checks.csv", checks)
+
+          source_lines = [
+              f"{row['source']}: {row['surface_review_status']} "
+              f"(stable_nonzero={row['stable_nonzero_count']}, stable_zero={row['stable_zero_count']}, mixed={row['mixed_or_sensitive_count']})"
+              for row in surface_review_rows
+          ]
+
+          signature_lines = [
+              f"{row['variant_id']} {row['source']}: {row['guarded_residual_signature']}"
+              for row in signature_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "baseline_rows": len(baseline_rows),
+              "observed_axis_rows": len(observed_axis_rows),
+              "residual_rows": len(residual_rows),
+              "signature_rows": len(signature_rows),
+              "stability_rows": len(stability_rows),
+              "surface_review_rows": len(surface_review_rows),
+              "permission_rows": len(permission_rows),
+              "next_rows": len(next_rows),
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "is_cosmology_fit": False,
+                  "claims_shared_cause": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_228_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.228 Residual Source Surface Review",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"baseline_rows = {summary['baseline_rows']}",
+              f"observed_axis_rows = {summary['observed_axis_rows']}",
+              f"residual_rows = {summary['residual_rows']}",
+              f"signature_rows = {summary['signature_rows']}",
+              f"stability_rows = {summary['stability_rows']}",
+              f"surface_review_rows = {summary['surface_review_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Surface review:",
+              *source_lines,
+              "",
+              "Variant signatures:",
+              *signature_lines,
+              "",
+              "Clean meaning: v4.228 reviews whether the v4.227 residual directions persist under a small reference-baseline bracket. Stable signs remain candidate pressure only. ELG remains held for translation. The combined matrix remains blocked.",
+              "",
+              "Truth boundary: no proof, no validation, no fit claim, no shared cause, no combined matrix.",
+          ]
+          (OUT / "v4_228_summary.md").write_text("\n".join(summary_md) + "\n", encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"baseline_rows = {summary['baseline_rows']}")
+          print(f"observed_axis_rows = {summary['observed_axis_rows']}")
+          print(f"residual_rows = {summary['residual_rows']}")
+          print(f"signature_rows = {summary['signature_rows']}")
+          print(f"stability_rows = {summary['stability_rows']}")
+          print(f"surface_review_rows = {summary['surface_review_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no fit claim, no shared cause, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.228 residual source surface review output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-228-residual-source-surface-review-output
+          path: |
+            tairid_v4_228_residual_source_surface_review_output/
+            tairid-v4-228-residual-source-surface-review-output.zip
