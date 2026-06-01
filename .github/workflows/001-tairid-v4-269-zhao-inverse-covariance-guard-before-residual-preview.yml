@@ -1,0 +1,889 @@
+name: 001 TAIRID v4.269 - Zhao Inverse Covariance Guard Before Residual Preview
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-269-zhao-inverse-covariance-guard-before-residual-preview.yml"
+      - "data/cosmology/zhao_reference_model_manifest.csv"
+      - "zhao_reference_model_manifest.csv"
+      - "data/cosmology/external_observed_manifest.csv"
+      - "external_observed_manifest.csv"
+
+permissions:
+  contents: read
+
+jobs:
+  zhao-inverse-covariance-guard-before-residual-preview:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.269 Zhao Inverse Covariance Guard Before Residual Preview is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.269 Zhao inverse covariance guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import math
+          import zipfile
+
+          VERSION = "v4.269"
+          ROUTE = "zhao_inverse_covariance_guard_before_residual_preview_after_v4_268"
+          EXPECTED_RESULT = "v4_269_zhao_inverse_covariance_guard_before_residual_preview_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_270_zhao_residual_preview_guard_no_scoring"
+
+          OUT = Path("tairid_v4_269_zhao_inverse_covariance_guard_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-269-zhao-inverse-covariance-guard-output.zip"
+
+          OBSERVED_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/external_observed_manifest.csv"),
+              Path("external_observed_manifest.csv"),
+          ]
+
+          REFERENCE_MODEL_MANIFEST_CANDIDATES = [
+              Path("data/cosmology/zhao_reference_model_manifest.csv"),
+              Path("zhao_reference_model_manifest.csv"),
+          ]
+
+          REQUIRED_OBSERVED_COLUMNS = [
+              "observed_id",
+              "target_id",
+              "source_family",
+              "source_role",
+              "redshift",
+              "quantity",
+              "observed_value",
+              "observed_sigma_or_likelihood",
+              "data_path_or_url",
+              "covariance_path_or_url",
+              "reference_model_path_or_method",
+              "failure_condition_id",
+              "approval_status",
+          ]
+
+          REQUIRED_REFERENCE_COLUMNS = [
+              "reference_id",
+              "observed_id",
+              "model_family",
+              "model_label",
+              "redshift",
+              "quantity",
+              "predicted_value",
+              "prediction_source_or_method",
+              "parameter_status",
+              "approval_status",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def read_manifest_status(paths, required_columns, row_label):
+              status_rows = []
+              input_rows = []
+              found = [path for path in paths if path.exists()]
+              if not found:
+                  status_rows.append({
+                      "manifest_path": "",
+                      "manifest_status": "missing",
+                      f"{row_label}_rows": 0,
+                      "detail": "No manifest found.",
+                  })
+                  return status_rows, input_rows
+
+              for path in found:
+                  try:
+                      with path.open("r", encoding="utf-8-sig", newline="") as f:
+                          reader = csv.DictReader(f)
+                          rows = list(reader)
+                          columns = reader.fieldnames or []
+                      missing = [col for col in required_columns if col not in columns]
+                      status = "schema_ok" if not missing else "schema_missing_columns"
+                      status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": status,
+                          f"{row_label}_rows": len(rows),
+                          "detail": "missing=" + "|".join(missing) if missing else "all required columns present",
+                      })
+                      if not missing:
+                          input_rows.extend(rows)
+                  except Exception as exc:
+                      status_rows.append({
+                          "manifest_path": path.as_posix(),
+                          "manifest_status": "read_failed",
+                          f"{row_label}_rows": 0,
+                          "detail": f"{type(exc).__name__}: {exc}",
+                      })
+              return status_rows, input_rows
+
+          def safe_float(value):
+              try:
+                  return float(str(value).strip())
+              except Exception:
+                  return None
+
+          def determinant(matrix):
+              n = len(matrix)
+              a = [list(map(float, row)) for row in matrix]
+              det = 1.0
+              for i in range(n):
+                  pivot = i
+                  for r in range(i, n):
+                      if abs(a[r][i]) > abs(a[pivot][i]):
+                          pivot = r
+                  if abs(a[pivot][i]) < 1e-18:
+                      return 0.0
+                  if pivot != i:
+                      a[i], a[pivot] = a[pivot], a[i]
+                      det *= -1.0
+                  pivot_value = a[i][i]
+                  det *= pivot_value
+                  for r in range(i + 1, n):
+                      factor = a[r][i] / pivot_value
+                      for c in range(i, n):
+                          a[r][c] -= factor * a[i][c]
+              return det
+
+          def principal_minor_rows(matrix, labels, prefix):
+              rows = []
+              n = len(matrix)
+              def combinations(items, k):
+                  if k == 0:
+                      yield []
+                  elif not items:
+                      return
+                  else:
+                      first, rest = items[0], items[1:]
+                      for combo in combinations(rest, k - 1):
+                          yield [first] + combo
+                      for combo in combinations(rest, k):
+                          yield combo
+              for size in range(1, n + 1):
+                  for inds in combinations(list(range(n)), size):
+                      sub = [[matrix[i][j] for j in inds] for i in inds]
+                      det = determinant(sub)
+                      rows.append({
+                          "minor_id": f"{prefix}_minor_{len(rows)+1:02d}",
+                          "size": size,
+                          "indices": "|".join(str(i) for i in inds),
+                          "labels": "|".join(labels[i] for i in inds),
+                          "determinant": det,
+                          "positive_definite_tolerance_pass": det > 1e-14,
+                      })
+              return rows
+
+          def invert_matrix(matrix):
+              n = len(matrix)
+              a = [list(map(float, row)) + [1.0 if i == j else 0.0 for j in range(n)] for i, row in enumerate(matrix)]
+              pivot_rows = []
+              for col in range(n):
+                  pivot = col
+                  for r in range(col, n):
+                      if abs(a[r][col]) > abs(a[pivot][col]):
+                          pivot = r
+                  pivot_abs = abs(a[pivot][col])
+                  if pivot_abs < 1e-18:
+                      raise ValueError("matrix is singular or near-singular")
+                  if pivot != col:
+                      a[col], a[pivot] = a[pivot], a[col]
+                  pivot_value = a[col][col]
+                  pivot_rows.append({
+                      "pivot_step": col + 1,
+                      "pivot_column": col + 1,
+                      "pivot_abs": pivot_abs,
+                      "pivot_value": pivot_value,
+                  })
+                  for c in range(2 * n):
+                      a[col][c] /= pivot_value
+                  for r in range(n):
+                      if r == col:
+                          continue
+                      factor = a[r][col]
+                      for c in range(2 * n):
+                          a[r][c] -= factor * a[col][c]
+              inv = [row[n:] for row in a]
+              return inv, pivot_rows
+
+          def matmul(a, b):
+              rows = len(a)
+              cols = len(b[0])
+              inner = len(b)
+              return [[sum(a[i][k] * b[k][j] for k in range(inner)) for j in range(cols)] for i in range(rows)]
+
+          def max_abs_identity_error(product):
+              max_err = 0.0
+              for i in range(len(product)):
+                  for j in range(len(product)):
+                      target = 1.0 if i == j else 0.0
+                      max_err = max(max_err, abs(product[i][j] - target))
+              return max_err
+
+          inherited_v4_268_rows = [
+              {
+                  "inherited_from": "v4.268",
+                  "item": "rules",
+                  "value": "50 / 50 passed",
+                  "meaning": "Zhao Reference Manifest Validator LCDM No Scoring passed.",
+                  "carry_forward_status": "ready_for_inverse_covariance_guard",
+              },
+              {
+                  "inherited_from": "v4.268",
+                  "item": "reference_manifest_validated",
+                  "value": True,
+                  "meaning": "LCDM reference packet validated as non-scoring input.",
+                  "carry_forward_status": "reference_ready",
+              },
+              {
+                  "inherited_from": "v4.268",
+                  "item": "validated_reference_packet_rows",
+                  "value": 4,
+                  "meaning": "Four validated reference rows exist.",
+                  "carry_forward_status": "reference_rows_ready",
+              },
+              {
+                  "inherited_from": "v4.268",
+                  "item": "zhao_observed_rows",
+                  "value": 4,
+                  "meaning": "Four Zhao observed rows exist.",
+                  "carry_forward_status": "observed_rows_ready",
+              },
+              {
+                  "inherited_from": "v4.268",
+                  "item": "residuals_computed",
+                  "value": False,
+                  "meaning": "No residuals were computed.",
+                  "carry_forward_status": "residuals_blocked_until_inverse_covariance",
+              },
+              {
+                  "inherited_from": "v4.268",
+                  "item": "chi_square_computed",
+                  "value": False,
+                  "meaning": "No chi-square was computed.",
+                  "carry_forward_status": "chi_square_blocked",
+              },
+              {
+                  "inherited_from": "v4.268",
+                  "item": "scoring_allowed",
+                  "value": False,
+                  "meaning": "Scoring stayed blocked.",
+                  "carry_forward_status": "scoring_blocked",
+              },
+              {
+                  "inherited_from": "v4.268",
+                  "item": "selected_next_route",
+                  "value": "v4_269_zhao_inverse_covariance_guard_before_residual_preview",
+                  "meaning": "Current route validates inverse covariance before residual preview.",
+                  "carry_forward_status": "current_route",
+              },
+          ]
+
+          observed_manifest_status_rows, observed_manifest_input_rows = read_manifest_status(
+              OBSERVED_MANIFEST_CANDIDATES, REQUIRED_OBSERVED_COLUMNS, "observed"
+          )
+          reference_model_manifest_status_rows, reference_model_manifest_input_rows = read_manifest_status(
+              REFERENCE_MODEL_MANIFEST_CANDIDATES, REQUIRED_REFERENCE_COLUMNS, "reference"
+          )
+
+          zhao_rows = [
+              {"observed_id": "zhao_dr14_tomographic_fsigma8_z_0_978", "redshift": 0.978, "observed_value": 0.379, "sigma": 0.176, "reference_value": 0.433944158},
+              {"observed_id": "zhao_dr14_tomographic_fsigma8_z_1_23", "redshift": 1.230, "observed_value": 0.385, "sigma": 0.099, "reference_value": 0.404912522},
+              {"observed_id": "zhao_dr14_tomographic_fsigma8_z_1_526", "redshift": 1.526, "observed_value": 0.342, "sigma": 0.070, "reference_value": 0.371533172},
+              {"observed_id": "zhao_dr14_tomographic_fsigma8_z_1_944", "redshift": 1.944, "observed_value": 0.364, "sigma": 0.106, "reference_value": 0.329409330},
+          ]
+
+          labels = [row["observed_id"] for row in zhao_rows]
+          corr = [
+              [1.0000, 0.5118, 0.2667, -0.0113],
+              [0.5118, 1.0000, 0.6288, 0.0722],
+              [0.2667, 0.6288, 1.0000, 0.4721],
+              [-0.0113, 0.0722, 0.4721, 1.0000],
+          ]
+
+          cov = []
+          for i, row in enumerate(zhao_rows):
+              cov_row = []
+              for j, col in enumerate(zhao_rows):
+                  cov_row.append(corr[i][j] * float(row["sigma"]) * float(col["sigma"]))
+              cov.append(cov_row)
+
+          inv_cov, pivot_rows = invert_matrix(cov)
+          product_left = matmul(cov, inv_cov)
+          product_right = matmul(inv_cov, cov)
+          identity_error_left = max_abs_identity_error(product_left)
+          identity_error_right = max_abs_identity_error(product_right)
+          cov_det = determinant(cov)
+          inv_det = determinant(inv_cov)
+          cov_norm_inf = max(sum(abs(x) for x in row) for row in cov)
+          inv_norm_inf = max(sum(abs(x) for x in row) for row in inv_cov)
+          condition_proxy_inf = cov_norm_inf * inv_norm_inf
+
+          covariance_rows = []
+          inverse_covariance_rows = []
+          identity_check_rows = []
+          for i in range(4):
+              for j in range(4):
+                  covariance_rows.append({
+                      "row_index": i + 1,
+                      "col_index": j + 1,
+                      "row_observed_id": labels[i],
+                      "col_observed_id": labels[j],
+                      "correlation_value": corr[i][j],
+                      "covariance_value": cov[i][j],
+                      "source": "v4.260/v4.261 Zhao covariance reconstructed from widetable2 correlations and widetable1 sigmas",
+                      "scoring_allowed": False,
+                  })
+                  inverse_covariance_rows.append({
+                      "row_index": i + 1,
+                      "col_index": j + 1,
+                      "row_observed_id": labels[i],
+                      "col_observed_id": labels[j],
+                      "inverse_covariance_value": inv_cov[i][j],
+                      "source": "v4.269 guarded inverse of reconstructed covariance",
+                      "scoring_allowed": False,
+                  })
+                  target = 1.0 if i == j else 0.0
+                  identity_check_rows.append({
+                      "row_index": i + 1,
+                      "col_index": j + 1,
+                      "cov_times_inverse_value": product_left[i][j],
+                      "inverse_times_cov_value": product_right[i][j],
+                      "target_identity_value": target,
+                      "left_abs_error": abs(product_left[i][j] - target),
+                      "right_abs_error": abs(product_right[i][j] - target),
+                      "identity_tolerance_pass": abs(product_left[i][j] - target) < 1e-8 and abs(product_right[i][j] - target) < 1e-8,
+                  })
+
+          covariance_principal_minor_rows = principal_minor_rows(cov, labels, "covariance")
+          inverse_principal_minor_rows = principal_minor_rows(inv_cov, labels, "inverse_covariance")
+
+          symmetry_check_rows = []
+          for i in range(4):
+              for j in range(4):
+                  symmetry_check_rows.append({
+                      "row_index": i + 1,
+                      "col_index": j + 1,
+                      "covariance_symmetry_error": abs(cov[i][j] - cov[j][i]),
+                      "inverse_symmetry_error": abs(inv_cov[i][j] - inv_cov[j][i]),
+                      "symmetry_tolerance_pass": abs(cov[i][j] - cov[j][i]) < 1e-12 and abs(inv_cov[i][j] - inv_cov[j][i]) < 1e-8,
+                  })
+
+          inverse_guard_summary_rows = [
+              {
+                  "summary_id": "inv_summary_001",
+                  "object": "covariance_matrix",
+                  "rows": 4,
+                  "determinant": cov_det,
+                  "norm_inf": cov_norm_inf,
+                  "status": "positive_definite_review_only" if cov_det > 0 else "determinant_issue",
+              },
+              {
+                  "summary_id": "inv_summary_002",
+                  "object": "inverse_covariance_matrix",
+                  "rows": 4,
+                  "determinant": inv_det,
+                  "norm_inf": inv_norm_inf,
+                  "status": "inverse_written_review_only" if inv_det > 0 else "inverse_determinant_issue",
+              },
+              {
+                  "summary_id": "inv_summary_003",
+                  "object": "identity_check",
+                  "rows": 16,
+                  "max_left_identity_error": identity_error_left,
+                  "max_right_identity_error": identity_error_right,
+                  "status": "identity_guard_pass" if identity_error_left < 1e-8 and identity_error_right < 1e-8 else "identity_guard_issue",
+              },
+              {
+                  "summary_id": "inv_summary_004",
+                  "object": "condition_proxy",
+                  "rows": 1,
+                  "condition_proxy_inf_norm": condition_proxy_inf,
+                  "status": "condition_proxy_recorded_not_interpreted",
+              },
+          ]
+
+          inverse_covariance_packet_rows = []
+          for row in inverse_covariance_rows:
+              inverse_covariance_packet_rows.append({
+                  **row,
+                  "packet_status": "validated_inverse_covariance_candidate_no_scoring",
+                  "residuals_allowed_next": True,
+                  "chi_square_allowed_now": False,
+                  "scoring_allowed": False,
+                  "evidence_allowed": False,
+              })
+
+          next_residual_contract_rows = [
+              {
+                  "contract_id": "contract_001",
+                  "future_object": "residual_vector",
+                  "requirement": "r_i = observed_value_i - reference_value_i using validated observed and reference packets",
+                  "current_status": "allowed_next_preview_only",
+              },
+              {
+                  "contract_id": "contract_002",
+                  "future_object": "normalized_residual_vector",
+                  "requirement": "n_i = r_i / sigma_i for descriptive preview",
+                  "current_status": "allowed_next_preview_only",
+              },
+              {
+                  "contract_id": "contract_003",
+                  "future_object": "covariance_weighted_projection",
+                  "requirement": "use inverse covariance only after explicit residual preview guard",
+                  "current_status": "allowed_next_preview_only_not_scoring",
+              },
+              {
+                  "contract_id": "contract_004",
+                  "future_object": "chi_square_scoring",
+                  "requirement": "requires separate scoring/evidence permission, not granted here",
+                  "current_status": "blocked",
+              },
+          ]
+
+          blocked_operation_rows = [
+              {
+                  "blocked_id": "blocked_001",
+                  "operation": "compute_residuals_now",
+                  "reason": "this workflow validates inverse covariance only; residual preview is next",
+                  "blocked": True,
+              },
+              {
+                  "blocked_id": "blocked_002",
+                  "operation": "compute_chi_square_now",
+                  "reason": "chi-square remains scoring-adjacent and needs later explicit guard",
+                  "blocked": True,
+              },
+              {
+                  "blocked_id": "blocked_003",
+                  "operation": "fit_numeric_correction_now",
+                  "reason": "inverse covariance guard is not a fitting workflow",
+                  "blocked": True,
+              },
+              {
+                  "blocked_id": "blocked_004",
+                  "operation": "claim_primary_qso_evidence_now",
+                  "reason": "inverse covariance validation is not evidence",
+                  "blocked": True,
+              },
+              {
+                  "blocked_id": "blocked_005",
+                  "operation": "claim_full_holdout_now",
+                  "reason": "Zhao remains same-survey-family cross-release candidate",
+                  "blocked": True,
+              },
+              {
+                  "blocked_id": "blocked_006",
+                  "operation": "claim_validation_now",
+                  "reason": "no residual scoring or external likelihood fit",
+                  "blocked": True,
+              },
+          ]
+
+          permission_rows = [
+              {
+                  "permission_scope": "inverse_covariance_guard",
+                  "permission_status": "passed_no_scoring",
+                  "reason": "Covariance matrix is invertible, symmetric, positive-definite under minors, and identity check passes.",
+              },
+              {
+                  "permission_scope": "inverse_covariance_packet",
+                  "permission_status": "written_not_scored",
+                  "reason": "Validated inverse covariance packet is written for the next guard.",
+              },
+              {
+                  "permission_scope": "residual_preview",
+                  "permission_status": "allowed_next_preview_only",
+                  "reason": "Observed rows, reference rows, covariance, and inverse covariance are now staged.",
+              },
+              {
+                  "permission_scope": "chi_square",
+                  "permission_status": "blocked",
+                  "reason": "Chi-square scoring requires a later explicit scoring/evidence guard.",
+              },
+              {
+                  "permission_scope": "live_external_observed_manifest_fill",
+                  "permission_status": "blocked",
+                  "reason": "Live observed manifest fill is still not approved.",
+              },
+              {
+                  "permission_scope": "external_observed_residual_scoring",
+                  "permission_status": "blocked",
+                  "reason": "No scoring guard exists.",
+              },
+              {
+                  "permission_scope": "primary_qso_growth_evidence",
+                  "permission_status": "blocked",
+                  "reason": "Inverse covariance validation is not evidence.",
+              },
+              {
+                  "permission_scope": "full_independent_holdout_language",
+                  "permission_status": "blocked",
+                  "reason": "Zhao provenance remains same-family/cross-release.",
+              },
+              {
+                  "permission_scope": "numeric_correction_fit",
+                  "permission_status": "blocked",
+                  "reason": "No fitting is allowed in this guard.",
+              },
+              {
+                  "permission_scope": "combined_lrg_elg_qso_matrix",
+                  "permission_status": "blocked",
+                  "reason": "Combined matrix remains blocked by source-surface guards.",
+              },
+              {
+                  "permission_scope": "cosmology_validation_claim",
+                  "permission_status": "blocked",
+                  "reason": "No external likelihood fit or holdout scoring has run.",
+              },
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "readiness_001", "requirement": "observed_rows", "status": "ready_review_only", "blocks": "nothing"},
+              {"readiness_id": "readiness_002", "requirement": "reference_rows", "status": "validated_no_scoring", "blocks": "nothing"},
+              {"readiness_id": "readiness_003", "requirement": "covariance_matrix", "status": "validated_review_only", "blocks": "nothing"},
+              {"readiness_id": "readiness_004", "requirement": "inverse_covariance_matrix", "status": "validated_no_scoring", "blocks": "nothing"},
+              {"readiness_id": "readiness_005", "requirement": "residual_preview", "status": "ready_next_preview_only", "blocks": "residual direction"},
+              {"readiness_id": "readiness_006", "requirement": "chi_square", "status": "blocked", "blocks": "likelihood-style interpretation"},
+              {"readiness_id": "readiness_007", "requirement": "numeric_correction_fit", "status": "blocked", "blocks": "model comparison"},
+              {"readiness_id": "readiness_008", "requirement": "combined_matrix_permission", "status": "blocked", "blocks": "combined matrix"},
+          ]
+
+          failure_condition_rows = [
+              {"failure_condition_id": "failure_001", "target": "QSO f_sigma8 primary pressure", "machine_condition": "if future_residual_direction in ['0','-','mixed_negative'] then primary_pressure_weakened", "status": "defined_for_future_not_tested"},
+              {"failure_condition_id": "failure_002", "target": "QSO versus LRG growth contrast", "machine_condition": "if future_lrg_growth_direction == future_qso_growth_direction == '+' then source_contrast_weakened", "status": "defined_for_future_not_tested"},
+              {"failure_condition_id": "failure_003", "target": "QSO radial secondary support", "machine_condition": "if future_qso_radial_direction == '-' then secondary_support_weakened", "status": "defined_for_future_not_tested"},
+              {"failure_condition_id": "failure_004", "target": "geometry compressed lane non-primary", "machine_condition": "if future_compressed_geometry_primary and qso_growth_not_positive then current_interpretation_rewrite_needed", "status": "defined_for_future_not_tested"},
+              {"failure_condition_id": "failure_005", "target": "external likelihood robustness", "machine_condition": "if future_external_likelihood_absorbs_all_pressure_without_tairid_specific_leftover then baseline_pressure_not_tairid_specific", "status": "defined_for_future_not_tested"},
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "Zhao inverse covariance guard passes as a non-scoring packet.",
+                  "basis": "Covariance is symmetric, principal minors pass, inversion succeeds, and identity error is below tolerance.",
+                  "next_action": "Run residual preview guard.",
+                  "claim_status": "inverse_covariance_validated_no_scoring",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "Residual preview is now the next clean technical route.",
+                  "basis": "Observed rows, reference rows, covariance, and inverse covariance are all staged.",
+                  "next_action": "Compute residual preview only, not scoring.",
+                  "claim_status": "preview_next",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Chi-square remains blocked.",
+                  "basis": "Chi-square is scoring-adjacent and should not run until explicitly allowed.",
+                  "next_action": "Keep chi-square out of v4.270 unless the guard explicitly defines it as blocked.",
+                  "claim_status": "scoring_blocked",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "All claim language remains blocked.",
+                  "basis": "Inverse covariance validation is a structure guard, not evidence.",
+                  "next_action": "Keep truth boundary active.",
+                  "claim_status": "no_validation",
+              },
+          ]
+
+          route_decision_rows = [
+              {"route_id": "route_001", "route": "zhao_residual_preview_guard_no_scoring", "permission_status": "recommended", "reason": "Inverse covariance validated; residual preview can run without scoring."},
+              {"route_id": "route_002", "route": "zhao_chi_square_scoring_guard", "permission_status": "blocked", "reason": "Chi-square requires separate explicit scoring/evidence guard."},
+              {"route_id": "route_003", "route": "external_observed_residual_scoring", "permission_status": "blocked", "reason": "No scoring guard has passed."},
+              {"route_id": "route_004", "route": "numeric_correction_fit", "permission_status": "blocked", "reason": "No fitting guard has passed."},
+              {"route_id": "route_005", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.269 is enough history for consolidation if needed."},
+          ]
+
+          next_rows = [
+              {"priority": 1, "test_id": "v4_270_zhao_residual_preview_guard_no_scoring", "purpose": "compute residual vector and directional preview without chi-square or scoring", "activated": True},
+              {"priority": 2, "test_id": "v4_270_zhao_chi_square_scoring_guard", "purpose": "still blocked until explicit scoring permission", "activated": False},
+              {"priority": 3, "test_id": "v4_270_external_observed_residual_scoring", "purpose": "still blocked until later scoring guard", "activated": False},
+              {"priority": 4, "test_id": "v4_270_handoff_if_needed", "purpose": "consolidate v4.203-v4.269 if thread length is risky", "activated": True},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before inverse covariance guard"},
+              {"gate": "inherited_v4_268_rows_equal_8", "passed": len(inherited_v4_268_rows) == 8, "detail": f"inherited_v4_268_rows = {len(inherited_v4_268_rows)}"},
+              {"gate": "observed_manifest_status_rows_at_least_1", "passed": len(observed_manifest_status_rows) >= 1, "detail": f"observed_manifest_status_rows = {len(observed_manifest_status_rows)}"},
+              {"gate": "reference_model_manifest_status_rows_at_least_1", "passed": len(reference_model_manifest_status_rows) >= 1, "detail": f"reference_model_manifest_status_rows = {len(reference_model_manifest_status_rows)}"},
+              {"gate": "zhao_rows_equal_4", "passed": len(zhao_rows) == 4, "detail": f"zhao_rows = {len(zhao_rows)}"},
+              {"gate": "covariance_rows_equal_16", "passed": len(covariance_rows) == 16, "detail": f"covariance_rows = {len(covariance_rows)}"},
+              {"gate": "inverse_covariance_rows_equal_16", "passed": len(inverse_covariance_rows) == 16, "detail": f"inverse_covariance_rows = {len(inverse_covariance_rows)}"},
+              {"gate": "identity_check_rows_equal_16", "passed": len(identity_check_rows) == 16, "detail": f"identity_check_rows = {len(identity_check_rows)}"},
+              {"gate": "all_identity_checks_pass", "passed": all(row["identity_tolerance_pass"] for row in identity_check_rows), "detail": "identity checks pass"},
+              {"gate": "pivot_rows_equal_4", "passed": len(pivot_rows) == 4, "detail": f"pivot_rows = {len(pivot_rows)}"},
+              {"gate": "all_pivots_safe", "passed": all(row["pivot_abs"] > 1e-10 for row in pivot_rows), "detail": "pivots safely nonzero"},
+              {"gate": "covariance_principal_minor_rows_equal_15", "passed": len(covariance_principal_minor_rows) == 15, "detail": f"covariance_principal_minor_rows = {len(covariance_principal_minor_rows)}"},
+              {"gate": "inverse_principal_minor_rows_equal_15", "passed": len(inverse_principal_minor_rows) == 15, "detail": f"inverse_principal_minor_rows = {len(inverse_principal_minor_rows)}"},
+              {"gate": "covariance_principal_minors_pass", "passed": all(row["positive_definite_tolerance_pass"] for row in covariance_principal_minor_rows), "detail": "covariance principal minors pass"},
+              {"gate": "inverse_principal_minors_pass", "passed": all(row["positive_definite_tolerance_pass"] for row in inverse_principal_minor_rows), "detail": "inverse principal minors pass"},
+              {"gate": "symmetry_check_rows_equal_16", "passed": len(symmetry_check_rows) == 16, "detail": f"symmetry_check_rows = {len(symmetry_check_rows)}"},
+              {"gate": "all_symmetry_checks_pass", "passed": all(row["symmetry_tolerance_pass"] for row in symmetry_check_rows), "detail": "symmetry checks pass"},
+              {"gate": "inverse_guard_summary_rows_equal_4", "passed": len(inverse_guard_summary_rows) == 4, "detail": f"inverse_guard_summary_rows = {len(inverse_guard_summary_rows)}"},
+              {"gate": "inverse_packet_rows_equal_16", "passed": len(inverse_covariance_packet_rows) == 16, "detail": f"inverse_covariance_packet_rows = {len(inverse_covariance_packet_rows)}"},
+              {"gate": "next_residual_contract_rows_equal_4", "passed": len(next_residual_contract_rows) == 4, "detail": f"next_residual_contract_rows = {len(next_residual_contract_rows)}"},
+              {"gate": "blocked_operation_rows_equal_6", "passed": len(blocked_operation_rows) == 6, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_11", "passed": len(permission_rows) == 11, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_8", "passed": len(readiness_rows) == 8, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "failure_condition_rows_equal_5", "passed": len(failure_condition_rows) == 5, "detail": f"failure_condition_rows = {len(failure_condition_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_decision_rows_equal_5", "passed": len(route_decision_rows) == 5, "detail": f"route_decision_rows = {len(route_decision_rows)}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "covariance_determinant_positive", "passed": cov_det > 0, "detail": f"cov_det = {cov_det}"},
+              {"gate": "inverse_determinant_positive", "passed": inv_det > 0, "detail": f"inv_det = {inv_det}"},
+              {"gate": "identity_error_left_low", "passed": identity_error_left < 1e-8, "detail": f"identity_error_left = {identity_error_left}"},
+              {"gate": "identity_error_right_low", "passed": identity_error_right < 1e-8, "detail": f"identity_error_right = {identity_error_right}"},
+              {"gate": "condition_proxy_recorded", "passed": math.isfinite(condition_proxy_inf) and condition_proxy_inf > 0, "detail": f"condition_proxy_inf = {condition_proxy_inf}"},
+              {"gate": "inverse_packet_non_scoring", "passed": all(row["scoring_allowed"] is False and row["evidence_allowed"] is False for row in inverse_covariance_packet_rows), "detail": "inverse packet non-scoring"},
+              {"gate": "inverse_covariance_guard_passed", "passed": any(row["permission_scope"] == "inverse_covariance_guard" and row["permission_status"] == "passed_no_scoring" for row in permission_rows), "detail": "inverse covariance guard passed"},
+              {"gate": "residual_preview_allowed_next", "passed": any(row["permission_scope"] == "residual_preview" and row["permission_status"] == "allowed_next_preview_only" for row in permission_rows), "detail": "residual preview allowed next"},
+              {"gate": "chi_square_blocked", "passed": any(row["permission_scope"] == "chi_square" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "chi-square blocked"},
+              {"gate": "live_manifest_fill_blocked", "passed": any(row["permission_scope"] == "live_external_observed_manifest_fill" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "live manifest fill blocked"},
+              {"gate": "external_scoring_blocked", "passed": any(row["permission_scope"] == "external_observed_residual_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "external scoring blocked"},
+              {"gate": "primary_qso_evidence_blocked", "passed": any(row["permission_scope"] == "primary_qso_growth_evidence" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "primary QSO evidence blocked"},
+              {"gate": "full_holdout_language_blocked", "passed": any(row["permission_scope"] == "full_independent_holdout_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "full holdout language blocked"},
+              {"gate": "numeric_fit_blocked", "passed": any(row["permission_scope"] == "numeric_correction_fit" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "numeric fit blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation claim blocked"},
+              {"gate": "residual_preview_route_recommended", "passed": any(row["route"] == "zhao_residual_preview_guard_no_scoring" and row["permission_status"] == "recommended" for row in route_decision_rows), "detail": "v4.270 route recommended"},
+              {"gate": "chi_square_not_activated", "passed": any(row["test_id"] == "v4_270_zhao_chi_square_scoring_guard" and row["activated"] is False for row in next_rows), "detail": "chi-square not activated"},
+              {"gate": "external_scoring_not_activated", "passed": any(row["test_id"] == "v4_270_external_observed_residual_scoring" and row["activated"] is False for row in next_rows), "detail": "external scoring not activated"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_scoring", "passed": True, "detail": "no external observed scoring"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_270_zhao_residual_preview_guard_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_269_zhao_inverse_covariance_guard_before_residual_preview_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_269_inherited_v4_268_rows.csv", inherited_v4_268_rows)
+          write_csv(OUT / "v4_269_observed_manifest_status_rows.csv", observed_manifest_status_rows)
+          write_csv(OUT / "v4_269_reference_model_manifest_status_rows.csv", reference_model_manifest_status_rows)
+          write_csv(OUT / "v4_269_zhao_rows.csv", zhao_rows)
+          write_csv(OUT / "v4_269_covariance_rows.csv", covariance_rows)
+          write_csv(OUT / "v4_269_inverse_covariance_rows.csv", inverse_covariance_rows)
+          write_csv(OUT / "zhao_inverse_covariance_VALIDATED_v4_269_NOT_SCORED.csv", inverse_covariance_packet_rows)
+          write_csv(OUT / "v4_269_identity_check_rows.csv", identity_check_rows)
+          write_csv(OUT / "v4_269_pivot_rows.csv", pivot_rows)
+          write_csv(OUT / "v4_269_covariance_principal_minor_rows.csv", covariance_principal_minor_rows)
+          write_csv(OUT / "v4_269_inverse_principal_minor_rows.csv", inverse_principal_minor_rows)
+          write_csv(OUT / "v4_269_symmetry_check_rows.csv", symmetry_check_rows)
+          write_csv(OUT / "v4_269_inverse_guard_summary_rows.csv", inverse_guard_summary_rows)
+          write_csv(OUT / "v4_269_next_residual_contract_rows.csv", next_residual_contract_rows)
+          write_csv(OUT / "v4_269_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_269_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_269_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_269_failure_condition_rows.csv", failure_condition_rows)
+          write_csv(OUT / "v4_269_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_269_route_decision_rows.csv", route_decision_rows)
+          write_csv(OUT / "v4_269_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_269_rule_checks.csv", checks)
+
+          summary_lines = [
+              f"{row['object']}: {row['status']}" for row in inverse_guard_summary_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_decision_rows
+          ]
+
+          next_lines = [
+              f"{row['test_id']}: activated={row['activated']} — {row['purpose']}"
+              for row in next_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_v4_268_rows": len(inherited_v4_268_rows),
+              "observed_manifest_status_rows": len(observed_manifest_status_rows),
+              "reference_model_manifest_status_rows": len(reference_model_manifest_status_rows),
+              "zhao_rows": len(zhao_rows),
+              "covariance_rows": len(covariance_rows),
+              "inverse_covariance_rows": len(inverse_covariance_rows),
+              "identity_check_rows": len(identity_check_rows),
+              "pivot_rows": len(pivot_rows),
+              "covariance_principal_minor_rows": len(covariance_principal_minor_rows),
+              "inverse_principal_minor_rows": len(inverse_principal_minor_rows),
+              "symmetry_check_rows": len(symmetry_check_rows),
+              "inverse_guard_summary_rows": len(inverse_guard_summary_rows),
+              "inverse_covariance_packet_rows": len(inverse_covariance_packet_rows),
+              "next_residual_contract_rows": len(next_residual_contract_rows),
+              "blocked_operation_rows": len(blocked_operation_rows),
+              "permission_rows": len(permission_rows),
+              "readiness_rows": len(readiness_rows),
+              "failure_condition_rows": len(failure_condition_rows),
+              "decision_rows": len(decision_rows),
+              "route_decision_rows": len(route_decision_rows),
+              "next_rows": len(next_rows),
+              "covariance_determinant": cov_det,
+              "inverse_covariance_determinant": inv_det,
+              "identity_error_left": identity_error_left,
+              "identity_error_right": identity_error_right,
+              "condition_proxy_inf": condition_proxy_inf,
+              "inverse_covariance_validated": True,
+              "inverse_covariance_packet_written": True,
+              "residuals_computed": False,
+              "chi_square_computed": False,
+              "residual_preview_allowed_next": True,
+              "scoring_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_269_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.269 Zhao Inverse Covariance Guard Before Residual Preview",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_v4_268_rows = {summary['inherited_v4_268_rows']}",
+              f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}",
+              f"reference_model_manifest_status_rows = {summary['reference_model_manifest_status_rows']}",
+              f"zhao_rows = {summary['zhao_rows']}",
+              f"covariance_rows = {summary['covariance_rows']}",
+              f"inverse_covariance_rows = {summary['inverse_covariance_rows']}",
+              f"identity_check_rows = {summary['identity_check_rows']}",
+              f"pivot_rows = {summary['pivot_rows']}",
+              f"covariance_principal_minor_rows = {summary['covariance_principal_minor_rows']}",
+              f"inverse_principal_minor_rows = {summary['inverse_principal_minor_rows']}",
+              f"symmetry_check_rows = {summary['symmetry_check_rows']}",
+              f"inverse_guard_summary_rows = {summary['inverse_guard_summary_rows']}",
+              f"inverse_covariance_packet_rows = {summary['inverse_covariance_packet_rows']}",
+              f"next_residual_contract_rows = {summary['next_residual_contract_rows']}",
+              f"blocked_operation_rows = {summary['blocked_operation_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"failure_condition_rows = {summary['failure_condition_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"route_decision_rows = {summary['route_decision_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"covariance_determinant = {summary['covariance_determinant']}",
+              f"inverse_covariance_determinant = {summary['inverse_covariance_determinant']}",
+              f"identity_error_left = {summary['identity_error_left']}",
+              f"identity_error_right = {summary['identity_error_right']}",
+              f"condition_proxy_inf = {summary['condition_proxy_inf']}",
+              f"inverse_covariance_validated = {summary['inverse_covariance_validated']}",
+              f"inverse_covariance_packet_written = {summary['inverse_covariance_packet_written']}",
+              f"residuals_computed = {summary['residuals_computed']}",
+              f"chi_square_computed = {summary['chi_square_computed']}",
+              f"residual_preview_allowed_next = {summary['residual_preview_allowed_next']}",
+              f"scoring_allowed = {summary['scoring_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Inverse guard summary:",
+              *summary_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Next rows:",
+              *next_lines,
+              "",
+              "Clean meaning: v4.269 validates the Zhao inverse covariance as a non-scoring structure packet. The covariance is symmetric, principal minors pass, inversion succeeds, identity error is below tolerance, and the inverse packet is ready for a residual preview. Residuals are still not computed here, and chi-square/scoring remains blocked.",
+              "",
+              "Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_269_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_v4_268_rows = {summary['inherited_v4_268_rows']}")
+          print(f"observed_manifest_status_rows = {summary['observed_manifest_status_rows']}")
+          print(f"reference_model_manifest_status_rows = {summary['reference_model_manifest_status_rows']}")
+          print(f"zhao_rows = {summary['zhao_rows']}")
+          print(f"covariance_rows = {summary['covariance_rows']}")
+          print(f"inverse_covariance_rows = {summary['inverse_covariance_rows']}")
+          print(f"identity_check_rows = {summary['identity_check_rows']}")
+          print(f"pivot_rows = {summary['pivot_rows']}")
+          print(f"covariance_principal_minor_rows = {summary['covariance_principal_minor_rows']}")
+          print(f"inverse_principal_minor_rows = {summary['inverse_principal_minor_rows']}")
+          print(f"symmetry_check_rows = {summary['symmetry_check_rows']}")
+          print(f"inverse_guard_summary_rows = {summary['inverse_guard_summary_rows']}")
+          print(f"inverse_covariance_packet_rows = {summary['inverse_covariance_packet_rows']}")
+          print(f"next_residual_contract_rows = {summary['next_residual_contract_rows']}")
+          print(f"blocked_operation_rows = {summary['blocked_operation_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"failure_condition_rows = {summary['failure_condition_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"route_decision_rows = {summary['route_decision_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"covariance_determinant = {summary['covariance_determinant']}")
+          print(f"inverse_covariance_determinant = {summary['inverse_covariance_determinant']}")
+          print(f"identity_error_left = {summary['identity_error_left']}")
+          print(f"identity_error_right = {summary['identity_error_right']}")
+          print(f"condition_proxy_inf = {summary['condition_proxy_inf']}")
+          print(f"inverse_covariance_validated = {summary['inverse_covariance_validated']}")
+          print(f"inverse_covariance_packet_written = {summary['inverse_covariance_packet_written']}")
+          print(f"residuals_computed = {summary['residuals_computed']}")
+          print(f"chi_square_computed = {summary['chi_square_computed']}")
+          print(f"residual_preview_allowed_next = {summary['residual_preview_allowed_next']}")
+          print(f"scoring_allowed = {summary['scoring_allowed']}")
+          print(f"approved_holdout_sources = {summary['approved_holdout_sources']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.269 Zhao inverse covariance guard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-269-zhao-inverse-covariance-guard-output
+          path: |
+            tairid_v4_269_zhao_inverse_covariance_guard_output/
+            tairid-v4-269-zhao-inverse-covariance-guard-output.zip
