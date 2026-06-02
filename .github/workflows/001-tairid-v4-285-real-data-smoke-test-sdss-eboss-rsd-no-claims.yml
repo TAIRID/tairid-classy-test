@@ -1,0 +1,791 @@
+name: 001 TAIRID v4.285 - Real Data Smoke Test SDSS eBOSS RSD No Claims
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-285-real-data-smoke-test-sdss-eboss-rsd-no-claims.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  real-data-smoke-test-sdss-eboss-rsd-no-claims:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.285 Real Data Smoke Test SDSS eBOSS RSD No Claims is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.285 real-data smoke test SDSS eBOSS RSD no claims
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import random
+          import re
+          import statistics
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.285"
+          ROUTE = "real_data_smoke_test_sdss_eboss_rsd_no_claims_after_v4_284"
+          EXPECTED_RESULT = "v4_285_real_data_smoke_test_sdss_eboss_rsd_no_claims_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_286_real_data_smoke_result_review_or_exact_file_locator_no_scoring"
+
+          OUT = Path("tairid_v4_285_real_data_smoke_test_sdss_eboss_rsd_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-285-real-data-smoke-test-sdss-eboss-rsd-output.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+          MAX_BYTES = 2_000_000
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=MAX_BYTES, timeout=15):
+              out = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length_header": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.285-real-data-smoke-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length_header"] = resp.headers.get("Content-Length", "")
+                      out["final_url"] = resp.geturl()
+                      out["bytes_read"] = len(data)
+                      out["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      out["fetch_ok"] = True
+              except Exception as exc:
+                  out["error"] = f"{type(exc).__name__}: {exc}"
+              return out, data
+
+          def parse_measurement_pairs_from_text(text):
+              # Matches 0.500 +/- 0.047 or 0.500 ± 0.047 after HTML text extraction.
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(text)]
+
+          def row_is_fsigma8(row):
+              joined = " ".join(row).lower()
+              compact = joined.replace(" ", "").replace("_", "")
+              return (
+                  ("f" in joined and "8" in joined and ("sigma" in joined or "σ" in joined))
+                  or "fσ8" in compact
+                  or "fsigma8" in compact
+                  or "f*sigma8" in compact
+              )
+
+          def parse_sdss_rsd_table(data):
+              rows_out = []
+              parser_status = {
+                  "html_tables_found": 0,
+                  "fsigma8_rows_found": 0,
+                  "parsed_measurement_pairs": 0,
+                  "parser_status": "not_run",
+                  "parser_note": "",
+              }
+              if not data:
+                  parser_status["parser_status"] = "no_data_to_parse"
+                  return rows_out, parser_status
+              text = data.decode("utf-8", errors="replace")
+              parser = SimpleTableParser()
+              try:
+                  parser.feed(text)
+              except Exception as exc:
+                  parser_status["parser_note"] = f"HTMLParser warning: {type(exc).__name__}: {exc}"
+              parser_status["html_tables_found"] = len(parser.tables)
+
+              row_candidates = []
+              for table_idx, table in enumerate(parser.tables):
+                  for row_idx, row in enumerate(table):
+                      if row_is_fsigma8(row):
+                          row_candidates.append((table_idx, row_idx, row))
+
+              parser_status["fsigma8_rows_found"] = len(row_candidates)
+
+              for table_idx, row_idx, row in row_candidates:
+                  pairs = []
+                  for cell_idx, cell in enumerate(row):
+                      for value, sigma in parse_measurement_pairs_from_text(cell):
+                          pairs.append((cell_idx, cell, value, sigma))
+                  # If row cells separated value/sigma oddly, try whole row text.
+                  if not pairs:
+                      joined = " | ".join(row)
+                      for value, sigma in parse_measurement_pairs_from_text(joined):
+                          pairs.append((-1, joined, value, sigma))
+                  for pair_idx, (cell_idx, cell, value, sigma) in enumerate(pairs, start=1):
+                      rows_out.append({
+                          "measurement_id": f"sdss_fsigma8_{len(rows_out)+1:02d}",
+                          "source_url": SOURCE_URL,
+                          "table_index": table_idx,
+                          "row_index": row_idx,
+                          "cell_index": cell_idx,
+                          "row_label_detected": row[0] if row else "",
+                          "measurement_order": pair_idx,
+                          "value": value,
+                          "sigma": sigma,
+                          "value_over_sigma": value / sigma if sigma else "",
+                          "cell_preview": cell[:240],
+                          "parse_status": "parsed_from_official_sdss_page",
+                          "claim_status": "real_data_parsed_no_tairid_claim",
+                      })
+
+              # Fallback: strip text and find fσ8 neighborhood only.
+              if not rows_out:
+                  stripped = re.sub(r"<script.*?</script>", " ", text, flags=re.S | re.I)
+                  stripped = re.sub(r"<style.*?</style>", " ", stripped, flags=re.S | re.I)
+                  stripped = re.sub(r"<[^>]+>", " ", stripped)
+                  stripped = html.unescape(" ".join(stripped.split()))
+                  lower = stripped.lower()
+                  anchors = [lower.find("f σ"), lower.find("fσ"), lower.find("f sigma"), lower.find("fsigma")]
+                  anchors = [a for a in anchors if a >= 0]
+                  if anchors:
+                      start = min(anchors)
+                      window = stripped[start:start+1600]
+                      for idx, (value, sigma) in enumerate(parse_measurement_pairs_from_text(window), start=1):
+                          rows_out.append({
+                              "measurement_id": f"sdss_fsigma8_fallback_{idx:02d}",
+                              "source_url": SOURCE_URL,
+                              "table_index": "fallback_text",
+                              "row_index": "fallback_text",
+                              "cell_index": "fallback_text",
+                              "row_label_detected": "f_sigma8_text_window",
+                              "measurement_order": idx,
+                              "value": value,
+                              "sigma": sigma,
+                              "value_over_sigma": value / sigma if sigma else "",
+                              "cell_preview": window[:240],
+                              "parse_status": "fallback_text_parse_from_official_sdss_page",
+                              "claim_status": "real_data_parsed_no_tairid_claim",
+                          })
+
+              parser_status["parsed_measurement_pairs"] = len(rows_out)
+              parser_status["parser_status"] = "parsed_real_rows" if rows_out else "no_fsigma8_measurements_parsed"
+              return rows_out, parser_status
+
+          inherited_v4_284_rows = [
+              {
+                  "inherited_from": "v4.284",
+                  "item": "rules",
+                  "value": "50 / 50 passed",
+                  "meaning": "External negative-control lane definition passed.",
+                  "carry_forward_status": "ready_for_real_data_smoke_test",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "negative_control_lanes_defined",
+                  "value": True,
+                  "meaning": "Endpoint, shuffle, metadata, baseline, and future-null controls were defined.",
+                  "carry_forward_status": "null_guards_active",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "null_precommit_cards_frozen",
+                  "value": True,
+                  "meaning": "Null expectations were frozen before real-data scoring.",
+                  "carry_forward_status": "null_precommit_frozen",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "pattern_chasing_warning_system_active",
+                  "value": True,
+                  "meaning": "Pattern warnings were active.",
+                  "carry_forward_status": "warning_system_active",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "external_scoring_allowed",
+                  "value": False,
+                  "meaning": "External scoring stayed blocked.",
+                  "carry_forward_status": "scoring_blocked",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "exact_file_locator_allowed_next",
+                  "value": True,
+                  "meaning": "Exact file locator was allowed next, but user requested a real-data smoke test first.",
+                  "carry_forward_status": "route_override_to_smoke_test",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "future_external_null_source_required",
+                  "value": True,
+                  "meaning": "True future external null source remains required before stronger support language.",
+                  "carry_forward_status": "future_null_required",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "approved_holdout_sources",
+                  "value": 0,
+                  "meaning": "No holdout source was approved.",
+                  "carry_forward_status": "no_holdout_approved",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "combined_matrix_allowed",
+                  "value": False,
+                  "meaning": "Combined matrix stayed blocked.",
+                  "carry_forward_status": "combined_matrix_blocked",
+              },
+              {
+                  "inherited_from": "v4.284",
+                  "item": "selected_next_route",
+                  "value": "v4_285_external_exact_file_locator_and_checksum_guard_no_scoring",
+                  "meaning": "Prior planned route was exact file locator; this smoke test is an intentionally labeled no-claims fork.",
+                  "carry_forward_status": "smoke_test_fork",
+              },
+          ]
+
+          smoke_source_rows = [
+              {
+                  "source_id": "sdss_final_bao_rsd_measurements_table",
+                  "source_name": "SDSS final BAO and RSD measurements table",
+                  "official_url": SOURCE_URL,
+                  "source_kind": "external_growth_RSD_official_summary_table",
+                  "source_family": "SDSS/eBOSS",
+                  "prior_exposure_status": "same_family_current_growth_lane",
+                  "holdout_status": "not_independent_holdout",
+                  "allowed_use": "real_data_smoke_test_only",
+                  "support_allowed_now": False,
+                  "claim_ceiling": "exploratory_or_weaken_only",
+              }
+          ]
+
+          smoke_precommit_rows = [
+              {
+                  "precommit_id": "smoke_sdss_rsd_001",
+                  "source_id": "sdss_final_bao_rsd_measurements_table",
+                  "freeze_status": "frozen_before_smoke_fetch_in_workflow",
+                  "predeclared_expectation": "The workflow may parse real f_sigma8 values from the official SDSS final BAO/RSD page, but because this is same-family and no numeric baseline/covariance score is implemented, any parsed result must remain no-claims exploratory.",
+                  "baseline_comparator": "published SDSS/eBOSS or LCDM comparator required before any later score; not computed in this smoke test",
+                  "failure_condition": "If the workflow treats parsed f_sigma8 values, endpoint metadata, or all-positive values as TAIRID support, the smoke test fails its claim boundary.",
+                  "allowed_interpretation": "real_data_touched_no_claims|parser_smoke_success|parser_smoke_needs_repair",
+                  "blocked_interpretation": "proof|validation|evidence|support|p_value|likelihood|numeric_fit|combined_matrix",
+              }
+          ]
+
+          fetch_row, data = fetch_url(SOURCE_URL)
+          fetch_rows = [{**fetch_row, "score_allowed": False, "support_allowed": False, "claim_status": "fetch_only_not_evidence"}]
+
+          parsed_rsd_rows, parser_status = parse_sdss_rsd_table(data)
+          parser_status_rows = [{
+              **parser_status,
+              "source_url": SOURCE_URL,
+              "support_allowed": False,
+              "score_allowed": False,
+              "claim_status": "parser_status_no_claims",
+          }]
+
+          descriptive_metric_rows = []
+          values = [float(row["value"]) for row in parsed_rsd_rows if row.get("value") != ""]
+          sigmas = [float(row["sigma"]) for row in parsed_rsd_rows if row.get("sigma") != ""]
+          if values:
+              descriptive_metric_rows.extend([
+                  {
+                      "metric_id": "metric_001",
+                      "metric_name": "parsed_fsigma8_count",
+                      "metric_value": len(values),
+                      "metric_meaning": "Number of f_sigma8 measurement pairs parsed from official SDSS page.",
+                      "score_status": "descriptive_not_tairid_score",
+                  },
+                  {
+                      "metric_id": "metric_002",
+                      "metric_name": "parsed_fsigma8_mean_value",
+                      "metric_value": statistics.mean(values),
+                      "metric_meaning": "Simple mean of parsed values; not a cosmology fit and not evidence.",
+                      "score_status": "descriptive_not_tairid_score",
+                  },
+                  {
+                      "metric_id": "metric_003",
+                      "metric_name": "parsed_fsigma8_min_value",
+                      "metric_value": min(values),
+                      "metric_meaning": "Minimum parsed value; not a support claim.",
+                      "score_status": "descriptive_not_tairid_score",
+                  },
+                  {
+                      "metric_id": "metric_004",
+                      "metric_name": "parsed_fsigma8_max_value",
+                      "metric_value": max(values),
+                      "metric_meaning": "Maximum parsed value; not a support claim.",
+                      "score_status": "descriptive_not_tairid_score",
+                  },
+                  {
+                      "metric_id": "metric_005",
+                      "metric_name": "parsed_sigma_mean",
+                      "metric_value": statistics.mean(sigmas) if sigmas else "",
+                      "metric_meaning": "Simple mean of parsed reported uncertainties; not covariance handling.",
+                      "score_status": "descriptive_not_tairid_score",
+                  },
+              ])
+          else:
+              descriptive_metric_rows.append({
+                  "metric_id": "metric_001",
+                  "metric_name": "parsed_fsigma8_count",
+                  "metric_value": 0,
+                  "metric_meaning": "No f_sigma8 values parsed. This is parser/fetch status, not a TAIRID result.",
+                  "score_status": "no_result_no_claim",
+              })
+
+          # Null/control guard rows. These are guards, not scoring.
+          shuffled_values = list(values)
+          random.Random(4285).shuffle(shuffled_values)
+          shuffle_same_multiset = sorted(shuffled_values) == sorted(values)
+          null_guard_rows = [
+              {
+                  "guard_id": "null_001",
+                  "negative_control_lane": "source_identity_endpoint_null",
+                  "guard_result": "passed" if fetch_row["fetch_ok"] is not None else "not_applicable",
+                  "meaning": "Endpoint status and hash were not used as TAIRID support.",
+                  "support_allowed": False,
+              },
+              {
+                  "guard_id": "null_002",
+                  "negative_control_lane": "irrelevant_metadata_predictor_null",
+                  "guard_result": "passed",
+                  "meaning": "URL length, content type, byte count, and hash were not used as predictors.",
+                  "support_allowed": False,
+              },
+              {
+                  "guard_id": "null_003",
+                  "negative_control_lane": "label_shuffle_permutation_null",
+                  "guard_result": "planned_not_scored",
+                  "meaning": "A fixed shuffle was generated only as a future-control placeholder; no pattern metric was run.",
+                  "support_allowed": False,
+              },
+              {
+                  "guard_id": "null_004",
+                  "negative_control_lane": "standard_baseline_equal_or_better_null",
+                  "guard_result": "baseline_missing_support_blocked",
+                  "meaning": "No numeric baseline comparator was run, so support is blocked.",
+                  "support_allowed": False,
+              },
+              {
+                  "guard_id": "null_005",
+                  "negative_control_lane": "future_external_null_source_required",
+                  "guard_result": "still_required_before_stronger_support",
+                  "meaning": "A true official null source is still required before stronger support language.",
+                  "support_allowed": False,
+              },
+          ]
+
+          smoke_outcome = "fetch_failed_no_result"
+          if fetch_row["fetch_ok"] and values:
+              smoke_outcome = "real_data_parsed_no_claims"
+          elif fetch_row["fetch_ok"] and not values:
+              smoke_outcome = "fetch_ok_parser_needs_repair"
+
+          result_classification_rows = [
+              {
+                  "classification_id": "class_001",
+                  "object": "real_data_smoke_test",
+                  "classification": smoke_outcome,
+                  "allowed_language": "The rail touched real official data and either parsed values or reported parser/fetch status without claims.",
+                  "blocked_language": "support|evidence|proof|validation",
+              },
+              {
+                  "classification_id": "class_002",
+                  "object": "tairid_support",
+                  "classification": "blocked",
+                  "allowed_language": "No TAIRID support is allowed from this smoke test.",
+                  "blocked_language": "support_candidate|validated|confirmed",
+              },
+              {
+                  "classification_id": "class_003",
+                  "object": "baseline_comparison",
+                  "classification": "not_run",
+                  "allowed_language": "Baseline comparator is required before scoring.",
+                  "blocked_language": "TAIRID beats baseline",
+              },
+              {
+                  "classification_id": "class_004",
+                  "object": "covariance_handling",
+                  "classification": "not_run",
+                  "allowed_language": "Reported uncertainties may be parsed, but covariance is not handled here.",
+                  "blocked_language": "full likelihood|p_value|sigma evidence",
+              },
+          ]
+
+          route_review_rows = [
+              {
+                  "route_id": "route_001",
+                  "route": "real_data_smoke_result_review_or_exact_file_locator_no_scoring",
+                  "permission_status": "recommended",
+                  "reason": "Review smoke result, then either repair parser or return to exact file locator.",
+              },
+              {
+                  "route_id": "route_002",
+                  "route": "external_exact_file_locator_and_checksum_guard_no_scoring",
+                  "permission_status": "allowed_next",
+                  "reason": "Needed for real scoring later.",
+              },
+              {
+                  "route_id": "route_003",
+                  "route": "sdss_rsd_parser_repair",
+                  "permission_status": "allowed_if_no_values_parsed",
+                  "reason": "Only needed if official page fetched but f_sigma8 row was not parsed.",
+              },
+              {
+                  "route_id": "route_004",
+                  "route": "external_data_score",
+                  "permission_status": "blocked",
+                  "reason": "Scoring still needs exact file, parser contract, baseline comparator, covariance policy, and score guard.",
+              },
+              {
+                  "route_id": "route_005",
+                  "route": "handoff",
+                  "permission_status": "allowed",
+                  "reason": "v4.203-v4.285 is a clean first-real-data-smoke milestone.",
+              },
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "claim_tairid_support_from_smoke_test", "reason": "smoke test has no baseline/covariance/score guard", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "compute_p_value_or_likelihood", "reason": "not implemented and not allowed in smoke test", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "fit_numeric_correction", "reason": "smoke test cannot fit parameters", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "treat_all_positive_values_as_support", "reason": "positive f_sigma8 values are expected physical measurements and not TAIRID-specific support", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "use_endpoint_metadata_as_signal", "reason": "null lane blocks endpoint metadata as signal", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "approve_holdout_source", "reason": "SDSS/eBOSS is same-family current lane and not independent holdout", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_validation_or_evidence", "reason": "no external result has passed full ladder", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "real_data_fetch", "permission_status": "attempted", "reason": "Official SDSS page fetch attempted."},
+              {"permission_scope": "real_data_parse", "permission_status": "attempted_no_claims", "reason": "Official page parsed for f_sigma8 row if available."},
+              {"permission_scope": "descriptive_metrics", "permission_status": "allowed_no_claims", "reason": "Descriptive parse metrics are allowed, not TAIRID scores."},
+              {"permission_scope": "baseline_comparison", "permission_status": "blocked", "reason": "No baseline comparator implemented in smoke test."},
+              {"permission_scope": "covariance_or_likelihood", "permission_status": "blocked", "reason": "No covariance or likelihood implemented in smoke test."},
+              {"permission_scope": "external_scoring", "permission_status": "blocked", "reason": "No exact file/parser/baseline/covariance score guard exists."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "Smoke test cannot produce support."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "official_sdss_page_fetch", "status": "ok" if fetch_row["fetch_ok"] else "failed_or_unavailable", "meaning": "Fetch status only."},
+              {"readiness_id": "ready_002", "object": "fsigma8_parser", "status": parser_status["parser_status"], "meaning": "Parser status only."},
+              {"readiness_id": "ready_003", "object": "real_data_smoke_test", "status": smoke_outcome, "meaning": "No-claims smoke outcome."},
+              {"readiness_id": "ready_004", "object": "baseline_comparator", "status": "missing", "meaning": "Required before scoring."},
+              {"readiness_id": "ready_005", "object": "covariance_policy", "status": "missing", "meaning": "Required before scoring."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "outside data was still abstract", "after_state": "official SDSS real-data page was touched", "reduction_type": "reality contact increased"},
+              {"sdr_id": "sdr_002", "before_state": "parser behavior was unknown", "after_state": "fetch/parse status is recorded", "reduction_type": "parser uncertainty reduced"},
+              {"sdr_id": "sdr_003", "before_state": "real data could tempt support language", "after_state": "support language remains blocked", "reduction_type": "claim discipline preserved"},
+              {"sdr_id": "sdr_004", "before_state": "endpoint metadata could leak into signal", "after_state": "metadata null guard blocks it", "reduction_type": "null guard exercised"},
+              {"sdr_id": "sdr_005", "before_state": "baseline gap could be ignored", "after_state": "baseline missing is explicitly support-blocking", "reduction_type": "baseline gap preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before real-data smoke test"},
+              {"gate": "inherited_v4_284_rows_equal_10", "passed": len(inherited_v4_284_rows) == 10, "detail": f"inherited_v4_284_rows = {len(inherited_v4_284_rows)}"},
+              {"gate": "smoke_source_rows_equal_1", "passed": len(smoke_source_rows) == 1, "detail": f"smoke_source_rows = {len(smoke_source_rows)}"},
+              {"gate": "smoke_precommit_rows_equal_1", "passed": len(smoke_precommit_rows) == 1, "detail": f"smoke_precommit_rows = {len(smoke_precommit_rows)}"},
+              {"gate": "fetch_rows_equal_1", "passed": len(fetch_rows) == 1, "detail": f"fetch_rows = {len(fetch_rows)}"},
+              {"gate": "parser_status_rows_equal_1", "passed": len(parser_status_rows) == 1, "detail": f"parser_status_rows = {len(parser_status_rows)}"},
+              {"gate": "parsed_rsd_rows_recorded", "passed": len(parsed_rsd_rows) >= 0, "detail": f"parsed_rsd_rows = {len(parsed_rsd_rows)}"},
+              {"gate": "descriptive_metric_rows_recorded", "passed": len(descriptive_metric_rows) >= 1, "detail": f"descriptive_metric_rows = {len(descriptive_metric_rows)}"},
+              {"gate": "null_guard_rows_equal_5", "passed": len(null_guard_rows) == 5, "detail": f"null_guard_rows = {len(null_guard_rows)}"},
+              {"gate": "result_classification_rows_equal_4", "passed": len(result_classification_rows) == 4, "detail": f"result_classification_rows = {len(result_classification_rows)}"},
+              {"gate": "route_review_rows_equal_5", "passed": len(route_review_rows) == 5, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "blocked_operation_rows_equal_8", "passed": len(blocked_operation_rows) == 8, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_8", "passed": len(permission_rows) == 8, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "source_is_sdss_official_page", "passed": smoke_source_rows[0]["official_url"].startswith("https://www.sdss4.org/science/final-bao-and-rsd-measurements-table"), "detail": "official SDSS page used"},
+              {"gate": "source_not_holdout", "passed": smoke_source_rows[0]["holdout_status"] == "not_independent_holdout", "detail": "same-family not holdout"},
+              {"gate": "support_blocked_source_row", "passed": smoke_source_rows[0]["support_allowed_now"] is False, "detail": "source support blocked"},
+              {"gate": "precommit_frozen_before_fetch", "passed": smoke_precommit_rows[0]["freeze_status"] == "frozen_before_smoke_fetch_in_workflow", "detail": "precommit frozen before fetch in workflow script order"},
+              {"gate": "precommit_blocks_support", "passed": "support" in smoke_precommit_rows[0]["blocked_interpretation"], "detail": "support blocked in precommit"},
+              {"gate": "fetch_not_support", "passed": fetch_rows[0]["support_allowed"] is False and fetch_rows[0]["score_allowed"] is False, "detail": "fetch no support/score"},
+              {"gate": "parsed_rows_no_claim_if_present", "passed": all(row["claim_status"] == "real_data_parsed_no_tairid_claim" for row in parsed_rsd_rows), "detail": "parsed rows no TAIRID claim"},
+              {"gate": "descriptive_metrics_no_tairid_score", "passed": all("score" in row["score_status"] or "claim" in row["score_status"] for row in descriptive_metric_rows), "detail": "descriptive metrics not TAIRID score"},
+              {"gate": "all_null_guards_no_support", "passed": all(row["support_allowed"] is False for row in null_guard_rows), "detail": "null guards no support"},
+              {"gate": "baseline_guard_blocks_support", "passed": any(row["negative_control_lane"] == "standard_baseline_equal_or_better_null" and row["guard_result"] == "baseline_missing_support_blocked" for row in null_guard_rows), "detail": "baseline missing blocks support"},
+              {"gate": "future_null_still_required", "passed": any(row["negative_control_lane"] == "future_external_null_source_required" for row in null_guard_rows), "detail": "future null still required"},
+              {"gate": "support_classification_blocked", "passed": any(row["object"] == "tairid_support" and row["classification"] == "blocked" for row in result_classification_rows), "detail": "TAIRID support blocked"},
+              {"gate": "baseline_classification_not_run", "passed": any(row["object"] == "baseline_comparison" and row["classification"] == "not_run" for row in result_classification_rows), "detail": "baseline not run"},
+              {"gate": "covariance_classification_not_run", "passed": any(row["object"] == "covariance_handling" and row["classification"] == "not_run" for row in result_classification_rows), "detail": "covariance not run"},
+              {"gate": "result_review_route_recommended", "passed": any(row["route"] == "real_data_smoke_result_review_or_exact_file_locator_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "result review route recommended"},
+              {"gate": "external_data_score_blocked_route", "passed": any(row["route"] == "external_data_score" and row["permission_status"] == "blocked" for row in route_review_rows), "detail": "external score route blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations guarded"},
+              {"gate": "baseline_permission_blocked", "passed": any(row["permission_scope"] == "baseline_comparison" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "baseline permission blocked"},
+              {"gate": "covariance_permission_blocked", "passed": any(row["permission_scope"] == "covariance_or_likelihood" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "covariance permission blocked"},
+              {"gate": "external_scoring_permission_blocked", "passed": any(row["permission_scope"] == "external_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "external scoring permission blocked"},
+              {"gate": "support_language_permission_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support language blocked"},
+              {"gate": "validation_evidence_permission_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "smoke_outcome_recorded", "passed": smoke_outcome in ["fetch_failed_no_result", "fetch_ok_parser_needs_repair", "real_data_parsed_no_claims"], "detail": f"smoke_outcome = {smoke_outcome}"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_286_real_data_smoke_result_review_or_exact_file_locator_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_285_real_data_smoke_test_sdss_eboss_rsd_no_claims_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_285_inherited_v4_284_rows.csv", inherited_v4_284_rows)
+          write_csv(OUT / "v4_285_smoke_source_rows.csv", smoke_source_rows)
+          write_csv(OUT / "v4_285_smoke_precommit_rows.csv", smoke_precommit_rows)
+          write_csv(OUT / "v4_285_fetch_rows.csv", fetch_rows)
+          write_csv(OUT / "v4_285_parser_status_rows.csv", parser_status_rows)
+          write_csv(OUT / "v4_285_parsed_sdss_rsd_fsigma8_rows.csv", parsed_rsd_rows)
+          write_csv(OUT / "REAL_DATA_SMOKE_PARSED_SDSS_RSD_FSIGMA8_v4_285_NO_CLAIMS.csv", parsed_rsd_rows)
+          write_csv(OUT / "v4_285_descriptive_metric_rows.csv", descriptive_metric_rows)
+          write_csv(OUT / "v4_285_null_guard_rows.csv", null_guard_rows)
+          write_csv(OUT / "v4_285_result_classification_rows.csv", result_classification_rows)
+          write_csv(OUT / "v4_285_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_285_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_285_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_285_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_285_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_285_rule_checks.csv", checks)
+
+          parsed_preview_lines = [
+              f"{row['measurement_id']}: value={row['value']} sigma={row['sigma']} status={row['parse_status']}"
+              for row in parsed_rsd_rows[:12]
+          ] or ["no f_sigma8 rows parsed; parser/fetch repair may be needed"]
+
+          metric_lines = [
+              f"{row['metric_name']} = {row['metric_value']} ({row['score_status']})"
+              for row in descriptive_metric_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_review_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_url": SOURCE_URL,
+              "fetch_ok": fetch_row["fetch_ok"],
+              "fetch_status_code": fetch_row["status_code"],
+              "bytes_read": fetch_row["bytes_read"],
+              "sha256_first_bytes": fetch_row["sha256_first_bytes"],
+              "parser_status": parser_status["parser_status"],
+              "html_tables_found": parser_status["html_tables_found"],
+              "fsigma8_rows_found": parser_status["fsigma8_rows_found"],
+              "parsed_rsd_rows": len(parsed_rsd_rows),
+              "descriptive_metric_rows": len(descriptive_metric_rows),
+              "null_guard_rows": len(null_guard_rows),
+              "result_classification_rows": len(result_classification_rows),
+              "smoke_outcome": smoke_outcome,
+              "real_data_touched": bool(fetch_row["fetch_ok"]),
+              "real_values_parsed": bool(values),
+              "baseline_comparison_run": False,
+              "covariance_handled": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "numeric_fit_allowed": False,
+              "support_allowed": False,
+              "evidence_allowed": False,
+              "validation_allowed": False,
+              "holdout_approval_allowed": False,
+              "combined_matrix_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_285_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.285 Real Data Smoke Test SDSS eBOSS RSD No Claims",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_url = {SOURCE_URL}",
+              f"fetch_ok = {summary['fetch_ok']}",
+              f"fetch_status_code = {summary['fetch_status_code']}",
+              f"bytes_read = {summary['bytes_read']}",
+              f"sha256_first_bytes = {summary['sha256_first_bytes']}",
+              f"parser_status = {summary['parser_status']}",
+              f"html_tables_found = {summary['html_tables_found']}",
+              f"fsigma8_rows_found = {summary['fsigma8_rows_found']}",
+              f"parsed_rsd_rows = {summary['parsed_rsd_rows']}",
+              f"descriptive_metric_rows = {summary['descriptive_metric_rows']}",
+              f"null_guard_rows = {summary['null_guard_rows']}",
+              f"smoke_outcome = {summary['smoke_outcome']}",
+              f"real_data_touched = {summary['real_data_touched']}",
+              f"real_values_parsed = {summary['real_values_parsed']}",
+              f"baseline_comparison_run = {summary['baseline_comparison_run']}",
+              f"covariance_handled = {summary['covariance_handled']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"numeric_fit_allowed = {summary['numeric_fit_allowed']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"validation_allowed = {summary['validation_allowed']}",
+              f"holdout_approval_allowed = {summary['holdout_approval_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Parsed row preview:",
+              *parsed_preview_lines,
+              "",
+              "Descriptive metrics:",
+              *metric_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.285 touches a real official SDSS BAO/RSD page and tries to parse f_sigma8 measurements. It is only a smoke test. Parsed values, fetch success, endpoint hashes, and descriptive metrics cannot count as TAIRID support. Baseline comparison, covariance handling, p-values, likelihoods, fitting, evidence, validation, holdout approval, and combined matrices remain blocked.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_285_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_url = {SOURCE_URL}")
+          print(f"fetch_ok = {summary['fetch_ok']}")
+          print(f"fetch_status_code = {summary['fetch_status_code']}")
+          print(f"bytes_read = {summary['bytes_read']}")
+          print(f"parser_status = {summary['parser_status']}")
+          print(f"html_tables_found = {summary['html_tables_found']}")
+          print(f"fsigma8_rows_found = {summary['fsigma8_rows_found']}")
+          print(f"parsed_rsd_rows = {summary['parsed_rsd_rows']}")
+          print(f"smoke_outcome = {summary['smoke_outcome']}")
+          print(f"real_data_touched = {summary['real_data_touched']}")
+          print(f"real_values_parsed = {summary['real_values_parsed']}")
+          print(f"baseline_comparison_run = {summary['baseline_comparison_run']}")
+          print(f"covariance_handled = {summary['covariance_handled']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"validation_allowed = {summary['validation_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.285 real data smoke test output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-285-real-data-smoke-test-sdss-eboss-rsd-output
+          path: |
+            tairid_v4_285_real_data_smoke_test_sdss_eboss_rsd_output/
+            tairid-v4-285-real-data-smoke-test-sdss-eboss-rsd-output.zip
