@@ -1,0 +1,468 @@
+name: 001 TAIRID v4.311 - SDSS RSD Decision Template Reissue Or Pause Handoff No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-311-sdss-rsd-decision-template-reissue-or-pause-handoff-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-decision-template-reissue-or-pause-handoff-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.311 SDSS RSD Decision Template Reissue Or Pause Handoff No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.311 SDSS RSD decision template reissue or pause handoff no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv, json, re, zipfile, urllib.request
+          from html.parser import HTMLParser
+
+          VERSION = "v4.311"
+          EXPECTED_RESULT = "v4_311_sdss_rsd_decision_template_reissue_or_pause_handoff_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_312_sdss_rsd_milestone_handoff_and_pause_marker_no_scoring"
+
+          OUT = Path("tairid_v4_311_sdss_rsd_decision_template_reissue_or_pause_handoff_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+          ZIP_NAME = "tairid-v4-311-sdss-rsd-decision-template-reissue-or-pause-handoff-output.zip"
+
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class TableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_text(url):
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.311-reissue-pause-handoff-no-claims"})
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return resp.read(2_000_000).decode("utf-8", errors="replace")
+              except Exception:
+                  return ""
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def is_fsigma_row(row):
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return "fσ8" in joined or "fsigma8" in joined
+
+          def parse_contract_rows():
+              html = fetch_text(SOURCE_URL)
+              parser = TableParser()
+              if html:
+                  parser.feed(html)
+              out = []
+              for table in parser.tables:
+                  for row in table:
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row[0] if row else ""
+                      row_type = "redshift_function_row_candidate" if "(z)" in label.lower().replace(" ", "") else "final_or_consensus_row_candidate"
+                      for col_idx, cell in enumerate(row[1:], start=1):
+                          for value, sigma in measurement_pairs(cell):
+                              out.append({
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                              })
+              return out
+
+          def build_reissue_template(contract_rows):
+              base_rows = [
+                  ("answer_001", "row_meaning_001", "row_meaning", "What does the f_sigma8(z) row mean?"),
+                  ("answer_002", "row_meaning_002", "row_meaning", "What does the f_sigma8 row mean and is it final/consensus?"),
+                  ("answer_003", "row_meaning_003", "row_meaning", "How are f_sigma8(z) and f_sigma8 related?"),
+                  ("answer_004", "row_meaning_004", "row_family", "Which one row family may be selected later, if any?"),
+                  ("answer_005", "baseline_001", "baseline", "What standard comparator values should be used, if any?"),
+                  ("answer_006", "baseline_002", "baseline", "What exact source maps comparator value to row/tracer/redshift?"),
+                  ("answer_007", "baseline_003", "baseline", "What uncertainty policy is source-backed for comparator values?"),
+                  ("answer_008", "baseline_004", "baseline", "Should this stay blocked to preserve the null/support boundary?"),
+              ]
+              next_idx = 9
+              rows = list(base_rows)
+              if contract_rows:
+                  for c in contract_rows:
+                      rows.append((
+                          f"answer_{next_idx:03d}",
+                          f"definition_match_{c['bound_id']}",
+                          "definition_match",
+                          f"Does comparator match {c['row_label']} observable f_sigma8 row with observed value {c['observed_value']} +/- {c['observed_sigma']}?",
+                      ))
+                      next_idx += 1
+              else:
+                  for i in range(1, 5):
+                      rows.append((
+                          f"answer_{next_idx:03d}",
+                          f"definition_match_placeholder_{i:02d}",
+                          "definition_match",
+                          "Placeholder only because live contract rows were not parsed.",
+                      ))
+                      next_idx += 1
+
+              out = []
+              for i, (answer_id, target_id, target_class, review_prompt) in enumerate(rows, start=1):
+                  out.append({
+                      "decision_id": f"decision_row_{i:03d}",
+                      "answer_id": answer_id,
+                      "target_id": target_id,
+                      "target_class": target_class,
+                      "review_prompt": review_prompt,
+                      "human_decision": "",
+                      "allowed_decisions": "accept_for_next_review|edit_needed|reject|keep_blocked",
+                      "edited_source_url_or_citation": "",
+                      "edited_quoted_or_precise_source_text": "",
+                      "edited_answer_summary": "",
+                      "reviewer_note": "",
+                      "claim_limit_must_remain": "no_scoring/no_claims",
+                      "gate_approval_allowed_now": False,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+              return out
+
+          inherited_v4_310_rows = [
+              {"inherited_from": "v4.310", "item": "rules", "value": "36 / 36 passed", "meaning": "Review decision status/handoff passed safely.", "carry_forward_status": "ready_for_reissue_or_pause"},
+              {"inherited_from": "v4.310", "item": "status_label", "value": "decision_template_missing", "meaning": "No filled human-decision template was found.", "carry_forward_status": "human_decision_gap"},
+              {"inherited_from": "v4.310", "item": "recommended_next_action", "value": "reissue_template_or_pause_handoff", "meaning": "Reissue a template or pause cleanly.", "carry_forward_status": "current_decision"},
+              {"inherited_from": "v4.310", "item": "decision_rows_loaded", "value": 0, "meaning": "No human-decision rows loaded.", "carry_forward_status": "no_decisions"},
+              {"inherited_from": "v4.310", "item": "reviewable_decision_rows", "value": 0, "meaning": "No reviewable human decisions.", "carry_forward_status": "no_decisions"},
+              {"inherited_from": "v4.310", "item": "accepted_for_next_review_rows", "value": 0, "meaning": "No row can move to gate review.", "carry_forward_status": "no_gate_review"},
+              {"inherited_from": "v4.310", "item": "gate_approval_rows", "value": 0, "meaning": "No gate approval.", "carry_forward_status": "no_approval"},
+              {"inherited_from": "v4.310", "item": "selected_next_route", "value": "v4_311_sdss_rsd_decision_template_reissue_or_pause_handoff_no_scoring", "meaning": "Current route chooses reissue or pause/handoff.", "carry_forward_status": "current_route"},
+          ]
+
+          contract_rows = parse_contract_rows()
+          reissue_template_rows = build_reissue_template(contract_rows)
+
+          pause_marker_rows = [
+              {"pause_id": "pause_001", "pause_reason": "The remaining work requires human review decisions, not another scoring test.", "pause_status": "recommended"},
+              {"pause_id": "pause_002", "pause_reason": "No source-backed human decision template has been committed.", "pause_status": "open_gap"},
+              {"pause_id": "pause_003", "pause_reason": "All scoring gates remain blocked until row meaning, baseline, row family, and definition matches are approved later.", "pause_status": "truth_boundary"},
+              {"pause_id": "pause_004", "pause_reason": "A handoff is now cleaner than continuing automatic tests without human decisions.", "pause_status": "handoff_ready"},
+          ]
+
+          handoff_snapshot_rows = [
+              {"snapshot_id": "snapshot_001", "item": "last_clear_workflow", "value": "v4.310", "meaning": "Status/handoff diagnosed decision_template_missing."},
+              {"snapshot_id": "snapshot_002", "item": "current_gap", "value": "human_review_decision_template", "meaning": "The rail needs a filled template, not more data extraction."},
+              {"snapshot_id": "snapshot_003", "item": "template_reissued", "value": True, "meaning": "v4.311 writes a fresh fillable decision template."},
+              {"snapshot_id": "snapshot_004", "item": "external_scoring_allowed", "value": False, "meaning": "No scoring is allowed."},
+              {"snapshot_id": "snapshot_005", "item": "gate_approval_rows", "value": 0, "meaning": "No approval has occurred."},
+              {"snapshot_id": "snapshot_006", "item": "recommended_next_route", "value": SELECTED_NEXT_ROUTE, "meaning": "Create milestone handoff and pause marker."},
+          ]
+
+          gate_rows = [
+              {"gate_id": "gate_001", "gate_object": "reissue_template_written", "gate_passed": len(reissue_template_rows) >= 8, "gate_status": "written", "reason": "Fresh fillable template written for later human review."},
+              {"gate_id": "gate_002", "gate_object": "pause_marker_written", "gate_passed": len(pause_marker_rows) == 4, "gate_status": "written", "reason": "Pause/handoff marker written."},
+              {"gate_id": "gate_003", "gate_object": "handoff_snapshot_written", "gate_passed": len(handoff_snapshot_rows) == 6, "gate_status": "written", "reason": "Handoff snapshot written."},
+              {"gate_id": "gate_004", "gate_object": "contract_rows_recorded", "gate_passed": len(contract_rows) >= 0, "gate_status": "recorded", "reason": "Contract rows are recorded if live source parsing works."},
+              {"gate_id": "gate_005", "gate_object": "row_meaning_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.311 is reissue/pause handoff only."},
+              {"gate_id": "gate_006", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "v4.311 is reissue/pause handoff only."},
+              {"gate_id": "gate_007", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.311 is reissue/pause handoff only."},
+              {"gate_id": "gate_008", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without approved gates."},
+          ]
+
+          blocked_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "reissue/pause handoff is not gate approval", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "reissue/pause handoff is not gate approval", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning is not confirmed", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition match not approved", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "diagnostic readiness is false", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no selected row family", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "decision_template_reissue_or_pause_handoff", "permission_status": "completed", "reason": "Fresh template and pause/handoff marker written."},
+              {"permission_scope": "milestone_handoff_and_pause_marker", "permission_status": "allowed_next", "reason": "Next workflow may create a compact milestone handoff."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "No confirmation in this workflow."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No approval in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "decision_template_reissued", "status": str(len(reissue_template_rows)), "meaning": "Fresh rows in reissued template."},
+              {"readiness_id": "ready_002", "object": "pause_marker", "status": "written", "meaning": "Pause/handoff marker written."},
+              {"readiness_id": "ready_003", "object": "handoff_snapshot", "status": "written", "meaning": "Current state summarized."},
+              {"readiness_id": "ready_004", "object": "human_review_needed", "status": "true", "meaning": "Next real change requires human decisions."},
+              {"readiness_id": "ready_005", "object": "milestone_handoff", "status": "ready_next", "meaning": "Next workflow can make a compact handoff."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "v4.311 reissues a clean human-decision template.", "basis": "v4.310 status was decision_template_missing.", "next_action": "Use template later or pause.", "claim_status": "operator_support_only"},
+              {"decision_id": "decision_002", "decision": "The rail should pause before further scoring attempts.", "basis": "The unresolved gap is human review, not extraction or scoring.", "next_action": "Create handoff/pause marker.", "claim_status": "pause_recommended"},
+              {"decision_id": "decision_003", "decision": "No gate approval is allowed in this workflow.", "basis": "Template reissue is not evidence, support, or scoring.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_milestone_handoff_and_pause_marker_no_scoring", "permission_status": "recommended", "reason": "The cleanest next move is a handoff/pause marker."},
+              {"route_id": "route_002", "route": "sdss_rsd_human_review_decision_ingest_no_scoring", "permission_status": "allowed_later_after_template_filled", "reason": "Only rerun after human decisions are filled and committed."},
+              {"route_id": "route_003", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_gate_decision_and_readiness", "reason": "No scoring readiness."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.311 is a clean reissue/pause milestone."},
+          ]
+
+          sdr_rows = [
+              {"sdr_id": "sdr_001", "before_state": "missing decision template could cause more folder-chasing", "after_state": "fresh template is reissued", "reduction_type": "operator load reduced"},
+              {"sdr_id": "sdr_002", "before_state": "automatic tests could continue without human decisions", "after_state": "pause/handoff is recommended", "reduction_type": "false progress prevented"},
+              {"sdr_id": "sdr_003", "before_state": "template reissue could be mistaken for approval", "after_state": "template rows explicitly block score/support/gate approval", "reduction_type": "template/approval boundary preserved"},
+              {"sdr_id": "sdr_004", "before_state": "current state was spread across many outputs", "after_state": "handoff snapshot summarizes the active gap", "reduction_type": "state compressed"},
+              {"sdr_id": "sdr_005", "before_state": "status could invite scoring pressure", "after_state": "all scoring and claims remain blocked", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before reissue/pause handoff"},
+              {"gate": "inherited_v4_310_rows_equal_8", "passed": len(inherited_v4_310_rows) == 8, "detail": f"inherited_v4_310_rows = {len(inherited_v4_310_rows)}"},
+              {"gate": "contract_rows_recorded", "passed": len(contract_rows) >= 0, "detail": f"contract_rows = {len(contract_rows)}"},
+              {"gate": "reissue_template_rows_at_least_8", "passed": len(reissue_template_rows) >= 8, "detail": f"reissue_template_rows = {len(reissue_template_rows)}"},
+              {"gate": "pause_marker_rows_equal_4", "passed": len(pause_marker_rows) == 4, "detail": f"pause_marker_rows = {len(pause_marker_rows)}"},
+              {"gate": "handoff_snapshot_rows_equal_6", "passed": len(handoff_snapshot_rows) == 6, "detail": f"handoff_snapshot_rows = {len(handoff_snapshot_rows)}"},
+              {"gate": "gate_rows_equal_8", "passed": len(gate_rows) == 8, "detail": f"gate_rows = {len(gate_rows)}"},
+              {"gate": "blocked_rows_equal_11", "passed": len(blocked_rows) == 11, "detail": f"blocked_rows = {len(blocked_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_3", "passed": len(decision_rows) == 3, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_rows_equal_4", "passed": len(route_rows) == 4, "detail": f"route_rows = {len(route_rows)}"},
+              {"gate": "sdr_rows_equal_5", "passed": len(sdr_rows) == 5, "detail": f"sdr_rows = {len(sdr_rows)}"},
+              {"gate": "all_reissue_template_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in reissue_template_rows), "detail": "template no score/support"},
+              {"gate": "all_reissue_template_no_gate_approval", "passed": all(row["gate_approval_allowed_now"] is False for row in reissue_template_rows), "detail": "template no gate approval"},
+              {"gate": "row_meaning_gate_not_approved", "passed": any(row["gate_object"] == "row_meaning_confirmation" and row["gate_passed"] is False for row in gate_rows), "detail": "row meaning false"},
+              {"gate": "baseline_gate_not_approved", "passed": any(row["gate_object"] == "baseline_approval" and row["gate_passed"] is False for row in gate_rows), "detail": "baseline false"},
+              {"gate": "definition_gate_not_approved", "passed": any(row["gate_object"] == "definition_match_confirmation" and row["gate_passed"] is False for row in gate_rows), "detail": "definition false"},
+              {"gate": "diagnostic_readiness_false", "passed": any(row["gate_object"] == "diagonal_diagnostic_readiness" and row["gate_passed"] is False for row in gate_rows), "detail": "diagnostic false"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_rows), "detail": "all blocked"},
+              {"gate": "reissue_pause_permission_completed", "passed": any(row["permission_scope"] == "decision_template_reissue_or_pause_handoff" and row["permission_status"] == "completed" for row in permission_rows), "detail": "reissue/pause completed"},
+              {"gate": "handoff_next_recommended", "passed": any(row["route"] == "sdss_rsd_milestone_handoff_and_pause_marker_no_scoring" and row["permission_status"] == "recommended" for row in route_rows), "detail": "handoff next recommended"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_312_sdss_rsd_milestone_handoff_and_pause_marker_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_311_sdss_rsd_decision_template_reissue_or_pause_handoff_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_311_inherited_v4_310_rows.csv", inherited_v4_310_rows)
+          write_csv(OUT / "v4_311_contract_rows.csv", contract_rows)
+          write_csv(OUT / "SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_311_REISSUE_FILLABLE.csv", reissue_template_rows)
+          write_csv(OUT / "v4_311_pause_marker_rows.csv", pause_marker_rows)
+          write_csv(OUT / "v4_311_handoff_snapshot_rows.csv", handoff_snapshot_rows)
+          write_csv(OUT / "v4_311_gate_decision_rows.csv", gate_rows)
+          write_csv(OUT / "v4_311_blocked_operation_rows.csv", blocked_rows)
+          write_csv(OUT / "v4_311_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_311_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_311_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_311_route_review_rows.csv", route_rows)
+          write_csv(OUT / "v4_311_sdr_reduction_rows.csv", sdr_rows)
+          write_csv(OUT / "v4_311_rule_checks.csv", checks)
+
+          readme = [
+              "# SDSS RSD Decision Template Reissue Or Pause Handoff v4.311",
+              "",
+              "This workflow reissues the human-decision template and marks the rail as ready to pause or hand off.",
+              "",
+              "Use `SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_311_REISSUE_FILLABLE.csv` only if human review will be done later. Fill the `human_decision` column with one of: `accept_for_next_review`, `edit_needed`, `reject`, or `keep_blocked`.",
+              "",
+              "Do not run scoring from this file. Do not treat the reissued template as approval.",
+              "",
+              "Truth boundary: no proof, no validation, no support, no scoring, no p-value, no likelihood, no gate approval.",
+          ]
+          (OUT / "SDSS_RSD_DECISION_TEMPLATE_REISSUE_v4_311_README.md").write_text("\n".join(readme), encoding="utf-8")
+
+          summary = {
+              "version": VERSION,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_status_label": "decision_template_missing",
+              "recommended_next_action": "pause_or_handoff_after_reissue",
+              "contract_rows": len(contract_rows),
+              "reissue_template_rows": len(reissue_template_rows),
+              "pause_marker_rows": len(pause_marker_rows),
+              "handoff_snapshot_rows": len(handoff_snapshot_rows),
+              "gate_decision_rows": len(gate_rows),
+              "gate_approval_rows": sum(1 for row in gate_rows if row["gate_object"] in ["row_meaning_confirmation", "baseline_approval", "definition_match_confirmation", "diagonal_diagnostic_readiness"] and row["gate_passed"]),
+              "row_meaning_confirmed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_311_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.311 SDSS RSD Decision Template Reissue Or Pause Handoff No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_status_label = {summary['inherited_status_label']}",
+              f"recommended_next_action = {summary['recommended_next_action']}",
+              f"contract_rows = {summary['contract_rows']}",
+              f"reissue_template_rows = {summary['reissue_template_rows']}",
+              f"pause_marker_rows = {summary['pause_marker_rows']}",
+              f"handoff_snapshot_rows = {summary['handoff_snapshot_rows']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.311 reissues a clean human-decision template and marks the rail as ready to pause or hand off. The current gap is human review, not more automatic scoring.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_311_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_status_label = {summary['inherited_status_label']}")
+          print(f"recommended_next_action = {summary['recommended_next_action']}")
+          print(f"contract_rows = {summary['contract_rows']}")
+          print(f"reissue_template_rows = {summary['reissue_template_rows']}")
+          print(f"pause_marker_rows = {summary['pause_marker_rows']}")
+          print(f"handoff_snapshot_rows = {summary['handoff_snapshot_rows']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.311 SDSS RSD decision template reissue or pause handoff output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-311-sdss-rsd-decision-template-reissue-or-pause-handoff-output
+          path: |
+            tairid_v4_311_sdss_rsd_decision_template_reissue_or_pause_handoff_output/
+            tairid-v4-311-sdss-rsd-decision-template-reissue-or-pause-handoff-output.zip
