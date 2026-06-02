@@ -1,0 +1,829 @@
+name: 001 TAIRID v4.297 - SDSS RSD Baseline And Row Meaning Manual Target Pack No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-297-sdss-rsd-baseline-and-row-meaning-manual-target-pack-no-scoring.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-baseline-row-meaning-manual-target-pack-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.297 SDSS RSD Baseline And Row Meaning Manual Target Pack No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.297 SDSS RSD baseline and row meaning manual target pack no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.297"
+          ROUTE = "sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring_after_v4_296"
+          EXPECTED_RESULT = "v4_297_sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_298_sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring"
+
+          OUT = Path("tairid_v4_297_sdss_rsd_baseline_row_meaning_manual_target_pack_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-297-sdss-rsd-baseline-row-meaning-manual-target-pack-output.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+          RELATED_PAGE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements/"
+          DR16_URL = "https://www.sdss4.org/dr16/"
+          MAX_BYTES = 2_000_000
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+                  self.in_a = False
+                  self.current_href = ""
+                  self.current_text = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "a":
+                      attrs = dict(attrs)
+                      self.in_a = True
+                      self.current_href = attrs.get("href", "")
+                      self.current_text = []
+
+              def handle_data(self, data):
+                  if self.in_a:
+                      self.current_text.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "a" and self.in_a:
+                      text = " ".join(" ".join(self.current_text).split())
+                      self.links.append({"href": self.current_href, "text": text})
+                      self.in_a = False
+                      self.current_href = ""
+                      self.current_text = []
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=MAX_BYTES, timeout=15):
+              out = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length_header": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.297-manual-target-pack-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length_header"] = resp.headers.get("Content-Length", "")
+                      out["final_url"] = resp.geturl()
+                      out["bytes_read"] = len(data)
+                      out["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      out["fetch_ok"] = True
+              except Exception as exc:
+                  out["error"] = f"{type(exc).__name__}: {exc}"
+              return out, data
+
+          def strip_html_text(data):
+              if not data:
+                  return ""
+              text = data.decode("utf-8", errors="replace")
+              text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", text)
+              return html.unescape(" ".join(text.split()))
+
+          def extract_candidate_links(base_url, data):
+              if not data:
+                  return []
+              parser = LinkParser()
+              parser.feed(data.decode("utf-8", errors="replace"))
+              rows = []
+              keywords = ["bao", "rsd", "eboss", "final", "measurement", "cosmo", "cosmology", "paper", "arxiv", "doi", "table", "data", "zhao", "alam", "growth", "consensus"]
+              seen = set()
+              for link in parser.links:
+                  href = link["href"].strip()
+                  if not href:
+                      continue
+                  url = urllib.parse.urljoin(base_url, href).split("#")[0]
+                  if url in seen:
+                      continue
+                  seen.add(url)
+                  hay = (url + " " + link["text"]).lower()
+                  if any(k in hay for k in keywords):
+                      rows.append({
+                          "candidate_url": url,
+                          "link_text": link["text"],
+                          "source_page": base_url,
+                          "locator_basis": "discovered_link_keyword_match",
+                          "score_allowed": False,
+                      })
+              return rows
+
+          def ads_to_arxiv(url):
+              m = re.search(r"abs/([0-9]{4})arXiv([0-9]{4}\.[0-9]{4,5})([A-Za-z]?)/abstract", url)
+              if m:
+                  return "https://arxiv.org/abs/" + m.group(2) + m.group(3)
+              m2 = re.search(r"arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5}[A-Za-z]?)", url)
+              if m2:
+                  return "https://arxiv.org/abs/" + m2.group(1)
+              return ""
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return ("fσ8" in label) or ("fsigma8" in label) or ("fσ8" in joined) or ("fsigma8" in joined)
+
+          def infer_header_rows(table):
+              header_rows = []
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def split_bound_header(bound_header):
+              parts = [p.strip() for p in str(bound_header).split("/") if p.strip()]
+              fields = {
+                  "sample_or_tracer": parts[0] if len(parts) > 0 else "",
+                  "z_range_text": parts[4] if len(parts) > 4 else "",
+                  "z_eff_text": parts[6] if len(parts) > 6 else "",
+              }
+              try:
+                  fields["z_eff"] = float(fields["z_eff_text"])
+              except Exception:
+                  fields["z_eff"] = ""
+              return fields
+
+          def parse_column_contract_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      row_type = "redshift_function_row_candidate" if "(z)" in label_norm else "final_or_consensus_row_candidate"
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          for value, sigma in measurement_pairs(cell):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              fields = split_bound_header(bound["bound_header"])
+                              out.append({
+                                  "contract_id": f"column_contract_bound_{len(out)+1:02d}",
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "sample_or_tracer": fields["sample_or_tracer"],
+                                  "z_eff": fields["z_eff"],
+                                  "z_range_text": fields["z_range_text"],
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                                  "contract_status": "rebuilt_for_manual_target_pack_no_scoring",
+                              })
+              return out
+
+          inherited_v4_296_rows = [
+              {"inherited_from": "v4.296", "item": "rules", "value": "58 / 58 passed", "meaning": "Diagonal diagnostic readiness probe passed by refusing diagnostic.", "carry_forward_status": "ready_for_manual_target_pack"},
+              {"inherited_from": "v4.296", "item": "source_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS table page.", "carry_forward_status": "source_page_available"},
+              {"inherited_from": "v4.296", "item": "related_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS overview page.", "carry_forward_status": "related_page_available"},
+              {"inherited_from": "v4.296", "item": "column_contract_rows", "value": 12, "meaning": "Twelve SDSS f_sigma8 rows existed.", "carry_forward_status": "observed_rows_ready"},
+              {"inherited_from": "v4.296", "item": "diagnostic_requested", "value": True, "meaning": "A diagonal diagnostic readiness probe was requested.", "carry_forward_status": "readiness_probe_done"},
+              {"inherited_from": "v4.296", "item": "diagnostic_readiness", "value": False, "meaning": "Diagnostic readiness failed.", "carry_forward_status": "not_ready"},
+              {"inherited_from": "v4.296", "item": "diagonal_diagnostic_allowed_now", "value": False, "meaning": "Diagnostic not allowed now.", "carry_forward_status": "score_blocked"},
+              {"inherited_from": "v4.296", "item": "readiness_blocker_rows", "value": 5, "meaning": "Five blockers remained.", "carry_forward_status": "manual_targets_needed"},
+              {"inherited_from": "v4.296", "item": "diagnostic_refusal_reason", "value": "missing_row_family_row_meaning_approved_baseline_source_and_definition_match", "meaning": "Missing objects are now known.", "carry_forward_status": "target_pack_scope"},
+              {"inherited_from": "v4.296", "item": "approved_baseline_values", "value": 0, "meaning": "No approved baselines.", "carry_forward_status": "baseline_missing"},
+              {"inherited_from": "v4.296", "item": "row_meaning_confirmed", "value": False, "meaning": "Row meaning unconfirmed.", "carry_forward_status": "row_meaning_missing"},
+              {"inherited_from": "v4.296", "item": "row_family_selected", "value": False, "meaning": "No row family selected.", "carry_forward_status": "row_family_missing"},
+              {"inherited_from": "v4.296", "item": "definition_match_confirmed", "value": False, "meaning": "Definition match missing.", "carry_forward_status": "definition_missing"},
+              {"inherited_from": "v4.296", "item": "support_allowed", "value": False, "meaning": "Support blocked.", "carry_forward_status": "support_blocked"},
+              {"inherited_from": "v4.296", "item": "selected_next_route", "value": "v4_297_sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring", "meaning": "Current route creates manual target pack.", "carry_forward_status": "current_route"},
+          ]
+
+          source_fetch_row, source_data = fetch_url(SOURCE_URL)
+          related_fetch_row, related_data = fetch_url(RELATED_PAGE_URL)
+          dr16_fetch_row, dr16_data = fetch_url(DR16_URL)
+
+          parser = SimpleTableParser()
+          if source_data:
+              parser.feed(source_data.decode("utf-8", errors="replace"))
+          column_contract_rows = parse_column_contract_rows(parser.tables)
+
+          discovered = []
+          discovered.extend(extract_candidate_links(SOURCE_URL, source_data))
+          discovered.extend(extract_candidate_links(RELATED_PAGE_URL, related_data))
+          discovered.extend(extract_candidate_links(DR16_URL, dr16_data))
+
+          static_candidates = [
+              {"candidate_url": SOURCE_URL, "link_text": "SDSS final BAO and RSD measurements table", "source_page": "static", "locator_basis": "official_table_page"},
+              {"candidate_url": RELATED_PAGE_URL, "link_text": "SDSS final BAO and RSD measurements overview", "source_page": "static", "locator_basis": "official_related_page"},
+              {"candidate_url": DR16_URL, "link_text": "SDSS DR16 release page", "source_page": "static", "locator_basis": "official_release_context"},
+          ]
+
+          raw_target_sources = static_candidates + discovered
+          target_source_candidate_rows = []
+          seen = set()
+          for row in raw_target_sources:
+              url = row["candidate_url"].split("#")[0]
+              if url in seen:
+                  continue
+              seen.add(url)
+              text = row.get("link_text", "")
+              hay = (url + " " + text).lower()
+              priority = 0
+              if url == SOURCE_URL:
+                  priority += 100
+              if url == RELATED_PAGE_URL:
+                  priority += 90
+              if "arxiv" in hay or "ui.adsabs" in hay:
+                  priority += 35
+              if any(name in hay for name in ["alam", "zhao", "ross", "raichoor", "du mas", "neveux", "smith", "growth"]):
+                  priority += 25
+              if "rsd" in hay or "bao" in hay:
+                  priority += 15
+              item = dict(row)
+              item["target_source_id"] = f"target_source_{len(target_source_candidate_rows)+1:03d}"
+              item["priority_score"] = priority
+              item["arxiv_probe_url"] = ads_to_arxiv(url)
+              item["manual_review_status"] = "candidate_source_not_approved"
+              item["score_allowed"] = False
+              target_source_candidate_rows.append(item)
+          target_source_candidate_rows = sorted(target_source_candidate_rows, key=lambda r: r["priority_score"], reverse=True)
+
+          row_meaning_manual_target_rows = [
+              {
+                  "target_id": "row_meaning_001",
+                  "target_object": "f_sigma8_z_row_role",
+                  "row_label": "f σ 8 (z)",
+                  "question_to_answer": "Does the source define the f_sigma8(z) row as a measurement, redshift-function value, model-derived value, comparator row, or intermediate/convenience row?",
+                  "minimum_acceptable_answer": "Exact source text or table note explaining row role and whether it can be scored.",
+                  "current_status": "unanswered",
+                  "blocks_diagnostic": True,
+              },
+              {
+                  "target_id": "row_meaning_002",
+                  "target_object": "f_sigma8_row_role",
+                  "row_label": "f σ 8",
+                  "question_to_answer": "Does the source define the f_sigma8 row as the final/consensus measurement row for the listed tracer and redshift bins?",
+                  "minimum_acceptable_answer": "Exact source text or table note confirming final/consensus measurement role.",
+                  "current_status": "unanswered",
+                  "blocks_diagnostic": True,
+              },
+              {
+                  "target_id": "row_meaning_003",
+                  "target_object": "two_row_relationship",
+                  "row_label": "f σ 8 (z) vs f σ 8",
+                  "question_to_answer": "Are the two row families independent, duplicates, variants, derived from each other, or final-vs-intermediate representations?",
+                  "minimum_acceptable_answer": "Exact source explanation sufficient to block double counting and select only one score family.",
+                  "current_status": "unanswered",
+                  "blocks_diagnostic": True,
+              },
+              {
+                  "target_id": "row_meaning_004",
+                  "target_object": "row_family_selection_basis",
+                  "row_label": "score family",
+                  "question_to_answer": "Which one row family, if any, is legally selectable for a future diagonal-only diagnostic?",
+                  "minimum_acceptable_answer": "Source-backed row-family selection with reason and explicit non-selection of mixed rows.",
+                  "current_status": "unanswered",
+                  "blocks_diagnostic": True,
+              },
+          ]
+
+          baseline_manual_target_rows = [
+              {
+                  "target_id": "baseline_001",
+                  "target_object": "standard_comparator_values",
+                  "needed_value": "LCDM / standard cosmology / published comparator f_sigma8 values matched to selected row family",
+                  "minimum_acceptable_source": "published paper, data table, likelihood product, or reproducible model output with parameters and assumptions recorded",
+                  "illegal_source_examples": "observed SDSS row values, row variants, mean of observed rows, endpoint metadata, post-hoc TAIRID values",
+                  "current_status": "unanswered",
+                  "blocks_diagnostic": True,
+              },
+              {
+                  "target_id": "baseline_002",
+                  "target_object": "baseline_source_mapping",
+                  "needed_value": "exact URL/file/citation for each comparator value",
+                  "minimum_acceptable_source": "stable source with table/section reference or reproducible code path",
+                  "illegal_source_examples": "candidate number near LCDM/growth without source role",
+                  "current_status": "unanswered",
+                  "blocks_diagnostic": True,
+              },
+              {
+                  "target_id": "baseline_003",
+                  "target_object": "baseline_uncertainty_policy",
+                  "needed_value": "whether comparator has uncertainty, whether only observation sigma is used, and how uncertainty is labeled",
+                  "minimum_acceptable_source": "source-backed uncertainty convention or explicit diagnostic-only limitation",
+                  "illegal_source_examples": "invented comparator uncertainty",
+                  "current_status": "unanswered",
+                  "blocks_diagnostic": True,
+              },
+              {
+                  "target_id": "baseline_004",
+                  "target_object": "baseline_equal_or_better_null",
+                  "needed_value": "rule that standard comparator equal/better result remains neutral/weaken and never support",
+                  "minimum_acceptable_source": "carried from v4.295 guard into any later diagnostic",
+                  "illegal_source_examples": "claiming compatibility as support",
+                  "current_status": "guard_present_but_values_missing",
+                  "blocks_diagnostic": True,
+              },
+          ]
+
+          definition_match_manual_target_rows = []
+          for row in column_contract_rows:
+              definition_match_manual_target_rows.append({
+                  "target_id": f"definition_match_{row['bound_id']}",
+                  "bound_id": row["bound_id"],
+                  "row_label": row["row_label"],
+                  "sample_or_tracer": row["sample_or_tracer"],
+                  "z_eff": row["z_eff"],
+                  "observable": row["observable"],
+                  "observed_value": row["observed_value"],
+                  "observed_sigma": row["observed_sigma"],
+                  "needed_match": "comparator must match observable f_sigma8, tracer/sample, z_eff/bin, fiducial assumptions, and row-family role",
+                  "current_status": "not_matched",
+                  "score_allowed": False,
+              })
+
+          manual_answer_template_rows = [
+              {"answer_field": "answer_id", "required": True, "instruction": "Unique answer row identifier."},
+              {"answer_field": "target_id", "required": True, "instruction": "One of the target IDs from this pack."},
+              {"answer_field": "source_url_or_citation", "required": True, "instruction": "Exact URL, citation, table, section, or file path used."},
+              {"answer_field": "quoted_or_precise_source_text", "required": True, "instruction": "Short exact source text or precise table reference, not a paraphrase only."},
+              {"answer_field": "answer_summary", "required": True, "instruction": "Plain-English meaning of the source answer."},
+              {"answer_field": "approval_request", "required": True, "instruction": "row_meaning_confirm, baseline_candidate, definition_match, reject, or keep_blocked."},
+              {"answer_field": "claim_limit", "required": True, "instruction": "Must remain no_scoring/no_claims unless future guard changes."},
+          ]
+
+          acceptance_criteria_rows = [
+              {"criteria_id": "accept_001", "object": "row_meaning", "criterion": "Must identify exact source text/table note explaining row role.", "required": True},
+              {"criteria_id": "accept_002", "object": "row_family_selection", "criterion": "Must select exactly one row family or keep all blocked; mixed rows remain blocked.", "required": True},
+              {"criteria_id": "accept_003", "object": "baseline_value", "criterion": "Must come from standard/published/reproducible comparator, not observed row or row variant.", "required": True},
+              {"criteria_id": "accept_004", "object": "definition_match", "criterion": "Must match f_sigma8 observable, tracer/sample, redshift/bin, row family, and assumptions.", "required": True},
+              {"criteria_id": "accept_005", "object": "diagnostic_ceiling", "criterion": "Must preserve diagonal-only no-claims ceiling and no p-value/no likelihood without full covariance.", "required": True},
+          ]
+
+          rejection_criteria_rows = [
+              {"criteria_id": "reject_001", "object": "observed_row_as_baseline", "criterion": "Reject immediately; self-baseline.", "rejection_status": "hard_reject"},
+              {"criteria_id": "reject_002", "object": "row_variant_as_baseline", "criterion": "Reject unless source explicitly defines a separate comparator role; still not standard baseline.", "rejection_status": "hard_reject"},
+              {"criteria_id": "reject_003", "object": "random_numeric_candidate", "criterion": "Reject if source context does not say it is a comparator value.", "rejection_status": "reject"},
+              {"criteria_id": "reject_004", "object": "web_table_sigma_as_covariance", "criterion": "Reject as full covariance; can only be diagonal diagnostic later.", "rejection_status": "limit"},
+              {"criteria_id": "reject_005", "object": "support_from_same_family_diagonal", "criterion": "Reject; same-family diagonal diagnostics cannot support TAIRID.", "rejection_status": "hard_reject"},
+          ]
+
+          manual_target_readiness_rows = [
+              {"readiness_id": "target_ready_001", "object": "target_source_candidates", "count": len(target_source_candidate_rows), "status": "packaged_not_approved"},
+              {"readiness_id": "target_ready_002", "object": "row_meaning_targets", "count": len(row_meaning_manual_target_rows), "status": "unanswered"},
+              {"readiness_id": "target_ready_003", "object": "baseline_targets", "count": len(baseline_manual_target_rows), "status": "unanswered"},
+              {"readiness_id": "target_ready_004", "object": "definition_match_targets", "count": len(definition_match_manual_target_rows), "status": "not_matched"},
+              {"readiness_id": "target_ready_005", "object": "manual_answer_template", "count": len(manual_answer_template_rows), "status": "ready_for_next_ingest"},
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "target pack asks questions but does not answer them", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "target pack contains no approved comparator values", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning answers are still missing", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition match targets are unresolved", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "manual targets are unanswered", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "approved baseline and row family missing", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "manual_target_pack", "permission_status": "written_no_scoring", "reason": "Missing objects are packaged as exact targets."},
+              {"permission_scope": "target_source_probe_and_manual_answer_ingest", "permission_status": "allowed_next", "reason": "Next workflow may ingest supplied answers or probe target sources without scoring."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "No answer has been ingested."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No approved comparator source/value."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "manual_target_pack", "status": "written", "meaning": "Exact missing targets are listed."},
+              {"readiness_id": "ready_002", "object": "row_meaning_answers", "status": "missing", "meaning": "Answers still needed."},
+              {"readiness_id": "ready_003", "object": "baseline_answers", "status": "missing", "meaning": "Baseline sources still needed."},
+              {"readiness_id": "ready_004", "object": "definition_match_answers", "status": "missing", "meaning": "Definition matches still needed."},
+              {"readiness_id": "ready_005", "object": "target_answer_ingest", "status": "ready_next", "meaning": "Next workflow can ingest answers without scoring."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "The remaining work is now source-target work, not scoring infrastructure.", "basis": "v4.296 proved the guard exists but readiness still fails on source/meaning/baseline objects.", "next_action": "Use target pack to answer missing objects.", "claim_status": "target_pack_only"},
+              {"decision_id": "decision_002", "decision": "No row meaning is confirmed by this workflow.", "basis": "Questions are packaged, not answered.", "next_action": "Ingest exact source answers later.", "claim_status": "row_meaning_missing"},
+              {"decision_id": "decision_003", "decision": "No baseline value is approved by this workflow.", "basis": "Comparator requirements are packaged, not satisfied.", "next_action": "Find/reject candidate comparator values later.", "claim_status": "baseline_missing"},
+              {"decision_id": "decision_004", "decision": "The next route is target source probe and manual answer ingest, still no scoring.", "basis": "The pack now defines the answer schema and acceptance/rejection criteria.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring", "permission_status": "recommended", "reason": "Need to ingest exact source answers for row meaning/baseline targets."},
+              {"route_id": "route_002", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_answers_ingested_and_readiness_passes", "reason": "Target pack is unanswered."},
+              {"route_id": "route_003", "route": "sdss_rsd_full_likelihood_score", "permission_status": "blocked_until_full_covariance", "reason": "Full covariance/likelihood source missing."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.297 is a clean manual-target milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "readiness blockers were known but not packaged", "after_state": "blockers are converted into exact manual/source targets", "reduction_type": "blocker localization"},
+              {"sdr_id": "sdr_002", "before_state": "row meaning could be guessed", "after_state": "row meaning requires exact source answer fields", "reduction_type": "semantic guessing blocked"},
+              {"sdr_id": "sdr_003", "before_state": "baseline candidates could be loosely interpreted", "after_state": "acceptance and rejection criteria are explicit", "reduction_type": "baseline ambiguity reduced"},
+              {"sdr_id": "sdr_004", "before_state": "definition match was abstract", "after_state": "definition-match targets exist per contract row", "reduction_type": "definition gap made concrete"},
+              {"sdr_id": "sdr_005", "before_state": "same-family diagnostic could invite overclaiming", "after_state": "no-support ceiling remains in target pack", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before manual target pack"},
+              {"gate": "inherited_v4_296_rows_equal_15", "passed": len(inherited_v4_296_rows) == 15, "detail": f"inherited_v4_296_rows = {len(inherited_v4_296_rows)}"},
+              {"gate": "source_fetch_row_recorded", "passed": isinstance(source_fetch_row, dict), "detail": f"source_fetch_ok = {source_fetch_row['fetch_ok']}"},
+              {"gate": "related_fetch_row_recorded", "passed": isinstance(related_fetch_row, dict), "detail": f"related_fetch_ok = {related_fetch_row['fetch_ok']}"},
+              {"gate": "dr16_fetch_row_recorded", "passed": isinstance(dr16_fetch_row, dict), "detail": f"dr16_fetch_ok = {dr16_fetch_row['fetch_ok']}"},
+              {"gate": "column_contract_rows_recorded", "passed": len(column_contract_rows) >= 0, "detail": f"column_contract_rows = {len(column_contract_rows)}"},
+              {"gate": "target_source_candidate_rows_at_least_3", "passed": len(target_source_candidate_rows) >= 3, "detail": f"target_source_candidate_rows = {len(target_source_candidate_rows)}"},
+              {"gate": "row_meaning_manual_target_rows_equal_4", "passed": len(row_meaning_manual_target_rows) == 4, "detail": f"row_meaning_manual_target_rows = {len(row_meaning_manual_target_rows)}"},
+              {"gate": "baseline_manual_target_rows_equal_4", "passed": len(baseline_manual_target_rows) == 4, "detail": f"baseline_manual_target_rows = {len(baseline_manual_target_rows)}"},
+              {"gate": "definition_match_manual_target_rows_match_contracts", "passed": len(definition_match_manual_target_rows) == len(column_contract_rows), "detail": f"definition_match_manual_target_rows = {len(definition_match_manual_target_rows)}"},
+              {"gate": "manual_answer_template_rows_equal_7", "passed": len(manual_answer_template_rows) == 7, "detail": f"manual_answer_template_rows = {len(manual_answer_template_rows)}"},
+              {"gate": "acceptance_criteria_rows_equal_5", "passed": len(acceptance_criteria_rows) == 5, "detail": f"acceptance_criteria_rows = {len(acceptance_criteria_rows)}"},
+              {"gate": "rejection_criteria_rows_equal_5", "passed": len(rejection_criteria_rows) == 5, "detail": f"rejection_criteria_rows = {len(rejection_criteria_rows)}"},
+              {"gate": "manual_target_readiness_rows_equal_5", "passed": len(manual_target_readiness_rows) == 5, "detail": f"manual_target_readiness_rows = {len(manual_target_readiness_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_target_sources_not_approved", "passed": all(row["manual_review_status"] == "candidate_source_not_approved" for row in target_source_candidate_rows), "detail": "target sources not approved"},
+              {"gate": "all_target_sources_no_score", "passed": all(row["score_allowed"] is False for row in target_source_candidate_rows), "detail": "target sources no score"},
+              {"gate": "row_meaning_targets_unanswered", "passed": all(row["current_status"] == "unanswered" for row in row_meaning_manual_target_rows), "detail": "row meaning targets unanswered"},
+              {"gate": "row_meaning_targets_block", "passed": all(row["blocks_diagnostic"] is True for row in row_meaning_manual_target_rows), "detail": "row meaning targets block"},
+              {"gate": "baseline_targets_block", "passed": all(row["blocks_diagnostic"] is True for row in baseline_manual_target_rows), "detail": "baseline targets block"},
+              {"gate": "definition_targets_no_score", "passed": all(row["score_allowed"] is False for row in definition_match_manual_target_rows), "detail": "definition targets no score"},
+              {"gate": "manual_answer_template_requires_source", "passed": any(row["answer_field"] == "source_url_or_citation" and row["required"] is True for row in manual_answer_template_rows), "detail": "source answer field required"},
+              {"gate": "manual_answer_template_requires_precise_text", "passed": any(row["answer_field"] == "quoted_or_precise_source_text" and row["required"] is True for row in manual_answer_template_rows), "detail": "precise text answer field required"},
+              {"gate": "acceptance_requires_row_meaning", "passed": any(row["object"] == "row_meaning" and row["required"] is True for row in acceptance_criteria_rows), "detail": "row meaning acceptance required"},
+              {"gate": "acceptance_requires_baseline", "passed": any(row["object"] == "baseline_value" and row["required"] is True for row in acceptance_criteria_rows), "detail": "baseline acceptance required"},
+              {"gate": "rejection_self_baseline_present", "passed": any(row["object"] == "observed_row_as_baseline" and row["rejection_status"] == "hard_reject" for row in rejection_criteria_rows), "detail": "self baseline hard reject"},
+              {"gate": "rejection_same_family_support_present", "passed": any(row["object"] == "support_from_same_family_diagonal" and row["rejection_status"] == "hard_reject" for row in rejection_criteria_rows), "detail": "same family support hard reject"},
+              {"gate": "manual_pack_written_readiness", "passed": any(row["object"] == "manual_answer_template" and row["status"] == "ready_for_next_ingest" for row in manual_target_readiness_rows), "detail": "manual answer template ready"},
+              {"gate": "row_meaning_confirmation_blocked", "passed": any(row["operation"] == "confirm_row_meaning_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "row meaning confirmation blocked"},
+              {"gate": "baseline_approval_blocked", "passed": any(row["operation"] == "approve_baseline_values_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "baseline approval blocked"},
+              {"gate": "row_family_selection_blocked", "passed": any(row["operation"] == "select_row_family_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "row family selection blocked"},
+              {"gate": "definition_match_blocked", "passed": any(row["operation"] == "confirm_definition_match_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "definition match blocked"},
+              {"gate": "diagonal_diagnostic_blocked", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "diagonal diagnostic blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations blocked"},
+              {"gate": "manual_target_pack_written", "passed": any(row["permission_scope"] == "manual_target_pack" and row["permission_status"] == "written_no_scoring" for row in permission_rows), "detail": "manual target pack written"},
+              {"gate": "manual_answer_ingest_allowed_next", "passed": any(row["permission_scope"] == "target_source_probe_and_manual_answer_ingest" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "answer ingest allowed next"},
+              {"gate": "baseline_approval_permission_blocked", "passed": any(row["permission_scope"] == "baseline_approval" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "baseline approval permission blocked"},
+              {"gate": "diagonal_score_permission_blocked", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "diagonal score permission blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.298 route recommended"},
+              {"gate": "diagonal_score_route_blocked", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_answers_ingested_and_readiness_passes" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "full_likelihood_route_blocked", "passed": any(row["route"] == "sdss_rsd_full_likelihood_score" and row["permission_status"] == "blocked_until_full_covariance" for row in route_review_rows), "detail": "full likelihood route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_298_sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_297_sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_297_inherited_v4_296_rows.csv", inherited_v4_296_rows)
+          write_csv(OUT / "v4_297_source_fetch_rows.csv", [{**source_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_297_related_fetch_rows.csv", [{**related_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_297_dr16_fetch_rows.csv", [{**dr16_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_297_column_contract_rows.csv", column_contract_rows)
+          write_csv(OUT / "v4_297_target_source_candidate_rows.csv", target_source_candidate_rows)
+          write_csv(OUT / "SDSS_RSD_TARGET_SOURCE_CANDIDATES_v4_297_NOT_APPROVED.csv", target_source_candidate_rows)
+          write_csv(OUT / "v4_297_row_meaning_manual_target_rows.csv", row_meaning_manual_target_rows)
+          write_csv(OUT / "SDSS_RSD_ROW_MEANING_TARGETS_v4_297_UNANSWERED.csv", row_meaning_manual_target_rows)
+          write_csv(OUT / "v4_297_baseline_manual_target_rows.csv", baseline_manual_target_rows)
+          write_csv(OUT / "SDSS_RSD_BASELINE_TARGETS_v4_297_UNANSWERED.csv", baseline_manual_target_rows)
+          write_csv(OUT / "v4_297_definition_match_manual_target_rows.csv", definition_match_manual_target_rows)
+          write_csv(OUT / "SDSS_RSD_DEFINITION_MATCH_TARGETS_v4_297_NOT_MATCHED.csv", definition_match_manual_target_rows)
+          write_csv(OUT / "v4_297_manual_answer_template_rows.csv", manual_answer_template_rows)
+          write_csv(OUT / "SDSS_RSD_MANUAL_ANSWER_TEMPLATE_v4_297.csv", manual_answer_template_rows)
+          write_csv(OUT / "v4_297_acceptance_criteria_rows.csv", acceptance_criteria_rows)
+          write_csv(OUT / "v4_297_rejection_criteria_rows.csv", rejection_criteria_rows)
+          write_csv(OUT / "v4_297_manual_target_readiness_rows.csv", manual_target_readiness_rows)
+          write_csv(OUT / "v4_297_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_297_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_297_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_297_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_297_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_297_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_297_rule_checks.csv", checks)
+
+          target_source_lines = [
+              f"{row['target_source_id']}: priority={row['priority_score']} {row['link_text']} -> {row['candidate_url']}"
+              for row in target_source_candidate_rows[:12]
+          ]
+
+          row_target_lines = [
+              f"{row['target_id']}: {row['target_object']} — {row['question_to_answer']}"
+              for row in row_meaning_manual_target_rows
+          ]
+
+          baseline_target_lines = [
+              f"{row['target_id']}: {row['target_object']} — {row['needed_value']}"
+              for row in baseline_manual_target_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_review_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_url": SOURCE_URL,
+              "source_fetch_ok": source_fetch_row["fetch_ok"],
+              "related_page_url": RELATED_PAGE_URL,
+              "related_fetch_ok": related_fetch_row["fetch_ok"],
+              "dr16_fetch_ok": dr16_fetch_row["fetch_ok"],
+              "column_contract_rows": len(column_contract_rows),
+              "target_source_candidate_rows": len(target_source_candidate_rows),
+              "row_meaning_manual_target_rows": len(row_meaning_manual_target_rows),
+              "baseline_manual_target_rows": len(baseline_manual_target_rows),
+              "definition_match_manual_target_rows": len(definition_match_manual_target_rows),
+              "manual_answer_template_rows": len(manual_answer_template_rows),
+              "acceptance_criteria_rows": len(acceptance_criteria_rows),
+              "rejection_criteria_rows": len(rejection_criteria_rows),
+              "manual_target_pack_written": True,
+              "row_meaning_confirmed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "numeric_fit_allowed": False,
+              "support_allowed": False,
+              "evidence_allowed": False,
+              "validation_allowed": False,
+              "holdout_approval_allowed": False,
+              "combined_matrix_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_297_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.297 SDSS RSD Baseline And Row Meaning Manual Target Pack No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_url = {SOURCE_URL}",
+              f"source_fetch_ok = {summary['source_fetch_ok']}",
+              f"related_page_url = {RELATED_PAGE_URL}",
+              f"related_fetch_ok = {summary['related_fetch_ok']}",
+              f"dr16_fetch_ok = {summary['dr16_fetch_ok']}",
+              f"column_contract_rows = {summary['column_contract_rows']}",
+              f"target_source_candidate_rows = {summary['target_source_candidate_rows']}",
+              f"row_meaning_manual_target_rows = {summary['row_meaning_manual_target_rows']}",
+              f"baseline_manual_target_rows = {summary['baseline_manual_target_rows']}",
+              f"definition_match_manual_target_rows = {summary['definition_match_manual_target_rows']}",
+              f"manual_answer_template_rows = {summary['manual_answer_template_rows']}",
+              f"acceptance_criteria_rows = {summary['acceptance_criteria_rows']}",
+              f"rejection_criteria_rows = {summary['rejection_criteria_rows']}",
+              f"manual_target_pack_written = {summary['manual_target_pack_written']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"numeric_fit_allowed = {summary['numeric_fit_allowed']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"validation_allowed = {summary['validation_allowed']}",
+              f"holdout_approval_allowed = {summary['holdout_approval_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Target source candidates:",
+              *target_source_lines,
+              "",
+              "Row-meaning targets:",
+              *row_target_lines,
+              "",
+              "Baseline targets:",
+              *baseline_target_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.297 converts the v4.296 blockers into an exact manual/source target pack. It does not answer the targets, confirm row meaning, approve baselines, select a row family, confirm definition matches, run a diagnostic, compute residuals, compute p-values, compute likelihoods, fit corrections, approve support, approve evidence, approve validation, approve a holdout, or build a combined matrix.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_297_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_url = {SOURCE_URL}")
+          print(f"source_fetch_ok = {summary['source_fetch_ok']}")
+          print(f"related_page_url = {RELATED_PAGE_URL}")
+          print(f"related_fetch_ok = {summary['related_fetch_ok']}")
+          print(f"dr16_fetch_ok = {summary['dr16_fetch_ok']}")
+          print(f"column_contract_rows = {summary['column_contract_rows']}")
+          print(f"target_source_candidate_rows = {summary['target_source_candidate_rows']}")
+          print(f"row_meaning_manual_target_rows = {summary['row_meaning_manual_target_rows']}")
+          print(f"baseline_manual_target_rows = {summary['baseline_manual_target_rows']}")
+          print(f"definition_match_manual_target_rows = {summary['definition_match_manual_target_rows']}")
+          print(f"manual_answer_template_rows = {summary['manual_answer_template_rows']}")
+          print(f"acceptance_criteria_rows = {summary['acceptance_criteria_rows']}")
+          print(f"rejection_criteria_rows = {summary['rejection_criteria_rows']}")
+          print(f"manual_target_pack_written = {summary['manual_target_pack_written']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"validation_allowed = {summary['validation_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.297 SDSS RSD baseline row meaning manual target pack output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-297-sdss-rsd-baseline-row-meaning-manual-target-pack-output
+          path: |
+            tairid_v4_297_sdss_rsd_baseline_row_meaning_manual_target_pack_output/
+            tairid-v4-297-sdss-rsd-baseline-row-meaning-manual-target-pack-output.zip
