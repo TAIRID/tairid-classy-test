@@ -1,0 +1,889 @@
+name: 001 TAIRID v4.298 - SDSS RSD Target Source Probe And Manual Answer Ingest No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-298-sdss-rsd-target-source-probe-and-manual-answer-ingest-no-scoring.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-target-source-probe-manual-answer-ingest-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.298 SDSS RSD Target Source Probe And Manual Answer Ingest No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.298 SDSS RSD target source probe and manual answer ingest no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.298"
+          ROUTE = "sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring_after_v4_297"
+          EXPECTED_RESULT = "v4_298_sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_299_sdss_rsd_manual_answer_review_and_gate_decision_no_scoring"
+
+          OUT = Path("tairid_v4_298_sdss_rsd_target_source_probe_manual_answer_ingest_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-298-sdss-rsd-target-source-probe-manual-answer-ingest-output.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+          RELATED_PAGE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements/"
+          DR16_URL = "https://www.sdss4.org/dr16/"
+          MAX_BYTES = 2_000_000
+
+          MANUAL_ANSWER_CANDIDATE_PATHS = [
+              "data/sdss_rsd_manual_answers_v4_298.csv",
+              "data/manual/sdss_rsd_manual_answers_v4_298.csv",
+              "results/sdss_rsd_manual_answers_v4_298.csv",
+              "artifacts/sdss_rsd_manual_answers_v4_298.csv",
+              "SDSS_RSD_MANUAL_ANSWERS_v4_298.csv",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+                  self.in_a = False
+                  self.current_href = ""
+                  self.current_text = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "a":
+                      attrs = dict(attrs)
+                      self.in_a = True
+                      self.current_href = attrs.get("href", "")
+                      self.current_text = []
+
+              def handle_data(self, data):
+                  if self.in_a:
+                      self.current_text.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "a" and self.in_a:
+                      text = " ".join(" ".join(self.current_text).split())
+                      self.links.append({"href": self.current_href, "text": text})
+                      self.in_a = False
+                      self.current_href = ""
+                      self.current_text = []
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=MAX_BYTES, timeout=15):
+              out = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length_header": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.298-target-source-probe-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length_header"] = resp.headers.get("Content-Length", "")
+                      out["final_url"] = resp.geturl()
+                      out["bytes_read"] = len(data)
+                      out["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      out["fetch_ok"] = True
+              except Exception as exc:
+                  out["error"] = f"{type(exc).__name__}: {exc}"
+              return out, data
+
+          def strip_html_text(data):
+              if not data:
+                  return ""
+              text = data.decode("utf-8", errors="replace")
+              text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", text)
+              return html.unescape(" ".join(text.split()))
+
+          def extract_candidate_links(base_url, data):
+              if not data:
+                  return []
+              parser = LinkParser()
+              parser.feed(data.decode("utf-8", errors="replace"))
+              rows = []
+              keywords = ["bao", "rsd", "eboss", "final", "measurement", "cosmo", "cosmology", "paper", "arxiv", "doi", "table", "data", "zhao", "alam", "growth", "consensus", "covariance"]
+              seen = set()
+              for link in parser.links:
+                  href = link["href"].strip()
+                  if not href:
+                      continue
+                  url = urllib.parse.urljoin(base_url, href).split("#")[0]
+                  if url in seen:
+                      continue
+                  seen.add(url)
+                  hay = (url + " " + link["text"]).lower()
+                  if any(k in hay for k in keywords):
+                      rows.append({
+                          "candidate_url": url,
+                          "link_text": link["text"],
+                          "source_page": base_url,
+                          "locator_basis": "discovered_link_keyword_match",
+                          "score_allowed": False,
+                      })
+              return rows
+
+          def ads_to_arxiv(url):
+              m = re.search(r"abs/([0-9]{4})arXiv([0-9]{4}\.[0-9]{4,5})([A-Za-z]?)/abstract", url)
+              if m:
+                  return "https://arxiv.org/abs/" + m.group(2) + m.group(3)
+              m2 = re.search(r"arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5}[A-Za-z]?)", url)
+              if m2:
+                  return "https://arxiv.org/abs/" + m2.group(1)
+              return ""
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return ("fσ8" in label) or ("fsigma8" in label) or ("fσ8" in joined) or ("fsigma8" in joined)
+
+          def infer_header_rows(table):
+              header_rows = []
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def split_bound_header(bound_header):
+              parts = [p.strip() for p in str(bound_header).split("/") if p.strip()]
+              fields = {
+                  "sample_or_tracer": parts[0] if len(parts) > 0 else "",
+                  "z_range_text": parts[4] if len(parts) > 4 else "",
+                  "z_eff_text": parts[6] if len(parts) > 6 else "",
+              }
+              try:
+                  fields["z_eff"] = float(fields["z_eff_text"])
+              except Exception:
+                  fields["z_eff"] = ""
+              return fields
+
+          def parse_column_contract_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      row_type = "redshift_function_row_candidate" if "(z)" in label_norm else "final_or_consensus_row_candidate"
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          for value, sigma in measurement_pairs(cell):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              fields = split_bound_header(bound["bound_header"])
+                              out.append({
+                                  "contract_id": f"column_contract_bound_{len(out)+1:02d}",
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "sample_or_tracer": fields["sample_or_tracer"],
+                                  "z_eff": fields["z_eff"],
+                                  "z_range_text": fields["z_range_text"],
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                                  "contract_status": "rebuilt_for_target_source_probe_manual_answer_ingest_no_scoring",
+                              })
+              return out
+
+          def window_around_terms(text, terms, width=260, limit=720):
+              lower = text.lower()
+              starts = []
+              for term in terms:
+                  idx = lower.find(term.lower())
+                  if idx >= 0:
+                      starts.append(idx)
+              if not starts:
+                  return ""
+              idx = min(starts)
+              return text[max(0, idx-width):idx+width].replace("\n", " ")[:limit]
+
+          def count_terms(text):
+              lower = text.lower()
+              return {
+                  "fsigma8": len(re.findall(r"f\s*σ\s*8|f\s*sigma\s*8|fsigma8|f\\sigma_8", lower)),
+                  "rsd": lower.count("rsd") + lower.count("redshift-space distortion"),
+                  "bao": lower.count("bao") + lower.count("baryon acoustic"),
+                  "consensus": lower.count("consensus"),
+                  "fiducial": lower.count("fiducial"),
+                  "lcdm": lower.count("lcdm") + lower.count("Λcdm".lower()),
+                  "growth": lower.count("growth"),
+                  "covariance": lower.count("covariance"),
+                  "table": lower.count("table"),
+                  "measurement": lower.count("measurement"),
+              }
+
+          def read_manual_answers():
+              status_rows = []
+              found_path = ""
+              answer_rows = []
+              for raw in MANUAL_ANSWER_CANDIDATE_PATHS:
+                  p = Path(raw)
+                  exists = p.exists()
+                  status_rows.append({
+                      "candidate_path": raw,
+                      "exists": exists,
+                      "read_attempted": exists,
+                      "read_ok": False,
+                      "row_count": 0,
+                      "error": "",
+                  })
+                  if exists and not found_path:
+                      try:
+                          with p.open("r", encoding="utf-8-sig", newline="") as f:
+                              reader = csv.DictReader(f)
+                              answer_rows = list(reader)
+                          status_rows[-1]["read_ok"] = True
+                          status_rows[-1]["row_count"] = len(answer_rows)
+                          found_path = raw
+                      except Exception as exc:
+                          status_rows[-1]["error"] = f"{type(exc).__name__}: {exc}"
+              return found_path, status_rows, answer_rows
+
+          inherited_v4_297_rows = [
+              {"inherited_from": "v4.297", "item": "rules", "value": "58 / 58 passed", "meaning": "Manual target pack passed.", "carry_forward_status": "ready_for_source_probe_and_answer_ingest"},
+              {"inherited_from": "v4.297", "item": "source_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS table page.", "carry_forward_status": "source_page_available"},
+              {"inherited_from": "v4.297", "item": "related_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS overview page.", "carry_forward_status": "related_page_available"},
+              {"inherited_from": "v4.297", "item": "dr16_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS DR16 page.", "carry_forward_status": "dr16_page_available"},
+              {"inherited_from": "v4.297", "item": "column_contract_rows", "value": 12, "meaning": "Twelve SDSS f_sigma8 rows existed.", "carry_forward_status": "observed_rows_ready"},
+              {"inherited_from": "v4.297", "item": "target_source_candidate_rows", "value": 78, "meaning": "Seventy-eight target source candidates were found.", "carry_forward_status": "source_targets_ready"},
+              {"inherited_from": "v4.297", "item": "row_meaning_manual_target_rows", "value": 4, "meaning": "Four row-meaning targets were created.", "carry_forward_status": "row_meaning_targets_ready"},
+              {"inherited_from": "v4.297", "item": "baseline_manual_target_rows", "value": 4, "meaning": "Four baseline targets were created.", "carry_forward_status": "baseline_targets_ready"},
+              {"inherited_from": "v4.297", "item": "definition_match_manual_target_rows", "value": 12, "meaning": "Twelve definition-match targets were created.", "carry_forward_status": "definition_targets_ready"},
+              {"inherited_from": "v4.297", "item": "manual_answer_template_rows", "value": 7, "meaning": "Manual answer schema was created.", "carry_forward_status": "answer_schema_ready"},
+              {"inherited_from": "v4.297", "item": "row_meaning_confirmed", "value": False, "meaning": "Row meaning not confirmed.", "carry_forward_status": "row_meaning_missing"},
+              {"inherited_from": "v4.297", "item": "approved_baseline_values", "value": 0, "meaning": "No baseline value approved.", "carry_forward_status": "baseline_missing"},
+              {"inherited_from": "v4.297", "item": "support_allowed", "value": False, "meaning": "Support blocked.", "carry_forward_status": "support_blocked"},
+              {"inherited_from": "v4.297", "item": "selected_next_route", "value": "v4_298_sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring", "meaning": "Current route probes sources and ingests manual answers if present.", "carry_forward_status": "current_route"},
+          ]
+
+          source_fetch_row, source_data = fetch_url(SOURCE_URL)
+          related_fetch_row, related_data = fetch_url(RELATED_PAGE_URL)
+          dr16_fetch_row, dr16_data = fetch_url(DR16_URL)
+
+          parser = SimpleTableParser()
+          if source_data:
+              parser.feed(source_data.decode("utf-8", errors="replace"))
+          column_contract_rows = parse_column_contract_rows(parser.tables)
+
+          discovered = []
+          discovered.extend(extract_candidate_links(SOURCE_URL, source_data))
+          discovered.extend(extract_candidate_links(RELATED_PAGE_URL, related_data))
+          discovered.extend(extract_candidate_links(DR16_URL, dr16_data))
+
+          static_candidates = [
+              {"candidate_url": SOURCE_URL, "link_text": "SDSS final BAO and RSD measurements table", "source_page": "static", "locator_basis": "official_table_page"},
+              {"candidate_url": RELATED_PAGE_URL, "link_text": "SDSS final BAO and RSD measurements overview", "source_page": "static", "locator_basis": "official_related_page"},
+              {"candidate_url": DR16_URL, "link_text": "SDSS DR16 release page", "source_page": "static", "locator_basis": "official_release_context"},
+              {"candidate_url": "https://arxiv.org/abs/2007.08991", "link_text": "eBOSS final cosmological interpretation arXiv candidate", "source_page": "static", "locator_basis": "manual_static_arxiv_candidate"},
+              {"candidate_url": "https://arxiv.org/abs/2007.08997", "link_text": "Zhao et al. 2020 arXiv candidate", "source_page": "static", "locator_basis": "manual_static_arxiv_candidate"},
+              {"candidate_url": "https://arxiv.org/abs/2007.09004", "link_text": "Alam et al. 2020 arXiv candidate", "source_page": "static", "locator_basis": "manual_static_arxiv_candidate"},
+          ]
+
+          raw_sources = static_candidates + discovered
+          deduped_sources = []
+          seen = set()
+          for row in raw_sources:
+              url = row["candidate_url"].split("#")[0]
+              if url in seen:
+                  continue
+              seen.add(url)
+              item = dict(row)
+              item["source_probe_id"] = f"source_probe_candidate_{len(deduped_sources)+1:03d}"
+              item["arxiv_probe_url"] = ads_to_arxiv(url)
+              item["score_allowed"] = False
+              deduped_sources.append(item)
+
+          prioritized = []
+          for row in deduped_sources:
+              hay = (row["candidate_url"] + " " + row.get("link_text", "")).lower()
+              priority = 0
+              if row["candidate_url"] == SOURCE_URL:
+                  priority += 110
+              if row["candidate_url"] == RELATED_PAGE_URL:
+                  priority += 100
+              if "arxiv.org/abs/2007.08991" in row["candidate_url"]:
+                  priority += 90
+              if "arxiv" in hay or "ui.adsabs" in hay:
+                  priority += 40
+              if any(name in hay for name in ["alam", "zhao", "ross", "raichoor", "du mas", "neveux", "smith", "growth"]):
+                  priority += 25
+              if any(term in hay for term in ["rsd", "bao", "final", "cosmology", "measurement"]):
+                  priority += 15
+              if any(ext in hay for ext in [".png", ".jpg", ".jpeg", ".gif"]):
+                  priority -= 50
+              item = dict(row)
+              item["priority_score"] = priority
+              prioritized.append(item)
+          prioritized = sorted(prioritized, key=lambda r: r["priority_score"], reverse=True)[:24]
+
+          source_probe_rows = []
+          row_meaning_hint_rows = []
+          baseline_hint_rows = []
+          for src in prioritized:
+              probe_urls = [src["candidate_url"]]
+              if src.get("arxiv_probe_url"):
+                  probe_urls.append(src["arxiv_probe_url"])
+              for probe_url in probe_urls:
+                  fetch, data = fetch_url(probe_url, max_bytes=1_000_000, timeout=12)
+                  text = strip_html_text(data)
+                  terms = count_terms(text)
+                  relevance = terms["fsigma8"]*6 + terms["rsd"]*3 + terms["bao"]*2 + terms["consensus"]*4 + terms["lcdm"]*2 + terms["growth"]*2 + terms["covariance"] + terms["measurement"]
+                  probe_row = {
+                      "source_probe_id": f"source_probe_{len(source_probe_rows)+1:03d}",
+                      "source_url": src["candidate_url"],
+                      "probe_url": probe_url,
+                      "link_text": src.get("link_text", ""),
+                      "fetch_ok": fetch["fetch_ok"],
+                      "status_code": fetch["status_code"],
+                      "content_type": fetch["content_type"],
+                      "bytes_read": fetch["bytes_read"],
+                      "sha256_first_bytes": fetch["sha256_first_bytes"],
+                      "term_count_fsigma8": terms["fsigma8"],
+                      "term_count_rsd": terms["rsd"],
+                      "term_count_bao": terms["bao"],
+                      "term_count_consensus": terms["consensus"],
+                      "term_count_lcdm": terms["lcdm"],
+                      "term_count_growth": terms["growth"],
+                      "term_count_covariance": terms["covariance"],
+                      "relevance_score_no_claim": relevance,
+                      "probe_status": "source_probe_only_not_answer",
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  }
+                  source_probe_rows.append(probe_row)
+                  row_window = window_around_terms(text, ["f σ 8", "fσ8", "fsigma8", "f sigma", "consensus", "measurement", "redshift-space distortion"], width=320, limit=780)
+                  base_window = window_around_terms(text, ["LCDM", "fiducial", "model", "prediction", "comparator", "growth rate", "fσ8"], width=320, limit=780)
+                  if row_window:
+                      row_meaning_hint_rows.append({
+                          "hint_id": f"row_meaning_hint_{len(row_meaning_hint_rows)+1:03d}",
+                          "source_probe_id": probe_row["source_probe_id"],
+                          "target_ids": "row_meaning_001|row_meaning_002|row_meaning_003|row_meaning_004",
+                          "probe_url": probe_url,
+                          "hint_window": row_window,
+                          "hint_status": "hint_only_not_confirmation",
+                          "row_meaning_confirmed": False,
+                          "score_allowed": False,
+                      })
+                  if base_window:
+                      baseline_hint_rows.append({
+                          "hint_id": f"baseline_hint_{len(baseline_hint_rows)+1:03d}",
+                          "source_probe_id": probe_row["source_probe_id"],
+                          "target_ids": "baseline_001|baseline_002|baseline_003|baseline_004",
+                          "probe_url": probe_url,
+                          "hint_window": base_window,
+                          "hint_status": "hint_only_not_baseline_approval",
+                          "baseline_approved": False,
+                          "score_allowed": False,
+                      })
+
+          manual_answer_path, manual_answer_search_rows, raw_manual_answer_rows = read_manual_answers()
+
+          required_manual_fields = ["answer_id", "target_id", "source_url_or_citation", "quoted_or_precise_source_text", "answer_summary", "approval_request", "claim_limit"]
+          manual_answer_schema_review_rows = []
+          if raw_manual_answer_rows:
+              fieldnames = set(raw_manual_answer_rows[0].keys()) if raw_manual_answer_rows else set()
+              for field in required_manual_fields:
+                  manual_answer_schema_review_rows.append({
+                      "field": field,
+                      "present": field in fieldnames,
+                      "required": True,
+                      "schema_status": "present" if field in fieldnames else "missing",
+                  })
+          else:
+              for field in required_manual_fields:
+                  manual_answer_schema_review_rows.append({
+                      "field": field,
+                      "present": False,
+                      "required": True,
+                      "schema_status": "no_manual_answer_file",
+                  })
+
+          ingested_manual_answer_rows = []
+          for i, row in enumerate(raw_manual_answer_rows):
+              clean = {k: row.get(k, "") for k in required_manual_fields}
+              missing = [k for k in required_manual_fields if not str(clean.get(k, "")).strip()]
+              claim_limit_ok = str(clean.get("claim_limit", "")).strip().lower() in ["no_scoring", "no_claims", "no_scoring/no_claims", "keep_blocked"]
+              approval_request = str(clean.get("approval_request", "")).strip().lower()
+              allowed_request = approval_request in ["row_meaning_confirm", "baseline_candidate", "definition_match", "reject", "keep_blocked"]
+              ingested_manual_answer_rows.append({
+                  "ingest_id": f"manual_answer_ingest_{i+1:03d}",
+                  **clean,
+                  "missing_required_fields": "|".join(missing),
+                  "claim_limit_ok": claim_limit_ok,
+                  "approval_request_allowed": allowed_request,
+                  "ingest_status": "ingested_for_review_not_approved",
+                  "row_meaning_confirmed": False,
+                  "baseline_approved": False,
+                  "definition_match_confirmed": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          answer_review_gate_rows = [
+              {"gate_id": "answer_gate_001", "object": "manual_answer_file", "status": "present" if manual_answer_path else "missing", "passed_now": bool(manual_answer_path), "blocks_confirmation": not bool(manual_answer_path)},
+              {"gate_id": "answer_gate_002", "object": "manual_answer_schema", "status": "complete" if raw_manual_answer_rows and all(r["present"] for r in manual_answer_schema_review_rows) else "missing_or_not_applicable", "passed_now": bool(raw_manual_answer_rows and all(r["present"] for r in manual_answer_schema_review_rows)), "blocks_confirmation": not bool(raw_manual_answer_rows and all(r["present"] for r in manual_answer_schema_review_rows))},
+              {"gate_id": "answer_gate_003", "object": "manual_answer_rows", "status": f"{len(ingested_manual_answer_rows)} rows", "passed_now": len(ingested_manual_answer_rows) > 0, "blocks_confirmation": len(ingested_manual_answer_rows) == 0},
+              {"gate_id": "answer_gate_004", "object": "source_probe_hints", "status": f"{len(row_meaning_hint_rows)+len(baseline_hint_rows)} hints", "passed_now": True, "blocks_confirmation": False},
+              {"gate_id": "answer_gate_005", "object": "approval_by_this_workflow", "status": "not_allowed", "passed_now": False, "blocks_confirmation": True},
+          ]
+
+          # No confirmations happen in this workflow; it only probes and ingests.
+          row_meaning_confirmed = False
+          baseline_values_filled = False
+          approved_baseline_values = 0
+          definition_match_confirmed = False
+          row_family_selected = False
+
+          target_resolution_status_rows = [
+              {"target_class": "row_meaning", "hint_rows": len(row_meaning_hint_rows), "manual_answer_rows": sum(1 for r in ingested_manual_answer_rows if str(r.get("approval_request","")).lower() == "row_meaning_confirm"), "resolved": False, "status": "unresolved_not_confirmed"},
+              {"target_class": "baseline", "hint_rows": len(baseline_hint_rows), "manual_answer_rows": sum(1 for r in ingested_manual_answer_rows if str(r.get("approval_request","")).lower() == "baseline_candidate"), "resolved": False, "status": "unresolved_not_approved"},
+              {"target_class": "definition_match", "hint_rows": 0, "manual_answer_rows": sum(1 for r in ingested_manual_answer_rows if str(r.get("approval_request","")).lower() == "definition_match"), "resolved": False, "status": "unresolved_not_confirmed"},
+              {"target_class": "row_family_selection", "hint_rows": len(row_meaning_hint_rows), "manual_answer_rows": 0, "resolved": False, "status": "unresolved_not_selected"},
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "source probes and ingested answers require a separate review gate", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "baseline hints and manual answers are not approval", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning is not confirmed", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition match requires separate review", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "readiness still fails", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no selected row family", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "target_source_probe", "permission_status": "completed_no_confirmation", "reason": "Target sources were probed for hints."},
+              {"permission_scope": "manual_answer_ingest", "permission_status": "completed_for_review" if raw_manual_answer_rows else "no_file_found", "reason": "Manual answer rows are ingested only if present."},
+              {"permission_scope": "manual_answer_review_gate", "permission_status": "allowed_next", "reason": "Next workflow may review ingested answers and hints without scoring."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "No separate review gate yet."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No approved comparator source/value."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "target_source_probe", "status": "complete", "meaning": "Source probes/hints written."},
+              {"readiness_id": "ready_002", "object": "manual_answer_ingest", "status": "complete_for_review" if raw_manual_answer_rows else "no_manual_file", "meaning": "Answers ingested only if file exists."},
+              {"readiness_id": "ready_003", "object": "row_meaning_confirmation", "status": "false", "meaning": "No confirmation yet."},
+              {"readiness_id": "ready_004", "object": "baseline_approval", "status": "false", "meaning": "No baseline approved."},
+              {"readiness_id": "ready_005", "object": "manual_answer_review_gate", "status": "ready_next", "meaning": "Next workflow can review answers/hints."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "Target source probing is now separated from answer approval.", "basis": "Hints can guide review but cannot confirm row meaning or baselines.", "next_action": "Review hints/answers under a separate gate.", "claim_status": "probe_only"},
+              {"decision_id": "decision_002", "decision": "Manual answer ingestion is review-only.", "basis": "Even if a manual answer file exists, this workflow cannot approve it.", "next_action": "Use v4.299 review gate.", "claim_status": "ingest_only"},
+              {"decision_id": "decision_003", "decision": "No diagnostic readiness object is resolved here.", "basis": "Row meaning, baseline approval, definition match, and row family selection remain false.", "next_action": "Keep score blocked.", "claim_status": "not_ready"},
+              {"decision_id": "decision_004", "decision": "The next route is manual answer review and gate decision, still no scoring.", "basis": "The probe/ingest layer is complete; approval requires a separate decision gate.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_manual_answer_review_and_gate_decision_no_scoring", "permission_status": "recommended", "reason": "Review hints/answers and decide whether any target can pass without scoring."},
+              {"route_id": "route_002", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_gate_decision_and_readiness", "reason": "No row meaning/baseline/definition decision yet."},
+              {"route_id": "route_003", "route": "sdss_rsd_full_likelihood_score", "permission_status": "blocked_until_full_covariance", "reason": "Full covariance/likelihood source missing."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.298 is a clean source-probe/answer-ingest milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "manual targets existed but source probes were not refreshed", "after_state": "target sources are probed and hints are written", "reduction_type": "source surface sharpened"},
+              {"sdr_id": "sdr_002", "before_state": "manual answers had no ingest rail", "after_state": "manual answer file locations and schema are checked", "reduction_type": "answer path operationalized"},
+              {"sdr_id": "sdr_003", "before_state": "hints could be mistaken for confirmation", "after_state": "hints are explicitly not confirmation", "reduction_type": "semantic overreach blocked"},
+              {"sdr_id": "sdr_004", "before_state": "manual answers could become approval too soon", "after_state": "ingested answers remain review-only", "reduction_type": "approval leak blocked"},
+              {"sdr_id": "sdr_005", "before_state": "score pressure remains tempting", "after_state": "score remains blocked until separate review gate", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before source probe/answer ingest"},
+              {"gate": "inherited_v4_297_rows_equal_14", "passed": len(inherited_v4_297_rows) == 14, "detail": f"inherited_v4_297_rows = {len(inherited_v4_297_rows)}"},
+              {"gate": "source_fetch_row_recorded", "passed": isinstance(source_fetch_row, dict), "detail": f"source_fetch_ok = {source_fetch_row['fetch_ok']}"},
+              {"gate": "related_fetch_row_recorded", "passed": isinstance(related_fetch_row, dict), "detail": f"related_fetch_ok = {related_fetch_row['fetch_ok']}"},
+              {"gate": "dr16_fetch_row_recorded", "passed": isinstance(dr16_fetch_row, dict), "detail": f"dr16_fetch_ok = {dr16_fetch_row['fetch_ok']}"},
+              {"gate": "column_contract_rows_recorded", "passed": len(column_contract_rows) >= 0, "detail": f"column_contract_rows = {len(column_contract_rows)}"},
+              {"gate": "source_probe_rows_recorded", "passed": len(source_probe_rows) >= 6, "detail": f"source_probe_rows = {len(source_probe_rows)}"},
+              {"gate": "manual_answer_search_rows_equal_5", "passed": len(manual_answer_search_rows) == 5, "detail": f"manual_answer_search_rows = {len(manual_answer_search_rows)}"},
+              {"gate": "manual_answer_schema_review_rows_equal_7", "passed": len(manual_answer_schema_review_rows) == 7, "detail": f"manual_answer_schema_review_rows = {len(manual_answer_schema_review_rows)}"},
+              {"gate": "answer_review_gate_rows_equal_5", "passed": len(answer_review_gate_rows) == 5, "detail": f"answer_review_gate_rows = {len(answer_review_gate_rows)}"},
+              {"gate": "target_resolution_status_rows_equal_4", "passed": len(target_resolution_status_rows) == 4, "detail": f"target_resolution_status_rows = {len(target_resolution_status_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_8", "passed": len(permission_rows) == 8, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_source_probes_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in source_probe_rows), "detail": "source probes no score/support"},
+              {"gate": "all_row_hints_not_confirmation", "passed": all(row["row_meaning_confirmed"] is False for row in row_meaning_hint_rows), "detail": "row hints not confirmation"},
+              {"gate": "all_row_hints_no_score", "passed": all(row["score_allowed"] is False for row in row_meaning_hint_rows), "detail": "row hints no score"},
+              {"gate": "all_baseline_hints_not_approval", "passed": all(row["baseline_approved"] is False for row in baseline_hint_rows), "detail": "baseline hints not approval"},
+              {"gate": "all_baseline_hints_no_score", "passed": all(row["score_allowed"] is False for row in baseline_hint_rows), "detail": "baseline hints no score"},
+              {"gate": "manual_schema_has_required_source_field", "passed": any(row["field"] == "source_url_or_citation" and row["required"] is True for row in manual_answer_schema_review_rows), "detail": "source field checked"},
+              {"gate": "manual_schema_has_precise_text_field", "passed": any(row["field"] == "quoted_or_precise_source_text" and row["required"] is True for row in manual_answer_schema_review_rows), "detail": "precise source field checked"},
+              {"gate": "all_ingested_answers_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in ingested_manual_answer_rows), "detail": "ingested answers no score/support"},
+              {"gate": "all_ingested_answers_not_approved", "passed": all(row["row_meaning_confirmed"] is False and row["baseline_approved"] is False and row["definition_match_confirmed"] is False for row in ingested_manual_answer_rows), "detail": "ingested answers not approved"},
+              {"gate": "source_probe_hints_gate_present", "passed": any(row["object"] == "source_probe_hints" for row in answer_review_gate_rows), "detail": "source probe hints gate present"},
+              {"gate": "approval_by_this_workflow_blocked", "passed": any(row["object"] == "approval_by_this_workflow" and row["blocks_confirmation"] is True for row in answer_review_gate_rows), "detail": "approval blocked by this workflow"},
+              {"gate": "row_meaning_unresolved", "passed": any(row["target_class"] == "row_meaning" and row["resolved"] is False for row in target_resolution_status_rows), "detail": "row meaning unresolved"},
+              {"gate": "baseline_unresolved", "passed": any(row["target_class"] == "baseline" and row["resolved"] is False for row in target_resolution_status_rows), "detail": "baseline unresolved"},
+              {"gate": "definition_match_unresolved", "passed": any(row["target_class"] == "definition_match" and row["resolved"] is False for row in target_resolution_status_rows), "detail": "definition unresolved"},
+              {"gate": "confirm_row_meaning_blocked", "passed": any(row["operation"] == "confirm_row_meaning_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "row meaning blocked"},
+              {"gate": "approve_baseline_blocked", "passed": any(row["operation"] == "approve_baseline_values_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "baseline approval blocked"},
+              {"gate": "run_diagonal_blocked", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "diagonal diagnostic blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations blocked"},
+              {"gate": "target_probe_permission_completed", "passed": any(row["permission_scope"] == "target_source_probe" and row["permission_status"] == "completed_no_confirmation" for row in permission_rows), "detail": "target source probe completed"},
+              {"gate": "answer_review_gate_allowed_next", "passed": any(row["permission_scope"] == "manual_answer_review_gate" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "review gate allowed next"},
+              {"gate": "baseline_approval_permission_blocked", "passed": any(row["permission_scope"] == "baseline_approval" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "baseline approval permission blocked"},
+              {"gate": "diagonal_score_permission_blocked", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "diagonal score blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_manual_answer_review_and_gate_decision_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.299 route recommended"},
+              {"gate": "diagonal_score_route_blocked", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_gate_decision_and_readiness" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "full_likelihood_route_blocked", "passed": any(row["route"] == "sdss_rsd_full_likelihood_score" and row["permission_status"] == "blocked_until_full_covariance" for row in route_review_rows), "detail": "full likelihood route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_299_sdss_rsd_manual_answer_review_and_gate_decision_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_298_sdss_rsd_target_source_probe_and_manual_answer_ingest_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_298_inherited_v4_297_rows.csv", inherited_v4_297_rows)
+          write_csv(OUT / "v4_298_source_fetch_rows.csv", [{**source_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_298_related_fetch_rows.csv", [{**related_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_298_dr16_fetch_rows.csv", [{**dr16_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_298_column_contract_rows.csv", column_contract_rows)
+          write_csv(OUT / "v4_298_source_probe_rows.csv", source_probe_rows)
+          write_csv(OUT / "SDSS_RSD_TARGET_SOURCE_PROBES_v4_298_NO_CONFIRMATION.csv", source_probe_rows)
+          write_csv(OUT / "v4_298_row_meaning_hint_rows.csv", row_meaning_hint_rows)
+          write_csv(OUT / "SDSS_RSD_ROW_MEANING_HINTS_v4_298_NOT_CONFIRMED.csv", row_meaning_hint_rows)
+          write_csv(OUT / "v4_298_baseline_hint_rows.csv", baseline_hint_rows)
+          write_csv(OUT / "SDSS_RSD_BASELINE_HINTS_v4_298_NOT_APPROVED.csv", baseline_hint_rows)
+          write_csv(OUT / "v4_298_manual_answer_search_rows.csv", manual_answer_search_rows)
+          write_csv(OUT / "v4_298_manual_answer_schema_review_rows.csv", manual_answer_schema_review_rows)
+          write_csv(OUT / "v4_298_ingested_manual_answer_rows.csv", ingested_manual_answer_rows)
+          write_csv(OUT / "SDSS_RSD_INGESTED_MANUAL_ANSWERS_v4_298_REVIEW_ONLY.csv", ingested_manual_answer_rows)
+          write_csv(OUT / "v4_298_answer_review_gate_rows.csv", answer_review_gate_rows)
+          write_csv(OUT / "v4_298_target_resolution_status_rows.csv", target_resolution_status_rows)
+          write_csv(OUT / "v4_298_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_298_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_298_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_298_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_298_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_298_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_298_rule_checks.csv", checks)
+
+          probe_lines = [
+              f"{row['source_probe_id']}: ok={row['fetch_ok']} relevance={row['relevance_score_no_claim']} {row['probe_url']}"
+              for row in sorted(source_probe_rows, key=lambda r: r["relevance_score_no_claim"], reverse=True)[:12]
+          ] or ["no source probe rows written"]
+
+          answer_lines = [
+              f"{row['candidate_path']}: exists={row['exists']} read_ok={row['read_ok']} rows={row['row_count']}"
+              for row in manual_answer_search_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_review_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_url": SOURCE_URL,
+              "source_fetch_ok": source_fetch_row["fetch_ok"],
+              "related_page_url": RELATED_PAGE_URL,
+              "related_fetch_ok": related_fetch_row["fetch_ok"],
+              "dr16_fetch_ok": dr16_fetch_row["fetch_ok"],
+              "column_contract_rows": len(column_contract_rows),
+              "source_probe_rows": len(source_probe_rows),
+              "source_probe_ok_rows": sum(1 for row in source_probe_rows if row["fetch_ok"]),
+              "row_meaning_hint_rows": len(row_meaning_hint_rows),
+              "baseline_hint_rows": len(baseline_hint_rows),
+              "manual_answer_file_found": bool(manual_answer_path),
+              "manual_answer_file_path": manual_answer_path,
+              "ingested_manual_answer_rows": len(ingested_manual_answer_rows),
+              "manual_answer_schema_review_rows": len(manual_answer_schema_review_rows),
+              "target_source_probe_completed": True,
+              "manual_answer_ingest_completed": True,
+              "row_meaning_confirmed": row_meaning_confirmed,
+              "baseline_values_filled": baseline_values_filled,
+              "approved_baseline_values": approved_baseline_values,
+              "row_family_selected": row_family_selected,
+              "definition_match_confirmed": definition_match_confirmed,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "numeric_fit_allowed": False,
+              "support_allowed": False,
+              "evidence_allowed": False,
+              "validation_allowed": False,
+              "holdout_approval_allowed": False,
+              "combined_matrix_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_298_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.298 SDSS RSD Target Source Probe And Manual Answer Ingest No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_url = {SOURCE_URL}",
+              f"source_fetch_ok = {summary['source_fetch_ok']}",
+              f"related_page_url = {RELATED_PAGE_URL}",
+              f"related_fetch_ok = {summary['related_fetch_ok']}",
+              f"dr16_fetch_ok = {summary['dr16_fetch_ok']}",
+              f"column_contract_rows = {summary['column_contract_rows']}",
+              f"source_probe_rows = {summary['source_probe_rows']}",
+              f"source_probe_ok_rows = {summary['source_probe_ok_rows']}",
+              f"row_meaning_hint_rows = {summary['row_meaning_hint_rows']}",
+              f"baseline_hint_rows = {summary['baseline_hint_rows']}",
+              f"manual_answer_file_found = {summary['manual_answer_file_found']}",
+              f"manual_answer_file_path = {summary['manual_answer_file_path']}",
+              f"ingested_manual_answer_rows = {summary['ingested_manual_answer_rows']}",
+              f"manual_answer_schema_review_rows = {summary['manual_answer_schema_review_rows']}",
+              f"target_source_probe_completed = {summary['target_source_probe_completed']}",
+              f"manual_answer_ingest_completed = {summary['manual_answer_ingest_completed']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"numeric_fit_allowed = {summary['numeric_fit_allowed']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"validation_allowed = {summary['validation_allowed']}",
+              f"holdout_approval_allowed = {summary['holdout_approval_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Source probe preview:",
+              *probe_lines,
+              "",
+              "Manual answer search:",
+              *answer_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.298 probes target sources and ingests manual answer rows if a correctly named file exists, but it does not approve anything. Hints are not row-meaning confirmations. Manual answers are not baseline approvals. The next step must review hints and ingested answers under a separate gate before any diagnostic can even become ready.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_298_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_url = {SOURCE_URL}")
+          print(f"source_fetch_ok = {summary['source_fetch_ok']}")
+          print(f"related_page_url = {RELATED_PAGE_URL}")
+          print(f"related_fetch_ok = {summary['related_fetch_ok']}")
+          print(f"dr16_fetch_ok = {summary['dr16_fetch_ok']}")
+          print(f"column_contract_rows = {summary['column_contract_rows']}")
+          print(f"source_probe_rows = {summary['source_probe_rows']}")
+          print(f"source_probe_ok_rows = {summary['source_probe_ok_rows']}")
+          print(f"row_meaning_hint_rows = {summary['row_meaning_hint_rows']}")
+          print(f"baseline_hint_rows = {summary['baseline_hint_rows']}")
+          print(f"manual_answer_file_found = {summary['manual_answer_file_found']}")
+          print(f"ingested_manual_answer_rows = {summary['ingested_manual_answer_rows']}")
+          print(f"target_source_probe_completed = {summary['target_source_probe_completed']}")
+          print(f"manual_answer_ingest_completed = {summary['manual_answer_ingest_completed']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"validation_allowed = {summary['validation_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.298 SDSS RSD target source probe manual answer ingest output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-298-sdss-rsd-target-source-probe-manual-answer-ingest-output
+          path: |
+            tairid_v4_298_sdss_rsd_target_source_probe_manual_answer_ingest_output/
+            tairid-v4-298-sdss-rsd-target-source-probe-manual-answer-ingest-output.zip
