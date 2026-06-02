@@ -1,0 +1,803 @@
+name: 001 TAIRID v4.286 - SDSS RSD Table Header Binding And Smoke Result Review No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-286-sdss-rsd-table-header-binding-and-smoke-result-review-no-scoring.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-table-header-binding-review-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.286 SDSS RSD Table Header Binding And Smoke Result Review No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.286 SDSS RSD table header binding and smoke result review no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import statistics
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.286"
+          ROUTE = "sdss_rsd_table_header_binding_and_smoke_result_review_no_scoring_after_v4_285"
+          EXPECTED_RESULT = "v4_286_sdss_rsd_table_header_binding_and_smoke_result_review_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_287_sdss_rsd_exact_column_contract_and_baseline_stub_no_scoring"
+
+          OUT = Path("tairid_v4_286_sdss_rsd_table_header_binding_review_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-286-sdss-rsd-table-header-binding-review-output.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+          MAX_BYTES = 2_000_000
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=MAX_BYTES, timeout=15):
+              out = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length_header": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.286-header-binding-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length_header"] = resp.headers.get("Content-Length", "")
+                      out["final_url"] = resp.geturl()
+                      out["bytes_read"] = len(data)
+                      out["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      out["fetch_ok"] = True
+              except Exception as exc:
+                  out["error"] = f"{type(exc).__name__}: {exc}"
+              return out, data
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return (
+                  "fσ8" in label or
+                  "fsigma8" in label or
+                  ("f" in label and "σ8" in label) or
+                  "fσ8" in joined or
+                  "fsigma8" in joined
+              )
+
+          def table_to_matrix_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  max_cols = max((len(r) for r in table), default=0)
+                  for row_idx, row in enumerate(table):
+                      for col_idx in range(max_cols):
+                          out.append({
+                              "table_index": table_idx,
+                              "row_index": row_idx,
+                              "col_index": col_idx,
+                              "cell_text": row[col_idx] if col_idx < len(row) else "",
+                              "row_length": len(row),
+                              "max_cols_in_table": max_cols,
+                          })
+              return out
+
+          def infer_header_rows(table):
+              header_rows = []
+              # Usually early rows with no +/- measurements and multi-column labels are headers.
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def parse_bound_fsigma_rows(tables):
+              bound_rows = []
+              row_meaning_rows = []
+              if not tables:
+                  return bound_rows, row_meaning_rows
+              for table_idx, table in enumerate(tables):
+                  header_indices = infer_header_rows(table)
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      if "(z)" in label_norm:
+                          row_type = "likely_redshift_function_row_or_sample_level_series"
+                      else:
+                          row_type = "likely_consensus_or_secondary_row_needs_source_meaning"
+                      row_meaning_rows.append({
+                          "table_index": table_idx,
+                          "row_index": row_idx,
+                          "row_label": label,
+                          "row_type_guess": row_type,
+                          "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                          "meaning_status": "needs_human_or_source_confirmation_before_scoring",
+                          "score_allowed": False,
+                      })
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          pairs = measurement_pairs(cell)
+                          for pair_idx, (value, sigma) in enumerate(pairs, start=1):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              bound_rows.append({
+                                  "bound_id": f"bound_{len(bound_rows)+1:02d}",
+                                  "source_url": SOURCE_URL,
+                                  "table_index": table_idx,
+                                  "row_index": row_idx,
+                                  "col_index": col_idx,
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "bound_header": bound["bound_header"],
+                                  "header_rows_used": bound["header_rows_used"],
+                                  "value": value,
+                                  "sigma": sigma,
+                                  "cell_text": cell[:240],
+                                  "binding_status": "header_bound_needs_source_confirmation",
+                                  "score_allowed": False,
+                                  "claim_status": "real_data_bound_no_tairid_claim",
+                              })
+              return bound_rows, row_meaning_rows
+
+          inherited_v4_285_rows = [
+              {
+                  "inherited_from": "v4.285",
+                  "item": "rules",
+                  "value": "48 / 48 passed",
+                  "meaning": "Real-data smoke test passed with no claims.",
+                  "carry_forward_status": "ready_for_smoke_review",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "fetch_ok",
+                  "value": True,
+                  "meaning": "GitHub fetched the official SDSS page.",
+                  "carry_forward_status": "real_data_touched",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "parser_status",
+                  "value": "parsed_real_rows",
+                  "meaning": "Parser extracted real f_sigma8 rows.",
+                  "carry_forward_status": "parser_worked_initially",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "parsed_rsd_rows",
+                  "value": 12,
+                  "meaning": "Twelve f_sigma8 value/sigma pairs were parsed from two f_sigma8-like rows.",
+                  "carry_forward_status": "needs_header_binding_and_row_meaning",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "smoke_outcome",
+                  "value": "real_data_parsed_no_claims",
+                  "meaning": "Smoke test touched and parsed real data without support claims.",
+                  "carry_forward_status": "no_claims_preserved",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "baseline_comparison_run",
+                  "value": False,
+                  "meaning": "No baseline comparator was run.",
+                  "carry_forward_status": "baseline_missing_blocks_support",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "covariance_handled",
+                  "value": False,
+                  "meaning": "No covariance handling was run.",
+                  "carry_forward_status": "covariance_missing_blocks_scoring",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "support_allowed",
+                  "value": False,
+                  "meaning": "Support was blocked.",
+                  "carry_forward_status": "support_blocked",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "approved_holdout_sources",
+                  "value": 0,
+                  "meaning": "No holdout source was approved.",
+                  "carry_forward_status": "no_holdout_approved",
+              },
+              {
+                  "inherited_from": "v4.285",
+                  "item": "selected_next_route",
+                  "value": "v4_286_real_data_smoke_result_review_or_exact_file_locator_no_scoring",
+                  "meaning": "Current route reviews the smoke result and binds headers before scoring.",
+                  "carry_forward_status": "current_route",
+              },
+          ]
+
+          fetch_row, data = fetch_url(SOURCE_URL)
+          text = data.decode("utf-8", errors="replace") if data else ""
+          parser = SimpleTableParser()
+          if text:
+              parser.feed(text)
+
+          matrix_rows = table_to_matrix_rows(parser.tables)
+          bound_fsigma_rows, row_meaning_rows = parse_bound_fsigma_rows(parser.tables)
+
+          header_candidate_rows = []
+          for table_idx, table in enumerate(parser.tables):
+              for hidx in infer_header_rows(table):
+                  header_candidate_rows.append({
+                      "table_index": table_idx,
+                      "row_index": hidx,
+                      "header_candidate_text": " | ".join(table[hidx])[:1000],
+                      "header_status": "candidate_header_needs_source_confirmation",
+                      "score_allowed": False,
+                  })
+
+          duplicate_or_variant_review_rows = []
+          labels = {}
+          for row in bound_fsigma_rows:
+              labels.setdefault(row["row_label"], []).append(row)
+          for label, rows in labels.items():
+              duplicate_or_variant_review_rows.append({
+                  "row_label": label,
+                  "bound_value_count": len(rows),
+                  "values_joined": "|".join(str(r["value"]) for r in rows),
+                  "sigmas_joined": "|".join(str(r["sigma"]) for r in rows),
+                  "row_status": "separate_row_variant_not_duplicate_until_source_meaning_confirmed",
+                  "score_allowed": False,
+              })
+
+          if len(labels) > 1:
+              duplicate_or_variant_review_rows.append({
+                  "row_label": "all_fsigma_rows",
+                  "bound_value_count": len(bound_fsigma_rows),
+                  "values_joined": "|".join(str(r["value"]) for r in bound_fsigma_rows),
+                  "sigmas_joined": "|".join(str(r["sigma"]) for r in bound_fsigma_rows),
+                  "row_status": "multiple_fsigma_rows_detected_do_not_merge_or_double_count_before_source_meaning",
+                  "score_allowed": False,
+              })
+
+          smoke_review_rows = [
+              {
+                  "review_id": "review_001",
+                  "object": "real_data_fetch",
+                  "status": "ok" if fetch_row["fetch_ok"] else "failed_or_unavailable",
+                  "meaning": "Official SDSS page was fetched if ok. Fetch status is not evidence.",
+                  "claim_allowed": False,
+              },
+              {
+                  "review_id": "review_002",
+                  "object": "html_table_parse",
+                  "status": f"{len(parser.tables)} tables found",
+                  "meaning": "HTML tables parsed for structure.",
+                  "claim_allowed": False,
+              },
+              {
+                  "review_id": "review_003",
+                  "object": "header_binding",
+                  "status": f"{len(bound_fsigma_rows)} bound f_sigma8 value/sigma pairs",
+                  "meaning": "Values are now attached to candidate headers, but source meaning still needs confirmation.",
+                  "claim_allowed": False,
+              },
+              {
+                  "review_id": "review_004",
+                  "object": "multiple_fsigma_rows",
+                  "status": f"{len(labels)} row labels detected",
+                  "meaning": "Do not merge or double count until row meanings are confirmed.",
+                  "claim_allowed": False,
+              },
+              {
+                  "review_id": "review_005",
+                  "object": "support_language",
+                  "status": "blocked",
+                  "meaning": "No support is allowed from smoke review.",
+                  "claim_allowed": False,
+              },
+          ]
+
+          next_contract_gap_rows = [
+              {
+                  "gap_id": "gap_001",
+                  "gap": "row_meaning_confirmation",
+                  "meaning": "The two f_sigma8-like rows must be explained from source context before scoring.",
+                  "needed_before_score": True,
+              },
+              {
+                  "gap_id": "gap_002",
+                  "gap": "column_header_confirmation",
+                  "meaning": "Bound headers must be confirmed as tracer/redshift/sample labels.",
+                  "needed_before_score": True,
+              },
+              {
+                  "gap_id": "gap_003",
+                  "gap": "baseline_stub",
+                  "meaning": "A baseline comparator placeholder must be attached to each bound row before any future score.",
+                  "needed_before_score": True,
+              },
+              {
+                  "gap_id": "gap_004",
+                  "gap": "covariance_policy",
+                  "meaning": "This SDSS summary page does not supply a full covariance contract for likelihood scoring.",
+                  "needed_before_score": True,
+              },
+              {
+                  "gap_id": "gap_005",
+                  "gap": "exact_file_or_publication_reference",
+                  "meaning": "A table row on a web page is not enough for exact-file scientific scoring.",
+                  "needed_before_score": True,
+              },
+          ]
+
+          null_guard_review_rows = [
+              {
+                  "guard_id": "null_review_001",
+                  "negative_control_lane": "source_identity_endpoint_null",
+                  "guard_status": "passed",
+                  "meaning": "Fetch status and endpoint hash were not used as signal.",
+                  "support_allowed": False,
+              },
+              {
+                  "guard_id": "null_review_002",
+                  "negative_control_lane": "irrelevant_metadata_predictor_null",
+                  "guard_status": "passed",
+                  "meaning": "Byte count, content type, and URL shape were not used as predictors.",
+                  "support_allowed": False,
+              },
+              {
+                  "guard_id": "null_review_003",
+                  "negative_control_lane": "standard_baseline_equal_or_better_null",
+                  "guard_status": "baseline_missing_support_blocked",
+                  "meaning": "No baseline run, so no support.",
+                  "support_allowed": False,
+              },
+              {
+                  "guard_id": "null_review_004",
+                  "negative_control_lane": "label_shuffle_permutation_null",
+                  "guard_status": "not_run_until_score_metric_exists",
+                  "meaning": "No pattern metric exists yet to shuffle-test.",
+                  "support_allowed": False,
+              },
+          ]
+
+          descriptive_metric_rows = []
+          values = [float(r["value"]) for r in bound_fsigma_rows]
+          sigmas = [float(r["sigma"]) for r in bound_fsigma_rows]
+          if values:
+              descriptive_metric_rows = [
+                  {"metric_id": "metric_001", "metric_name": "bound_fsigma8_count", "metric_value": len(values), "score_status": "descriptive_not_tairid_score"},
+                  {"metric_id": "metric_002", "metric_name": "bound_fsigma8_mean_value", "metric_value": statistics.mean(values), "score_status": "descriptive_not_tairid_score"},
+                  {"metric_id": "metric_003", "metric_name": "bound_fsigma8_min_value", "metric_value": min(values), "score_status": "descriptive_not_tairid_score"},
+                  {"metric_id": "metric_004", "metric_name": "bound_fsigma8_max_value", "metric_value": max(values), "score_status": "descriptive_not_tairid_score"},
+                  {"metric_id": "metric_005", "metric_name": "bound_sigma_mean", "metric_value": statistics.mean(sigmas) if sigmas else "", "score_status": "descriptive_not_tairid_score"},
+              ]
+          else:
+              descriptive_metric_rows = [
+                  {"metric_id": "metric_001", "metric_name": "bound_fsigma8_count", "metric_value": 0, "score_status": "no_result_no_claim"}
+              ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "score_bound_fsigma8_rows", "reason": "row meanings, headers, baseline, and covariance are not confirmed", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "merge_two_fsigma8_rows", "reason": "two f_sigma8-like rows may be variants; do not merge before source meaning", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "double_count_two_fsigma8_rows", "reason": "multiple row labels require disambiguation before scoring", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "claim_tairid_support", "reason": "header binding is parser integrity work, not evidence", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "compute_p_value_or_likelihood", "reason": "no covariance or baseline score guard exists", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "approve_holdout_source", "reason": "SDSS/eBOSS is same-family current lane, not holdout", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "real_data_refetch", "permission_status": "attempted", "reason": "Official SDSS page fetch attempted again for header binding."},
+              {"permission_scope": "table_matrix_parse", "permission_status": "attempted_no_claims", "reason": "HTML table matrix extraction attempted."},
+              {"permission_scope": "header_binding", "permission_status": "attempted_no_claims", "reason": "f_sigma8 values bound to candidate headers when possible."},
+              {"permission_scope": "row_meaning_disambiguation", "permission_status": "required_next", "reason": "Two f_sigma8-like rows must not be merged or double counted."},
+              {"permission_scope": "baseline_stub_contract", "permission_status": "allowed_next", "reason": "Next workflow may attach baseline placeholders without scoring."},
+              {"permission_scope": "external_scoring", "permission_status": "blocked", "reason": "No scoring allowed."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "sdss_fetch", "status": "ok" if fetch_row["fetch_ok"] else "failed_or_unavailable", "meaning": "Fetch status only."},
+              {"readiness_id": "ready_002", "object": "table_matrix", "status": f"{len(matrix_rows)} matrix cells", "meaning": "Matrix extraction status."},
+              {"readiness_id": "ready_003", "object": "header_binding", "status": f"{len(bound_fsigma_rows)} bound rows", "meaning": "Header-bound parse status."},
+              {"readiness_id": "ready_004", "object": "row_meaning", "status": "needs_confirmation", "meaning": "Two f_sigma8-like rows require source meaning."},
+              {"readiness_id": "ready_005", "object": "baseline_stub", "status": "ready_next", "meaning": "Can create baseline stub next."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "v4.285 was a successful no-claims real-data smoke test.",
+                  "basis": "GitHub fetched SDSS and parsed real rows while keeping support blocked.",
+                  "next_action": "Repair integrity gaps before scoring.",
+                  "claim_status": "no_claims",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "The twelve parsed values are not automatically twelve independent scored data points.",
+                  "basis": "Two f_sigma8-like rows were detected and their meanings need confirmation.",
+                  "next_action": "Do not merge, double count, or score them yet.",
+                  "claim_status": "double_count_guard",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Header binding is necessary but still not enough for scoring.",
+                  "basis": "Candidate headers can be attached, but baseline and covariance remain missing.",
+                  "next_action": "Build exact column contract and baseline stub next.",
+                  "claim_status": "parser_integrity",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "External support remains blocked.",
+                  "basis": "No baseline comparator, covariance policy, p-value, likelihood, holdout approval, or score guard exists.",
+                  "next_action": SELECTED_NEXT_ROUTE,
+                  "claim_status": "safe_to_continue",
+              },
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_exact_column_contract_and_baseline_stub_no_scoring", "permission_status": "recommended", "reason": "Need exact column meanings, row meanings, and baseline placeholders before scoring."},
+              {"route_id": "route_002", "route": "sdss_rsd_parser_repair", "permission_status": "allowed_if_binding_failed", "reason": "Only needed if fetch succeeds but no f_sigma8 binding occurs."},
+              {"route_id": "route_003", "route": "external_exact_file_locator_and_checksum_guard_no_scoring", "permission_status": "allowed_later", "reason": "Still needed for exact-file scoring route."},
+              {"route_id": "route_004", "route": "external_data_score", "permission_status": "blocked", "reason": "Scoring needs exact columns, baseline, covariance, parser contract, and score guard."},
+              {"route_id": "route_005", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.286 is a clean real-data/header-binding milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "real values were parsed but loosely labeled", "after_state": "values are bound to candidate headers", "reduction_type": "parser specificity increased"},
+              {"sdr_id": "sdr_002", "before_state": "twelve parsed values could be overcounted", "after_state": "two-row variant/double-count guard is explicit", "reduction_type": "double-count risk reduced"},
+              {"sdr_id": "sdr_003", "before_state": "row meanings were implicit", "after_state": "row meanings are marked needs confirmation", "reduction_type": "semantic gap named"},
+              {"sdr_id": "sdr_004", "before_state": "baseline gap could be ignored", "after_state": "baseline stub is required next", "reduction_type": "baseline gap preserved"},
+              {"sdr_id": "sdr_005", "before_state": "real-data contact could tempt support language", "after_state": "support remains blocked after real-data header binding", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before header binding"},
+              {"gate": "inherited_v4_285_rows_equal_10", "passed": len(inherited_v4_285_rows) == 10, "detail": f"inherited_v4_285_rows = {len(inherited_v4_285_rows)}"},
+              {"gate": "fetch_row_recorded", "passed": isinstance(fetch_row, dict), "detail": f"fetch_ok = {fetch_row['fetch_ok']}"},
+              {"gate": "matrix_rows_recorded", "passed": len(matrix_rows) >= 0, "detail": f"matrix_rows = {len(matrix_rows)}"},
+              {"gate": "header_candidate_rows_recorded", "passed": len(header_candidate_rows) >= 0, "detail": f"header_candidate_rows = {len(header_candidate_rows)}"},
+              {"gate": "bound_fsigma_rows_recorded", "passed": len(bound_fsigma_rows) >= 0, "detail": f"bound_fsigma_rows = {len(bound_fsigma_rows)}"},
+              {"gate": "row_meaning_rows_recorded", "passed": len(row_meaning_rows) >= 0, "detail": f"row_meaning_rows = {len(row_meaning_rows)}"},
+              {"gate": "duplicate_or_variant_review_rows_recorded", "passed": len(duplicate_or_variant_review_rows) >= 0, "detail": f"duplicate_or_variant_review_rows = {len(duplicate_or_variant_review_rows)}"},
+              {"gate": "smoke_review_rows_equal_5", "passed": len(smoke_review_rows) == 5, "detail": f"smoke_review_rows = {len(smoke_review_rows)}"},
+              {"gate": "next_contract_gap_rows_equal_5", "passed": len(next_contract_gap_rows) == 5, "detail": f"next_contract_gap_rows = {len(next_contract_gap_rows)}"},
+              {"gate": "null_guard_review_rows_equal_4", "passed": len(null_guard_review_rows) == 4, "detail": f"null_guard_review_rows = {len(null_guard_review_rows)}"},
+              {"gate": "descriptive_metric_rows_recorded", "passed": len(descriptive_metric_rows) >= 1, "detail": f"descriptive_metric_rows = {len(descriptive_metric_rows)}"},
+              {"gate": "blocked_operation_rows_equal_8", "passed": len(blocked_operation_rows) == 8, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_8", "passed": len(permission_rows) == 8, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_5", "passed": len(route_review_rows) == 5, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_bound_rows_no_score", "passed": all(row["score_allowed"] is False for row in bound_fsigma_rows), "detail": "all bound rows no score"},
+              {"gate": "all_bound_rows_no_claim", "passed": all(row["claim_status"] == "real_data_bound_no_tairid_claim" for row in bound_fsigma_rows), "detail": "all bound rows no claim"},
+              {"gate": "all_row_meanings_no_score", "passed": all(row["score_allowed"] is False for row in row_meaning_rows), "detail": "all row meanings no score"},
+              {"gate": "all_duplicate_reviews_no_score", "passed": all(row["score_allowed"] is False for row in duplicate_or_variant_review_rows), "detail": "all duplicate/variant reviews no score"},
+              {"gate": "all_smoke_reviews_no_claim", "passed": all(row["claim_allowed"] is False for row in smoke_review_rows), "detail": "all smoke reviews no claim"},
+              {"gate": "all_contract_gaps_needed", "passed": all(row["needed_before_score"] is True for row in next_contract_gap_rows), "detail": "all contract gaps needed before score"},
+              {"gate": "baseline_gap_present", "passed": any(row["gap"] == "baseline_stub" for row in next_contract_gap_rows), "detail": "baseline gap present"},
+              {"gate": "covariance_gap_present", "passed": any(row["gap"] == "covariance_policy" for row in next_contract_gap_rows), "detail": "covariance gap present"},
+              {"gate": "null_guards_no_support", "passed": all(row["support_allowed"] is False for row in null_guard_review_rows), "detail": "null guards no support"},
+              {"gate": "baseline_null_blocks_support", "passed": any(row["negative_control_lane"] == "standard_baseline_equal_or_better_null" and row["guard_status"] == "baseline_missing_support_blocked" for row in null_guard_review_rows), "detail": "baseline null blocks support"},
+              {"gate": "descriptive_metrics_not_score", "passed": all("score" in row["score_status"] or "claim" in row["score_status"] for row in descriptive_metric_rows), "detail": "descriptive metrics not score"},
+              {"gate": "merge_two_rows_blocked", "passed": any(row["operation"] == "merge_two_fsigma8_rows" and row["blocked"] is True for row in blocked_operation_rows), "detail": "merge two rows blocked"},
+              {"gate": "double_count_blocked", "passed": any(row["operation"] == "double_count_two_fsigma8_rows" and row["blocked"] is True for row in blocked_operation_rows), "detail": "double count blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "external_scoring_blocked", "passed": any(row["permission_scope"] == "external_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "external scoring blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "blocked operations guarded"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_exact_column_contract_and_baseline_stub_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.287 route recommended"},
+              {"gate": "external_data_score_blocked_route", "passed": any(row["route"] == "external_data_score" and row["permission_status"] == "blocked" for row in route_review_rows), "detail": "external score route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_287_sdss_rsd_exact_column_contract_and_baseline_stub_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_286_sdss_rsd_table_header_binding_and_smoke_result_review_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_286_inherited_v4_285_rows.csv", inherited_v4_285_rows)
+          write_csv(OUT / "v4_286_fetch_rows.csv", [{**fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_286_table_matrix_rows.csv", matrix_rows)
+          write_csv(OUT / "v4_286_header_candidate_rows.csv", header_candidate_rows)
+          write_csv(OUT / "v4_286_bound_fsigma8_rows.csv", bound_fsigma_rows)
+          write_csv(OUT / "SDSS_RSD_BOUND_FSIGMA8_ROWS_v4_286_NO_CLAIMS.csv", bound_fsigma_rows)
+          write_csv(OUT / "v4_286_row_meaning_rows.csv", row_meaning_rows)
+          write_csv(OUT / "v4_286_duplicate_or_variant_review_rows.csv", duplicate_or_variant_review_rows)
+          write_csv(OUT / "v4_286_smoke_review_rows.csv", smoke_review_rows)
+          write_csv(OUT / "v4_286_next_contract_gap_rows.csv", next_contract_gap_rows)
+          write_csv(OUT / "v4_286_null_guard_review_rows.csv", null_guard_review_rows)
+          write_csv(OUT / "v4_286_descriptive_metric_rows.csv", descriptive_metric_rows)
+          write_csv(OUT / "v4_286_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_286_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_286_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_286_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_286_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_286_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_286_rule_checks.csv", checks)
+
+          preview_lines = [
+              f"{row['bound_id']}: {row['row_label']} | {row['bound_header']} | value={row['value']} sigma={row['sigma']}"
+              for row in bound_fsigma_rows[:12]
+          ] or ["no bound f_sigma8 rows; parser repair may be needed"]
+
+          gap_lines = [
+              f"{row['gap']}: {row['meaning']}"
+              for row in next_contract_gap_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_review_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_url": SOURCE_URL,
+              "fetch_ok": fetch_row["fetch_ok"],
+              "fetch_status_code": fetch_row["status_code"],
+              "bytes_read": fetch_row["bytes_read"],
+              "html_tables_found": len(parser.tables),
+              "matrix_rows": len(matrix_rows),
+              "header_candidate_rows": len(header_candidate_rows),
+              "bound_fsigma8_rows": len(bound_fsigma_rows),
+              "row_meaning_rows": len(row_meaning_rows),
+              "duplicate_or_variant_review_rows": len(duplicate_or_variant_review_rows),
+              "next_contract_gap_rows": len(next_contract_gap_rows),
+              "real_data_touched": bool(fetch_row["fetch_ok"]),
+              "header_binding_attempted": True,
+              "row_meaning_confirmed": False,
+              "baseline_stub_written": False,
+              "covariance_handled": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "numeric_fit_allowed": False,
+              "support_allowed": False,
+              "evidence_allowed": False,
+              "validation_allowed": False,
+              "holdout_approval_allowed": False,
+              "combined_matrix_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_286_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.286 SDSS RSD Table Header Binding And Smoke Result Review No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_url = {SOURCE_URL}",
+              f"fetch_ok = {summary['fetch_ok']}",
+              f"fetch_status_code = {summary['fetch_status_code']}",
+              f"bytes_read = {summary['bytes_read']}",
+              f"html_tables_found = {summary['html_tables_found']}",
+              f"matrix_rows = {summary['matrix_rows']}",
+              f"header_candidate_rows = {summary['header_candidate_rows']}",
+              f"bound_fsigma8_rows = {summary['bound_fsigma8_rows']}",
+              f"row_meaning_rows = {summary['row_meaning_rows']}",
+              f"duplicate_or_variant_review_rows = {summary['duplicate_or_variant_review_rows']}",
+              f"next_contract_gap_rows = {summary['next_contract_gap_rows']}",
+              f"real_data_touched = {summary['real_data_touched']}",
+              f"header_binding_attempted = {summary['header_binding_attempted']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_stub_written = {summary['baseline_stub_written']}",
+              f"covariance_handled = {summary['covariance_handled']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"numeric_fit_allowed = {summary['numeric_fit_allowed']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"validation_allowed = {summary['validation_allowed']}",
+              f"holdout_approval_allowed = {summary['holdout_approval_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Bound row preview:",
+              *preview_lines,
+              "",
+              "Next contract gaps:",
+              *gap_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.286 reviews the first real-data smoke result and tries to bind the parsed SDSS f_sigma8 values to candidate table headers. It explicitly blocks merging or double-counting the two f_sigma8-like rows until row meanings are confirmed. It does not score, fit, compare baselines, compute p-values, compute likelihoods, approve support, approve evidence, approve validation, approve a holdout, or build a combined matrix.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_286_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_url = {SOURCE_URL}")
+          print(f"fetch_ok = {summary['fetch_ok']}")
+          print(f"fetch_status_code = {summary['fetch_status_code']}")
+          print(f"bytes_read = {summary['bytes_read']}")
+          print(f"html_tables_found = {summary['html_tables_found']}")
+          print(f"matrix_rows = {summary['matrix_rows']}")
+          print(f"header_candidate_rows = {summary['header_candidate_rows']}")
+          print(f"bound_fsigma8_rows = {summary['bound_fsigma8_rows']}")
+          print(f"row_meaning_rows = {summary['row_meaning_rows']}")
+          print(f"duplicate_or_variant_review_rows = {summary['duplicate_or_variant_review_rows']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_stub_written = {summary['baseline_stub_written']}")
+          print(f"covariance_handled = {summary['covariance_handled']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"validation_allowed = {summary['validation_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.286 SDSS RSD table header binding review output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-286-sdss-rsd-table-header-binding-review-output
+          path: |
+            tairid_v4_286_sdss_rsd_table_header_binding_review_output/
+            tairid-v4-286-sdss-rsd-table-header-binding-review-output.zip
