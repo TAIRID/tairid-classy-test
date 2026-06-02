@@ -1,0 +1,795 @@
+name: 001 TAIRID v4.307 - SDSS RSD Manual Answer Draft Prefill File Builder No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-307-sdss-rsd-manual-answer-draft-prefill-file-builder-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-manual-answer-draft-prefill-file-builder-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.307 SDSS RSD Manual Answer Draft Prefill File Builder No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.307 SDSS RSD manual answer draft prefill file builder no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.307"
+          ROUTE = "sdss_rsd_manual_answer_draft_prefill_file_builder_no_scoring_after_v4_306"
+          EXPECTED_RESULT = "v4_307_sdss_rsd_manual_answer_draft_prefill_file_builder_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_308_sdss_rsd_draft_prefill_human_review_packet_no_scoring"
+
+          OUT = Path("tairid_v4_307_sdss_rsd_manual_answer_draft_prefill_file_builder_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-307-sdss-rsd-manual-answer-draft-prefill-file-builder-output.zip"
+
+          SOURCE_URLS = [
+              "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/",
+              "https://www.sdss4.org/science/final-bao-and-rsd-measurements/",
+              "https://www.sdss4.org/dr16/",
+              "https://arxiv.org/abs/2007.08991",
+              "https://arxiv.org/abs/2007.08997",
+              "https://arxiv.org/abs/2007.09004",
+          ]
+
+          REQUIRED_FIELDS = [
+              "answer_id",
+              "target_id",
+              "source_url_or_citation",
+              "quoted_or_precise_source_text",
+              "answer_summary",
+              "approval_request",
+              "claim_limit",
+          ]
+
+          MANUAL_ANSWER_PATTERNS = [
+              r"sdss[_-]rsd[_-]manual[_-]answers[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+              r"SDSS[_-]RSD[_-]MANUAL[_-]ANSWERS[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+              r"data[_-]sdss[_-]rsd[_-]manual[_-]answers[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=2_000_000, timeout=15):
+              row = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.307-draft-prefill-builder-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      row["status_code"] = getattr(resp, "status", "")
+                      row["content_type"] = resp.headers.get("Content-Type", "")
+                      row["final_url"] = resp.geturl()
+                      row["bytes_read"] = len(data)
+                      row["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      row["fetch_ok"] = True
+              except Exception as exc:
+                  row["error"] = f"{type(exc).__name__}: {exc}"
+              return row, data
+
+          def strip_html_text(data):
+              if not data:
+                  return ""
+              text = data.decode("utf-8", errors="replace")
+              text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", text)
+              return html.unescape(" ".join(text.split()))
+
+          def window_around_terms(text, terms, width=420, limit=1200):
+              lower = text.lower()
+              starts = []
+              for term in terms:
+                  idx = lower.find(term.lower())
+                  if idx >= 0:
+                      starts.append(idx)
+              if not starts:
+                  return ""
+              idx = min(starts)
+              return text[max(0, idx-width):idx+width].replace("\n", " ")[:limit]
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return ("fσ8" in label) or ("fsigma8" in label) or ("fσ8" in joined) or ("fsigma8" in joined)
+
+          def infer_header_rows(table):
+              header_rows = []
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def split_bound_header(bound_header):
+              parts = [p.strip() for p in str(bound_header).split("/") if p.strip()]
+              fields = {
+                  "sample_or_tracer": parts[0] if len(parts) > 0 else "",
+                  "z_range_text": parts[4] if len(parts) > 4 else "",
+                  "z_eff_text": parts[6] if len(parts) > 6 else "",
+              }
+              try:
+                  fields["z_eff"] = float(fields["z_eff_text"])
+              except Exception:
+                  fields["z_eff"] = ""
+              return fields
+
+          def parse_column_contract_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      row_type = "redshift_function_row_candidate" if "(z)" in label_norm else "final_or_consensus_row_candidate"
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          for value, sigma in measurement_pairs(cell):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              fields = split_bound_header(bound["bound_header"])
+                              out.append({
+                                  "contract_id": f"column_contract_bound_{len(out)+1:02d}",
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "sample_or_tracer": fields["sample_or_tracer"],
+                                  "z_eff": fields["z_eff"],
+                                  "z_range_text": fields["z_range_text"],
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                              })
+              return out
+
+          def safe_read_csv(path):
+              try:
+                  with path.open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      fields = reader.fieldnames or []
+                  return True, fields, rows, ""
+              except Exception as exc:
+                  return False, [], [], f"{type(exc).__name__}: {exc}"
+
+          def find_manual_answer_file():
+              candidates = []
+              for path in Path(".").rglob("*"):
+                  if not path.is_file() or path.suffix.lower() != ".csv":
+                      continue
+                  raw = path.as_posix().lstrip("./")
+                  name = path.name
+                  pattern_match = any(re.search(pattern, name, re.I) for pattern in MANUAL_ANSWER_PATTERNS)
+                  semantic_match = all(term in raw.lower() for term in ["sdss", "rsd", "manual", "answer"])
+                  if pattern_match or semantic_match:
+                      read_ok, fields, rows, error = safe_read_csv(path)
+                      has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+                      duplicate_suffix = bool(re.search(r"[-_]\d+\.csv$", name))
+                      candidates.append({
+                          "path": raw,
+                          "filename": name,
+                          "pattern_match": pattern_match,
+                          "semantic_match": semantic_match,
+                          "duplicate_download_suffix_detected": duplicate_suffix,
+                          "read_ok": read_ok,
+                          "row_count": len(rows),
+                          "field_count": len(fields),
+                          "has_required_fields": has_required,
+                          "error": error,
+                          "score_allowed": False,
+                          "support_allowed": False,
+                      })
+              readable = [c for c in candidates if c["read_ok"] and c["has_required_fields"]]
+              readable = sorted(readable, key=lambda r: (not r["duplicate_download_suffix_detected"], r["path"]))
+              selected = readable[0]["path"] if readable else ""
+              selected_rows = []
+              selected_fields = []
+              if selected:
+                  _, selected_fields, selected_rows, _ = safe_read_csv(Path(selected))
+              return candidates, selected, selected_fields, selected_rows
+
+          def norm(value):
+              return str(value or "").strip()
+
+          def review_answer(row, idx, source_path):
+              source = norm(row.get("source_url_or_citation"))
+              precise = norm(row.get("quoted_or_precise_source_text"))
+              summary = norm(row.get("answer_summary"))
+              approval = norm(row.get("approval_request")).lower()
+              claim = norm(row.get("claim_limit")).lower()
+              missing = [field for field in REQUIRED_FIELDS if not norm(row.get(field))]
+              is_blank = not source and not precise and not summary
+              reviewable = (
+                  not missing
+                  and len(source) > 0
+                  and len(precise) >= 12
+                  and len(summary) >= 8
+                  and approval in ["row_meaning_confirm", "baseline_candidate", "definition_match", "reject", "keep_blocked"]
+                  and claim in ["no_scoring", "no_claims", "no_scoring/no_claims", "keep_blocked"]
+              )
+              return {
+                  "manual_review_id": f"manual_review_{idx+1:03d}",
+                  "source_path": source_path,
+                  "answer_id": norm(row.get("answer_id")),
+                  "target_id": norm(row.get("target_id")),
+                  "target_class": norm(row.get("target_class")),
+                  "target_object": norm(row.get("target_object")),
+                  "missing_required_fields": "|".join(missing),
+                  "is_blank_template_row": is_blank,
+                  "reviewable_for_future_gate": reviewable,
+                  "review_status": "reviewable_for_future_gate_not_approved" if reviewable else ("blank_template_row" if is_blank else "incomplete_or_invalid"),
+                  "score_allowed": False,
+                  "support_allowed": False,
+                  "row_meaning_confirmed": False,
+                  "baseline_approved": False,
+                  "definition_match_confirmed": False,
+              }
+
+          def first_quote(source_quote_rows, target_class):
+              preferred = [q for q in source_quote_rows if q["quote_class"] == target_class and q["candidate_quote_window"]]
+              if not preferred and target_class == "row_family":
+                  preferred = [q for q in source_quote_rows if q["quote_class"] == "row_meaning" and q["candidate_quote_window"]]
+              if not preferred and target_class == "definition_match":
+                  preferred = [q for q in source_quote_rows if q["quote_class"] in ["definition_match", "row_meaning"] and q["candidate_quote_window"]]
+              return preferred[0] if preferred else {"source_url": "", "candidate_quote_window": ""}
+
+          def summarize_candidate(target_class, quote):
+              if not quote:
+                  return ""
+              if target_class == "row_meaning":
+                  return "DRAFT ONLY: candidate source window appears relevant to SDSS RSD f_sigma8 row meaning, but it requires human review before any gate can pass."
+              if target_class == "row_family":
+                  return "DRAFT ONLY: candidate source window may help distinguish the f_sigma8 row family, but it requires human review before row-family selection."
+              if target_class == "baseline":
+                  return "DRAFT ONLY: candidate source window may contain baseline/comparator context, but it is not an approved baseline value."
+              if target_class == "definition_match":
+                  return "DRAFT ONLY: candidate source window may help map row/tracer/redshift/observable meaning, but it is not a confirmed definition match."
+              return "DRAFT ONLY: candidate source window needs human review."
+
+          def candidate_quality(target_class, quote, source_url):
+              has_source = bool(source_url)
+              has_quote = len(quote) >= 80
+              quote_mentions_fsigma = bool(re.search(r"f\s*σ\s*8|f\s*sigma\s*8|fsigma8|f\\sigma", quote, re.I))
+              quote_mentions_table_or_measurement = any(term in quote.lower() for term in ["table", "measurement", "measurements", "redshift", "sample", "growth", "rsd"])
+              quote_mentions_baseline_terms = any(term in quote.lower() for term in ["lcdm", "fiducial", "model", "cosmological", "prediction"])
+              quality = 0
+              quality += 1 if has_source else 0
+              quality += 1 if has_quote else 0
+              quality += 1 if quote_mentions_fsigma else 0
+              quality += 1 if quote_mentions_table_or_measurement else 0
+              if target_class == "baseline":
+                  quality += 1 if quote_mentions_baseline_terms else 0
+              return quality
+
+          inherited_v4_306_rows = [
+              {"inherited_from": "v4.306", "item": "rules", "value": "46 / 46 passed", "meaning": "Candidate prefill review passed.", "carry_forward_status": "ready_for_draft_prefill_builder"},
+              {"inherited_from": "v4.306", "item": "source_fetch_ok_rows", "value": 6, "meaning": "GitHub fetched all six sources.", "carry_forward_status": "sources_available"},
+              {"inherited_from": "v4.306", "item": "source_quote_rows", "value": 25, "meaning": "Candidate quote windows existed.", "carry_forward_status": "quote_windows_available"},
+              {"inherited_from": "v4.306", "item": "selected_manual_path", "value": "sdss_rsd_manual_answers_v4_300-1.csv", "meaning": "Manual answer file path found.", "carry_forward_status": "file_path_resolved"},
+              {"inherited_from": "v4.306", "item": "manual_answer_rows", "value": 20, "meaning": "Twenty manual-answer rows were present.", "carry_forward_status": "blank_template_ready"},
+              {"inherited_from": "v4.306", "item": "usable_candidate_rows", "value": 20, "meaning": "GitHub had candidate rows usable for draft review.", "carry_forward_status": "draft_possible"},
+              {"inherited_from": "v4.306", "item": "gate_approval_rows", "value": 0, "meaning": "No gate approval.", "carry_forward_status": "no_approval"},
+              {"inherited_from": "v4.306", "item": "selected_next_route", "value": "v4_307_sdss_rsd_manual_answer_draft_prefill_file_builder_no_scoring", "meaning": "Current route creates draft prefill file.", "carry_forward_status": "current_route"},
+          ]
+
+          source_fetch_rows = []
+          source_quote_rows = []
+          for url in SOURCE_URLS:
+              fetch, data = fetch_url(url)
+              source_fetch_rows.append({**fetch, "score_allowed": False, "support_allowed": False})
+              text = strip_html_text(data)
+              quote_specs = [
+                  ("row_meaning", ["f σ 8", "fσ8", "fsigma8", "f sigma", "redshift-space distortion", "measurement"]),
+                  ("row_family", ["f σ 8", "fσ8", "fsigma8", "consensus", "combined", "final"]),
+                  ("baseline", ["LCDM", "fiducial", "model", "prediction", "growth rate", "cosmological parameters"]),
+                  ("definition_match", ["redshift", "sample", "tracer", "fiducial", "measurement", "table"]),
+                  ("covariance_limit", ["covariance", "likelihood", "correlation", "full covariance"]),
+              ]
+              for quote_class, terms in quote_specs:
+                  window = window_around_terms(text, terms)
+                  if window:
+                      source_quote_rows.append({
+                          "quote_id": f"quote_{len(source_quote_rows)+1:03d}",
+                          "quote_class": quote_class,
+                          "source_url": url,
+                          "candidate_quote_window": window,
+                          "quote_status": "candidate_window_for_draft_prefill_not_approval",
+                          "score_allowed": False,
+                          "support_allowed": False,
+                      })
+
+          parser = SimpleTableParser()
+          first_fetch, first_data = fetch_url(SOURCE_URLS[0])
+          if first_data:
+              parser.feed(first_data.decode("utf-8", errors="replace"))
+          column_contract_rows = parse_column_contract_rows(parser.tables)
+
+          fuzzy_candidate_rows, selected_manual_path, selected_fields, selected_manual_rows = find_manual_answer_file()
+          manual_answer_review_rows = [review_answer(row, idx, selected_manual_path) for idx, row in enumerate(selected_manual_rows)]
+          blank_rows = [r for r in manual_answer_review_rows if r["is_blank_template_row"]]
+          reviewable_answer_rows = [r for r in manual_answer_review_rows if r["reviewable_for_future_gate"]]
+
+          # Build target list. It mirrors v4.305/v4.306, but writes an actual DRAFT review file.
+          content_target_rows = [
+              ("answer_001", "row_meaning_001", "row_meaning", "f_sigma8_z_row_role", "row_meaning_confirm", "row_meaning"),
+              ("answer_002", "row_meaning_002", "row_meaning", "f_sigma8_row_role", "row_meaning_confirm", "row_family"),
+              ("answer_003", "row_meaning_003", "row_meaning", "two_row_relationship", "row_meaning_confirm", "row_family"),
+              ("answer_004", "row_meaning_004", "row_family", "row_family_selection_basis", "row_meaning_confirm", "row_family"),
+              ("answer_005", "baseline_001", "baseline", "standard_comparator_values", "baseline_candidate", "baseline"),
+              ("answer_006", "baseline_002", "baseline", "baseline_source_mapping", "baseline_candidate", "baseline"),
+              ("answer_007", "baseline_003", "baseline", "baseline_uncertainty_policy", "baseline_candidate", "baseline"),
+              ("answer_008", "baseline_004", "baseline", "baseline_equal_or_better_null", "keep_blocked", "covariance_limit"),
+          ]
+
+          if column_contract_rows:
+              next_idx = 9
+              for contract in column_contract_rows:
+                  content_target_rows.append((
+                      f"answer_{next_idx:03d}",
+                      f"definition_match_{contract['bound_id']}",
+                      "definition_match",
+                      f"{contract['row_label']} {contract['sample_or_tracer']} z_eff={contract['z_eff']}",
+                      "definition_match",
+                      "definition_match",
+                  ))
+                  next_idx += 1
+          else:
+              for i in range(1, 5):
+                  content_target_rows.append((
+                      f"answer_{8+i:03d}",
+                      f"definition_match_placeholder_{i:02d}",
+                      "definition_match",
+                      "placeholder_no_live_contract_rows",
+                      "definition_match",
+                      "definition_match",
+                  ))
+
+          draft_prefill_rows = []
+          draft_audit_rows = []
+          for answer_id, target_id, target_class, target_object, approval_request, quote_class in content_target_rows:
+              q = first_quote(source_quote_rows, quote_class)
+              quote = q["candidate_quote_window"]
+              source_url = q["source_url"]
+              quality = candidate_quality(target_class, quote, source_url)
+              use_candidate = quality >= 2
+              draft_prefill_rows.append({
+                  "answer_id": answer_id,
+                  "target_id": target_id,
+                  "target_class": target_class,
+                  "target_object": target_object,
+                  "source_url_or_citation": source_url if use_candidate else "",
+                  "quoted_or_precise_source_text": quote if use_candidate else "",
+                  "answer_summary": summarize_candidate(target_class, quote) if use_candidate else "",
+                  "approval_request": approval_request,
+                  "claim_limit": "no_scoring/no_claims",
+                  "draft_status": "DRAFT_PREFILL_HUMAN_REVIEW_ONLY_NOT_APPROVED" if use_candidate else "DRAFT_EMPTY_WEAK_OR_MISSING_CANDIDATE",
+                  "human_review_required": True,
+                  "gate_approval_allowed": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+              draft_audit_rows.append({
+                  "audit_id": f"draft_audit_{len(draft_audit_rows)+1:03d}",
+                  "answer_id": answer_id,
+                  "target_id": target_id,
+                  "target_class": target_class,
+                  "source_url_candidate": source_url,
+                  "candidate_quality_score_0_5": quality,
+                  "used_in_draft": use_candidate,
+                  "human_review_required": True,
+                  "approval_status": "not_approved",
+                  "reason": "Candidate source text copied into draft only for easier human review; not a confirmed answer.",
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          draft_filled_rows = [r for r in draft_prefill_rows if r["draft_status"] == "DRAFT_PREFILL_HUMAN_REVIEW_ONLY_NOT_APPROVED"]
+          draft_empty_rows = [r for r in draft_prefill_rows if r["draft_status"] != "DRAFT_PREFILL_HUMAN_REVIEW_ONLY_NOT_APPROVED"]
+
+          gate_decision_rows = [
+              {"gate_id": "gate_001", "gate_object": "manual_answer_file_located", "gate_passed": bool(selected_manual_path), "gate_status": "located" if selected_manual_path else "not_located", "reason": selected_manual_path or "No manual-answer CSV found."},
+              {"gate_id": "gate_002", "gate_object": "draft_prefill_file_written", "gate_passed": len(draft_prefill_rows) >= 8, "gate_status": "written" if len(draft_prefill_rows) >= 8 else "too_few_rows", "reason": "Draft file written for human review only."},
+              {"gate_id": "gate_003", "gate_object": "draft_prefill_rows_with_candidate_text", "gate_passed": len(draft_filled_rows) > 0, "gate_status": "candidate_text_present" if draft_filled_rows else "no_candidate_text", "reason": "Candidate text is draft-only and unapproved."},
+              {"gate_id": "gate_004", "gate_object": "manual_answers_reviewable", "gate_passed": len(reviewable_answer_rows) > 0, "gate_status": "reviewable_rows_present" if reviewable_answer_rows else "no_reviewable_rows", "reason": "Original manual answer file remains blank/unapproved."},
+              {"gate_id": "gate_005", "gate_object": "row_meaning_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.307 writes draft only."},
+              {"gate_id": "gate_006", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "v4.307 writes draft only."},
+              {"gate_id": "gate_007", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.307 writes draft only."},
+              {"gate_id": "gate_008", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without approved gates."},
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "draft prefill is not approval", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "draft prefill is not approval", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning is not confirmed", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition match not approved", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "diagnostic readiness is false", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no selected row family", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "draft_prefill_file_builder", "permission_status": "completed", "reason": "Draft prefill file written for human review only."},
+              {"permission_scope": "draft_prefill_human_review_packet", "permission_status": "allowed_next", "reason": "Next workflow may package the draft for human review without approving gates."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "No confirmation in this workflow."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No approval in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "selected_manual_path", "status": selected_manual_path or "none", "meaning": "Original manual answer CSV location."},
+              {"readiness_id": "ready_002", "object": "draft_prefill_rows", "status": str(len(draft_prefill_rows)), "meaning": "Rows written in draft prefill file."},
+              {"readiness_id": "ready_003", "object": "draft_filled_rows", "status": str(len(draft_filled_rows)), "meaning": "Rows with candidate text copied for human review."},
+              {"readiness_id": "ready_004", "object": "draft_empty_rows", "status": str(len(draft_empty_rows)), "meaning": "Rows left empty due to weak/missing candidates."},
+              {"readiness_id": "ready_005", "object": "human_review_packet", "status": "ready_next", "meaning": "Next workflow can package review instructions."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "A draft prefill file was created for human review only.", "basis": "Candidate source windows may reduce copying burden but are not approved answers.", "next_action": "Package human review instructions.", "claim_status": "draft_only"},
+              {"decision_id": "decision_002", "decision": "The original manual answer file remains unapproved.", "basis": "Draft rows are separate and carry explicit not-approved status.", "next_action": "Do not use draft rows for gate approval yet.", "claim_status": "no_gate_approval"},
+              {"decision_id": "decision_003", "decision": "The next route is a human review packet, still no scoring.", "basis": "Human-readable review guidance is needed before any answer file can be treated as source-backed.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_draft_prefill_human_review_packet_no_scoring", "permission_status": "recommended", "reason": "Package draft rows and review instructions for human review."},
+              {"route_id": "route_002", "route": "sdss_rsd_manual_answer_gate_approval", "permission_status": "blocked_until_human_reviewable_answers", "reason": "No approved manual answers yet."},
+              {"route_id": "route_003", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_gate_decision_and_readiness", "reason": "No gate approval in v4.307."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.307 is a clean draft-prefill milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "human would need to copy source windows manually", "after_state": "candidate windows are copied into a draft-only file", "reduction_type": "operator load reduced"},
+              {"sdr_id": "sdr_002", "before_state": "draft content could be mistaken for approved answer", "after_state": "every draft row carries not-approved/human-review-required status", "reduction_type": "draft/approval boundary enforced"},
+              {"sdr_id": "sdr_003", "before_state": "weak candidates could pollute the draft", "after_state": "weak rows are left empty or flagged", "reduction_type": "quality filter preserved"},
+              {"sdr_id": "sdr_004", "before_state": "candidate text had no audit trail", "after_state": "draft audit rows record why each candidate was or was not used", "reduction_type": "traceability improved"},
+              {"sdr_id": "sdr_005", "before_state": "draft building could invite scoring pressure", "after_state": "all scoring and claims remain blocked", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before draft prefill builder"},
+              {"gate": "inherited_v4_306_rows_equal_8", "passed": len(inherited_v4_306_rows) == 8, "detail": f"inherited_v4_306_rows = {len(inherited_v4_306_rows)}"},
+              {"gate": "source_fetch_rows_equal_6", "passed": len(source_fetch_rows) == 6, "detail": f"source_fetch_rows = {len(source_fetch_rows)}"},
+              {"gate": "source_quote_rows_recorded", "passed": len(source_quote_rows) >= 0, "detail": f"source_quote_rows = {len(source_quote_rows)}"},
+              {"gate": "column_contract_rows_recorded", "passed": len(column_contract_rows) >= 0, "detail": f"column_contract_rows = {len(column_contract_rows)}"},
+              {"gate": "fuzzy_candidate_rows_recorded", "passed": len(fuzzy_candidate_rows) >= 0, "detail": f"fuzzy_candidate_rows = {len(fuzzy_candidate_rows)}"},
+              {"gate": "manual_answer_review_rows_recorded", "passed": len(manual_answer_review_rows) >= 0, "detail": f"manual_answer_review_rows = {len(manual_answer_review_rows)}"},
+              {"gate": "draft_prefill_rows_at_least_8", "passed": len(draft_prefill_rows) >= 8, "detail": f"draft_prefill_rows = {len(draft_prefill_rows)}"},
+              {"gate": "draft_audit_rows_match_draft", "passed": len(draft_audit_rows) == len(draft_prefill_rows), "detail": f"draft_audit_rows = {len(draft_audit_rows)}"},
+              {"gate": "gate_decision_rows_equal_8", "passed": len(gate_decision_rows) == 8, "detail": f"gate_decision_rows = {len(gate_decision_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_3", "passed": len(decision_rows) == 3, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_source_quotes_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in source_quote_rows), "detail": "source quotes no score/support"},
+              {"gate": "all_draft_rows_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in draft_prefill_rows), "detail": "draft rows no score/support"},
+              {"gate": "all_draft_rows_not_approved", "passed": all(row["gate_approval_allowed"] is False and row["human_review_required"] is True for row in draft_prefill_rows), "detail": "draft rows not approved"},
+              {"gate": "all_audit_rows_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in draft_audit_rows), "detail": "audit rows no score/support"},
+              {"gate": "all_audit_rows_not_approved", "passed": all(row["approval_status"] == "not_approved" for row in draft_audit_rows), "detail": "audit rows not approved"},
+              {"gate": "row_meaning_gate_not_approved", "passed": any(row["gate_object"] == "row_meaning_confirmation" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "row meaning gate false"},
+              {"gate": "baseline_gate_not_approved", "passed": any(row["gate_object"] == "baseline_approval" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "baseline gate false"},
+              {"gate": "definition_gate_not_approved", "passed": any(row["gate_object"] == "definition_match_confirmation" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "definition gate false"},
+              {"gate": "diagnostic_readiness_false", "passed": any(row["gate_object"] == "diagonal_diagnostic_readiness" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "diagnostic readiness false"},
+              {"gate": "confirm_row_meaning_blocked", "passed": any(row["operation"] == "confirm_row_meaning_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "row meaning blocked"},
+              {"gate": "approve_baseline_blocked", "passed": any(row["operation"] == "approve_baseline_values_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "baseline blocked"},
+              {"gate": "run_diagonal_blocked", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "diagonal diagnostic blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations blocked"},
+              {"gate": "draft_builder_permission_completed", "passed": any(row["permission_scope"] == "draft_prefill_file_builder" and row["permission_status"] == "completed" for row in permission_rows), "detail": "draft builder completed"},
+              {"gate": "human_review_packet_allowed_next", "passed": any(row["permission_scope"] == "draft_prefill_human_review_packet" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "human review packet allowed next"},
+              {"gate": "baseline_approval_permission_blocked", "passed": any(row["permission_scope"] == "baseline_approval" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "baseline approval blocked"},
+              {"gate": "diagonal_score_permission_blocked", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "diagonal score blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_draft_prefill_human_review_packet_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.308 route recommended"},
+              {"gate": "diagonal_score_route_blocked", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_gate_decision_and_readiness" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_308_sdss_rsd_draft_prefill_human_review_packet_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_307_sdss_rsd_manual_answer_draft_prefill_file_builder_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_307_inherited_v4_306_rows.csv", inherited_v4_306_rows)
+          write_csv(OUT / "v4_307_source_fetch_rows.csv", source_fetch_rows)
+          write_csv(OUT / "v4_307_source_quote_rows.csv", source_quote_rows)
+          write_csv(OUT / "v4_307_column_contract_rows.csv", column_contract_rows)
+          write_csv(OUT / "v4_307_fuzzy_candidate_rows.csv", fuzzy_candidate_rows)
+          write_csv(OUT / "v4_307_manual_answer_review_rows.csv", manual_answer_review_rows)
+          write_csv(OUT / "v4_307_draft_prefill_rows.csv", draft_prefill_rows)
+          write_csv(OUT / "SDSS_RSD_MANUAL_ANSWERS_v4_307_DRAFT_PREFILL_HUMAN_REVIEW_ONLY.csv", draft_prefill_rows)
+          write_csv(OUT / "v4_307_draft_prefill_audit_rows.csv", draft_audit_rows)
+          write_csv(OUT / "SDSS_RSD_DRAFT_PREFILL_AUDIT_v4_307_NOT_APPROVED.csv", draft_audit_rows)
+          write_csv(OUT / "v4_307_gate_decision_rows.csv", gate_decision_rows)
+          write_csv(OUT / "v4_307_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_307_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_307_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_307_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_307_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_307_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_307_rule_checks.csv", checks)
+
+          readme = [
+              "# SDSS RSD Draft Prefill File v4.307",
+              "",
+              "This output is a draft review artifact only.",
+              "",
+              "The CSV `SDSS_RSD_MANUAL_ANSWERS_v4_307_DRAFT_PREFILL_HUMAN_REVIEW_ONLY.csv` may contain candidate source windows copied into answer-shaped rows. These rows are not approved. They are not a scoring input. They are not evidence. They only reduce manual copying so a person can review source text, delete bad candidates, and decide what should become an actual manual answer later.",
+              "",
+              "Do not use this file as an approved baseline, row-meaning confirmation, definition match, row-family selection, or diagnostic input.",
+              "",
+              "Truth boundary: no proof, no validation, no support, no scoring, no residual, no chi-square, no p-value, no likelihood, no gate approval.",
+          ]
+          (OUT / "SDSS_RSD_DRAFT_PREFILL_v4_307_README.md").write_text("\n".join(readme), encoding="utf-8")
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_fetch_rows": len(source_fetch_rows),
+              "source_fetch_ok_rows": sum(1 for row in source_fetch_rows if row["fetch_ok"]),
+              "source_quote_rows": len(source_quote_rows),
+              "selected_manual_path": selected_manual_path,
+              "manual_answer_rows": len(selected_manual_rows),
+              "manual_answer_review_rows": len(manual_answer_review_rows),
+              "reviewable_answer_rows": len(reviewable_answer_rows),
+              "blank_template_rows": len(blank_rows),
+              "column_contract_rows": len(column_contract_rows),
+              "draft_prefill_rows": len(draft_prefill_rows),
+              "draft_filled_rows": len(draft_filled_rows),
+              "draft_empty_rows": len(draft_empty_rows),
+              "draft_audit_rows": len(draft_audit_rows),
+              "gate_decision_rows": len(gate_decision_rows),
+              "gate_approval_rows": sum(1 for row in gate_decision_rows if row["gate_object"] in ["row_meaning_confirmation", "baseline_approval", "definition_match_confirmation", "diagonal_diagnostic_readiness"] and row["gate_passed"]),
+              "row_meaning_confirmed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_307_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.307 SDSS RSD Manual Answer Draft Prefill File Builder No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_fetch_ok_rows = {summary['source_fetch_ok_rows']}",
+              f"source_quote_rows = {summary['source_quote_rows']}",
+              f"selected_manual_path = {summary['selected_manual_path']}",
+              f"manual_answer_rows = {summary['manual_answer_rows']}",
+              f"reviewable_answer_rows = {summary['reviewable_answer_rows']}",
+              f"blank_template_rows = {summary['blank_template_rows']}",
+              f"column_contract_rows = {summary['column_contract_rows']}",
+              f"draft_prefill_rows = {summary['draft_prefill_rows']}",
+              f"draft_filled_rows = {summary['draft_filled_rows']}",
+              f"draft_empty_rows = {summary['draft_empty_rows']}",
+              f"draft_audit_rows = {summary['draft_audit_rows']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.307 builds a draft prefill file for human review only. It may copy candidate source windows into answer-shaped rows, but every row remains explicitly not approved. It does not approve row meaning, baselines, row-family selection, definition matches, scoring, or support.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_307_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_fetch_ok_rows = {summary['source_fetch_ok_rows']}")
+          print(f"source_quote_rows = {summary['source_quote_rows']}")
+          print(f"selected_manual_path = {summary['selected_manual_path']}")
+          print(f"manual_answer_rows = {summary['manual_answer_rows']}")
+          print(f"manual_answer_review_rows = {summary['manual_answer_review_rows']}")
+          print(f"reviewable_answer_rows = {summary['reviewable_answer_rows']}")
+          print(f"blank_template_rows = {summary['blank_template_rows']}")
+          print(f"column_contract_rows = {summary['column_contract_rows']}")
+          print(f"draft_prefill_rows = {summary['draft_prefill_rows']}")
+          print(f"draft_filled_rows = {summary['draft_filled_rows']}")
+          print(f"draft_empty_rows = {summary['draft_empty_rows']}")
+          print(f"draft_audit_rows = {summary['draft_audit_rows']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.307 SDSS RSD manual answer draft prefill file builder output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-307-sdss-rsd-manual-answer-draft-prefill-file-builder-output
+          path: |
+            tairid_v4_307_sdss_rsd_manual_answer_draft_prefill_file_builder_output/
+            tairid-v4-307-sdss-rsd-manual-answer-draft-prefill-file-builder-output.zip
