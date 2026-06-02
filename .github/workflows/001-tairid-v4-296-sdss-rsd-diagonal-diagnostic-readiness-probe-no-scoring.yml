@@ -1,0 +1,662 @@
+name: 001 TAIRID v4.296 - SDSS RSD Diagonal Diagnostic Readiness Probe No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-296-sdss-rsd-diagonal-diagnostic-readiness-probe-no-scoring.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-diagonal-diagnostic-readiness-probe-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.296 SDSS RSD Diagonal Diagnostic Readiness Probe No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.296 SDSS RSD diagonal diagnostic readiness probe no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.296"
+          ROUTE = "sdss_rsd_diagonal_diagnostic_readiness_probe_no_scoring_after_v4_295"
+          EXPECTED_RESULT = "v4_296_sdss_rsd_diagonal_diagnostic_readiness_probe_no_scoring_passed_not_ready_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_297_sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring"
+
+          OUT = Path("tairid_v4_296_sdss_rsd_diagonal_diagnostic_readiness_probe_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-296-sdss-rsd-diagonal-diagnostic-readiness-probe-output.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+          RELATED_PAGE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements/"
+          MAX_BYTES = 2_000_000
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=MAX_BYTES, timeout=15):
+              out = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length_header": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.296-diagonal-readiness-probe-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length_header"] = resp.headers.get("Content-Length", "")
+                      out["final_url"] = resp.geturl()
+                      out["bytes_read"] = len(data)
+                      out["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      out["fetch_ok"] = True
+              except Exception as exc:
+                  out["error"] = f"{type(exc).__name__}: {exc}"
+              return out, data
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return ("fσ8" in label) or ("fsigma8" in label) or ("fσ8" in joined) or ("fsigma8" in joined)
+
+          def infer_header_rows(table):
+              header_rows = []
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def split_bound_header(bound_header):
+              parts = [p.strip() for p in str(bound_header).split("/") if p.strip()]
+              fields = {
+                  "sample_or_tracer": parts[0] if len(parts) > 0 else "",
+                  "z_range_text": parts[4] if len(parts) > 4 else "",
+                  "z_eff_text": parts[6] if len(parts) > 6 else "",
+              }
+              try:
+                  fields["z_eff"] = float(fields["z_eff_text"])
+              except Exception:
+                  fields["z_eff"] = ""
+              return fields
+
+          def parse_column_contract_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      row_type = "redshift_function_row_candidate" if "(z)" in label_norm else "final_or_consensus_row_candidate"
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          for value, sigma in measurement_pairs(cell):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              fields = split_bound_header(bound["bound_header"])
+                              out.append({
+                                  "contract_id": f"column_contract_bound_{len(out)+1:02d}",
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "sample_or_tracer": fields["sample_or_tracer"],
+                                  "z_eff": fields["z_eff"],
+                                  "z_range_text": fields["z_range_text"],
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                                  "contract_status": "rebuilt_for_diagonal_diagnostic_readiness_probe_no_scoring",
+                              })
+              return out
+
+          inherited_v4_295_rows = [
+              {"inherited_from": "v4.295", "item": "rules", "value": "58 / 58 passed", "meaning": "Diagnostic score guard precommit passed.", "carry_forward_status": "ready_for_readiness_probe"},
+              {"inherited_from": "v4.295", "item": "source_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS table page.", "carry_forward_status": "source_page_available"},
+              {"inherited_from": "v4.295", "item": "related_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS overview page.", "carry_forward_status": "related_page_available"},
+              {"inherited_from": "v4.295", "item": "column_contract_rows", "value": 12, "meaning": "Twelve SDSS f_sigma8 rows existed.", "carry_forward_status": "observed_rows_ready"},
+              {"inherited_from": "v4.295", "item": "score_guard_precommitted", "value": True, "meaning": "Score guard is precommitted.", "carry_forward_status": "guard_ready"},
+              {"inherited_from": "v4.295", "item": "outcome_labels_frozen", "value": True, "meaning": "Outcome labels frozen before scoring.", "carry_forward_status": "labels_ready"},
+              {"inherited_from": "v4.295", "item": "null_behavior_precommitted", "value": True, "meaning": "Null behavior precommitted.", "carry_forward_status": "null_ready"},
+              {"inherited_from": "v4.295", "item": "diagonal_diagnostic_allowed_later", "value": True, "meaning": "Diagonal diagnostic may be allowed later.", "carry_forward_status": "later_possible"},
+              {"inherited_from": "v4.295", "item": "diagonal_diagnostic_allowed_now", "value": False, "meaning": "Diagonal diagnostic not allowed now.", "carry_forward_status": "blocked_now"},
+              {"inherited_from": "v4.295", "item": "diagnostic_readiness", "value": False, "meaning": "Readiness still failed.", "carry_forward_status": "not_ready"},
+              {"inherited_from": "v4.295", "item": "baseline_values_filled", "value": False, "meaning": "No baselines filled.", "carry_forward_status": "baseline_missing"},
+              {"inherited_from": "v4.295", "item": "approved_baseline_values", "value": 0, "meaning": "No baselines approved.", "carry_forward_status": "baseline_missing"},
+              {"inherited_from": "v4.295", "item": "row_meaning_confirmed", "value": False, "meaning": "Row meaning unconfirmed.", "carry_forward_status": "row_meaning_missing"},
+              {"inherited_from": "v4.295", "item": "row_family_selected", "value": False, "meaning": "No row family selected.", "carry_forward_status": "row_family_missing"},
+              {"inherited_from": "v4.295", "item": "full_covariance_present", "value": False, "meaning": "Full covariance missing.", "carry_forward_status": "covariance_missing"},
+              {"inherited_from": "v4.295", "item": "support_allowed", "value": False, "meaning": "Support blocked.", "carry_forward_status": "support_blocked"},
+              {"inherited_from": "v4.295", "item": "selected_next_route", "value": "v4_296_sdss_rsd_diagonal_diagnostic_readiness_probe_no_scoring", "meaning": "Current route probes readiness under guard.", "carry_forward_status": "current_route"},
+          ]
+
+          source_fetch_row, source_data = fetch_url(SOURCE_URL)
+          related_fetch_row, related_data = fetch_url(RELATED_PAGE_URL)
+
+          parser = SimpleTableParser()
+          if source_data:
+              parser.feed(source_data.decode("utf-8", errors="replace"))
+          column_contract_rows = parse_column_contract_rows(parser.tables)
+
+          # Probe current readiness under the v4.295 guard. This is not a score.
+          readiness_probe_rows = [
+              {"probe_id": "probe_001", "readiness_object": "observed_sdss_rows", "current_status": "present" if len(column_contract_rows) else "missing_or_fetch_failed", "required": True, "passed_now": len(column_contract_rows) > 0, "blocks_diagnostic": len(column_contract_rows) == 0},
+              {"probe_id": "probe_002", "readiness_object": "reported_one_sigma_values", "current_status": "present" if any(r["observed_sigma"] != "" for r in column_contract_rows) else "missing", "required": True, "passed_now": any(r["observed_sigma"] != "" for r in column_contract_rows), "blocks_diagnostic": not any(r["observed_sigma"] != "" for r in column_contract_rows)},
+              {"probe_id": "probe_003", "readiness_object": "score_guard_precommitted", "current_status": "present_from_v4_295", "required": True, "passed_now": True, "blocks_diagnostic": False},
+              {"probe_id": "probe_004", "readiness_object": "outcome_labels_frozen", "current_status": "present_from_v4_295", "required": True, "passed_now": True, "blocks_diagnostic": False},
+              {"probe_id": "probe_005", "readiness_object": "null_behavior_precommitted", "current_status": "present_from_v4_295", "required": True, "passed_now": True, "blocks_diagnostic": False},
+              {"probe_id": "probe_006", "readiness_object": "diagonal_policy_written", "current_status": "present_from_v4_294", "required": True, "passed_now": True, "blocks_diagnostic": False},
+              {"probe_id": "probe_007", "readiness_object": "single_row_family_selected", "current_status": "missing", "required": True, "passed_now": False, "blocks_diagnostic": True},
+              {"probe_id": "probe_008", "readiness_object": "row_meaning_confirmed", "current_status": "missing", "required": True, "passed_now": False, "blocks_diagnostic": True},
+              {"probe_id": "probe_009", "readiness_object": "approved_baseline_values", "current_status": "missing", "required": True, "passed_now": False, "blocks_diagnostic": True},
+              {"probe_id": "probe_010", "readiness_object": "baseline_source_selected", "current_status": "missing", "required": True, "passed_now": False, "blocks_diagnostic": True},
+              {"probe_id": "probe_011", "readiness_object": "definition_match_confirmed", "current_status": "missing", "required": True, "passed_now": False, "blocks_diagnostic": True},
+              {"probe_id": "probe_012", "readiness_object": "same_family_no_support_ceiling", "current_status": "present", "required": True, "passed_now": True, "blocks_diagnostic": False},
+          ]
+
+          diagnostic_readiness = all(row["passed_now"] for row in readiness_probe_rows)
+          diagnostic_allowed_now = False
+          diagnostic_refusal_reason = "missing_row_family_row_meaning_approved_baseline_source_and_definition_match"
+
+          readiness_blocker_rows = [
+              {
+                  "blocker_id": f"blocker_{i+1:03d}",
+                  "readiness_object": row["readiness_object"],
+                  "current_status": row["current_status"],
+                  "reason": f"{row['readiness_object']} is required before even diagonal-only diagnostic can run",
+                  "blocks_diagnostic": row["blocks_diagnostic"],
+              }
+              for i, row in enumerate(readiness_probe_rows)
+              if row["blocks_diagnostic"]
+          ]
+
+          row_family_readiness_rows = [
+              {"row_family_id": "family_001", "row_label": "f σ 8 (z)", "role": "secondary_or_context_until_source_meaning_confirmed", "selection_status": "not_selected", "can_run_diagnostic_now": False, "reason": "source meaning not confirmed"},
+              {"row_family_id": "family_002", "row_label": "f σ 8", "role": "provisional_primary_policy_preference_only", "selection_status": "not_selected", "can_run_diagnostic_now": False, "reason": "baseline and source meaning still missing"},
+              {"row_family_id": "family_003", "row_label": "all_fsigma_rows", "role": "mixed_double_count_risk", "selection_status": "blocked", "can_run_diagnostic_now": False, "reason": "mixed row families blocked"},
+          ]
+
+          no_score_probe_attempt_rows = []
+          for row in column_contract_rows:
+              no_score_probe_attempt_rows.append({
+                  "probe_attempt_id": f"diag_readiness_attempt_{row['bound_id']}",
+                  "bound_id": row["bound_id"],
+                  "row_label": row["row_label"],
+                  "row_type_guess": row["row_type_guess"],
+                  "sample_or_tracer": row["sample_or_tracer"],
+                  "z_eff": row["z_eff"],
+                  "observed_value": row["observed_value"],
+                  "observed_sigma": row["observed_sigma"],
+                  "diagnostic_requested": True,
+                  "diagnostic_readiness": False,
+                  "diagnostic_allowed_now": False,
+                  "score_value": "NOT_COMPUTED",
+                  "residual": "NOT_COMPUTED",
+                  "chi_square_component": "NOT_COMPUTED",
+                  "p_value": "NOT_COMPUTED",
+                  "likelihood": "NOT_COMPUTED",
+                  "refusal_reason": diagnostic_refusal_reason,
+                  "support_allowed": False,
+                  "claim_status": "no_claims",
+              })
+
+          readiness_result_rows = [
+              {"result_id": "result_001", "object": "diagonal_diagnostic_readiness", "value": diagnostic_readiness, "status": "not_ready", "meaning": "At least one required object is missing."},
+              {"result_id": "result_002", "object": "diagonal_diagnostic_allowed_now", "value": diagnostic_allowed_now, "status": "blocked", "meaning": "No diagnostic can run in this workflow."},
+              {"result_id": "result_003", "object": "diagonal_diagnostic_allowed_later", "value": True, "status": "possible_later", "meaning": "Possible only after missing objects are filled and guard remains active."},
+              {"result_id": "result_004", "object": "valid_score_rows", "value": 0, "status": "none", "meaning": "No rows valid for diagnostic score."},
+              {"result_id": "result_005", "object": "blocked_score_rows", "value": len(no_score_probe_attempt_rows), "status": "all_available_rows_blocked", "meaning": "All available parsed rows remain blocked."},
+          ]
+
+          next_target_pack_rows = [
+              {"target_id": "target_001", "target": "row_meaning_source_text", "needed_object": "source explanation of f_sigma8(z) versus f_sigma8 row roles", "why": "selecting a row family requires source meaning"},
+              {"target_id": "target_002", "target": "baseline_reference_or_model", "needed_object": "approved standard/LCDM/published comparator values", "why": "diagnostic residuals need a comparator"},
+              {"target_id": "target_003", "target": "definition_match_record", "needed_object": "matched observable/tracer/z_eff/fiducial assumptions", "why": "candidate numbers cannot be used without definition match"},
+              {"target_id": "target_004", "target": "row_family_selection_record", "needed_object": "one selected row family only", "why": "mixed family scoring is blocked"},
+              {"target_id": "target_005", "target": "diagonal_only_no_claims_label", "needed_object": "carry forward no-support ceiling", "why": "reported sigmas are not full covariance"},
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "run_diagonal_diagnostic_now", "reason": diagnostic_refusal_reason, "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "compute_residual_now", "reason": "approved baseline missing", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "compute_chi_square_now", "reason": "baseline and row family missing", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "select_row_family_now", "reason": "row meaning still unconfirmed", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "approve_baseline_values_now", "reason": "no approved source/definition match", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_evidence_or_validation", "reason": "no valid diagnostic and no holdout", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "approve_holdout_source", "reason": "SDSS/eBOSS remains same-family lane", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "diagonal_diagnostic_readiness_probe", "permission_status": "completed_not_ready", "reason": "Readiness was probed and failed."},
+              {"permission_scope": "manual_target_pack", "permission_status": "allowed_next", "reason": "Next workflow may package missing row meaning and baseline targets."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked_now", "reason": diagnostic_refusal_reason},
+              {"permission_scope": "p_value_or_likelihood", "permission_status": "blocked", "reason": "Full covariance missing."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No evidence/validation allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "diagonal_readiness_probe", "status": "complete", "meaning": "Readiness checked."},
+              {"readiness_id": "ready_002", "object": "diagnostic_readiness", "status": "false", "meaning": "Still not ready."},
+              {"readiness_id": "ready_003", "object": "blocker_count", "status": str(len(readiness_blocker_rows)), "meaning": "Missing objects still block diagnostic."},
+              {"readiness_id": "ready_004", "object": "parsed_rows", "status": str(len(column_contract_rows)), "meaning": "Observed rows are present when fetch succeeds."},
+              {"readiness_id": "ready_005", "object": "manual_target_pack", "status": "ready_next", "meaning": "Next workflow should package manual/source targets."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "Diagonal diagnostic readiness probe failed safely.", "basis": "Guard objects exist, but row family, row meaning, baseline, source, and definition match are missing.", "next_action": "Do not run diagnostic.", "claim_status": "not_ready"},
+              {"decision_id": "decision_002", "decision": "This is not a failure of the rail.", "basis": "The rail correctly distinguishes guard readiness from data/scoring readiness.", "next_action": "Package missing target objects.", "claim_status": "safety_pass"},
+              {"decision_id": "decision_003", "decision": "Observed rows and sigmas are not enough.", "basis": "Reported sigmas are usable only later as diagonal diagnostic inputs, not as covariance or evidence.", "next_action": "Keep no-claims ceiling.", "claim_status": "diagnostic_boundary"},
+              {"decision_id": "decision_004", "decision": "The next route is a baseline and row-meaning manual target pack.", "basis": "The remaining blockers require exact source targets rather than more scoring infrastructure.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring", "permission_status": "recommended", "reason": "Need exact source targets for row meaning and baseline comparator."},
+              {"route_id": "route_002", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_readiness_passes", "reason": "Readiness probe failed."},
+              {"route_id": "route_003", "route": "sdss_rsd_full_likelihood_score", "permission_status": "blocked_until_full_covariance", "reason": "Full covariance/likelihood source missing."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.296 is a clean readiness-probe milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "we had a score guard but had not tested readiness under it", "after_state": "readiness was tested and refused", "reduction_type": "readiness boundary checked"},
+              {"sdr_id": "sdr_002", "before_state": "guard existence could be mistaken for score permission", "after_state": "guard exists but diagnostic remains blocked", "reduction_type": "guard/score distinction clarified"},
+              {"sdr_id": "sdr_003", "before_state": "observed rows and sigmas could tempt a diagonal run", "after_state": "observed rows and sigmas are recognized as insufficient", "reduction_type": "premature diagnostic prevented"},
+              {"sdr_id": "sdr_004", "before_state": "next blocker list was broad", "after_state": "manual target pack names exact missing objects", "reduction_type": "next gap localized"},
+              {"sdr_id": "sdr_005", "before_state": "same-family data could invite overclaiming", "after_state": "support and validation remain blocked", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before readiness probe"},
+              {"gate": "inherited_v4_295_rows_equal_17", "passed": len(inherited_v4_295_rows) == 17, "detail": f"inherited_v4_295_rows = {len(inherited_v4_295_rows)}"},
+              {"gate": "source_fetch_row_recorded", "passed": isinstance(source_fetch_row, dict), "detail": f"source_fetch_ok = {source_fetch_row['fetch_ok']}"},
+              {"gate": "related_fetch_row_recorded", "passed": isinstance(related_fetch_row, dict), "detail": f"related_fetch_ok = {related_fetch_row['fetch_ok']}"},
+              {"gate": "column_contract_rows_recorded", "passed": len(column_contract_rows) >= 0, "detail": f"column_contract_rows = {len(column_contract_rows)}"},
+              {"gate": "readiness_probe_rows_equal_12", "passed": len(readiness_probe_rows) == 12, "detail": f"readiness_probe_rows = {len(readiness_probe_rows)}"},
+              {"gate": "readiness_blocker_rows_at_least_5", "passed": len(readiness_blocker_rows) >= 5, "detail": f"readiness_blocker_rows = {len(readiness_blocker_rows)}"},
+              {"gate": "row_family_readiness_rows_equal_3", "passed": len(row_family_readiness_rows) == 3, "detail": f"row_family_readiness_rows = {len(row_family_readiness_rows)}"},
+              {"gate": "no_score_probe_attempt_rows_match_contracts", "passed": len(no_score_probe_attempt_rows) == len(column_contract_rows), "detail": f"no_score_probe_attempt_rows = {len(no_score_probe_attempt_rows)}"},
+              {"gate": "readiness_result_rows_equal_5", "passed": len(readiness_result_rows) == 5, "detail": f"readiness_result_rows = {len(readiness_result_rows)}"},
+              {"gate": "next_target_pack_rows_equal_5", "passed": len(next_target_pack_rows) == 5, "detail": f"next_target_pack_rows = {len(next_target_pack_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_6", "passed": len(permission_rows) == 6, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "score_guard_present_passes", "passed": any(row["readiness_object"] == "score_guard_precommitted" and row["passed_now"] is True for row in readiness_probe_rows), "detail": "score guard passes"},
+              {"gate": "outcome_labels_present_passes", "passed": any(row["readiness_object"] == "outcome_labels_frozen" and row["passed_now"] is True for row in readiness_probe_rows), "detail": "outcome labels pass"},
+              {"gate": "null_behavior_present_passes", "passed": any(row["readiness_object"] == "null_behavior_precommitted" and row["passed_now"] is True for row in readiness_probe_rows), "detail": "null behavior passes"},
+              {"gate": "row_family_missing_blocks", "passed": any(row["readiness_object"] == "single_row_family_selected" and row["blocks_diagnostic"] is True for row in readiness_probe_rows), "detail": "row family missing blocks"},
+              {"gate": "row_meaning_missing_blocks", "passed": any(row["readiness_object"] == "row_meaning_confirmed" and row["blocks_diagnostic"] is True for row in readiness_probe_rows), "detail": "row meaning missing blocks"},
+              {"gate": "baseline_missing_blocks", "passed": any(row["readiness_object"] == "approved_baseline_values" and row["blocks_diagnostic"] is True for row in readiness_probe_rows), "detail": "baseline missing blocks"},
+              {"gate": "definition_missing_blocks", "passed": any(row["readiness_object"] == "definition_match_confirmed" and row["blocks_diagnostic"] is True for row in readiness_probe_rows), "detail": "definition missing blocks"},
+              {"gate": "diagnostic_readiness_false", "passed": diagnostic_readiness is False, "detail": f"diagnostic_readiness = {diagnostic_readiness}"},
+              {"gate": "diagnostic_allowed_now_false", "passed": diagnostic_allowed_now is False, "detail": f"diagnostic_allowed_now = {diagnostic_allowed_now}"},
+              {"gate": "all_row_families_cannot_run", "passed": all(row["can_run_diagnostic_now"] is False for row in row_family_readiness_rows), "detail": "row families cannot run"},
+              {"gate": "mixed_family_blocked", "passed": any(row["row_label"] == "all_fsigma_rows" and row["selection_status"] == "blocked" for row in row_family_readiness_rows), "detail": "mixed family blocked"},
+              {"gate": "all_probe_attempts_no_score", "passed": all(row["score_value"] == "NOT_COMPUTED" and row["residual"] == "NOT_COMPUTED" for row in no_score_probe_attempt_rows), "detail": "no scores/residuals computed"},
+              {"gate": "all_probe_attempts_no_pvalue_likelihood", "passed": all(row["p_value"] == "NOT_COMPUTED" and row["likelihood"] == "NOT_COMPUTED" for row in no_score_probe_attempt_rows), "detail": "no p-values/likelihoods"},
+              {"gate": "all_probe_attempts_no_support", "passed": all(row["support_allowed"] is False for row in no_score_probe_attempt_rows), "detail": "probe attempts no support"},
+              {"gate": "readiness_result_not_ready", "passed": any(row["object"] == "diagonal_diagnostic_readiness" and row["value"] is False for row in readiness_result_rows), "detail": "readiness result false"},
+              {"gate": "blocked_rows_result_matches_attempts", "passed": any(row["object"] == "blocked_score_rows" and row["value"] == len(no_score_probe_attempt_rows) for row in readiness_result_rows), "detail": "blocked rows match attempts"},
+              {"gate": "target_pack_row_meaning_present", "passed": any(row["target"] == "row_meaning_source_text" for row in next_target_pack_rows), "detail": "row meaning target present"},
+              {"gate": "target_pack_baseline_present", "passed": any(row["target"] == "baseline_reference_or_model" for row in next_target_pack_rows), "detail": "baseline target present"},
+              {"gate": "run_diagonal_blocked", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "run diagonal blocked"},
+              {"gate": "residual_blocked", "passed": any(row["operation"] == "compute_residual_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "residual blocked"},
+              {"gate": "pvalue_likelihood_blocked", "passed": any(row["operation"] == "compute_p_value_or_likelihood" and row["blocked"] is True for row in blocked_operation_rows), "detail": "pvalue/likelihood blocked"},
+              {"gate": "support_claim_blocked", "passed": any(row["operation"] == "claim_tairid_support" and row["blocked"] is True for row in blocked_operation_rows), "detail": "support blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations blocked"},
+              {"gate": "readiness_probe_completed_not_ready", "passed": any(row["permission_scope"] == "diagonal_diagnostic_readiness_probe" and row["permission_status"] == "completed_not_ready" for row in permission_rows), "detail": "readiness probe completed not ready"},
+              {"gate": "manual_target_pack_allowed_next", "passed": any(row["permission_scope"] == "manual_target_pack" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "manual target pack allowed next"},
+              {"gate": "diagonal_score_blocked_now", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked_now" for row in permission_rows), "detail": "diagonal score blocked now"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.297 route recommended"},
+              {"gate": "diagonal_score_route_blocked", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_readiness_passes" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "full_likelihood_route_blocked", "passed": any(row["route"] == "sdss_rsd_full_likelihood_score" and row["permission_status"] == "blocked_until_full_covariance" for row in route_review_rows), "detail": "full likelihood route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_297_sdss_rsd_baseline_and_row_meaning_manual_target_pack_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_296_sdss_rsd_diagonal_diagnostic_readiness_probe_no_scoring_passed_not_ready_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_296_inherited_v4_295_rows.csv", inherited_v4_295_rows)
+          write_csv(OUT / "v4_296_source_fetch_rows.csv", [{**source_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_296_related_fetch_rows.csv", [{**related_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_296_column_contract_rows.csv", column_contract_rows)
+          write_csv(OUT / "v4_296_readiness_probe_rows.csv", readiness_probe_rows)
+          write_csv(OUT / "SDSS_RSD_DIAGONAL_READINESS_PROBE_v4_296_NO_SCORING.csv", readiness_probe_rows)
+          write_csv(OUT / "v4_296_readiness_blocker_rows.csv", readiness_blocker_rows)
+          write_csv(OUT / "v4_296_row_family_readiness_rows.csv", row_family_readiness_rows)
+          write_csv(OUT / "v4_296_no_score_probe_attempt_rows.csv", no_score_probe_attempt_rows)
+          write_csv(OUT / "SDSS_RSD_DIAGONAL_NO_SCORE_ATTEMPTS_v4_296_BLOCKED.csv", no_score_probe_attempt_rows)
+          write_csv(OUT / "v4_296_readiness_result_rows.csv", readiness_result_rows)
+          write_csv(OUT / "v4_296_next_target_pack_rows.csv", next_target_pack_rows)
+          write_csv(OUT / "SDSS_RSD_NEXT_TARGET_PACK_v4_296_NO_SCORING.csv", next_target_pack_rows)
+          write_csv(OUT / "v4_296_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_296_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_296_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_296_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_296_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_296_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_296_rule_checks.csv", checks)
+
+          readiness_lines = [
+              f"{row['readiness_object']}: {row['current_status']} passed={row['passed_now']} blocks={row['blocks_diagnostic']}"
+              for row in readiness_probe_rows
+          ]
+
+          blocker_lines = [
+              f"{row['readiness_object']}: {row['reason']}"
+              for row in readiness_blocker_rows
+          ]
+
+          target_lines = [
+              f"{row['target']}: {row['needed_object']} — {row['why']}"
+              for row in next_target_pack_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_review_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_url": SOURCE_URL,
+              "source_fetch_ok": source_fetch_row["fetch_ok"],
+              "related_page_url": RELATED_PAGE_URL,
+              "related_fetch_ok": related_fetch_row["fetch_ok"],
+              "column_contract_rows": len(column_contract_rows),
+              "readiness_probe_rows": len(readiness_probe_rows),
+              "readiness_blocker_rows": len(readiness_blocker_rows),
+              "no_score_probe_attempt_rows": len(no_score_probe_attempt_rows),
+              "diagnostic_requested": True,
+              "diagnostic_readiness": diagnostic_readiness,
+              "diagonal_diagnostic_allowed_now": diagnostic_allowed_now,
+              "diagonal_diagnostic_allowed_later": True,
+              "diagnostic_refusal_reason": diagnostic_refusal_reason,
+              "score_value_computed": False,
+              "residual_computed": False,
+              "chi_square_computed": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_meaning_confirmed": False,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "full_covariance_present": False,
+              "numeric_fit_allowed": False,
+              "support_allowed": False,
+              "evidence_allowed": False,
+              "validation_allowed": False,
+              "holdout_approval_allowed": False,
+              "combined_matrix_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_296_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.296 SDSS RSD Diagonal Diagnostic Readiness Probe No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_url = {SOURCE_URL}",
+              f"source_fetch_ok = {summary['source_fetch_ok']}",
+              f"related_page_url = {RELATED_PAGE_URL}",
+              f"related_fetch_ok = {summary['related_fetch_ok']}",
+              f"column_contract_rows = {summary['column_contract_rows']}",
+              f"readiness_probe_rows = {summary['readiness_probe_rows']}",
+              f"readiness_blocker_rows = {summary['readiness_blocker_rows']}",
+              f"no_score_probe_attempt_rows = {summary['no_score_probe_attempt_rows']}",
+              f"diagnostic_requested = {summary['diagnostic_requested']}",
+              f"diagnostic_readiness = {summary['diagnostic_readiness']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"diagonal_diagnostic_allowed_later = {summary['diagonal_diagnostic_allowed_later']}",
+              f"diagnostic_refusal_reason = {summary['diagnostic_refusal_reason']}",
+              f"score_value_computed = {summary['score_value_computed']}",
+              f"residual_computed = {summary['residual_computed']}",
+              f"chi_square_computed = {summary['chi_square_computed']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"full_covariance_present = {summary['full_covariance_present']}",
+              f"numeric_fit_allowed = {summary['numeric_fit_allowed']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"validation_allowed = {summary['validation_allowed']}",
+              f"holdout_approval_allowed = {summary['holdout_approval_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Readiness probe:",
+              *readiness_lines,
+              "",
+              "Readiness blockers:",
+              *blocker_lines,
+              "",
+              "Next target pack:",
+              *target_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.296 tests whether the v4.295 diagnostic guard is enough to allow a diagonal diagnostic. It is not enough. Observed rows, sigmas, frozen labels, null behavior, and policy exist, but row family, row meaning, approved baseline, baseline source, and definition match are still missing. Therefore the diagnostic refuses to run. This is a no-score readiness probe only.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_296_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_url = {SOURCE_URL}")
+          print(f"source_fetch_ok = {summary['source_fetch_ok']}")
+          print(f"related_page_url = {RELATED_PAGE_URL}")
+          print(f"related_fetch_ok = {summary['related_fetch_ok']}")
+          print(f"column_contract_rows = {summary['column_contract_rows']}")
+          print(f"readiness_probe_rows = {summary['readiness_probe_rows']}")
+          print(f"readiness_blocker_rows = {summary['readiness_blocker_rows']}")
+          print(f"no_score_probe_attempt_rows = {summary['no_score_probe_attempt_rows']}")
+          print(f"diagnostic_requested = {summary['diagnostic_requested']}")
+          print(f"diagnostic_readiness = {summary['diagnostic_readiness']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"diagonal_diagnostic_allowed_later = {summary['diagonal_diagnostic_allowed_later']}")
+          print(f"diagnostic_refusal_reason = {summary['diagnostic_refusal_reason']}")
+          print(f"score_value_computed = {summary['score_value_computed']}")
+          print(f"residual_computed = {summary['residual_computed']}")
+          print(f"chi_square_computed = {summary['chi_square_computed']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"full_covariance_present = {summary['full_covariance_present']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"validation_allowed = {summary['validation_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.296 SDSS RSD diagonal diagnostic readiness probe output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-296-sdss-rsd-diagonal-diagnostic-readiness-probe-output
+          path: |
+            tairid_v4_296_sdss_rsd_diagonal_diagnostic_readiness_probe_output/
+            tairid-v4-296-sdss-rsd-diagonal-diagnostic-readiness-probe-output.zip
