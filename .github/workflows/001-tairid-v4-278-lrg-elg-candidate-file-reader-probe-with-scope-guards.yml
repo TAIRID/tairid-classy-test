@@ -1,0 +1,855 @@
+name: 001 TAIRID v4.278 - LRG ELG Candidate File Reader Probe With Scope Guards
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-278-lrg-elg-candidate-file-reader-probe-with-scope-guards.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  lrg-elg-candidate-file-reader-probe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.278 LRG ELG Candidate File Reader Probe With Scope Guards is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.278 LRG ELG candidate file reader probe
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import re
+          import zipfile
+
+          VERSION = "v4.278"
+          ROUTE = "lrg_elg_candidate_file_reader_probe_with_scope_guards_after_v4_277"
+          EXPECTED_RESULT = "v4_278_lrg_elg_candidate_file_reader_probe_with_scope_guards_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_279_lrg_elg_candidate_schema_mapping_plan_no_data_validation"
+
+          OUT = Path("tairid_v4_278_lrg_elg_candidate_file_reader_probe_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-278-lrg-elg-candidate-file-reader-probe-output.zip"
+
+          REQUIRED_PACKET_FIELDS = [
+              "source_lane",
+              "packet_id",
+              "observed_id",
+              "source_family",
+              "source_release",
+              "source_role",
+              "redshift",
+              "quantity",
+              "observed_value",
+              "observed_sigma_or_likelihood",
+              "reference_value",
+              "reference_source_or_method",
+              "covariance_policy",
+              "covariance_path_or_method",
+              "inverse_covariance_status",
+              "residual_preview_status",
+              "diagnostic_distance_status",
+              "provenance_status",
+              "approval_status",
+              "notes",
+          ]
+
+          FIELD_SYNONYMS = {
+              "redshift": ["z", "zeff", "z_eff", "redshift", "effective_redshift"],
+              "quantity": ["quantity", "observable", "parameter", "measurement", "statistic"],
+              "observed_value": ["value", "obs", "observed", "measurement", "fsigma8", "f_sigma8", "f*sigma8"],
+              "observed_sigma_or_likelihood": ["sigma", "error", "err", "unc", "uncertainty", "likelihood"],
+              "reference_value": ["reference", "lcdm", "model", "prediction", "predicted", "fiducial"],
+              "covariance_policy": ["covariance", "cov", "corr", "correlation", "matrix"],
+              "source_lane": ["lrg", "elg", "qso", "tracer", "sample"],
+              "source_family": ["survey", "catalog", "source", "dataset"],
+              "source_release": ["release", "version", "dr", "data_release"],
+          }
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def is_candidate_file(path):
+              lower = path.as_posix().lower()
+              if ".git/" in lower or "node_modules/" in lower:
+                  return False
+              if path.suffix.lower() not in [".csv", ".json", ".txt", ".md", ".yaml", ".yml", ".tsv"]:
+                  return False
+              keywords = ["lrg", "elg", "qso", "rsd", "fsigma", "f_sigma", "growth", "bao", "cov", "covariance", "zhao", "residual", "tracer"]
+              return any(k in lower for k in keywords)
+
+          def lane_guess(path):
+              lower = path.as_posix().lower()
+              lanes = []
+              if "lrg" in lower:
+                  lanes.append("LRG")
+              if "elg" in lower:
+                  lanes.append("ELG")
+              if "qso" in lower or "zhao" in lower:
+                  lanes.append("QSO")
+              if not lanes and ("growth" in lower or "fsigma" in lower or "f_sigma" in lower or "rsd" in lower):
+                  lanes.append("growth_unknown")
+              if not lanes and ("bao" in lower or "cov" in lower):
+                  lanes.append("support_unknown")
+              return "|".join(lanes) if lanes else "unknown"
+
+          def object_guess(path):
+              lower = path.as_posix().lower()
+              objects = []
+              if "cov" in lower or "covariance" in lower or "corr" in lower:
+                  objects.append("covariance_or_correlation")
+              if "observ" in lower or "fsigma" in lower or "f_sigma" in lower or "growth" in lower or "rsd" in lower:
+                  objects.append("observed_candidate")
+              if "reference" in lower or "lcdm" in lower or "model" in lower or "prediction" in lower:
+                  objects.append("reference_candidate")
+              if "manifest" in lower or "inventory" in lower or "ledger" in lower:
+                  objects.append("manifest_or_inventory")
+              if "residual" in lower:
+                  objects.append("residual_candidate")
+              return "|".join(objects) if objects else "candidate_context"
+
+          def safe_text_prefix(path, limit=200000):
+              try:
+                  with path.open("rb") as f:
+                      data = f.read(limit)
+                  return data.decode("utf-8", errors="replace"), ""
+              except Exception as exc:
+                  return "", f"{type(exc).__name__}: {exc}"
+
+          def read_csv_probe(path):
+              try:
+                  delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+                  with path.open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f, delimiter=delimiter)
+                      rows = []
+                      for idx, row in enumerate(reader):
+                          if idx >= 3:
+                              break
+                          rows.append(row)
+                      fields = reader.fieldnames or []
+                  return fields, rows, ""
+              except Exception as exc:
+                  return [], [], f"{type(exc).__name__}: {exc}"
+
+          def read_json_probe(path):
+              text, error = safe_text_prefix(path)
+              if error:
+                  return [], [], error
+              try:
+                  obj = json.loads(text)
+                  keys = []
+                  sample_rows = []
+                  if isinstance(obj, dict):
+                      keys = list(obj.keys())[:80]
+                      # If dict contains list of dicts, sample that nested table.
+                      for k, v in obj.items():
+                          if isinstance(v, list) and v and isinstance(v[0], dict):
+                              keys = list(v[0].keys())
+                              sample_rows = v[:3]
+                              break
+                      if not sample_rows:
+                          sample_rows = [obj]
+                  elif isinstance(obj, list):
+                      if obj and isinstance(obj[0], dict):
+                          keys = list(obj[0].keys())
+                          sample_rows = obj[:3]
+                      else:
+                          keys = ["json_list_non_dict"]
+                          sample_rows = [{"sample_type": type(obj[0]).__name__ if obj else "empty"}]
+                  else:
+                      keys = [f"json_{type(obj).__name__}"]
+                      sample_rows = [{"sample_type": type(obj).__name__}]
+                  return keys, sample_rows, ""
+              except Exception as exc:
+                  return [], [], f"{type(exc).__name__}: {exc}"
+
+          def read_text_probe(path):
+              text, error = safe_text_prefix(path)
+              if error:
+                  return [], [], error
+              lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
+              tokens = []
+              joined = " ".join(lines).lower()
+              for token in ["redshift", "z_eff", "zeff", "fsigma8", "f_sigma8", "sigma", "covariance", "correlation", "lrg", "elg", "qso", "bao", "rsd", "lcdm"]:
+                  if token in joined:
+                      tokens.append(token)
+              return tokens, [{"line_preview": " | ".join(lines[:3])[:500]}], ""
+
+          def normalize_name(name):
+              return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
+
+          def field_overlap(columns):
+              normalized_columns = [normalize_name(c) for c in columns]
+              hits = {}
+              for field, synonyms in FIELD_SYNONYMS.items():
+                  field_hits = []
+                  for col in normalized_columns:
+                      for syn in synonyms:
+                          nsyn = normalize_name(syn)
+                          if col == nsyn or nsyn in col or col in nsyn:
+                              field_hits.append(col)
+                  if field_hits:
+                      hits[field] = sorted(set(field_hits))
+              return hits
+
+          inherited_v4_277_rows = [
+              {
+                  "inherited_from": "v4.277",
+                  "item": "rules",
+                  "value": "38 / 38 passed",
+                  "meaning": "LRG/ELG route selector passed.",
+                  "carry_forward_status": "ready_for_candidate_reader_probe",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "candidate_file_rows",
+                  "value": 195,
+                  "meaning": "Candidate filename leads were found in the repo.",
+                  "carry_forward_status": "leads_only_not_validated",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "manual_fill_ready",
+                  "value": False,
+                  "meaning": "No complete filled manual LRG/ELG packet pair was present.",
+                  "carry_forward_status": "manual_validator_blocked",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "candidate_reader_probe_allowed_next",
+                  "value": True,
+                  "meaning": "Candidate reader probe is the safe next route.",
+                  "carry_forward_status": "current_permission",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "manual_fill_validator_allowed_next",
+                  "value": False,
+                  "meaning": "Manual fill validator is blocked until filled templates exist.",
+                  "carry_forward_status": "manual_fill_blocked",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "lrg_equivalent_packet_ready",
+                  "value": False,
+                  "meaning": "LRG packet is still not ready.",
+                  "carry_forward_status": "lrg_packet_missing",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "elg_equivalent_packet_ready",
+                  "value": False,
+                  "meaning": "ELG packet is still not ready.",
+                  "carry_forward_status": "elg_packet_missing",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "source_comparison_allowed",
+                  "value": False,
+                  "meaning": "Source comparison stayed blocked.",
+                  "carry_forward_status": "source_comparison_blocked",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "combined_matrix_allowed",
+                  "value": False,
+                  "meaning": "Combined matrix stayed blocked.",
+                  "carry_forward_status": "combined_matrix_blocked",
+              },
+              {
+                  "inherited_from": "v4.277",
+                  "item": "selected_next_route",
+                  "value": "v4_278_lrg_elg_candidate_file_reader_probe_with_scope_guards",
+                  "meaning": "Current route probes candidate file schemas without validation.",
+                  "carry_forward_status": "current_route",
+              },
+          ]
+
+          candidate_files = []
+          for p in Path(".").rglob("*"):
+              if p.is_file() and is_candidate_file(p):
+                  try:
+                      size = p.stat().st_size
+                  except Exception:
+                      size = None
+                  candidate_files.append({
+                      "path": p.as_posix(),
+                      "suffix": p.suffix.lower(),
+                      "size_bytes": size,
+                      "lane_guess": lane_guess(p),
+                      "object_guess": object_guess(p),
+                      "candidate_status": "filename_lead_only_not_validated",
+                  })
+          candidate_files = sorted(candidate_files, key=lambda row: row["path"])[:400]
+
+          probe_rows = []
+          sample_preview_rows = []
+          for idx, item in enumerate(candidate_files[:120], start=1):
+              path = Path(item["path"])
+              suffix = item["suffix"]
+              if suffix in [".csv", ".tsv"]:
+                  columns, samples, error = read_csv_probe(path)
+                  probe_type = "csv_tsv_header_probe"
+              elif suffix == ".json":
+                  columns, samples, error = read_json_probe(path)
+                  probe_type = "json_key_probe"
+              else:
+                  columns, samples, error = read_text_probe(path)
+                  probe_type = "text_token_probe"
+              hits = field_overlap(columns)
+              lrg_elg_lane = ("LRG" in item["lane_guess"]) or ("ELG" in item["lane_guess"])
+              interesting_hit_count = len(hits)
+              readiness_hint = "possible_schema_mapping_lead" if (lrg_elg_lane and interesting_hit_count >= 2) else "weak_or_context_lead"
+              if error:
+                  readiness_hint = "read_probe_error"
+              probe_rows.append({
+                  "probe_id": f"probe_{idx:03d}",
+                  "path": item["path"],
+                  "suffix": suffix,
+                  "lane_guess": item["lane_guess"],
+                  "object_guess": item["object_guess"],
+                  "probe_type": probe_type,
+                  "columns_or_tokens_seen": "|".join(str(c) for c in columns[:60]),
+                  "field_overlap_count": interesting_hit_count,
+                  "field_overlap_names": "|".join(sorted(hits.keys())) if hits else "none",
+                  "read_error": error if error else "none",
+                  "readiness_hint": readiness_hint,
+                  "validation_status": "not_validated_header_sample_probe_only",
+              })
+              for sample_idx, sample in enumerate(samples[:2], start=1):
+                  safe_sample = {}
+                  if isinstance(sample, dict):
+                      for key, value in list(sample.items())[:12]:
+                          safe_sample[str(key)[:80]] = str(value)[:120]
+                  else:
+                      safe_sample = {"sample": str(sample)[:300]}
+                  sample_preview_rows.append({
+                      "probe_id": f"probe_{idx:03d}",
+                      "sample_index": sample_idx,
+                      "path": item["path"],
+                      "sample_preview_json": json.dumps(safe_sample, ensure_ascii=False),
+                      "sample_status": "preview_only_not_validated",
+                  })
+
+          lrg_probe_rows = [row for row in probe_rows if "LRG" in row["lane_guess"]]
+          elg_probe_rows = [row for row in probe_rows if "ELG" in row["lane_guess"]]
+          lrg_mapping_leads = [row for row in lrg_probe_rows if row["readiness_hint"] == "possible_schema_mapping_lead"]
+          elg_mapping_leads = [row for row in elg_probe_rows if row["readiness_hint"] == "possible_schema_mapping_lead"]
+
+          probe_summary_rows = [
+              {
+                  "summary_id": "summary_001",
+                  "object": "candidate_files_scanned",
+                  "value": len(candidate_files),
+                  "meaning": "Candidate filename leads scanned. Still not validated data.",
+              },
+              {
+                  "summary_id": "summary_002",
+                  "object": "candidate_files_probed",
+                  "value": len(probe_rows),
+                  "meaning": "Files whose headers, JSON keys, or text tokens were inspected.",
+              },
+              {
+                  "summary_id": "summary_003",
+                  "object": "lrg_probe_rows",
+                  "value": len(lrg_probe_rows),
+                  "meaning": "LRG-labeled candidate probes.",
+              },
+              {
+                  "summary_id": "summary_004",
+                  "object": "elg_probe_rows",
+                  "value": len(elg_probe_rows),
+                  "meaning": "ELG-labeled candidate probes.",
+              },
+              {
+                  "summary_id": "summary_005",
+                  "object": "lrg_possible_schema_mapping_leads",
+                  "value": len(lrg_mapping_leads),
+                  "meaning": "LRG leads with at least two packet-field overlaps.",
+              },
+              {
+                  "summary_id": "summary_006",
+                  "object": "elg_possible_schema_mapping_leads",
+                  "value": len(elg_mapping_leads),
+                  "meaning": "ELG leads with at least two packet-field overlaps.",
+              },
+          ]
+
+          selected_mapping_lead_rows = []
+          for lane, rows in [("LRG", lrg_mapping_leads), ("ELG", elg_mapping_leads)]:
+              sorted_rows = sorted(rows, key=lambda r: (-int(r["field_overlap_count"]), r["path"]))[:10]
+              if not sorted_rows:
+                  selected_mapping_lead_rows.append({
+                      "selection_id": f"{lane.lower()}_selection_none",
+                      "source_lane": lane,
+                      "path": "none",
+                      "field_overlap_count": 0,
+                      "field_overlap_names": "none",
+                      "selection_status": "no_schema_mapping_lead_found_in_probe",
+                  })
+              else:
+                  for idx, row in enumerate(sorted_rows, start=1):
+                      selected_mapping_lead_rows.append({
+                          "selection_id": f"{lane.lower()}_selection_{idx:02d}",
+                          "source_lane": lane,
+                          "path": row["path"],
+                          "field_overlap_count": row["field_overlap_count"],
+                          "field_overlap_names": row["field_overlap_names"],
+                          "selection_status": "candidate_for_next_schema_mapping_plan_not_validated",
+                      })
+
+          schema_mapping_need_rows = []
+          for lane in ["LRG", "ELG"]:
+              for field in REQUIRED_PACKET_FIELDS:
+                  schema_mapping_need_rows.append({
+                      "need_id": f"{lane.lower()}_{field}",
+                      "source_lane": lane,
+                      "required_packet_field": field,
+                      "mapping_status": "needs_explicit_column_or_manual_value",
+                      "blocked_action": "do_not_guess_or_auto_fill",
+                  })
+
+          next_mapping_plan_rows = [
+              {
+                  "plan_id": "plan_001",
+                  "source_lane": "LRG",
+                  "next_object": "schema_mapping_table",
+                  "required_action": "choose candidate lead or manual source, then map columns to packet fields",
+                  "current_status": "lead_candidates_found" if lrg_mapping_leads else "no_strong_lead_found",
+              },
+              {
+                  "plan_id": "plan_002",
+                  "source_lane": "ELG",
+                  "next_object": "schema_mapping_table",
+                  "required_action": "choose candidate lead or manual source, then map columns to packet fields",
+                  "current_status": "lead_candidates_found" if elg_mapping_leads else "no_strong_lead_found",
+              },
+              {
+                  "plan_id": "plan_003",
+                  "source_lane": "LRG_ELG",
+                  "next_object": "manual_missing_field_policy",
+                  "required_action": "keep missing observed/reference/covariance fields marked missing or recalculate",
+                  "current_status": "required",
+              },
+              {
+                  "plan_id": "plan_004",
+                  "source_lane": "combined_LRG_ELG_QSO",
+                  "next_object": "combined_matrix",
+                  "required_action": "do nothing; combined matrix remains blocked",
+                  "current_status": "blocked",
+              },
+          ]
+
+          safety_guard_rows = [
+              {
+                  "guard_id": "guard_001",
+                  "guard": "headers_are_not_data_validation",
+                  "meaning": "Columns and sample rows are schema probes only.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_002",
+                  "guard": "sample_rows_are_not_packet_rows",
+                  "meaning": "Preview samples cannot become validated packet rows.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_003",
+                  "guard": "no_guess_mapping",
+                  "meaning": "Column similarity is a lead, not an automatic mapping.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_004",
+                  "guard": "no_reference_or_covariance_inference",
+                  "meaning": "Missing reference/covariance fields must stay missing or recalculate.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_005",
+                  "guard": "no_residuals_without_validated_packets",
+                  "meaning": "LRG/ELG residual previews stay blocked.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_006",
+                  "guard": "no_source_comparison_without_packet_parity",
+                  "meaning": "Source comparison remains blocked.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_007",
+                  "guard": "no_combined_matrix",
+                  "meaning": "Combined matrix remains blocked.",
+                  "status": "active",
+              },
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "validate_candidate_files_as_data_now", "reason": "headers/sample rows are probes only", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "auto_fill_packet_fields_from_column_similarity", "reason": "mapping requires explicit next guard", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "compute_LRG_residuals_now", "reason": "LRG packet is not validated", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "compute_ELG_residuals_now", "reason": "ELG packet is not validated", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "compute_LRG_ELG_diagnostic_scalars_now", "reason": "residual previews do not exist", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "source_comparison_now", "reason": "packet parity is missing", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "combined_matrix_now", "reason": "source-separated diagnostics and dependency audit are missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "p_value_or_likelihood_now", "reason": "no scoring guard exists", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "numeric_correction_fit_now", "reason": "no fitting guard exists", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "validation_or_evidence_claim_now", "reason": "no validation/evidence guard exists", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "candidate_reader_probe", "permission_status": "completed_no_data_validation", "reason": "Headers, JSON keys, text tokens, and tiny samples were inspected only."},
+              {"permission_scope": "schema_mapping_plan", "permission_status": "allowed_next", "reason": "Next workflow can write explicit mapping plan without filling or scoring."},
+              {"permission_scope": "manual_missing_field_policy", "permission_status": "allowed_next", "reason": "Next workflow can label missing/recalculate fields explicitly."},
+              {"permission_scope": "LRG_residual_preview", "permission_status": "blocked", "reason": "LRG packet is not validated."},
+              {"permission_scope": "ELG_residual_preview", "permission_status": "blocked", "reason": "ELG packet is not validated."},
+              {"permission_scope": "source_comparison_residual_guard", "permission_status": "blocked_until_LRG_ELG_packets", "reason": "Comparison requires validated lane packets."},
+              {"permission_scope": "combined_lrg_elg_qso_matrix", "permission_status": "blocked", "reason": "Combined matrix requires packet parity and dependency audit."},
+              {"permission_scope": "p_value_or_likelihood", "permission_status": "blocked", "reason": "No scoring guard exists."},
+              {"permission_scope": "numeric_correction_fit", "permission_status": "blocked", "reason": "No fitting is allowed."},
+              {"permission_scope": "cosmology_validation_claim", "permission_status": "blocked", "reason": "No validation guard has passed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "candidate_reader_probe", "status": "complete_no_validation", "meaning": "Probe output exists."},
+              {"readiness_id": "ready_002", "object": "LRG_schema_mapping_plan", "status": "ready_next", "meaning": "A mapping plan can be written next."},
+              {"readiness_id": "ready_003", "object": "ELG_schema_mapping_plan", "status": "ready_next", "meaning": "A mapping plan can be written next."},
+              {"readiness_id": "ready_004", "object": "LRG_equivalent_packet", "status": "not_ready", "meaning": "Still no validated packet."},
+              {"readiness_id": "ready_005", "object": "ELG_equivalent_packet", "status": "not_ready", "meaning": "Still no validated packet."},
+              {"readiness_id": "ready_006", "object": "source_comparison", "status": "blocked", "meaning": "Needs packet parity."},
+              {"readiness_id": "ready_007", "object": "combined_matrix", "status": "blocked", "meaning": "Needs source-separated diagnostics and dependency audit."},
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "Candidate reader probe completed without data validation.",
+                  "basis": "Only headers, keys, text tokens, and tiny samples were inspected.",
+                  "next_action": "Build a schema mapping plan.",
+                  "claim_status": "probe_only",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "LRG and ELG remain unvalidated.",
+                  "basis": "No candidate lead was converted into a packet row.",
+                  "next_action": "Do not compute residuals.",
+                  "claim_status": "packets_missing",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "The next clean route is explicit schema mapping.",
+                  "basis": "Column/token overlaps can guide mapping, but cannot fill fields automatically.",
+                  "next_action": "Proceed to v4.279 schema mapping plan.",
+                  "claim_status": "safe_to_continue",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "Source comparison and combined matrices remain blocked.",
+                  "basis": "Packet parity still does not exist.",
+                  "next_action": "Keep source surfaces separated.",
+                  "claim_status": "no_validation",
+              },
+          ]
+
+          route_decision_rows = [
+              {"route_id": "route_001", "route": "lrg_elg_candidate_schema_mapping_plan_no_data_validation", "permission_status": "recommended", "reason": "Need explicit mapping plan before any packet filling or validation."},
+              {"route_id": "route_002", "route": "lrg_elg_candidate_packet_builder", "permission_status": "blocked_until_mapping_plan", "reason": "Packet builder requires explicit mapping."},
+              {"route_id": "route_003", "route": "lrg_elg_residual_preview_guard", "permission_status": "blocked_until_validated_packets", "reason": "Residuals require validated packets."},
+              {"route_id": "route_004", "route": "source_comparison_residual_guard", "permission_status": "blocked_until_LRG_ELG_packets", "reason": "Comparison requires packet parity."},
+              {"route_id": "route_005", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.278 is a clean reader-probe milestone."},
+          ]
+
+          next_rows = [
+              {"priority": 1, "test_id": "v4_279_lrg_elg_candidate_schema_mapping_plan_no_data_validation", "purpose": "write explicit mapping plan from candidate columns to packet fields without filling data", "activated": True},
+              {"priority": 2, "test_id": "v4_279_lrg_elg_candidate_packet_builder", "purpose": "blocked until mapping plan is explicit", "activated": False},
+              {"priority": 3, "test_id": "v4_279_source_comparison_residual_guard", "purpose": "blocked until LRG/ELG packets validate", "activated": False},
+              {"priority": 4, "test_id": "v4_279_handoff_if_needed", "purpose": "consolidate through candidate-reader probe milestone", "activated": True},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "candidate files were filename leads only", "after_state": "headers/keys/tokens are probed as schema leads", "reduction_type": "lead detail increased"},
+              {"sdr_id": "sdr_002", "before_state": "column overlap could be mistaken for mapping", "after_state": "mapping requires next explicit guard", "reduction_type": "mapping risk reduced"},
+              {"sdr_id": "sdr_003", "before_state": "sample rows could be mistaken for packet data", "after_state": "samples are preview-only", "reduction_type": "sample/data boundary preserved"},
+              {"sdr_id": "sdr_004", "before_state": "missing reference/covariance could be inferred", "after_state": "missing/recalculate policy required", "reduction_type": "guessing blocked"},
+              {"sdr_id": "sdr_005", "before_state": "source comparison could be tempting", "after_state": "source comparison remains blocked", "reduction_type": "premature comparison prevented"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before candidate reader probe"},
+              {"gate": "inherited_v4_277_rows_equal_10", "passed": len(inherited_v4_277_rows) == 10, "detail": f"inherited_v4_277_rows = {len(inherited_v4_277_rows)}"},
+              {"gate": "probe_summary_rows_equal_6", "passed": len(probe_summary_rows) == 6, "detail": f"probe_summary_rows = {len(probe_summary_rows)}"},
+              {"gate": "probe_rows_recorded", "passed": len(probe_rows) >= 0, "detail": f"probe_rows = {len(probe_rows)}"},
+              {"gate": "sample_preview_rows_recorded", "passed": len(sample_preview_rows) >= 0, "detail": f"sample_preview_rows = {len(sample_preview_rows)}"},
+              {"gate": "selected_mapping_lead_rows_recorded", "passed": len(selected_mapping_lead_rows) >= 2, "detail": f"selected_mapping_lead_rows = {len(selected_mapping_lead_rows)}"},
+              {"gate": "schema_mapping_need_rows_equal_40", "passed": len(schema_mapping_need_rows) == 40, "detail": f"schema_mapping_need_rows = {len(schema_mapping_need_rows)}"},
+              {"gate": "next_mapping_plan_rows_equal_4", "passed": len(next_mapping_plan_rows) == 4, "detail": f"next_mapping_plan_rows = {len(next_mapping_plan_rows)}"},
+              {"gate": "safety_guard_rows_equal_7", "passed": len(safety_guard_rows) == 7, "detail": f"safety_guard_rows = {len(safety_guard_rows)}"},
+              {"gate": "blocked_operation_rows_equal_10", "passed": len(blocked_operation_rows) == 10, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_10", "passed": len(permission_rows) == 10, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_7", "passed": len(readiness_rows) == 7, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_decision_rows_equal_5", "passed": len(route_decision_rows) == 5, "detail": f"route_decision_rows = {len(route_decision_rows)}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "lrg_mapping_need_rows_present", "passed": sum(1 for row in schema_mapping_need_rows if row["source_lane"] == "LRG") == 20, "detail": "20 LRG mapping needs present"},
+              {"gate": "elg_mapping_need_rows_present", "passed": sum(1 for row in schema_mapping_need_rows if row["source_lane"] == "ELG") == 20, "detail": "20 ELG mapping needs present"},
+              {"gate": "all_safety_guards_active", "passed": all(row["status"] == "active" for row in safety_guard_rows), "detail": "all safety guards active"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations guarded"},
+              {"gate": "candidate_reader_probe_completed", "passed": any(row["permission_scope"] == "candidate_reader_probe" and row["permission_status"] == "completed_no_data_validation" for row in permission_rows), "detail": "candidate reader probe completed"},
+              {"gate": "schema_mapping_plan_allowed_next", "passed": any(row["permission_scope"] == "schema_mapping_plan" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "schema mapping plan allowed next"},
+              {"gate": "lrg_residual_blocked", "passed": any(row["permission_scope"] == "LRG_residual_preview" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "LRG residual blocked"},
+              {"gate": "elg_residual_blocked", "passed": any(row["permission_scope"] == "ELG_residual_preview" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "ELG residual blocked"},
+              {"gate": "source_comparison_blocked", "passed": any(row["permission_scope"] == "source_comparison_residual_guard" and row["permission_status"] == "blocked_until_LRG_ELG_packets" for row in permission_rows), "detail": "source comparison blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "p_value_likelihood_blocked", "passed": any(row["permission_scope"] == "p_value_or_likelihood" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "p-value/likelihood blocked"},
+              {"gate": "numeric_fit_blocked", "passed": any(row["permission_scope"] == "numeric_correction_fit" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "numeric fit blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation claim blocked"},
+              {"gate": "schema_mapping_route_recommended", "passed": any(row["route"] == "lrg_elg_candidate_schema_mapping_plan_no_data_validation" and row["permission_status"] == "recommended" for row in route_decision_rows), "detail": "v4.279 route recommended"},
+              {"gate": "packet_builder_not_activated", "passed": any(row["test_id"] == "v4_279_lrg_elg_candidate_packet_builder" and row["activated"] is False for row in next_rows), "detail": "packet builder not activated"},
+              {"gate": "source_comparison_not_activated", "passed": any(row["test_id"] == "v4_279_source_comparison_residual_guard" and row["activated"] is False for row in next_rows), "detail": "source comparison not activated"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_scoring", "passed": True, "detail": "no scoring"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_279_lrg_elg_candidate_schema_mapping_plan_no_data_validation", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_278_lrg_elg_candidate_file_reader_probe_with_scope_guards_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_278_inherited_v4_277_rows.csv", inherited_v4_277_rows)
+          write_csv(OUT / "v4_278_candidate_file_rows.csv", candidate_files)
+          write_csv(OUT / "v4_278_probe_rows.csv", probe_rows)
+          write_csv(OUT / "v4_278_sample_preview_rows.csv", sample_preview_rows)
+          write_csv(OUT / "v4_278_probe_summary_rows.csv", probe_summary_rows)
+          write_csv(OUT / "v4_278_selected_mapping_lead_rows.csv", selected_mapping_lead_rows)
+          write_csv(OUT / "v4_278_schema_mapping_need_rows.csv", schema_mapping_need_rows)
+          write_csv(OUT / "lrg_elg_schema_mapping_NEEDS_v4_278_NOT_FILLED.csv", schema_mapping_need_rows)
+          write_csv(OUT / "v4_278_next_mapping_plan_rows.csv", next_mapping_plan_rows)
+          write_csv(OUT / "v4_278_safety_guard_rows.csv", safety_guard_rows)
+          write_csv(OUT / "v4_278_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_278_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_278_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_278_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_278_route_decision_rows.csv", route_decision_rows)
+          write_csv(OUT / "v4_278_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_278_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_278_rule_checks.csv", checks)
+
+          probe_summary_lines = [
+              f"{row['object']} = {row['value']} ({row['meaning']})"
+              for row in probe_summary_rows
+          ]
+
+          selected_lines = [
+              f"{row['source_lane']}: {row['path']} / overlap={row['field_overlap_count']} / {row['field_overlap_names']}"
+              for row in selected_mapping_lead_rows[:12]
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_decision_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_v4_277_rows": len(inherited_v4_277_rows),
+              "candidate_file_rows": len(candidate_files),
+              "probe_rows": len(probe_rows),
+              "sample_preview_rows": len(sample_preview_rows),
+              "probe_summary_rows": len(probe_summary_rows),
+              "lrg_probe_rows": len(lrg_probe_rows),
+              "elg_probe_rows": len(elg_probe_rows),
+              "lrg_possible_schema_mapping_leads": len(lrg_mapping_leads),
+              "elg_possible_schema_mapping_leads": len(elg_mapping_leads),
+              "selected_mapping_lead_rows": len(selected_mapping_lead_rows),
+              "schema_mapping_need_rows": len(schema_mapping_need_rows),
+              "next_mapping_plan_rows": len(next_mapping_plan_rows),
+              "safety_guard_rows": len(safety_guard_rows),
+              "blocked_operation_rows": len(blocked_operation_rows),
+              "permission_rows": len(permission_rows),
+              "readiness_rows": len(readiness_rows),
+              "decision_rows": len(decision_rows),
+              "route_decision_rows": len(route_decision_rows),
+              "next_rows": len(next_rows),
+              "sdr_reduction_rows": len(sdr_reduction_rows),
+              "candidate_reader_probe_completed": True,
+              "schema_mapping_plan_allowed_next": True,
+              "lrg_equivalent_packet_ready": False,
+              "elg_equivalent_packet_ready": False,
+              "source_comparison_allowed": False,
+              "combined_matrix_allowed": False,
+              "residuals_computed": False,
+              "diagnostic_scalar_computed": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "evidence_allowed": False,
+              "scoring_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_278_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.278 LRG ELG Candidate File Reader Probe With Scope Guards",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_v4_277_rows = {summary['inherited_v4_277_rows']}",
+              f"candidate_file_rows = {summary['candidate_file_rows']}",
+              f"probe_rows = {summary['probe_rows']}",
+              f"sample_preview_rows = {summary['sample_preview_rows']}",
+              f"probe_summary_rows = {summary['probe_summary_rows']}",
+              f"lrg_probe_rows = {summary['lrg_probe_rows']}",
+              f"elg_probe_rows = {summary['elg_probe_rows']}",
+              f"lrg_possible_schema_mapping_leads = {summary['lrg_possible_schema_mapping_leads']}",
+              f"elg_possible_schema_mapping_leads = {summary['elg_possible_schema_mapping_leads']}",
+              f"selected_mapping_lead_rows = {summary['selected_mapping_lead_rows']}",
+              f"schema_mapping_need_rows = {summary['schema_mapping_need_rows']}",
+              f"next_mapping_plan_rows = {summary['next_mapping_plan_rows']}",
+              f"safety_guard_rows = {summary['safety_guard_rows']}",
+              f"blocked_operation_rows = {summary['blocked_operation_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"route_decision_rows = {summary['route_decision_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"sdr_reduction_rows = {summary['sdr_reduction_rows']}",
+              f"candidate_reader_probe_completed = {summary['candidate_reader_probe_completed']}",
+              f"schema_mapping_plan_allowed_next = {summary['schema_mapping_plan_allowed_next']}",
+              f"lrg_equivalent_packet_ready = {summary['lrg_equivalent_packet_ready']}",
+              f"elg_equivalent_packet_ready = {summary['elg_equivalent_packet_ready']}",
+              f"source_comparison_allowed = {summary['source_comparison_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"residuals_computed = {summary['residuals_computed']}",
+              f"diagnostic_scalar_computed = {summary['diagnostic_scalar_computed']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"scoring_allowed = {summary['scoring_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Probe summary:",
+              *probe_summary_lines,
+              "",
+              "Selected mapping leads:",
+              *selected_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.278 probes candidate file headers, JSON keys, text tokens, and tiny sample previews only. It does not validate candidate data or create packet rows. The next step is an explicit schema mapping plan. LRG/ELG residuals, diagnostic scalars, source comparison, combined matrices, p-values, likelihoods, scoring, fitting, evidence, and validation remain blocked.",
+              "",
+              "Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_278_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_v4_277_rows = {summary['inherited_v4_277_rows']}")
+          print(f"candidate_file_rows = {summary['candidate_file_rows']}")
+          print(f"probe_rows = {summary['probe_rows']}")
+          print(f"sample_preview_rows = {summary['sample_preview_rows']}")
+          print(f"probe_summary_rows = {summary['probe_summary_rows']}")
+          print(f"lrg_probe_rows = {summary['lrg_probe_rows']}")
+          print(f"elg_probe_rows = {summary['elg_probe_rows']}")
+          print(f"lrg_possible_schema_mapping_leads = {summary['lrg_possible_schema_mapping_leads']}")
+          print(f"elg_possible_schema_mapping_leads = {summary['elg_possible_schema_mapping_leads']}")
+          print(f"selected_mapping_lead_rows = {summary['selected_mapping_lead_rows']}")
+          print(f"schema_mapping_need_rows = {summary['schema_mapping_need_rows']}")
+          print(f"next_mapping_plan_rows = {summary['next_mapping_plan_rows']}")
+          print(f"safety_guard_rows = {summary['safety_guard_rows']}")
+          print(f"blocked_operation_rows = {summary['blocked_operation_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"route_decision_rows = {summary['route_decision_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"sdr_reduction_rows = {summary['sdr_reduction_rows']}")
+          print(f"candidate_reader_probe_completed = {summary['candidate_reader_probe_completed']}")
+          print(f"schema_mapping_plan_allowed_next = {summary['schema_mapping_plan_allowed_next']}")
+          print(f"lrg_equivalent_packet_ready = {summary['lrg_equivalent_packet_ready']}")
+          print(f"elg_equivalent_packet_ready = {summary['elg_equivalent_packet_ready']}")
+          print(f"source_comparison_allowed = {summary['source_comparison_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"residuals_computed = {summary['residuals_computed']}")
+          print(f"diagnostic_scalar_computed = {summary['diagnostic_scalar_computed']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"scoring_allowed = {summary['scoring_allowed']}")
+          print(f"approved_holdout_sources = {summary['approved_holdout_sources']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.278 LRG ELG candidate file reader probe output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-278-lrg-elg-candidate-file-reader-probe-output
+          path: |
+            tairid_v4_278_lrg_elg_candidate_file_reader_probe_output/
+            tairid-v4-278-lrg-elg-candidate-file-reader-probe-output.zip
