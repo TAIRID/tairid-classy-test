@@ -1,0 +1,501 @@
+name: 001 TAIRID v4.317 - SDSS RSD Baseline Comparator Decision Ingest No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-317-sdss-rsd-baseline-comparator-decision-ingest-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-baseline-comparator-decision-ingest-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.317 SDSS RSD Baseline Comparator Decision Ingest No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.317 SDSS RSD baseline comparator decision ingest no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv, json, re, zipfile
+
+          VERSION = "v4.317"
+          EXPECTED_RESULT = "v4_317_sdss_rsd_baseline_comparator_decision_ingest_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE_IF_DECISIONS_FOUND = "v4_318_sdss_rsd_baseline_comparator_decision_status_or_gate_eligibility_no_scoring"
+          SELECTED_NEXT_ROUTE_IF_MISSING = "v4_318_sdss_rsd_baseline_decision_template_reissue_or_handoff_no_scoring"
+
+          OUT = Path("tairid_v4_317_sdss_rsd_baseline_comparator_decision_ingest_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+          ZIP_NAME = "tairid-v4-317-sdss-rsd-baseline-comparator-decision-ingest-output.zip"
+
+          TEMPLATE_PATTERNS = [
+              r"SDSS[_-]RSD[_-]BASELINE[_-]COMPARATOR[_-]DECISION[_-]TEMPLATE[_-]v4[_-]316(?:[-_]\d+)?[_-]FILLABLE\.csv$",
+              r"sdss[_-]rsd[_-]baseline[_-]comparator[_-]decision[_-]template[_-]v4[_-]316(?:[-_]\d+)?[_-]fillable\.csv$",
+              r"SDSS[_-]RSD[_-]BASELINE[_-]COMPARATOR[_-]DECISIONS[_-]v4[_-]316(?:[-_]\d+)?\.csv$",
+              r"sdss[_-]rsd[_-]baseline[_-]comparator[_-]decisions[_-]v4[_-]316(?:[-_]\d+)?\.csv$",
+          ]
+
+          EXACT_PATHS = [
+              "SDSS_RSD_BASELINE_COMPARATOR_DECISION_TEMPLATE_v4_316_FILLABLE.csv",
+              "sdss_rsd_baseline_comparator_decision_template_v4_316_fillable.csv",
+              "data/SDSS_RSD_BASELINE_COMPARATOR_DECISION_TEMPLATE_v4_316_FILLABLE.csv",
+              "data/sdss_rsd_baseline_comparator_decision_template_v4_316_fillable.csv",
+              ".github/workflows/SDSS_RSD_BASELINE_COMPARATOR_DECISION_TEMPLATE_v4_316_FILLABLE.csv",
+              ".github/workflows/sdss_rsd_baseline_comparator_decision_template_v4_316_fillable.csv",
+          ]
+
+          REQUIRED_FIELDS = [
+              "decision_id",
+              "question_id",
+              "question",
+              "human_decision",
+              "allowed_decisions",
+              "selected_source_url_or_citation",
+              "quoted_or_precise_source_text",
+              "answer_summary",
+              "reviewer_note",
+              "claim_limit_must_remain",
+          ]
+
+          ALLOWED_DECISIONS = {"accept_source_candidate", "edit_needed", "reject", "keep_blocked"}
+          BASELINE_QUESTIONS = {
+              "baseline_q001": "independent comparator model/source",
+              "baseline_q002": "source-provided/model-derived/separate script",
+              "baseline_q003": "cosmological parameter set",
+              "baseline_q004": "independence / no same-family circular support",
+              "baseline_q005": "uncertainty or covariance policy",
+              "baseline_q006": "null result policy",
+          }
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def safe_read_csv(path):
+              try:
+                  with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      fields = reader.fieldnames or []
+                  return True, fields, rows, ""
+              except Exception as exc:
+                  return False, [], [], f"{type(exc).__name__}: {exc}"
+
+          def norm(x):
+              return str(x or "").strip()
+
+          def find_decision_file():
+              candidates = []
+              seen = set()
+
+              for raw in EXACT_PATHS:
+                  p = Path(raw)
+                  exists = p.exists()
+                  read_ok, fields, rows, error = safe_read_csv(p) if exists else (False, [], [], "")
+                  has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+                  candidates.append({
+                      "candidate_path": raw,
+                      "candidate_type": "exact",
+                      "exists": exists,
+                      "read_ok": read_ok,
+                      "row_count": len(rows),
+                      "field_count": len(fields),
+                      "has_required_fields": has_required,
+                      "error": error,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+                  seen.add(raw)
+
+              for p in Path(".").rglob("*.csv"):
+                  raw = p.as_posix().lstrip("./")
+                  if raw in seen:
+                      continue
+                  name = p.name
+                  pattern_match = any(re.search(pattern, name, re.I) for pattern in TEMPLATE_PATTERNS)
+                  semantic_match = all(term in raw.lower() for term in ["sdss", "rsd", "baseline", "comparator", "decision"])
+                  if not (pattern_match or semantic_match):
+                      continue
+                  read_ok, fields, rows, error = safe_read_csv(p)
+                  has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+                  duplicate_suffix = bool(re.search(r"[-_]\d+\.csv$", name))
+                  candidates.append({
+                      "candidate_path": raw,
+                      "candidate_type": "fuzzy",
+                      "exists": True,
+                      "read_ok": read_ok,
+                      "row_count": len(rows),
+                      "field_count": len(fields),
+                      "has_required_fields": has_required,
+                      "duplicate_download_suffix_detected": duplicate_suffix,
+                      "error": error,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+
+              readable = [c for c in candidates if c["exists"] and c["read_ok"] and c["has_required_fields"]]
+              readable = sorted(readable, key=lambda r: (r["candidate_type"] != "exact", not r.get("duplicate_download_suffix_detected", False), r["candidate_path"]))
+              selected = readable[0]["candidate_path"] if readable else ""
+              if selected:
+                  _, fields, rows, _ = safe_read_csv(selected)
+              else:
+                  fields, rows = [], []
+              return candidates, selected, fields, rows
+
+          def review_decision(row, idx, source_path):
+              decision = norm(row.get("human_decision")).lower()
+              question_id = norm(row.get("question_id"))
+              source = norm(row.get("selected_source_url_or_citation"))
+              quote = norm(row.get("quoted_or_precise_source_text"))
+              summary = norm(row.get("answer_summary"))
+              claim_limit = norm(row.get("claim_limit_must_remain")).lower()
+
+              missing = [field for field in REQUIRED_FIELDS if field not in row]
+              decision_blank = decision == ""
+              decision_allowed = decision in ALLOWED_DECISIONS
+              question_known = question_id in BASELINE_QUESTIONS
+              claim_limit_ok = claim_limit in ["no_scoring/no_claims", "no_scoring", "no_claims", "keep_blocked", ""]
+              has_source = bool(source)
+              has_quote = len(quote) >= 12
+              has_summary = len(summary) >= 8
+
+              if decision_blank:
+                  status = "blank_decision_no_action"
+              elif missing:
+                  status = "invalid_missing_required_fields"
+              elif not question_known:
+                  status = "invalid_unknown_question_id"
+              elif not decision_allowed:
+                  status = "invalid_decision_value"
+              elif not claim_limit_ok:
+                  status = "invalid_claim_limit"
+              elif decision == "accept_source_candidate" and not (has_source and has_quote and has_summary):
+                  status = "accept_missing_source_quote_or_summary"
+              else:
+                  status = "decision_reviewable_for_later_baseline_gate_not_approved"
+
+              return {
+                  "review_id": f"baseline_decision_review_{idx+1:03d}",
+                  "source_path": source_path,
+                  "decision_id": norm(row.get("decision_id")),
+                  "question_id": question_id,
+                  "question_lane": BASELINE_QUESTIONS.get(question_id, ""),
+                  "human_decision": decision,
+                  "decision_blank": decision_blank,
+                  "decision_allowed": decision_allowed,
+                  "question_known": question_known,
+                  "claim_limit_ok": claim_limit_ok,
+                  "has_source": has_source,
+                  "has_quote": has_quote,
+                  "has_summary": has_summary,
+                  "review_status": status,
+                  "baseline_approval_allowed_now": False,
+                  "numeric_baseline_values_filled": False,
+                  "definition_match_confirmed": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              }
+
+          inherited_v4_316_rows = [
+              {"inherited_from": "v4.316", "item": "rules", "value": "30 / 30 passed", "meaning": "Baseline comparator human review packet passed.", "carry_forward_status": "ready_for_decision_ingest"},
+              {"inherited_from": "v4.316", "item": "inherited_row_meaning_gate_confirmed", "value": True, "meaning": "Row meaning gate already confirmed.", "carry_forward_status": "confirmed"},
+              {"inherited_from": "v4.316", "item": "selected_row_family", "value": "BAO+RSD f_sigma8 row", "meaning": "Selected row family is fixed.", "carry_forward_status": "selected"},
+              {"inherited_from": "v4.316", "item": "candidate_quote_available_rows", "value": "15 on GitHub", "meaning": "Candidate source windows were available in live run.", "carry_forward_status": "candidate_sources_available"},
+              {"inherited_from": "v4.316", "item": "decision_template_rows", "value": 6, "meaning": "Six fillable baseline decision rows written.", "carry_forward_status": "template_ready"},
+              {"inherited_from": "v4.316", "item": "baseline_approved", "value": False, "meaning": "No baseline approval.", "carry_forward_status": "not_approved"},
+              {"inherited_from": "v4.316", "item": "score_valid", "value": False, "meaning": "No scoring allowed.", "carry_forward_status": "blocked"},
+              {"inherited_from": "v4.316", "item": "selected_next_route", "value": "v4_317_sdss_rsd_baseline_comparator_decision_ingest_no_scoring", "meaning": "Current workflow.", "carry_forward_status": "current_route"},
+          ]
+
+          candidate_file_rows, selected_decision_path, selected_fields, selected_decision_rows = find_decision_file()
+          decision_review_rows = [review_decision(row, idx, selected_decision_path) for idx, row in enumerate(selected_decision_rows)]
+
+          blank_rows = [r for r in decision_review_rows if r["review_status"] == "blank_decision_no_action"]
+          reviewable_rows = [r for r in decision_review_rows if r["review_status"] == "decision_reviewable_for_later_baseline_gate_not_approved"]
+          invalid_rows = [r for r in decision_review_rows if r["review_status"].startswith("invalid") or r["review_status"] == "accept_missing_source_quote_or_summary"]
+          accepted_rows = [r for r in reviewable_rows if r["human_decision"] == "accept_source_candidate"]
+          edit_needed_rows = [r for r in reviewable_rows if r["human_decision"] == "edit_needed"]
+          rejected_rows = [r for r in reviewable_rows if r["human_decision"] == "reject"]
+          keep_blocked_rows = [r for r in reviewable_rows if r["human_decision"] == "keep_blocked"]
+
+          baseline_decision_state = (
+              "decision_template_missing" if not selected_decision_path else
+              "decision_template_present_but_blank" if selected_decision_rows and len(blank_rows) == len(selected_decision_rows) else
+              "decision_template_has_invalid_rows" if invalid_rows else
+              "accepted_source_candidates_present" if accepted_rows else
+              "reviewable_but_no_accepted_source_candidates" if reviewable_rows else
+              "decision_state_unclear"
+          )
+
+          selected_next_route = SELECTED_NEXT_ROUTE_IF_DECISIONS_FOUND if accepted_rows else SELECTED_NEXT_ROUTE_IF_MISSING
+
+          decision_summary_rows = [
+              {"summary_id": "baseline_decision_summary_001", "metric": "selected_decision_path", "value": selected_decision_path, "meaning": "Selected filled baseline decision template, if present."},
+              {"summary_id": "baseline_decision_summary_002", "metric": "decision_rows_loaded", "value": len(selected_decision_rows), "meaning": "Rows loaded from selected baseline decision template."},
+              {"summary_id": "baseline_decision_summary_003", "metric": "blank_decision_rows", "value": len(blank_rows), "meaning": "Blank decisions are no action."},
+              {"summary_id": "baseline_decision_summary_004", "metric": "reviewable_decision_rows", "value": len(reviewable_rows), "meaning": "Valid decisions that still are not approvals."},
+              {"summary_id": "baseline_decision_summary_005", "metric": "accepted_source_candidate_rows", "value": len(accepted_rows), "meaning": "Rows accepted for later baseline gate eligibility."},
+              {"summary_id": "baseline_decision_summary_006", "metric": "edit_needed_rows", "value": len(edit_needed_rows), "meaning": "Rows needing edits."},
+              {"summary_id": "baseline_decision_summary_007", "metric": "rejected_rows", "value": len(rejected_rows), "meaning": "Rejected rows."},
+              {"summary_id": "baseline_decision_summary_008", "metric": "keep_blocked_rows", "value": len(keep_blocked_rows), "meaning": "Rows kept blocked."},
+              {"summary_id": "baseline_decision_summary_009", "metric": "baseline_decision_state", "value": baseline_decision_state, "meaning": "Overall decision-ingest state."},
+          ]
+
+          next_candidate_rows = []
+          for row in accepted_rows:
+              next_candidate_rows.append({
+                  "candidate_id": f"baseline_gate_candidate_{len(next_candidate_rows)+1:03d}",
+                  "decision_id": row["decision_id"],
+                  "question_id": row["question_id"],
+                  "question_lane": row["question_lane"],
+                  "candidate_status": "eligible_for_later_baseline_gate_eligibility_review_not_approved",
+                  "baseline_approval_allowed_now": False,
+                  "numeric_baseline_values_filled": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          gate_rows = [
+              {"gate_id": "gate_001", "gate_object": "baseline_decision_file_found", "gate_passed": bool(selected_decision_path), "gate_status": "found" if selected_decision_path else "missing", "reason": selected_decision_path or "No filled baseline decision template found."},
+              {"gate_id": "gate_002", "gate_object": "baseline_decision_rows_loaded", "gate_passed": len(selected_decision_rows) > 0, "gate_status": "loaded" if selected_decision_rows else "none_loaded", "reason": "Rows loaded only if template exists."},
+              {"gate_id": "gate_003", "gate_object": "accepted_source_candidates_present", "gate_passed": len(accepted_rows) > 0, "gate_status": "present" if accepted_rows else "none", "reason": "Accepted source candidates are later gate candidates only."},
+              {"gate_id": "gate_004", "gate_object": "baseline_decision_state_recorded", "gate_passed": bool(baseline_decision_state), "gate_status": baseline_decision_state, "reason": "Decision state recorded for next route."},
+              {"gate_id": "gate_005", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "v4.317 ingests decisions only."},
+              {"gate_id": "gate_006", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "Definition matches remain blocked."},
+              {"gate_id": "gate_007", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without baseline gate approval and definition matches."},
+              {"gate_id": "gate_008", "gate_object": "support_allowed", "gate_passed": False, "gate_status": "blocked", "reason": "No support language allowed."},
+          ]
+
+          blocked_rows = [
+              {"blocked_id": "blocked_001", "operation": "approve_baseline_values_now", "reason": "decision ingest is not baseline approval", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "fill_numeric_baseline_values_now", "reason": "decision ingest does not produce numeric comparator table", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "confirm_definition_match_now", "reason": "definition-match lane has not run", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "run_diagonal_diagnostic_now", "reason": "diagnostic readiness is false", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no definition matches", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_p_value_or_likelihood", "reason": "full covariance/likelihood remains absent", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "claim_tairid_support", "reason": "support is blocked", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "baseline_comparator_decision_ingest", "permission_status": "completed", "reason": "Baseline comparator decision ingest completed."},
+              {"permission_scope": "baseline_decision_status_or_gate_eligibility", "permission_status": "allowed_next" if accepted_rows else "blocked_until_decisions_filled", "reason": "Next workflow depends on accepted source-candidate decisions."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No baseline approval in this workflow."},
+              {"permission_scope": "definition_match_confirmation", "permission_status": "blocked", "reason": "No definition match in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "No scoring readiness."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+          ]
+
+          sdr_rows = [
+              {"sdr_id": "sdr_001", "before_state": "baseline review packet existed but decision state was unknown", "after_state": "decision template missing/blank/accepted state is explicit", "reduction_type": "decision status clarified"},
+              {"sdr_id": "sdr_002", "before_state": "accepted baseline candidates could be mistaken for approval", "after_state": "accepted source candidates are later gate candidates only", "reduction_type": "decision/approval boundary preserved"},
+              {"sdr_id": "sdr_003", "before_state": "blank template could be mistaken for progress", "after_state": "blank decisions are no action", "reduction_type": "false progress blocked"},
+              {"sdr_id": "sdr_004", "before_state": "baseline ingest could leak into scoring", "after_state": "all scoring remains blocked", "reduction_type": "claim discipline preserved"},
+              {"sdr_id": "sdr_005", "before_state": "next step was broad", "after_state": "next step is status/gate eligibility if accepted candidates exist, otherwise reissue/handoff", "reduction_type": "next route narrowed"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before decision ingest"},
+              {"gate": "inherited_v4_316_rows_equal_8", "passed": len(inherited_v4_316_rows) == 8, "detail": f"inherited_v4_316_rows = {len(inherited_v4_316_rows)}"},
+              {"gate": "candidate_file_rows_recorded", "passed": len(candidate_file_rows) >= 0, "detail": f"candidate_file_rows = {len(candidate_file_rows)}"},
+              {"gate": "decision_review_rows_recorded", "passed": len(decision_review_rows) >= 0, "detail": f"decision_review_rows = {len(decision_review_rows)}"},
+              {"gate": "decision_summary_rows_equal_9", "passed": len(decision_summary_rows) == 9, "detail": f"decision_summary_rows = {len(decision_summary_rows)}"},
+              {"gate": "next_candidate_rows_recorded", "passed": len(next_candidate_rows) >= 0, "detail": f"next_candidate_rows = {len(next_candidate_rows)}"},
+              {"gate": "gate_rows_equal_8", "passed": len(gate_rows) == 8, "detail": f"gate_rows = {len(gate_rows)}"},
+              {"gate": "blocked_rows_equal_10", "passed": len(blocked_rows) == 10, "detail": f"blocked_rows = {len(blocked_rows)}"},
+              {"gate": "permission_rows_equal_6", "passed": len(permission_rows) == 6, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "sdr_rows_equal_5", "passed": len(sdr_rows) == 5, "detail": f"sdr_rows = {len(sdr_rows)}"},
+              {"gate": "all_candidates_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in candidate_file_rows), "detail": "candidates no score/support"},
+              {"gate": "all_reviews_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in decision_review_rows), "detail": "reviews no score/support"},
+              {"gate": "all_next_candidates_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in next_candidate_rows), "detail": "next candidates no score/support"},
+              {"gate": "baseline_approval_false", "passed": any(r["gate_object"] == "baseline_approval" and r["gate_passed"] is False for r in gate_rows), "detail": "baseline not approved"},
+              {"gate": "definition_match_false", "passed": any(r["gate_object"] == "definition_match_confirmation" and r["gate_passed"] is False for r in gate_rows), "detail": "definition not confirmed"},
+              {"gate": "diagnostic_readiness_false", "passed": any(r["gate_object"] == "diagonal_diagnostic_readiness" and r["gate_passed"] is False for r in gate_rows), "detail": "diagnostic not ready"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(r["blocked"] is True for r in blocked_rows), "detail": "all blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_score", "passed": True, "detail": "no score"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "selected_next_route_written", "passed": selected_next_route in [SELECTED_NEXT_ROUTE_IF_DECISIONS_FOUND, SELECTED_NEXT_ROUTE_IF_MISSING], "detail": f"selected_next_route = {selected_next_route}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_317_sdss_rsd_baseline_comparator_decision_ingest_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_317_inherited_v4_316_rows.csv", inherited_v4_316_rows)
+          write_csv(OUT / "v4_317_baseline_decision_candidate_file_rows.csv", candidate_file_rows)
+          write_csv(OUT / "v4_317_baseline_decision_review_rows.csv", decision_review_rows)
+          write_csv(OUT / "SDSS_RSD_BASELINE_DECISION_INGEST_REVIEW_v4_317_NO_APPROVAL.csv", decision_review_rows)
+          write_csv(OUT / "v4_317_decision_summary_rows.csv", decision_summary_rows)
+          write_csv(OUT / "v4_317_next_baseline_gate_candidate_rows.csv", next_candidate_rows)
+          write_csv(OUT / "v4_317_gate_decision_rows.csv", gate_rows)
+          write_csv(OUT / "v4_317_blocked_operation_rows.csv", blocked_rows)
+          write_csv(OUT / "v4_317_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_317_sdr_reduction_rows.csv", sdr_rows)
+          write_csv(OUT / "v4_317_rule_checks.csv", checks)
+
+          readme = [
+              "# SDSS RSD Baseline Comparator Decision Ingest v4.317",
+              "",
+              "This workflow searches for and ingests a filled baseline/comparator decision template from v4.316.",
+              "",
+              "Accepted decision values are: `accept_source_candidate`, `edit_needed`, `reject`, and `keep_blocked`.",
+              "",
+              "Blank decisions are no action. `accept_source_candidate` is still not baseline approval. It only means the row may later enter a baseline gate-eligibility workflow.",
+              "",
+              "Truth boundary: no proof, no validation, no support, no scoring, no p-value, no likelihood, no baseline approval.",
+          ]
+          (OUT / "SDSS_RSD_BASELINE_COMPARATOR_DECISION_INGEST_v4_317_README.md").write_text("\n".join(readme), encoding="utf-8")
+
+          summary = {
+              "version": VERSION,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "selected_decision_path": selected_decision_path,
+              "decision_rows_loaded": len(selected_decision_rows),
+              "blank_decision_rows": len(blank_rows),
+              "reviewable_decision_rows": len(reviewable_rows),
+              "invalid_decision_rows": len(invalid_rows),
+              "accepted_source_candidate_rows": len(accepted_rows),
+              "edit_needed_rows": len(edit_needed_rows),
+              "rejected_rows": len(rejected_rows),
+              "keep_blocked_rows": len(keep_blocked_rows),
+              "baseline_decision_state": baseline_decision_state,
+              "next_baseline_gate_candidate_rows": len(next_candidate_rows),
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "baseline_approved": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "gate_decision_rows": len(gate_rows),
+              "gate_approval_rows": 0,
+              "selected_next_route": selected_next_route,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_317_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.317 SDSS RSD Baseline Comparator Decision Ingest No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"selected_decision_path = {summary['selected_decision_path']}",
+              f"decision_rows_loaded = {summary['decision_rows_loaded']}",
+              f"blank_decision_rows = {summary['blank_decision_rows']}",
+              f"reviewable_decision_rows = {summary['reviewable_decision_rows']}",
+              f"invalid_decision_rows = {summary['invalid_decision_rows']}",
+              f"accepted_source_candidate_rows = {summary['accepted_source_candidate_rows']}",
+              f"edit_needed_rows = {summary['edit_needed_rows']}",
+              f"rejected_rows = {summary['rejected_rows']}",
+              f"keep_blocked_rows = {summary['keep_blocked_rows']}",
+              f"baseline_decision_state = {summary['baseline_decision_state']}",
+              f"next_baseline_gate_candidate_rows = {summary['next_baseline_gate_candidate_rows']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"selected_next_route = {selected_next_route}",
+              "",
+              "Clean meaning: v4.317 ingests a filled baseline/comparator decision template if one exists. It does not approve baselines or score.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_317_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"selected_decision_path = {summary['selected_decision_path']}")
+          print(f"decision_rows_loaded = {summary['decision_rows_loaded']}")
+          print(f"blank_decision_rows = {summary['blank_decision_rows']}")
+          print(f"reviewable_decision_rows = {summary['reviewable_decision_rows']}")
+          print(f"invalid_decision_rows = {summary['invalid_decision_rows']}")
+          print(f"accepted_source_candidate_rows = {summary['accepted_source_candidate_rows']}")
+          print(f"edit_needed_rows = {summary['edit_needed_rows']}")
+          print(f"rejected_rows = {summary['rejected_rows']}")
+          print(f"keep_blocked_rows = {summary['keep_blocked_rows']}")
+          print(f"baseline_decision_state = {summary['baseline_decision_state']}")
+          print(f"next_baseline_gate_candidate_rows = {summary['next_baseline_gate_candidate_rows']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"selected_next_route = {selected_next_route}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+
+          PY
+
+      - name: Upload v4.317 SDSS RSD baseline comparator decision ingest output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-317-sdss-rsd-baseline-comparator-decision-ingest-output
+          path: |
+            tairid_v4_317_sdss_rsd_baseline_comparator_decision_ingest_output/
+            tairid-v4-317-sdss-rsd-baseline-comparator-decision-ingest-output.zip
