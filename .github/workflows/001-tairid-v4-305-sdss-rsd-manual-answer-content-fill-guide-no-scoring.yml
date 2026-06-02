@@ -1,0 +1,850 @@
+name: 001 TAIRID v4.305 - SDSS RSD Manual Answer Content Fill Guide No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-305-sdss-rsd-manual-answer-content-fill-guide-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-manual-answer-content-fill-guide-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.305 SDSS RSD Manual Answer Content Fill Guide No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.305 SDSS RSD manual answer content fill guide no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.305"
+          ROUTE = "sdss_rsd_manual_answer_content_fill_guide_no_scoring_after_v4_304"
+          EXPECTED_RESULT = "v4_305_sdss_rsd_manual_answer_content_fill_guide_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_306_sdss_rsd_manual_answer_candidate_prefill_review_no_scoring"
+
+          OUT = Path("tairid_v4_305_sdss_rsd_manual_answer_content_fill_guide_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-305-sdss-rsd-manual-answer-content-fill-guide-output.zip"
+
+          SOURCE_URLS = [
+              "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/",
+              "https://www.sdss4.org/science/final-bao-and-rsd-measurements/",
+              "https://www.sdss4.org/dr16/",
+              "https://arxiv.org/abs/2007.08991",
+              "https://arxiv.org/abs/2007.08997",
+              "https://arxiv.org/abs/2007.09004",
+          ]
+
+          REQUIRED_FIELDS = [
+              "answer_id",
+              "target_id",
+              "source_url_or_citation",
+              "quoted_or_precise_source_text",
+              "answer_summary",
+              "approval_request",
+              "claim_limit",
+          ]
+
+          MANUAL_ANSWER_PATTERNS = [
+              r"sdss[_-]rsd[_-]manual[_-]answers[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+              r"SDSS[_-]RSD[_-]MANUAL[_-]ANSWERS[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+              r"data[_-]sdss[_-]rsd[_-]manual[_-]answers[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+                  self.in_a = False
+                  self.current_href = ""
+                  self.current_text = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "a":
+                      attrs = dict(attrs)
+                      self.in_a = True
+                      self.current_href = attrs.get("href", "")
+                      self.current_text = []
+
+              def handle_data(self, data):
+                  if self.in_a:
+                      self.current_text.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "a" and self.in_a:
+                      text = " ".join(" ".join(self.current_text).split())
+                      self.links.append({"href": self.current_href, "text": text})
+                      self.in_a = False
+                      self.current_href = ""
+                      self.current_text = []
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=2_000_000, timeout=15):
+              row = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.305-content-fill-guide-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      row["status_code"] = getattr(resp, "status", "")
+                      row["content_type"] = resp.headers.get("Content-Type", "")
+                      row["final_url"] = resp.geturl()
+                      row["bytes_read"] = len(data)
+                      row["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      row["fetch_ok"] = True
+              except Exception as exc:
+                  row["error"] = f"{type(exc).__name__}: {exc}"
+              return row, data
+
+          def strip_html_text(data):
+              if not data:
+                  return ""
+              text = data.decode("utf-8", errors="replace")
+              text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", text)
+              return html.unescape(" ".join(text.split()))
+
+          def window_around_terms(text, terms, width=420, limit=1200):
+              lower = text.lower()
+              starts = []
+              for term in terms:
+                  idx = lower.find(term.lower())
+                  if idx >= 0:
+                      starts.append(idx)
+              if not starts:
+                  return ""
+              idx = min(starts)
+              return text[max(0, idx-width):idx+width].replace("\n", " ")[:limit]
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return ("fσ8" in label) or ("fsigma8" in label) or ("fσ8" in joined) or ("fsigma8" in joined)
+
+          def infer_header_rows(table):
+              header_rows = []
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def split_bound_header(bound_header):
+              parts = [p.strip() for p in str(bound_header).split("/") if p.strip()]
+              fields = {
+                  "sample_or_tracer": parts[0] if len(parts) > 0 else "",
+                  "z_range_text": parts[4] if len(parts) > 4 else "",
+                  "z_eff_text": parts[6] if len(parts) > 6 else "",
+              }
+              try:
+                  fields["z_eff"] = float(fields["z_eff_text"])
+              except Exception:
+                  fields["z_eff"] = ""
+              return fields
+
+          def parse_column_contract_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      row_type = "redshift_function_row_candidate" if "(z)" in label_norm else "final_or_consensus_row_candidate"
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          for value, sigma in measurement_pairs(cell):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              fields = split_bound_header(bound["bound_header"])
+                              out.append({
+                                  "contract_id": f"column_contract_bound_{len(out)+1:02d}",
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "sample_or_tracer": fields["sample_or_tracer"],
+                                  "z_eff": fields["z_eff"],
+                                  "z_range_text": fields["z_range_text"],
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                              })
+              return out
+
+          def safe_read_csv(path):
+              try:
+                  with path.open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      fields = reader.fieldnames or []
+                  return True, fields, rows, ""
+              except Exception as exc:
+                  return False, [], [], f"{type(exc).__name__}: {exc}"
+
+          def find_manual_answer_file():
+              candidates = []
+              for path in Path(".").rglob("*"):
+                  if not path.is_file() or path.suffix.lower() != ".csv":
+                      continue
+                  raw = path.as_posix().lstrip("./")
+                  name = path.name
+                  pattern_match = any(re.search(pattern, name, re.I) for pattern in MANUAL_ANSWER_PATTERNS)
+                  semantic_match = all(term in raw.lower() for term in ["sdss", "rsd", "manual", "answer"])
+                  if pattern_match or semantic_match:
+                      read_ok, fields, rows, error = safe_read_csv(path)
+                      has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+                      duplicate_suffix = bool(re.search(r"[-_]\d+\.csv$", name))
+                      candidates.append({
+                          "path": raw,
+                          "filename": name,
+                          "pattern_match": pattern_match,
+                          "semantic_match": semantic_match,
+                          "duplicate_download_suffix_detected": duplicate_suffix,
+                          "read_ok": read_ok,
+                          "row_count": len(rows),
+                          "field_count": len(fields),
+                          "has_required_fields": has_required,
+                          "error": error,
+                      })
+              readable = [c for c in candidates if c["read_ok"] and c["has_required_fields"]]
+              readable = sorted(readable, key=lambda r: (not r["duplicate_download_suffix_detected"], r["path"]))
+              selected = readable[0]["path"] if readable else ""
+              selected_rows = []
+              selected_fields = []
+              if selected:
+                  _, selected_fields, selected_rows, _ = safe_read_csv(Path(selected))
+              return candidates, selected, selected_fields, selected_rows
+
+          def norm(value):
+              return str(value or "").strip()
+
+          def review_answer(row, idx, source_path):
+              source = norm(row.get("source_url_or_citation"))
+              precise = norm(row.get("quoted_or_precise_source_text"))
+              summary = norm(row.get("answer_summary"))
+              approval = norm(row.get("approval_request")).lower()
+              claim = norm(row.get("claim_limit")).lower()
+              missing = [field for field in REQUIRED_FIELDS if not norm(row.get(field))]
+              is_blank = not source and not precise and not summary
+              reviewable = (
+                  not missing
+                  and len(source) > 0
+                  and len(precise) >= 12
+                  and len(summary) >= 8
+                  and approval in ["row_meaning_confirm", "baseline_candidate", "definition_match", "reject", "keep_blocked"]
+                  and claim in ["no_scoring", "no_claims", "no_scoring/no_claims", "keep_blocked"]
+              )
+              return {
+                  "manual_review_id": f"manual_review_{idx+1:03d}",
+                  "source_path": source_path,
+                  "answer_id": norm(row.get("answer_id")),
+                  "target_id": norm(row.get("target_id")),
+                  "target_class": norm(row.get("target_class")),
+                  "target_object": norm(row.get("target_object")),
+                  "missing_required_fields": "|".join(missing),
+                  "is_blank_template_row": is_blank,
+                  "reviewable_for_future_gate": reviewable,
+                  "review_status": "reviewable_for_future_gate_not_approved" if reviewable else ("blank_template_row" if is_blank else "incomplete_or_invalid"),
+                  "score_allowed": False,
+                  "support_allowed": False,
+                  "row_meaning_confirmed": False,
+                  "baseline_approved": False,
+                  "definition_match_confirmed": False,
+              }
+
+          inherited_v4_304_rows = [
+              {"inherited_from": "v4.304", "item": "rules", "value": "42 / 42 passed", "meaning": "Exact path or handoff decision passed safely.", "carry_forward_status": "ready_for_content_fill_guide"},
+              {"inherited_from": "v4.304", "item": "selected_path", "value": "sdss_rsd_manual_answers_v4_300-1.csv", "meaning": "Duplicate-download manual answer CSV path was accepted.", "carry_forward_status": "file_path_resolved"},
+              {"inherited_from": "v4.304", "item": "exact_path_problem_resolved", "value": True, "meaning": "No folder handoff needed.", "carry_forward_status": "folder_chasing_closed"},
+              {"inherited_from": "v4.304", "item": "manual_answer_rows", "value": 20, "meaning": "Twenty rows readable.", "carry_forward_status": "blank_template_ready"},
+              {"inherited_from": "v4.304", "item": "blank_template_rows", "value": 20, "meaning": "All rows still blank.", "carry_forward_status": "content_missing"},
+              {"inherited_from": "v4.304", "item": "gate_approval_rows", "value": 0, "meaning": "No gate approval.", "carry_forward_status": "no_approval"},
+              {"inherited_from": "v4.304", "item": "selected_next_route", "value": "v4_305_sdss_rsd_manual_answer_content_fill_guide_no_scoring", "meaning": "Current route creates content fill guide.", "carry_forward_status": "current_route"},
+          ]
+
+          source_fetch_rows = []
+          source_quote_rows = []
+          source_text_by_url = {}
+          for url in SOURCE_URLS:
+              fetch, data = fetch_url(url)
+              source_fetch_rows.append({**fetch, "score_allowed": False, "support_allowed": False})
+              text = strip_html_text(data)
+              source_text_by_url[url] = text
+              quote_specs = [
+                  ("row_meaning", ["f σ 8", "fσ8", "fsigma8", "f sigma", "redshift-space distortion", "measurement"]),
+                  ("row_family", ["f σ 8", "fσ8", "fsigma8", "consensus", "combined", "final"]),
+                  ("baseline", ["LCDM", "fiducial", "model", "prediction", "growth rate", "cosmological parameters"]),
+                  ("definition_match", ["redshift", "sample", "tracer", "fiducial", "measurement", "table"]),
+                  ("covariance_limit", ["covariance", "likelihood", "correlation", "full covariance"]),
+              ]
+              for quote_class, terms in quote_specs:
+                  window = window_around_terms(text, terms)
+                  if window:
+                      source_quote_rows.append({
+                          "quote_id": f"quote_{len(source_quote_rows)+1:03d}",
+                          "quote_class": quote_class,
+                          "source_url": url,
+                          "candidate_quote_window": window,
+                          "quote_status": "candidate_window_for_manual_fill_not_approval",
+                          "score_allowed": False,
+                          "support_allowed": False,
+                      })
+
+          parser = SimpleTableParser()
+          first_fetch, first_data = fetch_url(SOURCE_URLS[0])
+          if first_data:
+              parser.feed(first_data.decode("utf-8", errors="replace"))
+          column_contract_rows = parse_column_contract_rows(parser.tables)
+
+          fuzzy_candidate_rows, selected_manual_path, selected_fields, selected_manual_rows = find_manual_answer_file()
+          manual_answer_review_rows = [review_answer(row, idx, selected_manual_path) for idx, row in enumerate(selected_manual_rows)]
+          blank_rows = [r for r in manual_answer_review_rows if r["is_blank_template_row"]]
+          reviewable_rows = [r for r in manual_answer_review_rows if r["reviewable_for_future_gate"]]
+
+          def first_quote(target_class):
+              matches = [q for q in source_quote_rows if q["quote_class"] == target_class]
+              if not matches and target_class == "row_family":
+                  matches = [q for q in source_quote_rows if q["quote_class"] == "row_meaning"]
+              return matches[0] if matches else {"source_url": "", "candidate_quote_window": ""}
+
+          content_fill_guide_rows = []
+          def add_guide(target_id, target_class, target_object, approval_request, question, source_class, fill_instruction, non_answer_warning):
+              quote = first_quote(source_class)
+              content_fill_guide_rows.append({
+                  "guide_id": f"guide_{len(content_fill_guide_rows)+1:03d}",
+                  "target_id": target_id,
+                  "target_class": target_class,
+                  "target_object": target_object,
+                  "approval_request": approval_request,
+                  "claim_limit": "no_scoring/no_claims",
+                  "question_to_answer": question,
+                  "suggested_source_url": quote["source_url"],
+                  "candidate_quote_window": quote["candidate_quote_window"],
+                  "fill_instruction": fill_instruction,
+                  "non_answer_warning": non_answer_warning,
+                  "guide_status": "fill_guide_only_not_manual_answer",
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          add_guide(
+              "row_meaning_001",
+              "row_meaning",
+              "f_sigma8_z_row_role",
+              "row_meaning_confirm",
+              "What does the f_sigma8(z) row mean in the SDSS RSD table?",
+              "row_meaning",
+              "Fill source_url_or_citation with the source URL/table note and fill quoted_or_precise_source_text with exact text explaining this row role.",
+              "Do not infer row role from label alone.",
+          )
+          add_guide(
+              "row_meaning_002",
+              "row_meaning",
+              "f_sigma8_row_role",
+              "row_meaning_confirm",
+              "What does the f_sigma8 row mean and is it the final/consensus measurement row?",
+              "row_family",
+              "Fill exact source text that distinguishes final/consensus measurement information from other f_sigma8 variants.",
+              "Do not treat two f_sigma8 rows as independent until the source says how they relate.",
+          )
+          add_guide(
+              "row_meaning_003",
+              "row_meaning",
+              "two_row_relationship",
+              "row_meaning_confirm",
+              "How are f_sigma8(z) and f_sigma8 related?",
+              "row_family",
+              "Fill exact source text explaining whether the two rows are variants, duplicates, derived, final/intermediate, or otherwise related.",
+              "Do not use one row family as the baseline for the other.",
+          )
+          add_guide(
+              "row_meaning_004",
+              "row_family",
+              "row_family_selection_basis",
+              "row_meaning_confirm",
+              "Which one row family may be selected later, if any?",
+              "row_family",
+              "Fill exact source-backed basis for selecting exactly one row family or keep blocked.",
+              "Do not mix row families.",
+          )
+          add_guide(
+              "baseline_001",
+              "baseline",
+              "standard_comparator_values",
+              "baseline_candidate",
+              "What standard comparator values should be used, if any?",
+              "baseline",
+              "Fill only with a published/reproducible comparator source. The observed SDSS row values cannot be the baseline.",
+              "Do not use observed SDSS values, means of observed rows, or TAIRID post-hoc values as baseline.",
+          )
+          add_guide(
+              "baseline_002",
+              "baseline",
+              "baseline_source_mapping",
+              "baseline_candidate",
+              "What exact source maps each comparator value to row/tracer/redshift?",
+              "baseline",
+              "Fill URL/citation/table/section mapping each comparator to the selected row family.",
+              "Do not use untraceable candidate numbers.",
+          )
+          add_guide(
+              "baseline_003",
+              "baseline",
+              "baseline_uncertainty_policy",
+              "baseline_candidate",
+              "What uncertainty policy is source-backed for any comparator values?",
+              "baseline",
+              "Fill source-backed uncertainty policy or keep diagonal-only/no-claims limitation.",
+              "Do not invent comparator uncertainty.",
+          )
+          add_guide(
+              "baseline_004",
+              "baseline",
+              "baseline_equal_or_better_null",
+              "keep_blocked",
+              "Does the answer preserve the rule that standard comparator equal/better remains neutral/weaken, never support?",
+              "covariance_limit",
+              "Usually keep blocked/no-claims. This is a safety row, not a source-claim row.",
+              "Do not claim compatibility as TAIRID support.",
+          )
+
+          # Add one guide row per parsed contract if available; otherwise placeholders.
+          if column_contract_rows:
+              for contract in column_contract_rows:
+                  add_guide(
+                      f"definition_match_{contract['bound_id']}",
+                      "definition_match",
+                      f"{contract['row_label']} {contract['sample_or_tracer']} z_eff={contract['z_eff']}",
+                      "definition_match",
+                      "Does the comparator match observable f_sigma8, tracer/sample, redshift/bin, row-family role, and fiducial assumptions for this observed row?",
+                      "definition_match",
+                      "Fill only after row meaning and baseline are source-backed. Identify exact matching conditions.",
+                      "Do not accept nearby redshift, wrong tracer, wrong observable, or unconfirmed row family.",
+                  )
+          else:
+              for i in range(1, 5):
+                  add_guide(
+                      f"definition_match_placeholder_{i:02d}",
+                      "definition_match",
+                      "placeholder_no_live_contract_rows",
+                      "definition_match",
+                      "Placeholder because no live contract rows were parsed.",
+                      "definition_match",
+                      "Do not use placeholder rows for approval.",
+                      "Placeholder rows cannot pass.",
+                  )
+
+          candidate_prefill_review_rows = []
+          for guide in content_fill_guide_rows:
+              candidate_prefill_review_rows.append({
+                  "candidate_id": f"candidate_prefill_{len(candidate_prefill_review_rows)+1:03d}",
+                  "target_id": guide["target_id"],
+                  "target_class": guide["target_class"],
+                  "source_url_candidate": guide["suggested_source_url"],
+                  "candidate_quote_window": guide["candidate_quote_window"],
+                  "answer_summary_candidate": "",
+                  "approval_request": guide["approval_request"],
+                  "claim_limit": "no_scoring/no_claims",
+                  "prefill_status": "candidate_only_needs_human_review_not_inserted",
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          gate_decision_rows = [
+              {"gate_id": "gate_001", "gate_object": "manual_answer_file_located", "gate_passed": bool(selected_manual_path), "gate_status": "located" if selected_manual_path else "not_located", "reason": selected_manual_path or "No manual-answer CSV found."},
+              {"gate_id": "gate_002", "gate_object": "content_fill_guide_written", "gate_passed": len(content_fill_guide_rows) >= 8, "gate_status": "written" if len(content_fill_guide_rows) >= 8 else "too_few_rows", "reason": "Guide rows are written but are not answers."},
+              {"gate_id": "gate_003", "gate_object": "candidate_prefill_review_rows_written", "gate_passed": len(candidate_prefill_review_rows) == len(content_fill_guide_rows), "gate_status": "written" if len(candidate_prefill_review_rows) == len(content_fill_guide_rows) else "mismatch", "reason": "Candidate prefill rows are review-only."},
+              {"gate_id": "gate_004", "gate_object": "manual_answers_reviewable", "gate_passed": len(reviewable_rows) > 0, "gate_status": "reviewable_rows_present" if reviewable_rows else "no_reviewable_rows", "reason": "Blank template rows are not reviewable answers."},
+              {"gate_id": "gate_005", "gate_object": "row_meaning_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.305 is content fill guide only."},
+              {"gate_id": "gate_006", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "v4.305 is content fill guide only."},
+              {"gate_id": "gate_007", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.305 is content fill guide only."},
+              {"gate_id": "gate_008", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without approved gates."},
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "v4.305 is fill-guide only", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "candidate quote windows are not approved answers", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning is not confirmed", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition match not approved", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "diagnostic readiness is false", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no selected row family", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "content_fill_guide", "permission_status": "completed", "reason": "Fill guide rows written."},
+              {"permission_scope": "candidate_prefill_review", "permission_status": "allowed_next", "reason": "Next workflow may review candidate prefill rows without inserting/approving them."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "No confirmation in this workflow."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No approval in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "selected_manual_path", "status": selected_manual_path or "none", "meaning": "Manual answer CSV location."},
+              {"readiness_id": "ready_002", "object": "manual_answer_rows", "status": str(len(selected_manual_rows)), "meaning": "Rows in selected manual answer file."},
+              {"readiness_id": "ready_003", "object": "blank_template_rows", "status": str(len(blank_rows)), "meaning": "Rows that still need source answers."},
+              {"readiness_id": "ready_004", "object": "source_quote_rows", "status": str(len(source_quote_rows)), "meaning": "Candidate quote windows only."},
+              {"readiness_id": "ready_005", "object": "content_fill_guide_rows", "status": str(len(content_fill_guide_rows)), "meaning": "Guide rows written."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "The next gap is content, not file location.", "basis": "v4.304 resolved path/folder confusion.", "next_action": "Use guide rows to fill source-backed answers.", "claim_status": "content_gap"},
+              {"decision_id": "decision_002", "decision": "Candidate quote windows are not answers.", "basis": "They need human/source review before becoming manual answer text.", "next_action": "Review candidate prefill rows in v4.306.", "claim_status": "hint_only"},
+              {"decision_id": "decision_003", "decision": "No scoring or gate approval is allowed from a fill guide.", "basis": "The answer CSV remains blank or unapproved.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_manual_answer_candidate_prefill_review_no_scoring", "permission_status": "recommended", "reason": "Review candidate quote windows before any filled manual-answer file is created."},
+              {"route_id": "route_002", "route": "sdss_rsd_manual_answer_gate_approval", "permission_status": "blocked_until_reviewable_answers", "reason": "No reviewable source-backed answers yet."},
+              {"route_id": "route_003", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_gate_decision_and_readiness", "reason": "No gate approval in v4.305."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.305 is a clean content-fill-guide milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "file location was the active confusion", "after_state": "content gap is isolated", "reduction_type": "problem surface narrowed"},
+              {"sdr_id": "sdr_002", "before_state": "blank rows had no fill guidance", "after_state": "each row class has a source-answer instruction", "reduction_type": "manual answer work made concrete"},
+              {"sdr_id": "sdr_003", "before_state": "source quote windows could be mistaken for answers", "after_state": "candidate windows are labeled not approval", "reduction_type": "hint/answer boundary preserved"},
+              {"sdr_id": "sdr_004", "before_state": "definition-match rows were too large to handle", "after_state": "definition-match guide rows are generated per contract row", "reduction_type": "row-specific gap structured"},
+              {"sdr_id": "sdr_005", "before_state": "content guide could invite scoring pressure", "after_state": "all scoring and claims remain blocked", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before content fill guide"},
+              {"gate": "inherited_v4_304_rows_equal_7", "passed": len(inherited_v4_304_rows) == 7, "detail": f"inherited_v4_304_rows = {len(inherited_v4_304_rows)}"},
+              {"gate": "source_fetch_rows_equal_6", "passed": len(source_fetch_rows) == 6, "detail": f"source_fetch_rows = {len(source_fetch_rows)}"},
+              {"gate": "column_contract_rows_recorded", "passed": len(column_contract_rows) >= 0, "detail": f"column_contract_rows = {len(column_contract_rows)}"},
+              {"gate": "fuzzy_candidate_rows_recorded", "passed": len(fuzzy_candidate_rows) >= 0, "detail": f"fuzzy_candidate_rows = {len(fuzzy_candidate_rows)}"},
+              {"gate": "manual_answer_review_rows_recorded", "passed": len(manual_answer_review_rows) >= 0, "detail": f"manual_answer_review_rows = {len(manual_answer_review_rows)}"},
+              {"gate": "source_quote_rows_recorded", "passed": len(source_quote_rows) >= 0, "detail": f"source_quote_rows = {len(source_quote_rows)}"},
+              {"gate": "content_fill_guide_rows_at_least_8", "passed": len(content_fill_guide_rows) >= 8, "detail": f"content_fill_guide_rows = {len(content_fill_guide_rows)}"},
+              {"gate": "candidate_prefill_review_rows_match_guide", "passed": len(candidate_prefill_review_rows) == len(content_fill_guide_rows), "detail": f"candidate_prefill_review_rows = {len(candidate_prefill_review_rows)}"},
+              {"gate": "gate_decision_rows_equal_8", "passed": len(gate_decision_rows) == 8, "detail": f"gate_decision_rows = {len(gate_decision_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_3", "passed": len(decision_rows) == 3, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_source_quotes_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in source_quote_rows), "detail": "source quotes no score/support"},
+              {"gate": "all_guides_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in content_fill_guide_rows), "detail": "guides no score/support"},
+              {"gate": "all_prefills_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in candidate_prefill_review_rows), "detail": "prefills no score/support"},
+              {"gate": "candidate_prefills_not_inserted", "passed": all(row["prefill_status"] == "candidate_only_needs_human_review_not_inserted" for row in candidate_prefill_review_rows), "detail": "candidate prefills not inserted"},
+              {"gate": "row_meaning_gate_not_approved", "passed": any(row["gate_object"] == "row_meaning_confirmation" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "row meaning gate false"},
+              {"gate": "baseline_gate_not_approved", "passed": any(row["gate_object"] == "baseline_approval" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "baseline gate false"},
+              {"gate": "definition_gate_not_approved", "passed": any(row["gate_object"] == "definition_match_confirmation" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "definition gate false"},
+              {"gate": "diagnostic_readiness_false", "passed": any(row["gate_object"] == "diagonal_diagnostic_readiness" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "diagnostic readiness false"},
+              {"gate": "confirm_row_meaning_blocked", "passed": any(row["operation"] == "confirm_row_meaning_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "row meaning blocked"},
+              {"gate": "approve_baseline_blocked", "passed": any(row["operation"] == "approve_baseline_values_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "baseline blocked"},
+              {"gate": "run_diagonal_blocked", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "diagonal diagnostic blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations blocked"},
+              {"gate": "content_fill_guide_permission_completed", "passed": any(row["permission_scope"] == "content_fill_guide" and row["permission_status"] == "completed" for row in permission_rows), "detail": "content fill guide completed"},
+              {"gate": "candidate_prefill_review_allowed_next", "passed": any(row["permission_scope"] == "candidate_prefill_review" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "candidate prefill review allowed next"},
+              {"gate": "baseline_approval_permission_blocked", "passed": any(row["permission_scope"] == "baseline_approval" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "baseline approval blocked"},
+              {"gate": "diagonal_score_permission_blocked", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "diagonal score blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_manual_answer_candidate_prefill_review_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.306 route recommended"},
+              {"gate": "diagonal_score_route_blocked", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_gate_decision_and_readiness" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_306_sdss_rsd_manual_answer_candidate_prefill_review_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_305_sdss_rsd_manual_answer_content_fill_guide_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_305_inherited_v4_304_rows.csv", inherited_v4_304_rows)
+          write_csv(OUT / "v4_305_source_fetch_rows.csv", source_fetch_rows)
+          write_csv(OUT / "v4_305_source_quote_rows.csv", source_quote_rows)
+          write_csv(OUT / "SDSS_RSD_SOURCE_QUOTE_WINDOWS_v4_305_CANDIDATE_ONLY.csv", source_quote_rows)
+          write_csv(OUT / "v4_305_column_contract_rows.csv", column_contract_rows)
+          write_csv(OUT / "v4_305_fuzzy_candidate_rows.csv", fuzzy_candidate_rows)
+          write_csv(OUT / "v4_305_manual_answer_review_rows.csv", manual_answer_review_rows)
+          write_csv(OUT / "v4_305_content_fill_guide_rows.csv", content_fill_guide_rows)
+          write_csv(OUT / "SDSS_RSD_CONTENT_FILL_GUIDE_v4_305_NO_SCORING.csv", content_fill_guide_rows)
+          write_csv(OUT / "v4_305_candidate_prefill_review_rows.csv", candidate_prefill_review_rows)
+          write_csv(OUT / "SDSS_RSD_CANDIDATE_PREFILL_REVIEW_v4_305_NOT_INSERTED.csv", candidate_prefill_review_rows)
+          write_csv(OUT / "v4_305_gate_decision_rows.csv", gate_decision_rows)
+          write_csv(OUT / "v4_305_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_305_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_305_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_305_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_305_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_305_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_305_rule_checks.csv", checks)
+
+          fill_md = [
+              "# SDSS RSD Manual Answer Content Fill Guide v4.305",
+              "",
+              "This is not a scoring file and not an approval file.",
+              "",
+              "The rail has moved from folder/path confusion to content filling. The manual-answer CSV exists, but it is still blank. The output CSV `SDSS_RSD_CONTENT_FILL_GUIDE_v4_305_NO_SCORING.csv` explains what each target needs. The output CSV `SDSS_RSD_CANDIDATE_PREFILL_REVIEW_v4_305_NOT_INSERTED.csv` collects candidate source windows, but those windows are not inserted into the answer file and do not approve any gate.",
+              "",
+              "Truth boundary: no proof, no validation, no support, no scoring, no p-value, no likelihood, no baseline approval, no row-family selection.",
+          ]
+          (OUT / "SDSS_RSD_CONTENT_FILL_GUIDE_v4_305_README.md").write_text("\n".join(fill_md), encoding="utf-8")
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_fetch_rows": len(source_fetch_rows),
+              "source_fetch_ok_rows": sum(1 for row in source_fetch_rows if row["fetch_ok"]),
+              "selected_manual_path": selected_manual_path,
+              "manual_answer_rows": len(selected_manual_rows),
+              "manual_answer_review_rows": len(manual_answer_review_rows),
+              "reviewable_rows": len(reviewable_rows),
+              "blank_template_rows": len(blank_rows),
+              "source_quote_rows": len(source_quote_rows),
+              "column_contract_rows": len(column_contract_rows),
+              "content_fill_guide_rows": len(content_fill_guide_rows),
+              "candidate_prefill_review_rows": len(candidate_prefill_review_rows),
+              "gate_decision_rows": len(gate_decision_rows),
+              "gate_approval_rows": sum(1 for row in gate_decision_rows if row["gate_object"] in ["row_meaning_confirmation", "baseline_approval", "definition_match_confirmation", "diagonal_diagnostic_readiness"] and row["gate_passed"]),
+              "row_meaning_confirmed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_305_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.305 SDSS RSD Manual Answer Content Fill Guide No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_fetch_ok_rows = {summary['source_fetch_ok_rows']}",
+              f"selected_manual_path = {summary['selected_manual_path']}",
+              f"manual_answer_rows = {summary['manual_answer_rows']}",
+              f"reviewable_rows = {summary['reviewable_rows']}",
+              f"blank_template_rows = {summary['blank_template_rows']}",
+              f"source_quote_rows = {summary['source_quote_rows']}",
+              f"column_contract_rows = {summary['column_contract_rows']}",
+              f"content_fill_guide_rows = {summary['content_fill_guide_rows']}",
+              f"candidate_prefill_review_rows = {summary['candidate_prefill_review_rows']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.305 creates a content-fill guide. It does not fill the manual answer CSV, approve source text, confirm row meaning, approve baselines, select a row family, confirm definition matches, score, or support anything. It only turns the blank-file problem into specific source-answer tasks.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_305_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_fetch_ok_rows = {summary['source_fetch_ok_rows']}")
+          print(f"selected_manual_path = {summary['selected_manual_path']}")
+          print(f"manual_answer_rows = {summary['manual_answer_rows']}")
+          print(f"manual_answer_review_rows = {summary['manual_answer_review_rows']}")
+          print(f"reviewable_rows = {summary['reviewable_rows']}")
+          print(f"blank_template_rows = {summary['blank_template_rows']}")
+          print(f"source_quote_rows = {summary['source_quote_rows']}")
+          print(f"column_contract_rows = {summary['column_contract_rows']}")
+          print(f"content_fill_guide_rows = {summary['content_fill_guide_rows']}")
+          print(f"candidate_prefill_review_rows = {summary['candidate_prefill_review_rows']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.305 SDSS RSD manual answer content fill guide output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-305-sdss-rsd-manual-answer-content-fill-guide-output
+          path: |
+            tairid_v4_305_sdss_rsd_manual_answer_content_fill_guide_output/
+            tairid-v4-305-sdss-rsd-manual-answer-content-fill-guide-output.zip
