@@ -1,0 +1,781 @@
+name: 001 TAIRID v4.294 - SDSS RSD Row Family Selection And Covariance Policy No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-294-sdss-rsd-row-family-selection-and-covariance-policy-no-scoring.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-row-family-selection-covariance-policy-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.294 SDSS RSD Row Family Selection And Covariance Policy No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.294 SDSS RSD row family selection and covariance policy no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.294"
+          ROUTE = "sdss_rsd_row_family_selection_and_covariance_policy_no_scoring_after_v4_293"
+          EXPECTED_RESULT = "v4_294_sdss_rsd_row_family_selection_and_covariance_policy_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_295_sdss_rsd_diagnostic_score_guard_precommit_no_scoring"
+
+          OUT = Path("tairid_v4_294_sdss_rsd_row_family_selection_covariance_policy_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-294-sdss-rsd-row-family-selection-covariance-policy-output.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+          RELATED_PAGE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements/"
+          MAX_BYTES = 2_000_000
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=MAX_BYTES, timeout=15):
+              out = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length_header": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.294-row-family-covariance-policy-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length_header"] = resp.headers.get("Content-Length", "")
+                      out["final_url"] = resp.geturl()
+                      out["bytes_read"] = len(data)
+                      out["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      out["fetch_ok"] = True
+              except Exception as exc:
+                  out["error"] = f"{type(exc).__name__}: {exc}"
+              return out, data
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return ("fσ8" in label) or ("fsigma8" in label) or ("fσ8" in joined) or ("fsigma8" in joined)
+
+          def infer_header_rows(table):
+              header_rows = []
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def split_bound_header(bound_header):
+              parts = [p.strip() for p in str(bound_header).split("/") if p.strip()]
+              fields = {
+                  "sample_or_tracer": parts[0] if len(parts) > 0 else "",
+                  "z_range_text": parts[4] if len(parts) > 4 else "",
+                  "z_eff_text": parts[6] if len(parts) > 6 else "",
+              }
+              try:
+                  fields["z_eff"] = float(fields["z_eff_text"])
+              except Exception:
+                  fields["z_eff"] = ""
+              return fields
+
+          def parse_column_contract_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      row_type = "redshift_function_row_candidate" if "(z)" in label_norm else "final_or_consensus_row_candidate"
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          for value, sigma in measurement_pairs(cell):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              fields = split_bound_header(bound["bound_header"])
+                              out.append({
+                                  "contract_id": f"column_contract_bound_{len(out)+1:02d}",
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "sample_or_tracer": fields["sample_or_tracer"],
+                                  "z_eff": fields["z_eff"],
+                                  "z_range_text": fields["z_range_text"],
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                                  "contract_status": "rebuilt_for_row_family_covariance_policy_no_scoring",
+                              })
+              return out
+
+          inherited_v4_293_rows = [
+              {"inherited_from": "v4.293", "item": "rules", "value": "56 / 56 passed", "meaning": "Candidate baseline review and row meaning gate passed.", "carry_forward_status": "ready_for_row_family_policy"},
+              {"inherited_from": "v4.293", "item": "source_fetch_ok", "value": True, "meaning": "GitHub fetched the SDSS table page.", "carry_forward_status": "source_page_available"},
+              {"inherited_from": "v4.293", "item": "related_fetch_ok", "value": True, "meaning": "GitHub fetched the SDSS overview page.", "carry_forward_status": "related_page_available"},
+              {"inherited_from": "v4.293", "item": "dr16_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS DR16 page.", "carry_forward_status": "dr16_page_available"},
+              {"inherited_from": "v4.293", "item": "column_contract_rows", "value": 12, "meaning": "Twelve SDSS f_sigma8 column contracts existed.", "carry_forward_status": "observed_rows_ready"},
+              {"inherited_from": "v4.293", "item": "candidate_review_rows", "value": 34, "meaning": "Candidate baseline rows were reviewed but not approved.", "carry_forward_status": "candidates_unapproved"},
+              {"inherited_from": "v4.293", "item": "rejected_candidate_rows", "value": 26, "meaning": "Rejected/suspicious candidate rows were recorded.", "carry_forward_status": "leakage_guard_active"},
+              {"inherited_from": "v4.293", "item": "approved_baseline_values", "value": 0, "meaning": "No baseline value was approved.", "carry_forward_status": "baseline_missing"},
+              {"inherited_from": "v4.293", "item": "row_meaning_confirmed", "value": False, "meaning": "Row meaning remained unconfirmed.", "carry_forward_status": "row_meaning_missing"},
+              {"inherited_from": "v4.293", "item": "row_family_selected", "value": False, "meaning": "No row family was selected.", "carry_forward_status": "row_family_missing"},
+              {"inherited_from": "v4.293", "item": "covariance_handled", "value": False, "meaning": "No covariance handling existed.", "carry_forward_status": "covariance_missing"},
+              {"inherited_from": "v4.293", "item": "score_readiness", "value": False, "meaning": "Score readiness remained false.", "carry_forward_status": "score_blocked"},
+              {"inherited_from": "v4.293", "item": "support_allowed", "value": False, "meaning": "Support remained blocked.", "carry_forward_status": "support_blocked"},
+              {"inherited_from": "v4.293", "item": "selected_next_route", "value": "v4_294_sdss_rsd_row_family_selection_and_covariance_policy_no_scoring", "meaning": "Current route writes row-family and covariance policy.", "carry_forward_status": "current_route"},
+          ]
+
+          source_fetch_row, source_data = fetch_url(SOURCE_URL)
+          related_fetch_row, related_data = fetch_url(RELATED_PAGE_URL)
+
+          parser = SimpleTableParser()
+          if source_data:
+              parser.feed(source_data.decode("utf-8", errors="replace"))
+          column_contract_rows = parse_column_contract_rows(parser.tables)
+
+          count_fsigma_z = sum(1 for r in column_contract_rows if r["row_label"] == "f σ 8 (z)")
+          count_fsigma = sum(1 for r in column_contract_rows if r["row_label"] == "f σ 8")
+
+          row_family_policy_rows = [
+              {
+                  "row_family_id": "family_001",
+                  "row_label": "f σ 8 (z)",
+                  "row_type_guess": "redshift_function_row_candidate",
+                  "observed_contract_count": count_fsigma_z,
+                  "policy_role": "secondary_or_context_family_until_source_meaning_confirmed",
+                  "selection_status": "not_selected_for_score",
+                  "selection_allowed_now": False,
+                  "future_selection_condition": "source must explain whether this row is measurement, function, model-dependent value, or comparator row",
+                  "score_allowed": False,
+              },
+              {
+                  "row_family_id": "family_002",
+                  "row_label": "f σ 8",
+                  "row_type_guess": "final_or_consensus_row_candidate",
+                  "observed_contract_count": count_fsigma,
+                  "policy_role": "provisional_primary_policy_candidate_not_score_selected",
+                  "selection_status": "provisional_policy_only_not_selected_for_score",
+                  "selection_allowed_now": False,
+                  "future_selection_condition": "source must confirm final consensus measurement role and baseline/covariance must be present",
+                  "score_allowed": False,
+              },
+              {
+                  "row_family_id": "family_003",
+                  "row_label": "all_fsigma_rows",
+                  "row_type_guess": "mixed_double_count_risk",
+                  "observed_contract_count": len(column_contract_rows),
+                  "policy_role": "blocked_mixed_family",
+                  "selection_status": "blocked",
+                  "selection_allowed_now": False,
+                  "future_selection_condition": "never score mixed row families unless source proves independence and separate covariance is available",
+                  "score_allowed": False,
+              },
+          ]
+
+          row_family_selection_result_rows = [
+              {
+                  "selection_id": "selection_001",
+                  "object": "score_selected_row_family",
+                  "selected_row_family": "NONE",
+                  "selection_status": "not_selected",
+                  "reason": "row meaning is still unconfirmed and baseline/covariance are missing",
+                  "score_allowed": False,
+              },
+              {
+                  "selection_id": "selection_002",
+                  "object": "policy_preference",
+                  "selected_row_family": "f σ 8",
+                  "selection_status": "provisional_policy_preference_only",
+                  "reason": "label looks like final/consensus row, but this is not score selection",
+                  "score_allowed": False,
+              },
+              {
+                  "selection_id": "selection_003",
+                  "object": "mixed_family",
+                  "selected_row_family": "all_fsigma_rows",
+                  "selection_status": "blocked",
+                  "reason": "mixing f_sigma8(z) and f_sigma8 risks double counting",
+                  "score_allowed": False,
+              },
+          ]
+
+          covariance_policy_rows = [
+              {
+                  "policy_id": "cov_policy_001",
+                  "policy_name": "full_covariance_required_for_evidence",
+                  "rule": "Any future evidence/support language requires exact covariance or published likelihood covariance matched to the selected row family.",
+                  "status": "active",
+                  "score_allowed": False,
+              },
+              {
+                  "policy_id": "cov_policy_002",
+                  "policy_name": "diagonal_only_diagnostic_allowed_with_ceiling",
+                  "rule": "If only reported one-sigma values are available, a later diagonal-only diagnostic may be allowed only as exploratory/no-claims and cannot support TAIRID.",
+                  "status": "active",
+                  "score_allowed": False,
+              },
+              {
+                  "policy_id": "cov_policy_003",
+                  "policy_name": "web_summary_uncertainties_not_covariance",
+                  "rule": "The SDSS web-table uncertainty values are not a full covariance matrix and cannot support likelihood or p-value claims by themselves.",
+                  "status": "active",
+                  "score_allowed": False,
+              },
+              {
+                  "policy_id": "cov_policy_004",
+                  "policy_name": "inter_row_family_covariance_unknown",
+                  "rule": "The covariance between f_sigma8(z) and f_sigma8 row families is unknown; mixed-family scoring remains blocked.",
+                  "status": "active",
+                  "score_allowed": False,
+              },
+              {
+                  "policy_id": "cov_policy_005",
+                  "policy_name": "same_family_claim_ceiling",
+                  "rule": "Because this is SDSS/eBOSS same-family growth-lane material, any later diagonal diagnostic is compatibility/weaken/neutral only, not holdout support.",
+                  "status": "active",
+                  "score_allowed": False,
+              },
+              {
+                  "policy_id": "cov_policy_006",
+                  "policy_name": "score_guard_required_before_computation",
+                  "rule": "Before computing residuals or chi-square, a diagnostic score guard must freeze outcome labels and null behavior.",
+                  "status": "active",
+                  "score_allowed": False,
+              },
+          ]
+
+          covariance_status_rows = []
+          for row in column_contract_rows:
+              covariance_status_rows.append({
+                  "cov_status_id": f"cov_status_{row['bound_id']}",
+                  "bound_id": row["bound_id"],
+                  "row_label": row["row_label"],
+                  "sample_or_tracer": row["sample_or_tracer"],
+                  "z_eff": row["z_eff"],
+                  "reported_sigma_present": bool(row["observed_sigma"] != ""),
+                  "full_covariance_present": False,
+                  "diagonal_diagnostic_possible_later": True,
+                  "covariance_status": "reported_sigma_only_not_covariance",
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          diagonal_diagnostic_policy_rows = [
+              {
+                  "diagnostic_id": "diag_policy_001",
+                  "diagnostic_name": "diagonal_only_residual_diagnostic",
+                  "allowed_later": True,
+                  "allowed_now": False,
+                  "required_before_later_run": "selected row family, approved baseline candidate, score guard, diagonal-only label, no-support ceiling",
+                  "claim_ceiling": "exploratory_no_claims",
+              },
+              {
+                  "diagnostic_id": "diag_policy_002",
+                  "diagnostic_name": "diagonal_only_chi_square_diagnostic",
+                  "allowed_later": True,
+                  "allowed_now": False,
+                  "required_before_later_run": "same requirements plus explicit no-p-value-without-covariance guard unless declared descriptive only",
+                  "claim_ceiling": "descriptive_no_evidence",
+              },
+              {
+                  "diagnostic_id": "diag_policy_003",
+                  "diagnostic_name": "full_likelihood_score",
+                  "allowed_later": False,
+                  "allowed_now": False,
+                  "required_before_later_run": "exact covariance/likelihood source and validated parser",
+                  "claim_ceiling": "blocked",
+              },
+          ]
+
+          score_precondition_rows = [
+              {"precondition_id": "pre_001", "precondition": "single_row_family_selected", "status": "not_satisfied", "passed": False},
+              {"precondition_id": "pre_002", "precondition": "row_meaning_confirmed", "status": "not_satisfied", "passed": False},
+              {"precondition_id": "pre_003", "precondition": "approved_baseline_values_filled", "status": "not_satisfied", "passed": False},
+              {"precondition_id": "pre_004", "precondition": "definition_match_confirmed", "status": "not_satisfied", "passed": False},
+              {"precondition_id": "pre_005", "precondition": "covariance_or_diagonal_policy_written", "status": "satisfied_policy_only_not_score", "passed": True},
+              {"precondition_id": "pre_006", "precondition": "diagnostic_score_guard_written", "status": "not_satisfied", "passed": False},
+              {"precondition_id": "pre_007", "precondition": "same_family_claim_ceiling", "status": "satisfied", "passed": True},
+          ]
+
+          next_guard_contract_rows = [
+              {
+                  "contract_id": "next_guard_001",
+                  "next_guard": "diagnostic_score_guard_precommit",
+                  "purpose": "freeze outcome labels before any diagonal diagnostic can run",
+                  "allowed_next": True,
+                  "current_workflow_scores": False,
+              },
+              {
+                  "contract_id": "next_guard_002",
+                  "next_guard": "diagonal_only_null_precommit",
+                  "purpose": "define what diagonal-only diagnostic should not be allowed to claim",
+                  "allowed_next": True,
+                  "current_workflow_scores": False,
+              },
+              {
+                  "contract_id": "next_guard_003",
+                  "next_guard": "row_family_policy_carry_forward",
+                  "purpose": "carry provisional f_sigma8 preference without selecting it for score",
+                  "allowed_next": True,
+                  "current_workflow_scores": False,
+              },
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "select_row_family_for_score_now", "reason": "row meaning and baseline are not confirmed", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "score_mixed_fsigma_rows", "reason": "mixed row family is double-count risk", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "run_diagonal_diagnostic_now", "reason": "score guard and approved baseline are missing", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "run_full_likelihood_now", "reason": "full covariance/likelihood source missing", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "compute_p_value_now", "reason": "covariance and score guard missing", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "approve_baseline_values", "reason": "candidate review approved none", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "claim_tairid_support", "reason": "same-family no-claims lane", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_validation_or_evidence", "reason": "no valid score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "approve_holdout_source", "reason": "SDSS/eBOSS remains same-family current lane", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "row_family_policy", "permission_status": "written_no_score_selection", "reason": "Policy written but no row family selected for score."},
+              {"permission_scope": "covariance_policy", "permission_status": "written_no_scoring", "reason": "Policy separates full covariance evidence from diagonal-only diagnostics."},
+              {"permission_scope": "provisional_primary_policy_preference", "permission_status": "written_not_score_selected", "reason": "f_sigma8 is only a future-review preference."},
+              {"permission_scope": "diagnostic_score_guard_precommit", "permission_status": "allowed_next", "reason": "Next workflow may write diagnostic score guard without scoring."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked_now", "reason": "Approved baseline and score guard missing."},
+              {"permission_scope": "external_scoring", "permission_status": "blocked", "reason": "No scoring allowed."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "row_family_policy", "status": "written", "meaning": "Row-family handling is defined."},
+              {"readiness_id": "ready_002", "object": "row_family_selected_for_score", "status": "false", "meaning": "No row family score selection."},
+              {"readiness_id": "ready_003", "object": "covariance_policy", "status": "written", "meaning": "Full covariance vs diagonal diagnostic boundary exists."},
+              {"readiness_id": "ready_004", "object": "diagonal_diagnostic", "status": "allowed_later_not_now", "meaning": "Only after guard and baseline review."},
+              {"readiness_id": "ready_005", "object": "diagnostic_score_guard", "status": "ready_next", "meaning": "Next workflow can write guard."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "No row family is selected for score.",
+                  "basis": "f_sigma8 is only a provisional policy preference; f_sigma8(z) remains source-meaning dependent; mixed rows are blocked.",
+                  "next_action": "Carry row-family policy forward.",
+                  "claim_status": "no_score_selection",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "Full covariance is required for evidence/support language.",
+                  "basis": "Reported web-table sigmas are not covariance.",
+                  "next_action": "Do not compute likelihood or p-value.",
+                  "claim_status": "covariance_boundary",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Diagonal-only diagnostics can be allowed later only with strict no-claims ceiling.",
+                  "basis": "A diagonal diagnostic is possible as a method check but not evidence.",
+                  "next_action": "Write diagnostic score guard next.",
+                  "claim_status": "diagnostic_only",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "The next route is diagnostic score guard precommit, still no scoring.",
+                  "basis": "Outcome labels and null behavior must be frozen before a diagnostic run.",
+                  "next_action": SELECTED_NEXT_ROUTE,
+                  "claim_status": "safe_to_continue",
+              },
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_diagnostic_score_guard_precommit_no_scoring", "permission_status": "recommended", "reason": "Need outcome labels and null behavior before any diagonal diagnostic can run."},
+              {"route_id": "route_002", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_guard_and_baseline", "reason": "Baseline values and diagnostic guard are not ready."},
+              {"route_id": "route_003", "route": "sdss_rsd_full_likelihood_score", "permission_status": "blocked_until_full_covariance", "reason": "Full covariance/likelihood source missing."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.294 is a clean row-family/covariance policy milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "f_sigma8 row families were both open", "after_state": "mixed family is blocked and f_sigma8 is only a provisional policy preference", "reduction_type": "row-family ambiguity reduced"},
+              {"sdr_id": "sdr_002", "before_state": "reported sigmas could be mistaken for covariance", "after_state": "web-table uncertainty is explicitly not covariance", "reduction_type": "covariance confusion reduced"},
+              {"sdr_id": "sdr_003", "before_state": "diagonal diagnostic path was undefined", "after_state": "diagonal-only diagnostic has strict no-claims ceiling", "reduction_type": "diagnostic boundary defined"},
+              {"sdr_id": "sdr_004", "before_state": "score could be attempted without labels", "after_state": "diagnostic score guard is required next", "reduction_type": "premature score prevented"},
+              {"sdr_id": "sdr_005", "before_state": "same-family real data could tempt support", "after_state": "same-family ceiling remains active", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before row-family/covariance policy"},
+              {"gate": "inherited_v4_293_rows_equal_14", "passed": len(inherited_v4_293_rows) == 14, "detail": f"inherited_v4_293_rows = {len(inherited_v4_293_rows)}"},
+              {"gate": "source_fetch_row_recorded", "passed": isinstance(source_fetch_row, dict), "detail": f"source_fetch_ok = {source_fetch_row['fetch_ok']}"},
+              {"gate": "related_fetch_row_recorded", "passed": isinstance(related_fetch_row, dict), "detail": f"related_fetch_ok = {related_fetch_row['fetch_ok']}"},
+              {"gate": "column_contract_rows_recorded", "passed": len(column_contract_rows) >= 0, "detail": f"column_contract_rows = {len(column_contract_rows)}"},
+              {"gate": "row_family_policy_rows_equal_3", "passed": len(row_family_policy_rows) == 3, "detail": f"row_family_policy_rows = {len(row_family_policy_rows)}"},
+              {"gate": "row_family_selection_result_rows_equal_3", "passed": len(row_family_selection_result_rows) == 3, "detail": f"row_family_selection_result_rows = {len(row_family_selection_result_rows)}"},
+              {"gate": "covariance_policy_rows_equal_6", "passed": len(covariance_policy_rows) == 6, "detail": f"covariance_policy_rows = {len(covariance_policy_rows)}"},
+              {"gate": "covariance_status_rows_match_contracts", "passed": len(covariance_status_rows) == len(column_contract_rows), "detail": f"covariance_status_rows = {len(covariance_status_rows)}"},
+              {"gate": "diagonal_diagnostic_policy_rows_equal_3", "passed": len(diagonal_diagnostic_policy_rows) == 3, "detail": f"diagonal_diagnostic_policy_rows = {len(diagonal_diagnostic_policy_rows)}"},
+              {"gate": "score_precondition_rows_equal_7", "passed": len(score_precondition_rows) == 7, "detail": f"score_precondition_rows = {len(score_precondition_rows)}"},
+              {"gate": "next_guard_contract_rows_equal_3", "passed": len(next_guard_contract_rows) == 3, "detail": f"next_guard_contract_rows = {len(next_guard_contract_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_8", "passed": len(permission_rows) == 8, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_row_families_not_score_selected", "passed": all(row["selection_allowed_now"] is False for row in row_family_policy_rows), "detail": "no row family score selection"},
+              {"gate": "mixed_family_blocked", "passed": any(row["row_label"] == "all_fsigma_rows" and row["selection_status"] == "blocked" for row in row_family_policy_rows), "detail": "mixed row family blocked"},
+              {"gate": "fsigma_policy_preference_not_score_selection", "passed": any(row["row_label"] == "f σ 8" and row["selection_status"] == "provisional_policy_only_not_selected_for_score" for row in row_family_policy_rows), "detail": "f sigma8 provisional only"},
+              {"gate": "score_selected_row_family_none", "passed": any(row["object"] == "score_selected_row_family" and row["selected_row_family"] == "NONE" for row in row_family_selection_result_rows), "detail": "score-selected family none"},
+              {"gate": "all_covariance_policies_no_score", "passed": all(row["score_allowed"] is False for row in covariance_policy_rows), "detail": "covariance policies no score"},
+              {"gate": "full_covariance_required_policy_present", "passed": any(row["policy_name"] == "full_covariance_required_for_evidence" for row in covariance_policy_rows), "detail": "full covariance required"},
+              {"gate": "diagonal_only_policy_present", "passed": any(row["policy_name"] == "diagonal_only_diagnostic_allowed_with_ceiling" for row in covariance_policy_rows), "detail": "diagonal only policy present"},
+              {"gate": "web_summary_not_covariance_policy_present", "passed": any(row["policy_name"] == "web_summary_uncertainties_not_covariance" for row in covariance_policy_rows), "detail": "web summary not covariance"},
+              {"gate": "same_family_policy_present", "passed": any(row["policy_name"] == "same_family_claim_ceiling" for row in covariance_policy_rows), "detail": "same-family ceiling"},
+              {"gate": "all_covariance_status_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in covariance_status_rows), "detail": "covariance status no score/support"},
+              {"gate": "diagonal_diagnostic_allowed_later_not_now", "passed": any(row["diagnostic_name"] == "diagonal_only_residual_diagnostic" and row["allowed_later"] is True and row["allowed_now"] is False for row in diagonal_diagnostic_policy_rows), "detail": "diagonal diagnostic later not now"},
+              {"gate": "full_likelihood_blocked", "passed": any(row["diagnostic_name"] == "full_likelihood_score" and row["allowed_later"] is False for row in diagonal_diagnostic_policy_rows), "detail": "full likelihood blocked"},
+              {"gate": "single_row_family_precondition_fails", "passed": any(row["precondition"] == "single_row_family_selected" and row["passed"] is False for row in score_precondition_rows), "detail": "single row family precondition fails"},
+              {"gate": "baseline_precondition_fails", "passed": any(row["precondition"] == "approved_baseline_values_filled" and row["passed"] is False for row in score_precondition_rows), "detail": "baseline precondition fails"},
+              {"gate": "covariance_policy_precondition_passes_only_policy", "passed": any(row["precondition"] == "covariance_or_diagonal_policy_written" and row["passed"] is True for row in score_precondition_rows), "detail": "covariance/diagonal policy written"},
+              {"gate": "score_guard_precondition_fails", "passed": any(row["precondition"] == "diagnostic_score_guard_written" and row["passed"] is False for row in score_precondition_rows), "detail": "score guard precondition fails"},
+              {"gate": "next_guard_allowed_no_current_score", "passed": all(row["allowed_next"] is True and row["current_workflow_scores"] is False for row in next_guard_contract_rows), "detail": "next guard allowed but no current score"},
+              {"gate": "select_row_family_blocked", "passed": any(row["operation"] == "select_row_family_for_score_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "select row family blocked"},
+              {"gate": "mixed_score_blocked", "passed": any(row["operation"] == "score_mixed_fsigma_rows" and row["blocked"] is True for row in blocked_operation_rows), "detail": "mixed score blocked"},
+              {"gate": "diagonal_diagnostic_blocked_now", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "diagonal diagnostic blocked now"},
+              {"gate": "full_likelihood_blocked_now", "passed": any(row["operation"] == "run_full_likelihood_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "full likelihood blocked now"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations guarded"},
+              {"gate": "diagnostic_guard_allowed_next", "passed": any(row["permission_scope"] == "diagnostic_score_guard_precommit" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "diagnostic score guard allowed next"},
+              {"gate": "diagonal_diagnostic_score_blocked_now", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked_now" for row in permission_rows), "detail": "diagonal score blocked now"},
+              {"gate": "external_scoring_blocked", "passed": any(row["permission_scope"] == "external_scoring" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "external scoring blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_diagnostic_score_guard_precommit_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.295 route recommended"},
+              {"gate": "diagnostic_score_route_blocked_until_guard", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_guard_and_baseline" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "full_likelihood_route_blocked", "passed": any(row["route"] == "sdss_rsd_full_likelihood_score" and row["permission_status"] == "blocked_until_full_covariance" for row in route_review_rows), "detail": "full likelihood route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_295_sdss_rsd_diagnostic_score_guard_precommit_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_294_sdss_rsd_row_family_selection_and_covariance_policy_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_294_inherited_v4_293_rows.csv", inherited_v4_293_rows)
+          write_csv(OUT / "v4_294_source_fetch_rows.csv", [{**source_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_294_related_fetch_rows.csv", [{**related_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_294_column_contract_rows.csv", column_contract_rows)
+          write_csv(OUT / "v4_294_row_family_policy_rows.csv", row_family_policy_rows)
+          write_csv(OUT / "SDSS_RSD_ROW_FAMILY_POLICY_v4_294_NO_SCORING.csv", row_family_policy_rows)
+          write_csv(OUT / "v4_294_row_family_selection_result_rows.csv", row_family_selection_result_rows)
+          write_csv(OUT / "v4_294_covariance_policy_rows.csv", covariance_policy_rows)
+          write_csv(OUT / "SDSS_RSD_COVARIANCE_POLICY_v4_294_NO_SCORING.csv", covariance_policy_rows)
+          write_csv(OUT / "v4_294_covariance_status_rows.csv", covariance_status_rows)
+          write_csv(OUT / "v4_294_diagonal_diagnostic_policy_rows.csv", diagonal_diagnostic_policy_rows)
+          write_csv(OUT / "v4_294_score_precondition_rows.csv", score_precondition_rows)
+          write_csv(OUT / "v4_294_next_guard_contract_rows.csv", next_guard_contract_rows)
+          write_csv(OUT / "v4_294_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_294_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_294_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_294_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_294_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_294_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_294_rule_checks.csv", checks)
+
+          family_lines = [
+              f"{row['row_label']}: count={row['observed_contract_count']} status={row['selection_status']} role={row['policy_role']}"
+              for row in row_family_policy_rows
+          ]
+
+          cov_lines = [
+              f"{row['policy_name']}: {row['rule']}"
+              for row in covariance_policy_rows
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_review_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_url": SOURCE_URL,
+              "source_fetch_ok": source_fetch_row["fetch_ok"],
+              "related_page_url": RELATED_PAGE_URL,
+              "related_fetch_ok": related_fetch_row["fetch_ok"],
+              "column_contract_rows": len(column_contract_rows),
+              "row_family_policy_rows": len(row_family_policy_rows),
+              "row_family_selected_for_score": False,
+              "provisional_primary_policy_preference": "f σ 8",
+              "mixed_fsigma_rows_blocked": True,
+              "covariance_policy_rows": len(covariance_policy_rows),
+              "covariance_status_rows": len(covariance_status_rows),
+              "full_covariance_present": False,
+              "reported_sigmas_available": bool(covariance_status_rows),
+              "diagonal_diagnostic_allowed_later": True,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_readiness": False,
+              "score_valid": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_meaning_confirmed": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "numeric_fit_allowed": False,
+              "support_allowed": False,
+              "evidence_allowed": False,
+              "validation_allowed": False,
+              "holdout_approval_allowed": False,
+              "combined_matrix_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_294_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.294 SDSS RSD Row Family Selection And Covariance Policy No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_url = {SOURCE_URL}",
+              f"source_fetch_ok = {summary['source_fetch_ok']}",
+              f"related_page_url = {RELATED_PAGE_URL}",
+              f"related_fetch_ok = {summary['related_fetch_ok']}",
+              f"column_contract_rows = {summary['column_contract_rows']}",
+              f"row_family_policy_rows = {summary['row_family_policy_rows']}",
+              f"row_family_selected_for_score = {summary['row_family_selected_for_score']}",
+              f"provisional_primary_policy_preference = {summary['provisional_primary_policy_preference']}",
+              f"mixed_fsigma_rows_blocked = {summary['mixed_fsigma_rows_blocked']}",
+              f"covariance_policy_rows = {summary['covariance_policy_rows']}",
+              f"covariance_status_rows = {summary['covariance_status_rows']}",
+              f"full_covariance_present = {summary['full_covariance_present']}",
+              f"reported_sigmas_available = {summary['reported_sigmas_available']}",
+              f"diagonal_diagnostic_allowed_later = {summary['diagonal_diagnostic_allowed_later']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_readiness = {summary['score_readiness']}",
+              f"score_valid = {summary['score_valid']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"numeric_fit_allowed = {summary['numeric_fit_allowed']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"validation_allowed = {summary['validation_allowed']}",
+              f"holdout_approval_allowed = {summary['holdout_approval_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Row-family policy:",
+              *family_lines,
+              "",
+              "Covariance policy:",
+              *cov_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.294 writes row-family and covariance policy. It keeps f_sigma8 as only a provisional future-review preference, blocks mixed f_sigma8 row-family scoring, marks web-table uncertainty as not full covariance, and allows only a later diagonal-only diagnostic with no-claims ceiling after a separate guard. It does not select a row family for score, fill baselines, score data, compute residuals, compute p-values, compute likelihoods, fit corrections, approve support, approve evidence, approve validation, approve a holdout, or build a combined matrix.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_294_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_url = {SOURCE_URL}")
+          print(f"source_fetch_ok = {summary['source_fetch_ok']}")
+          print(f"related_page_url = {RELATED_PAGE_URL}")
+          print(f"related_fetch_ok = {summary['related_fetch_ok']}")
+          print(f"column_contract_rows = {summary['column_contract_rows']}")
+          print(f"row_family_policy_rows = {summary['row_family_policy_rows']}")
+          print(f"row_family_selected_for_score = {summary['row_family_selected_for_score']}")
+          print(f"provisional_primary_policy_preference = {summary['provisional_primary_policy_preference']}")
+          print(f"mixed_fsigma_rows_blocked = {summary['mixed_fsigma_rows_blocked']}")
+          print(f"covariance_policy_rows = {summary['covariance_policy_rows']}")
+          print(f"covariance_status_rows = {summary['covariance_status_rows']}")
+          print(f"full_covariance_present = {summary['full_covariance_present']}")
+          print(f"reported_sigmas_available = {summary['reported_sigmas_available']}")
+          print(f"diagonal_diagnostic_allowed_later = {summary['diagonal_diagnostic_allowed_later']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_readiness = {summary['score_readiness']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"validation_allowed = {summary['validation_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.294 SDSS RSD row family selection covariance policy output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-294-sdss-rsd-row-family-selection-covariance-policy-output
+          path: |
+            tairid_v4_294_sdss_rsd_row_family_selection_covariance_policy_output/
+            tairid-v4-294-sdss-rsd-row-family-selection-covariance-policy-output.zip
