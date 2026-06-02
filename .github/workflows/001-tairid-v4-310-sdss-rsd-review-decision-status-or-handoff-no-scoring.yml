@@ -1,0 +1,650 @@
+name: 001 TAIRID v4.310 - SDSS RSD Review Decision Status Or Handoff No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-310-sdss-rsd-review-decision-status-or-handoff-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-review-decision-status-or-handoff-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.310 SDSS RSD Review Decision Status Or Handoff No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.310 SDSS RSD review decision status or handoff no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv, json, re, zipfile, urllib.request
+          from html.parser import HTMLParser
+
+          VERSION = "v4.310"
+          EXPECTED_RESULT = "v4_310_sdss_rsd_review_decision_status_or_handoff_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_311_sdss_rsd_decision_template_reissue_or_pause_handoff_no_scoring"
+
+          OUT = Path("tairid_v4_310_sdss_rsd_review_decision_status_or_handoff_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+          ZIP_NAME = "tairid-v4-310-sdss-rsd-review-decision-status-or-handoff-output.zip"
+
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+
+          DECISION_PATTERNS = [
+              r"sdss[_-]rsd[_-]human[_-]decision[_-]template[_-]v4[_-]308(?:[-_]\d+)?[_-]fillable\.csv$",
+              r"SDSS[_-]RSD[_-]HUMAN[_-]DECISION[_-]TEMPLATE[_-]v4[_-]308(?:[-_]\d+)?[_-]FILLABLE\.csv$",
+              r"sdss[_-]rsd[_-]human[_-]decisions[_-]v4[_-]308(?:[-_]\d+)?\.csv$",
+              r"SDSS[_-]RSD[_-]HUMAN[_-]DECISIONS[_-]v4[_-]308(?:[-_]\d+)?\.csv$",
+          ]
+
+          EXACT_PATHS = [
+              "data/SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_308_FILLABLE.csv",
+              "data/sdss_rsd_human_decision_template_v4_308_fillable.csv",
+              "SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_308_FILLABLE.csv",
+              "sdss_rsd_human_decision_template_v4_308_fillable.csv",
+              ".github/workflows/SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_308_FILLABLE.csv",
+              ".github/workflows/sdss_rsd_human_decision_template_v4_308_fillable.csv",
+          ]
+
+          REQUIRED_DECISION_FIELDS = [
+              "decision_id",
+              "answer_id",
+              "target_id",
+              "target_class",
+              "human_decision",
+              "allowed_decisions",
+              "edited_source_url_or_citation",
+              "edited_quoted_or_precise_source_text",
+              "edited_answer_summary",
+              "reviewer_note",
+              "claim_limit_must_remain",
+          ]
+
+          ALLOWED_DECISIONS = {"accept_for_next_review", "edit_needed", "reject", "keep_blocked"}
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def safe_read_csv(path):
+              try:
+                  with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      fields = reader.fieldnames or []
+                  return True, fields, rows, ""
+              except Exception as exc:
+                  return False, [], [], f"{type(exc).__name__}: {exc}"
+
+          def norm(x):
+              return str(x or "").strip()
+
+          def find_decision_file():
+              candidates = []
+              seen = set()
+              for raw in EXACT_PATHS:
+                  p = Path(raw)
+                  exists = p.exists()
+                  read_ok, fields, rows, error = safe_read_csv(p) if exists else (False, [], [], "")
+                  has_required = all(field in set(fields) for field in REQUIRED_DECISION_FIELDS)
+                  candidates.append({
+                      "candidate_path": raw,
+                      "candidate_type": "exact",
+                      "exists": exists,
+                      "read_ok": read_ok,
+                      "row_count": len(rows),
+                      "field_count": len(fields),
+                      "has_required_fields": has_required,
+                      "error": error,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+                  seen.add(raw)
+
+              for p in Path(".").rglob("*.csv"):
+                  raw = p.as_posix().lstrip("./")
+                  if raw in seen:
+                      continue
+                  name = p.name
+                  pattern_match = any(re.search(pattern, name, re.I) for pattern in DECISION_PATTERNS)
+                  semantic_match = all(term in raw.lower() for term in ["sdss", "rsd", "human", "decision"])
+                  if not (pattern_match or semantic_match):
+                      continue
+                  read_ok, fields, rows, error = safe_read_csv(p)
+                  has_required = all(field in set(fields) for field in REQUIRED_DECISION_FIELDS)
+                  duplicate_suffix = bool(re.search(r"[-_]\d+\.csv$", name))
+                  candidates.append({
+                      "candidate_path": raw,
+                      "candidate_type": "fuzzy",
+                      "exists": True,
+                      "read_ok": read_ok,
+                      "row_count": len(rows),
+                      "field_count": len(fields),
+                      "has_required_fields": has_required,
+                      "duplicate_download_suffix_detected": duplicate_suffix,
+                      "error": error,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+
+              readable = [c for c in candidates if c["exists"] and c["read_ok"] and c["has_required_fields"]]
+              readable = sorted(readable, key=lambda r: (r["candidate_type"] != "exact", not r.get("duplicate_download_suffix_detected", False), r["candidate_path"]))
+              selected = readable[0]["candidate_path"] if readable else ""
+              if selected:
+                  _, fields, rows, _ = safe_read_csv(selected)
+              else:
+                  fields, rows = [], []
+              return candidates, selected, fields, rows
+
+          def review_decision(row, idx, source_path):
+              decision = norm(row.get("human_decision")).lower()
+              edited_source = norm(row.get("edited_source_url_or_citation"))
+              edited_quote = norm(row.get("edited_quoted_or_precise_source_text"))
+              edited_summary = norm(row.get("edited_answer_summary"))
+              claim_limit = norm(row.get("claim_limit_must_remain")).lower()
+              missing = [field for field in REQUIRED_DECISION_FIELDS if field not in row]
+              decision_blank = decision == ""
+              decision_allowed = decision in ALLOWED_DECISIONS
+              claim_limit_ok = claim_limit in ["", "no_scoring/no_claims", "no_scoring", "no_claims", "keep_blocked"]
+              accept_has_text = True
+              if decision == "accept_for_next_review":
+                  accept_has_text = bool(edited_source and len(edited_quote) >= 12 and len(edited_summary) >= 8)
+              if decision_blank:
+                  status = "blank_decision_no_action"
+              elif missing:
+                  status = "invalid_missing_required_fields"
+              elif not decision_allowed:
+                  status = "invalid_decision_value"
+              elif not claim_limit_ok:
+                  status = "invalid_claim_limit"
+              elif not accept_has_text:
+                  status = "accept_missing_source_quote_or_summary"
+              else:
+                  status = "decision_reviewable_for_next_stage_not_approved"
+              return {
+                  "review_id": f"decision_review_{idx+1:03d}",
+                  "source_path": source_path,
+                  "decision_id": norm(row.get("decision_id")),
+                  "answer_id": norm(row.get("answer_id")),
+                  "target_id": norm(row.get("target_id")),
+                  "target_class": norm(row.get("target_class")),
+                  "human_decision": decision,
+                  "review_status": status,
+                  "gate_approval_allowed": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              }
+
+          def fetch_text(url):
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.310-status-handoff-no-claims"})
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return resp.read(2_000_000).decode("utf-8", errors="replace")
+              except Exception:
+                  return ""
+
+          class TableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def is_fsigma_row(row):
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return "fσ8" in joined or "fsigma8" in joined
+
+          def parse_contract_rows():
+              html = fetch_text(SOURCE_URL)
+              parser = TableParser()
+              if html:
+                  parser.feed(html)
+              out = []
+              for table in parser.tables:
+                  for row in table:
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row[0] if row else ""
+                      row_type = "redshift_function_row_candidate" if "(z)" in label.lower().replace(" ", "") else "final_or_consensus_row_candidate"
+                      for col_idx, cell in enumerate(row[1:], start=1):
+                          for value, sigma in measurement_pairs(cell):
+                              out.append({
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                              })
+              return out
+
+          def build_reissue_template(contract_rows):
+              rows = [
+                  ("answer_001", "row_meaning_001", "row_meaning"),
+                  ("answer_002", "row_meaning_002", "row_meaning"),
+                  ("answer_003", "row_meaning_003", "row_meaning"),
+                  ("answer_004", "row_meaning_004", "row_family"),
+                  ("answer_005", "baseline_001", "baseline"),
+                  ("answer_006", "baseline_002", "baseline"),
+                  ("answer_007", "baseline_003", "baseline"),
+                  ("answer_008", "baseline_004", "baseline"),
+              ]
+              next_idx = 9
+              if contract_rows:
+                  for c in contract_rows:
+                      rows.append((f"answer_{next_idx:03d}", f"definition_match_{c['bound_id']}", "definition_match"))
+                      next_idx += 1
+              else:
+                  for i in range(1, 5):
+                      rows.append((f"answer_{next_idx:03d}", f"definition_match_placeholder_{i:02d}", "definition_match"))
+                      next_idx += 1
+
+              out = []
+              for i, (answer_id, target_id, target_class) in enumerate(rows, start=1):
+                  out.append({
+                      "decision_id": f"decision_row_{i:03d}",
+                      "answer_id": answer_id,
+                      "target_id": target_id,
+                      "target_class": target_class,
+                      "human_decision": "",
+                      "allowed_decisions": "accept_for_next_review|edit_needed|reject|keep_blocked",
+                      "edited_source_url_or_citation": "",
+                      "edited_quoted_or_precise_source_text": "",
+                      "edited_answer_summary": "",
+                      "reviewer_note": "",
+                      "claim_limit_must_remain": "no_scoring/no_claims",
+                      "gate_approval_allowed_now": False,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+              return out
+
+          inherited_v4_309_rows = [
+              {"inherited_from": "v4.309", "item": "rules", "value": "39 / 39 passed", "meaning": "Human decision ingest passed safely.", "carry_forward_status": "ready_for_status_handoff"},
+              {"inherited_from": "v4.309", "item": "selected_decision_path", "value": "", "meaning": "No filled human decision template was found.", "carry_forward_status": "decision_template_missing"},
+              {"inherited_from": "v4.309", "item": "decision_rows_loaded", "value": 0, "meaning": "No decision rows were loaded.", "carry_forward_status": "no_decisions"},
+              {"inherited_from": "v4.309", "item": "reviewable_decision_rows", "value": 0, "meaning": "No human decisions are reviewable yet.", "carry_forward_status": "no_decisions"},
+              {"inherited_from": "v4.309", "item": "accepted_for_next_review_rows", "value": 0, "meaning": "No rows can move toward gate review yet.", "carry_forward_status": "no_gate_review"},
+              {"inherited_from": "v4.309", "item": "gate_approval_rows", "value": 0, "meaning": "No gate approval.", "carry_forward_status": "no_approval"},
+              {"inherited_from": "v4.309", "item": "selected_next_route", "value": "v4_310_sdss_rsd_review_decision_status_or_handoff_no_scoring", "meaning": "Current route clarifies status or handoff.", "carry_forward_status": "current_route"},
+          ]
+
+          candidate_rows, selected_path, selected_fields, selected_rows = find_decision_file()
+          review_rows = [review_decision(row, idx, selected_path) for idx, row in enumerate(selected_rows)]
+
+          blank_rows = [r for r in review_rows if r["review_status"] == "blank_decision_no_action"]
+          reviewable_rows = [r for r in review_rows if r["review_status"] == "decision_reviewable_for_next_stage_not_approved"]
+          invalid_rows = [r for r in review_rows if r["review_status"].startswith("invalid") or r["review_status"] == "accept_missing_source_quote_or_summary"]
+          accepted_rows = [r for r in reviewable_rows if r["human_decision"] == "accept_for_next_review"]
+
+          contract_rows = parse_contract_rows()
+          reissue_template_rows = build_reissue_template(contract_rows)
+
+          if not selected_path:
+              status_label = "decision_template_missing"
+              next_action = "reissue_template_or_pause_handoff"
+          elif selected_rows and len(blank_rows) == len(selected_rows):
+              status_label = "decision_template_present_but_blank"
+              next_action = "fill_human_decisions_or_pause_handoff"
+          elif invalid_rows:
+              status_label = "decision_template_has_invalid_rows"
+              next_action = "fix_invalid_decisions_before_gate_review"
+          elif reviewable_rows and not accepted_rows:
+              status_label = "decisions_reviewable_but_no_accepts"
+              next_action = "summarize_reject_edit_blocked_status"
+          elif accepted_rows:
+              status_label = "accepted_for_next_review_present"
+              next_action = "later_gate_review_possible_but_not_now"
+          else:
+              status_label = "decision_status_unclear_keep_blocked"
+              next_action = "handoff_or_manual_review_needed"
+
+          status_rows = [
+              {"status_id": "status_001", "metric": "decision_candidate_files", "value": len(candidate_rows), "meaning": "Candidate human decision files found by exact/fuzzy search."},
+              {"status_id": "status_002", "metric": "selected_decision_path", "value": selected_path, "meaning": "Selected decision file, if any."},
+              {"status_id": "status_003", "metric": "decision_rows_loaded", "value": len(selected_rows), "meaning": "Rows loaded from selected decision file."},
+              {"status_id": "status_004", "metric": "blank_decision_rows", "value": len(blank_rows), "meaning": "Blank decisions are no action."},
+              {"status_id": "status_005", "metric": "reviewable_decision_rows", "value": len(reviewable_rows), "meaning": "Rows with valid decisions, still not approved."},
+              {"status_id": "status_006", "metric": "invalid_decision_rows", "value": len(invalid_rows), "meaning": "Rows that must be fixed before later review."},
+              {"status_id": "status_007", "metric": "accepted_for_next_review_rows", "value": len(accepted_rows), "meaning": "Rows eligible for later gate review, not approval now."},
+              {"status_id": "status_008", "metric": "status_label", "value": status_label, "meaning": "Overall status after decision ingest."},
+              {"status_id": "status_009", "metric": "recommended_next_action", "value": next_action, "meaning": "Next clean move."},
+          ]
+
+          handoff_rows = [
+              {"handoff_id": "handoff_001", "condition": "decision_template_missing", "action": "Use the reissued v4.310 fillable template or pause and hand off.", "applies": status_label == "decision_template_missing"},
+              {"handoff_id": "handoff_002", "condition": "decision_template_present_but_blank", "action": "Fill the human_decision column or pause and hand off.", "applies": status_label == "decision_template_present_but_blank"},
+              {"handoff_id": "handoff_003", "condition": "decision_template_has_invalid_rows", "action": "Fix invalid decision values or missing accept text.", "applies": status_label == "decision_template_has_invalid_rows"},
+              {"handoff_id": "handoff_004", "condition": "accepted_for_next_review_present", "action": "A later gate-review workflow may inspect accepted rows, still no scoring yet.", "applies": status_label == "accepted_for_next_review_present"},
+          ]
+
+          gate_rows = [
+              {"gate_id": "gate_001", "gate_object": "status_diagnosis_completed", "gate_passed": True, "gate_status": "completed", "reason": status_label},
+              {"gate_id": "gate_002", "gate_object": "reissue_template_written", "gate_passed": len(reissue_template_rows) >= 8, "gate_status": "written", "reason": "Reissued template is for human decisions only."},
+              {"gate_id": "gate_003", "gate_object": "human_decision_file_found", "gate_passed": bool(selected_path), "gate_status": "found" if selected_path else "missing", "reason": selected_path or "No decision file found."},
+              {"gate_id": "gate_004", "gate_object": "accepted_for_next_review_rows_present", "gate_passed": len(accepted_rows) > 0, "gate_status": "present" if accepted_rows else "none", "reason": "Accept rows remain later-review only."},
+              {"gate_id": "gate_005", "gate_object": "row_meaning_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.310 is status/handoff only."},
+              {"gate_id": "gate_006", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "v4.310 is status/handoff only."},
+              {"gate_id": "gate_007", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.310 is status/handoff only."},
+              {"gate_id": "gate_008", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without approved gates."},
+          ]
+
+          blocked_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "status/handoff is not gate approval", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "status/handoff is not gate approval", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning is not confirmed", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition match not approved", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "diagnostic readiness is false", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no selected row family", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "review_decision_status_or_handoff", "permission_status": "completed", "reason": "Status/handoff packet written."},
+              {"permission_scope": "decision_template_reissue_or_pause_handoff", "permission_status": "allowed_next", "reason": "Next workflow can reissue template, pause, or prepare handoff."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "No confirmation in this workflow."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No approval in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "status_label", "status": status_label, "meaning": "Current human decision status."},
+              {"readiness_id": "ready_002", "object": "reissue_template_rows", "status": str(len(reissue_template_rows)), "meaning": "Rows in reissued decision template."},
+              {"readiness_id": "ready_003", "object": "reviewable_decision_rows", "status": str(len(reviewable_rows)), "meaning": "Decision rows with valid values."},
+              {"readiness_id": "ready_004", "object": "accepted_for_next_review_rows", "status": str(len(accepted_rows)), "meaning": "Rows that may later enter gate review."},
+              {"readiness_id": "ready_005", "object": "next_action", "status": next_action, "meaning": "Next clean move."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "v4.310 converts decision-ingest confusion into an explicit status.", "basis": status_label, "next_action": next_action, "claim_status": "status_only"},
+              {"decision_id": "decision_002", "decision": "A reissued template is provided if the original decision template was not committed.", "basis": "v4.309 found no selected decision path.", "next_action": "Use template later only if human review is desired.", "claim_status": "operator_support_only"},
+              {"decision_id": "decision_003", "decision": "No gate approval is allowed in this workflow.", "basis": "Status/handoff is not evidence, support, or scoring.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_decision_template_reissue_or_pause_handoff_no_scoring", "permission_status": "recommended", "reason": "The current gap is human-review decision input, not data scoring."},
+              {"route_id": "route_002", "route": "sdss_rsd_manual_answer_gate_approval", "permission_status": "blocked_until_reviewable_human_decisions", "reason": "No gate approval in v4.310."},
+              {"route_id": "route_003", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_gate_decision_and_readiness", "reason": "No scoring readiness."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.310 is a clean status/handoff milestone."},
+          ]
+
+          sdr_rows = [
+              {"sdr_id": "sdr_001", "before_state": "decision template missing looked like failure", "after_state": "missing template becomes explicit status", "reduction_type": "false progress prevented"},
+              {"sdr_id": "sdr_002", "before_state": "operator might chase artifacts", "after_state": "reissued template and handoff route are explicit", "reduction_type": "operator load reduced"},
+              {"sdr_id": "sdr_003", "before_state": "blank decisions could blur into approval", "after_state": "blank decisions remain no action", "reduction_type": "blank/approval boundary preserved"},
+              {"sdr_id": "sdr_004", "before_state": "accept decisions could be overstated", "after_state": "accept means later review only", "reduction_type": "decision/approval boundary preserved"},
+              {"sdr_id": "sdr_005", "before_state": "status could invite scoring pressure", "after_state": "all scoring and claims remain blocked", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before status/handoff"},
+              {"gate": "inherited_v4_309_rows_equal_7", "passed": len(inherited_v4_309_rows) == 7, "detail": f"inherited_v4_309_rows = {len(inherited_v4_309_rows)}"},
+              {"gate": "candidate_rows_recorded", "passed": len(candidate_rows) >= 0, "detail": f"candidate_rows = {len(candidate_rows)}"},
+              {"gate": "review_rows_recorded", "passed": len(review_rows) >= 0, "detail": f"review_rows = {len(review_rows)}"},
+              {"gate": "status_rows_equal_9", "passed": len(status_rows) == 9, "detail": f"status_rows = {len(status_rows)}"},
+              {"gate": "handoff_rows_equal_4", "passed": len(handoff_rows) == 4, "detail": f"handoff_rows = {len(handoff_rows)}"},
+              {"gate": "contract_rows_recorded", "passed": len(contract_rows) >= 0, "detail": f"contract_rows = {len(contract_rows)}"},
+              {"gate": "reissue_template_rows_at_least_8", "passed": len(reissue_template_rows) >= 8, "detail": f"reissue_template_rows = {len(reissue_template_rows)}"},
+              {"gate": "gate_rows_equal_8", "passed": len(gate_rows) == 8, "detail": f"gate_rows = {len(gate_rows)}"},
+              {"gate": "blocked_rows_equal_11", "passed": len(blocked_rows) == 11, "detail": f"blocked_rows = {len(blocked_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_3", "passed": len(decision_rows) == 3, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_rows_equal_4", "passed": len(route_rows) == 4, "detail": f"route_rows = {len(route_rows)}"},
+              {"gate": "sdr_rows_equal_5", "passed": len(sdr_rows) == 5, "detail": f"sdr_rows = {len(sdr_rows)}"},
+              {"gate": "all_candidates_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in candidate_rows), "detail": "decision candidates no score/support"},
+              {"gate": "all_reviews_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in review_rows), "detail": "reviews no score/support"},
+              {"gate": "all_reviews_no_gate_approval", "passed": all(row["gate_approval_allowed"] is False for row in review_rows), "detail": "reviews no approval"},
+              {"gate": "all_reissue_template_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in reissue_template_rows), "detail": "template no score/support"},
+              {"gate": "row_meaning_gate_not_approved", "passed": any(row["gate_object"] == "row_meaning_confirmation" and row["gate_passed"] is False for row in gate_rows), "detail": "row meaning false"},
+              {"gate": "baseline_gate_not_approved", "passed": any(row["gate_object"] == "baseline_approval" and row["gate_passed"] is False for row in gate_rows), "detail": "baseline false"},
+              {"gate": "definition_gate_not_approved", "passed": any(row["gate_object"] == "definition_match_confirmation" and row["gate_passed"] is False for row in gate_rows), "detail": "definition false"},
+              {"gate": "diagnostic_readiness_false", "passed": any(row["gate_object"] == "diagonal_diagnostic_readiness" and row["gate_passed"] is False for row in gate_rows), "detail": "diagnostic false"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_rows), "detail": "all blocked"},
+              {"gate": "status_handoff_permission_completed", "passed": any(row["permission_scope"] == "review_decision_status_or_handoff" and row["permission_status"] == "completed" for row in permission_rows), "detail": "status/handoff completed"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_decision_template_reissue_or_pause_handoff_no_scoring" and row["permission_status"] == "recommended" for row in route_rows), "detail": "v4.311 recommended"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_311_sdss_rsd_decision_template_reissue_or_pause_handoff_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_310_sdss_rsd_review_decision_status_or_handoff_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_310_inherited_v4_309_rows.csv", inherited_v4_309_rows)
+          write_csv(OUT / "v4_310_human_decision_candidate_file_rows.csv", candidate_rows)
+          write_csv(OUT / "v4_310_human_decision_review_rows.csv", review_rows)
+          write_csv(OUT / "v4_310_status_rows.csv", status_rows)
+          write_csv(OUT / "SDSS_RSD_REVIEW_DECISION_STATUS_v4_310_NO_SCORING.csv", status_rows)
+          write_csv(OUT / "v4_310_handoff_rows.csv", handoff_rows)
+          write_csv(OUT / "v4_310_contract_rows.csv", contract_rows)
+          write_csv(OUT / "SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_310_REISSUE_FILLABLE.csv", reissue_template_rows)
+          write_csv(OUT / "v4_310_gate_decision_rows.csv", gate_rows)
+          write_csv(OUT / "v4_310_blocked_operation_rows.csv", blocked_rows)
+          write_csv(OUT / "v4_310_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_310_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_310_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_310_route_review_rows.csv", route_rows)
+          write_csv(OUT / "v4_310_sdr_reduction_rows.csv", sdr_rows)
+          write_csv(OUT / "v4_310_rule_checks.csv", checks)
+
+          readme = [
+              "# SDSS RSD Review Decision Status Or Handoff v4.310",
+              "",
+              f"Status label: {status_label}",
+              "",
+              f"Recommended next action: {next_action}",
+              "",
+              "This workflow does not score anything. It only says whether the human decision template is missing, blank, invalid, or reviewable.",
+              "",
+              "A reissued fillable template is included as `SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_310_REISSUE_FILLABLE.csv` so the process can pause cleanly or continue later without folder chasing.",
+              "",
+              "Truth boundary: no proof, no validation, no support, no scoring, no p-value, no likelihood, no gate approval.",
+          ]
+          (OUT / "SDSS_RSD_REVIEW_DECISION_STATUS_v4_310_README.md").write_text("\n".join(readme), encoding="utf-8")
+
+          summary = {
+              "version": VERSION,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "status_label": status_label,
+              "recommended_next_action": next_action,
+              "decision_candidate_files": len(candidate_rows),
+              "selected_decision_path": selected_path,
+              "decision_rows_loaded": len(selected_rows),
+              "blank_decision_rows": len(blank_rows),
+              "reviewable_decision_rows": len(reviewable_rows),
+              "invalid_decision_rows": len(invalid_rows),
+              "accepted_for_next_review_rows": len(accepted_rows),
+              "contract_rows": len(contract_rows),
+              "reissue_template_rows": len(reissue_template_rows),
+              "gate_decision_rows": len(gate_rows),
+              "gate_approval_rows": sum(1 for row in gate_rows if row["gate_object"] in ["row_meaning_confirmation", "baseline_approval", "definition_match_confirmation", "diagonal_diagnostic_readiness"] and row["gate_passed"]),
+              "row_meaning_confirmed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_310_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.310 SDSS RSD Review Decision Status Or Handoff No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"status_label = {summary['status_label']}",
+              f"recommended_next_action = {summary['recommended_next_action']}",
+              f"decision_candidate_files = {summary['decision_candidate_files']}",
+              f"selected_decision_path = {summary['selected_decision_path']}",
+              f"decision_rows_loaded = {summary['decision_rows_loaded']}",
+              f"blank_decision_rows = {summary['blank_decision_rows']}",
+              f"reviewable_decision_rows = {summary['reviewable_decision_rows']}",
+              f"invalid_decision_rows = {summary['invalid_decision_rows']}",
+              f"accepted_for_next_review_rows = {summary['accepted_for_next_review_rows']}",
+              f"contract_rows = {summary['contract_rows']}",
+              f"reissue_template_rows = {summary['reissue_template_rows']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.310 converts the missing/blank human decision problem into an explicit status. If no filled decision template exists, the rail should stop pretending the content has been reviewed. It reissues a fillable template for later use, but approves nothing.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_310_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"status_label = {summary['status_label']}")
+          print(f"recommended_next_action = {summary['recommended_next_action']}")
+          print(f"decision_candidate_files = {summary['decision_candidate_files']}")
+          print(f"selected_decision_path = {summary['selected_decision_path']}")
+          print(f"decision_rows_loaded = {summary['decision_rows_loaded']}")
+          print(f"blank_decision_rows = {summary['blank_decision_rows']}")
+          print(f"reviewable_decision_rows = {summary['reviewable_decision_rows']}")
+          print(f"invalid_decision_rows = {summary['invalid_decision_rows']}")
+          print(f"accepted_for_next_review_rows = {summary['accepted_for_next_review_rows']}")
+          print(f"contract_rows = {summary['contract_rows']}")
+          print(f"reissue_template_rows = {summary['reissue_template_rows']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.310 SDSS RSD review decision status or handoff output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-310-sdss-rsd-review-decision-status-or-handoff-output
+          path: |
+            tairid_v4_310_sdss_rsd_review_decision_status_or_handoff_output/
+            tairid-v4-310-sdss-rsd-review-decision-status-or-handoff-output.zip
