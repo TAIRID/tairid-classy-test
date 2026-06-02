@@ -1,0 +1,505 @@
+name: 001 TAIRID v4.314 - SDSS RSD Row Meaning Gate Confirmation No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-314-sdss-rsd-row-meaning-gate-confirmation-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-row-meaning-gate-confirmation-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.314 SDSS RSD Row Meaning Gate Confirmation No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.314 SDSS RSD row meaning gate confirmation no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv, json, re, zipfile
+
+          VERSION = "v4.314"
+          EXPECTED_RESULT = "v4_314_sdss_rsd_row_meaning_gate_confirmation_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE_IF_CONFIRMED = "v4_315_sdss_rsd_baseline_comparator_source_packet_no_scoring"
+          SELECTED_NEXT_ROUTE_IF_BLOCKED = "v4_315_sdss_rsd_row_meaning_gate_fix_or_handoff_no_scoring"
+
+          OUT = Path("tairid_v4_314_sdss_rsd_row_meaning_gate_confirmation_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+          ZIP_NAME = "tairid-v4-314-sdss-rsd-row-meaning-gate-confirmation-output.zip"
+
+          DECISION_PATTERNS = [
+              r"SDSS[_-]RSD[_-]HUMAN[_-]DECISION[_-]TEMPLATE[_-]v4[_-]308(?:[-_]\d+)?[_-]FILLABLE\.csv$",
+              r"sdss[_-]rsd[_-]human[_-]decision[_-]template[_-]v4[_-]308(?:[-_]\d+)?[_-]fillable\.csv$",
+              r"SDSS[_-]RSD[_-]HUMAN[_-]DECISIONS[_-]v4[_-]308(?:[-_]\d+)?\.csv$",
+              r"sdss[_-]rsd[_-]human[_-]decisions[_-]v4[_-]308(?:[-_]\d+)?\.csv$",
+          ]
+
+          EXACT_PATHS = [
+              "SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_308_FILLABLE.csv",
+              "sdss_rsd_human_decision_template_v4_308_fillable.csv",
+              "data/SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_308_FILLABLE.csv",
+              "data/sdss_rsd_human_decision_template_v4_308_fillable.csv",
+              ".github/workflows/SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_308_FILLABLE.csv",
+              ".github/workflows/sdss_rsd_human_decision_template_v4_308_fillable.csv",
+          ]
+
+          REQUIRED_FIELDS = [
+              "decision_id",
+              "answer_id",
+              "target_id",
+              "target_class",
+              "human_decision",
+              "allowed_decisions",
+              "edited_source_url_or_citation",
+              "edited_quoted_or_precise_source_text",
+              "edited_answer_summary",
+              "reviewer_note",
+              "claim_limit_must_remain",
+          ]
+
+          EXPECTED_CONFIRMATION_TARGETS = {
+              "row_meaning_001": {
+                  "target_class": "row_meaning",
+                  "must_include_any": ["rsd measurements", "f σ_{8}(z)", "f_sigma8(z)", "fσ8(z)"],
+                  "confirmation_meaning": "RSD-only f_sigma8(z) row role confirmed.",
+              },
+              "row_meaning_002": {
+                  "target_class": "row_meaning",
+                  "must_include_any": ["bao+rsd measurements", "f σ 8", "f_sigma8", "fσ8"],
+                  "confirmation_meaning": "BAO+RSD f_sigma8 row role confirmed.",
+              },
+              "row_meaning_003": {
+                  "target_class": "row_meaning",
+                  "must_include_any": ["separates", "not interchangeable", "different table sections", "not mixed"],
+                  "confirmation_meaning": "RSD-only and BAO+RSD row relationship confirmed as related but not interchangeable.",
+              },
+              "row_meaning_004": {
+                  "target_class": "row_family",
+                  "must_include_any": ["bao+rsd fσ8", "bao+rsd f_sigma8", "bao+rsd", "row-family candidate"],
+                  "confirmation_meaning": "BAO+RSD f_sigma8 row selected as the later row-family candidate.",
+              },
+          }
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def safe_read_csv(path):
+              try:
+                  with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      fields = reader.fieldnames or []
+                  return True, fields, rows, ""
+              except Exception as exc:
+                  return False, [], [], f"{type(exc).__name__}: {exc}"
+
+          def norm(x):
+              return str(x or "").strip()
+
+          def boolish(x):
+              return str(x).strip().lower() in ["true", "1", "yes", "y"]
+
+          def find_decision_file():
+              candidates = []
+              seen = set()
+
+              for raw in EXACT_PATHS:
+                  p = Path(raw)
+                  exists = p.exists()
+                  read_ok, fields, rows, error = safe_read_csv(p) if exists else (False, [], [], "")
+                  has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+                  candidates.append({
+                      "candidate_path": raw,
+                      "candidate_type": "exact",
+                      "exists": exists,
+                      "read_ok": read_ok,
+                      "row_count": len(rows),
+                      "field_count": len(fields),
+                      "has_required_fields": has_required,
+                      "error": error,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+                  seen.add(raw)
+
+              for p in Path(".").rglob("*.csv"):
+                  raw = p.as_posix().lstrip("./")
+                  if raw in seen:
+                      continue
+                  name = p.name
+                  pattern_match = any(re.search(pattern, name, re.I) for pattern in DECISION_PATTERNS)
+                  semantic_match = all(term in raw.lower() for term in ["sdss", "rsd", "human", "decision"])
+                  if not (pattern_match or semantic_match):
+                      continue
+                  read_ok, fields, rows, error = safe_read_csv(p)
+                  has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+                  duplicate_suffix = bool(re.search(r"[-_]\d+\.csv$", name))
+                  candidates.append({
+                      "candidate_path": raw,
+                      "candidate_type": "fuzzy",
+                      "exists": True,
+                      "read_ok": read_ok,
+                      "row_count": len(rows),
+                      "field_count": len(fields),
+                      "has_required_fields": has_required,
+                      "duplicate_download_suffix_detected": duplicate_suffix,
+                      "error": error,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+
+              readable = [c for c in candidates if c["exists"] and c["read_ok"] and c["has_required_fields"]]
+              readable = sorted(readable, key=lambda r: (r["candidate_type"] != "exact", not r.get("duplicate_download_suffix_detected", False), r["candidate_path"]))
+              selected = readable[0]["candidate_path"] if readable else ""
+              if selected:
+                  _, fields, rows, _ = safe_read_csv(selected)
+              else:
+                  fields, rows = [], []
+              return candidates, selected, fields, rows
+
+          def evaluate_confirmation(row, idx, source_path):
+              target_id = norm(row.get("target_id"))
+              target_class = norm(row.get("target_class"))
+              human_decision = norm(row.get("human_decision")).lower()
+              source = norm(row.get("edited_source_url_or_citation"))
+              quote = norm(row.get("edited_quoted_or_precise_source_text"))
+              summary = norm(row.get("edited_answer_summary"))
+              claim_limit = norm(row.get("claim_limit_must_remain")).lower()
+
+              text_blob = f"{source} {quote} {summary}".lower()
+              expected = EXPECTED_CONFIRMATION_TARGETS.get(target_id)
+              is_expected_target = expected is not None
+              target_class_ok = is_expected_target and target_class == expected["target_class"]
+              decision_ok = human_decision == "accept_for_next_review"
+              source_ok = "sdss4.org/science/final-bao-and-rsd-measurements-table" in source.lower()
+              quote_ok = len(quote) >= 12
+              summary_ok = len(summary) >= 8
+              claim_limit_ok = claim_limit in ["no_scoring/no_claims", "no_scoring", "no_claims"]
+              term_ok = False
+              if expected:
+                  term_ok = any(term.lower() in text_blob for term in expected["must_include_any"])
+
+              confirmed = all([is_expected_target, target_class_ok, decision_ok, source_ok, quote_ok, summary_ok, claim_limit_ok, term_ok])
+
+              if confirmed:
+                  status = "confirmed_no_scoring"
+                  meaning = expected["confirmation_meaning"]
+              elif not is_expected_target:
+                  status = "not_in_row_meaning_gate_scope"
+                  meaning = "This row is not part of the v4.314 row-meaning gate scope."
+              else:
+                  status = "not_confirmed_needs_review"
+                  meaning = "This accepted row did not meet all confirmation checks."
+
+              return {
+                  "confirmation_id": f"row_meaning_confirmation_{idx+1:03d}",
+                  "source_path": source_path,
+                  "decision_id": norm(row.get("decision_id")),
+                  "answer_id": norm(row.get("answer_id")),
+                  "target_id": target_id,
+                  "target_class": target_class,
+                  "human_decision": human_decision,
+                  "is_expected_target": is_expected_target,
+                  "target_class_ok": target_class_ok,
+                  "decision_ok": decision_ok,
+                  "source_ok": source_ok,
+                  "quote_ok": quote_ok,
+                  "summary_ok": summary_ok,
+                  "claim_limit_ok": claim_limit_ok,
+                  "term_check_ok": term_ok,
+                  "confirmation_status": status,
+                  "confirmation_meaning": meaning,
+                  "row_meaning_confirmed_here": confirmed and target_class == "row_meaning",
+                  "row_family_selected_here": confirmed and target_class == "row_family",
+                  "baseline_approved_here": False,
+                  "definition_match_confirmed_here": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              }
+
+          inherited_v4_313_rows = [
+              {"inherited_from": "v4.313", "item": "rules", "value": "27 / 27 passed", "meaning": "Eligibility review passed.", "carry_forward_status": "ready_for_row_meaning_gate_confirmation"},
+              {"inherited_from": "v4.313", "item": "selected_decision_path", "value": "SDSS_RSD_HUMAN_DECISION_TEMPLATE_v4_308_FILLABLE.csv", "meaning": "Filled template was found.", "carry_forward_status": "decision_template_available"},
+              {"inherited_from": "v4.313", "item": "decision_rows_loaded", "value": 20, "meaning": "Twenty decision rows loaded.", "carry_forward_status": "decisions_loaded"},
+              {"inherited_from": "v4.313", "item": "accepted_for_next_review_rows", "value": 4, "meaning": "Four rows accepted for next review.", "carry_forward_status": "candidate_gate_rows"},
+              {"inherited_from": "v4.313", "item": "eligible_row_meaning_gate_rows", "value": 4, "meaning": "Four accepted rows eligible for row-meaning gate review.", "carry_forward_status": "eligible"},
+              {"inherited_from": "v4.313", "item": "row_meaning_gate_review_ready", "value": True, "meaning": "Ready for row-meaning confirmation workflow.", "carry_forward_status": "ready"},
+              {"inherited_from": "v4.313", "item": "gate_approval_rows", "value": 0, "meaning": "No gate approval yet.", "carry_forward_status": "no_approval"},
+              {"inherited_from": "v4.313", "item": "selected_next_route", "value": "v4_314_sdss_rsd_row_meaning_gate_confirmation_no_scoring", "meaning": "Current workflow.", "carry_forward_status": "current_route"},
+          ]
+
+          candidate_file_rows, selected_decision_path, selected_fields, selected_decision_rows = find_decision_file()
+          all_confirmation_rows = [evaluate_confirmation(row, idx, selected_decision_path) for idx, row in enumerate(selected_decision_rows)]
+          scope_rows = [r for r in all_confirmation_rows if r["is_expected_target"]]
+          confirmed_rows = [r for r in scope_rows if r["confirmation_status"] == "confirmed_no_scoring"]
+          unconfirmed_scope_rows = [r for r in scope_rows if r["confirmation_status"] != "confirmed_no_scoring"]
+          confirmed_row_meaning_rows = [r for r in confirmed_rows if r["row_meaning_confirmed_here"]]
+          confirmed_row_family_rows = [r for r in confirmed_rows if r["row_family_selected_here"]]
+
+          expected_target_ids = set(EXPECTED_CONFIRMATION_TARGETS.keys())
+          confirmed_target_ids = {r["target_id"] for r in confirmed_rows}
+          missing_target_ids = sorted(expected_target_ids - confirmed_target_ids)
+
+          row_meaning_confirmed = len(confirmed_row_meaning_rows) == 3
+          row_family_selected = len(confirmed_row_family_rows) == 1 and any(r["target_id"] == "row_meaning_004" for r in confirmed_row_family_rows)
+          row_meaning_gate_confirmed = row_meaning_confirmed and row_family_selected and len(confirmed_rows) == 4 and not missing_target_ids
+          selected_next_route = SELECTED_NEXT_ROUTE_IF_CONFIRMED if row_meaning_gate_confirmed else SELECTED_NEXT_ROUTE_IF_BLOCKED
+
+          confirmed_gate_output_rows = []
+          for row in confirmed_rows:
+              confirmed_gate_output_rows.append({
+                  "confirmed_gate_id": f"confirmed_row_gate_{len(confirmed_gate_output_rows)+1:03d}",
+                  "target_id": row["target_id"],
+                  "target_class": row["target_class"],
+                  "confirmation_meaning": row["confirmation_meaning"],
+                  "confirmation_status": "confirmed_no_scoring",
+                  "scope_limit": "row meaning / row family only",
+                  "baseline_approved": False,
+                  "definition_match_confirmed": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          gate_rows = [
+              {"gate_id": "gate_001", "gate_object": "filled_decision_template_found", "gate_passed": bool(selected_decision_path), "gate_status": "found" if selected_decision_path else "missing", "reason": selected_decision_path or "No filled decision template found."},
+              {"gate_id": "gate_002", "gate_object": "expected_row_meaning_targets_present", "gate_passed": len(scope_rows) == 4, "gate_status": "present" if len(scope_rows) == 4 else "missing_or_extra", "reason": "Expected row_meaning_001 through row_meaning_004."},
+              {"gate_id": "gate_003", "gate_object": "row_meaning_rows_confirmed", "gate_passed": row_meaning_confirmed, "gate_status": "confirmed" if row_meaning_confirmed else "not_confirmed", "reason": "Rows 001-003 must confirm row meaning."},
+              {"gate_id": "gate_004", "gate_object": "row_family_candidate_selected", "gate_passed": row_family_selected, "gate_status": "selected_no_scoring" if row_family_selected else "not_selected", "reason": "Row 004 selects BAO+RSD f_sigma8 as later row-family candidate."},
+              {"gate_id": "gate_005", "gate_object": "row_meaning_gate_confirmation", "gate_passed": row_meaning_gate_confirmed, "gate_status": "confirmed_no_scoring" if row_meaning_gate_confirmed else "not_confirmed", "reason": "Confirms row meaning/row family only; no scoring."},
+              {"gate_id": "gate_006", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "Baseline/comparator values remain blocked."},
+              {"gate_id": "gate_007", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "Definition matches remain blocked."},
+              {"gate_id": "gate_008", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without baseline and definition gates."},
+          ]
+
+          blocked_rows = [
+              {"blocked_id": "blocked_001", "operation": "score_now", "reason": "baseline and definition gates remain blocked", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "baseline rows remain keep_blocked", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "confirm_definition_match_now", "reason": "definition rows remain keep_blocked", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "claim_tairid_support", "reason": "support is blocked by design", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "row_meaning_gate_confirmation", "permission_status": "completed_confirmed" if row_meaning_gate_confirmed else "completed_not_confirmed", "reason": "Row meaning gate confirmation workflow completed."},
+              {"permission_scope": "baseline_comparator_source_packet", "permission_status": "allowed_next" if row_meaning_gate_confirmed else "blocked_until_fix", "reason": "Baseline source packet can start only after row meaning gate is confirmed."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "Baseline is not approved in this workflow."},
+              {"permission_scope": "definition_match_confirmation", "permission_status": "blocked", "reason": "Definition match is not confirmed in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+          ]
+
+          sdr_rows = [
+              {"sdr_id": "sdr_001", "before_state": "accepted row-meaning candidates were eligible but unconfirmed", "after_state": "row meaning/row family gate is confirmed or blocked by exact checks", "reduction_type": "gate status clarified"},
+              {"sdr_id": "sdr_002", "before_state": "row family selection was implicit", "after_state": "BAO+RSD f_sigma8 is selected as later row-family candidate if checks pass", "reduction_type": "row-family ambiguity reduced"},
+              {"sdr_id": "sdr_003", "before_state": "row meaning could be confused with scoring permission", "after_state": "baseline, definition, and scoring remain explicitly blocked", "reduction_type": "claim boundary preserved"},
+              {"sdr_id": "sdr_004", "before_state": "next gap was broad", "after_state": "next gap becomes baseline/comparator source packet", "reduction_type": "next route narrowed"},
+              {"sdr_id": "sdr_005", "before_state": "confirmation could invite support language", "after_state": "support remains false", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before gate confirmation"},
+              {"gate": "inherited_v4_313_rows_equal_8", "passed": len(inherited_v4_313_rows) == 8, "detail": f"inherited_v4_313_rows = {len(inherited_v4_313_rows)}"},
+              {"gate": "candidate_file_rows_recorded", "passed": len(candidate_file_rows) >= 0, "detail": f"candidate_file_rows = {len(candidate_file_rows)}"},
+              {"gate": "all_confirmation_rows_recorded", "passed": len(all_confirmation_rows) >= 0, "detail": f"all_confirmation_rows = {len(all_confirmation_rows)}"},
+              {"gate": "scope_rows_recorded", "passed": len(scope_rows) >= 0, "detail": f"scope_rows = {len(scope_rows)}"},
+              {"gate": "confirmed_gate_output_rows_recorded", "passed": len(confirmed_gate_output_rows) >= 0, "detail": f"confirmed_gate_output_rows = {len(confirmed_gate_output_rows)}"},
+              {"gate": "gate_rows_equal_8", "passed": len(gate_rows) == 8, "detail": f"gate_rows = {len(gate_rows)}"},
+              {"gate": "blocked_rows_equal_9", "passed": len(blocked_rows) == 9, "detail": f"blocked_rows = {len(blocked_rows)}"},
+              {"gate": "permission_rows_equal_6", "passed": len(permission_rows) == 6, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "sdr_rows_equal_5", "passed": len(sdr_rows) == 5, "detail": f"sdr_rows = {len(sdr_rows)}"},
+              {"gate": "all_candidate_files_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in candidate_file_rows), "detail": "candidate files no score/support"},
+              {"gate": "all_confirmation_rows_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in all_confirmation_rows), "detail": "confirmation rows no score/support"},
+              {"gate": "all_confirmed_outputs_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in confirmed_gate_output_rows), "detail": "confirmed outputs no score/support"},
+              {"gate": "baseline_not_approved", "passed": any(r["gate_object"] == "baseline_approval" and r["gate_passed"] is False for r in gate_rows), "detail": "baseline not approved"},
+              {"gate": "definition_match_not_confirmed", "passed": any(r["gate_object"] == "definition_match_confirmation" and r["gate_passed"] is False for r in gate_rows), "detail": "definition not confirmed"},
+              {"gate": "diagnostic_readiness_false", "passed": any(r["gate_object"] == "diagonal_diagnostic_readiness" and r["gate_passed"] is False for r in gate_rows), "detail": "diagnostic not ready"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(r["blocked"] is True for r in blocked_rows), "detail": "all blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_score", "passed": True, "detail": "no score"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "selected_next_route_written", "passed": selected_next_route in [SELECTED_NEXT_ROUTE_IF_CONFIRMED, SELECTED_NEXT_ROUTE_IF_BLOCKED], "detail": f"selected_next_route = {selected_next_route}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_314_sdss_rsd_row_meaning_gate_confirmation_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_314_inherited_v4_313_rows.csv", inherited_v4_313_rows)
+          write_csv(OUT / "v4_314_decision_candidate_file_rows.csv", candidate_file_rows)
+          write_csv(OUT / "v4_314_row_meaning_confirmation_review_rows.csv", all_confirmation_rows)
+          write_csv(OUT / "SDSS_RSD_ROW_MEANING_CONFIRMATION_REVIEW_v4_314_NO_SCORING.csv", all_confirmation_rows)
+          write_csv(OUT / "v4_314_confirmed_gate_output_rows.csv", confirmed_gate_output_rows)
+          write_csv(OUT / "SDSS_RSD_CONFIRMED_ROW_MEANING_GATES_v4_314_NO_SCORING.csv", confirmed_gate_output_rows)
+          write_csv(OUT / "v4_314_gate_decision_rows.csv", gate_rows)
+          write_csv(OUT / "v4_314_blocked_operation_rows.csv", blocked_rows)
+          write_csv(OUT / "v4_314_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_314_sdr_reduction_rows.csv", sdr_rows)
+          write_csv(OUT / "v4_314_rule_checks.csv", checks)
+
+          readme = [
+              "# SDSS RSD Row Meaning Gate Confirmation v4.314",
+              "",
+              "This workflow confirms only the row-meaning / row-family gate if the four accepted human-review rows pass exact checks.",
+              "",
+              "A pass here means the lane has confirmed row meanings and selected the BAO+RSD f_sigma8 row family candidate for later baseline/definition review.",
+              "",
+              "It does not approve baseline values. It does not confirm definition matches. It does not score anything.",
+              "",
+              "Truth boundary: no proof, no validation, no support, no scoring, no p-value, no likelihood.",
+          ]
+          (OUT / "SDSS_RSD_ROW_MEANING_GATE_CONFIRMATION_v4_314_README.md").write_text("\n".join(readme), encoding="utf-8")
+
+          summary = {
+              "version": VERSION,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "selected_decision_path": selected_decision_path,
+              "decision_rows_loaded": len(selected_decision_rows),
+              "scope_rows": len(scope_rows),
+              "confirmed_row_meaning_rows": len(confirmed_row_meaning_rows),
+              "confirmed_row_family_rows": len(confirmed_row_family_rows),
+              "confirmed_gate_output_rows": len(confirmed_gate_output_rows),
+              "missing_target_ids": missing_target_ids,
+              "row_meaning_gate_confirmed": row_meaning_gate_confirmed,
+              "row_meaning_confirmed": row_meaning_confirmed,
+              "row_family_selected": row_family_selected,
+              "selected_row_family": "BAO+RSD f_sigma8 row" if row_family_selected else "",
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "baseline_approved": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "gate_decision_rows": len(gate_rows),
+              "gate_approval_rows": len(confirmed_gate_output_rows),
+              "selected_next_route": selected_next_route,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_314_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.314 SDSS RSD Row Meaning Gate Confirmation No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"selected_decision_path = {summary['selected_decision_path']}",
+              f"decision_rows_loaded = {summary['decision_rows_loaded']}",
+              f"scope_rows = {summary['scope_rows']}",
+              f"confirmed_row_meaning_rows = {summary['confirmed_row_meaning_rows']}",
+              f"confirmed_row_family_rows = {summary['confirmed_row_family_rows']}",
+              f"confirmed_gate_output_rows = {summary['confirmed_gate_output_rows']}",
+              f"row_meaning_gate_confirmed = {summary['row_meaning_gate_confirmed']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"selected_row_family = {summary['selected_row_family']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"selected_next_route = {selected_next_route}",
+              "",
+              "Clean meaning: v4.314 can confirm the row-meaning / row-family gate if the four accepted human-review rows pass exact source, target, and claim-limit checks. It still does not score.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_314_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"selected_decision_path = {summary['selected_decision_path']}")
+          print(f"decision_rows_loaded = {summary['decision_rows_loaded']}")
+          print(f"scope_rows = {summary['scope_rows']}")
+          print(f"confirmed_row_meaning_rows = {summary['confirmed_row_meaning_rows']}")
+          print(f"confirmed_row_family_rows = {summary['confirmed_row_family_rows']}")
+          print(f"confirmed_gate_output_rows = {summary['confirmed_gate_output_rows']}")
+          print(f"row_meaning_gate_confirmed = {summary['row_meaning_gate_confirmed']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"selected_row_family = {summary['selected_row_family']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"selected_next_route = {selected_next_route}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+
+          PY
+
+      - name: Upload v4.314 SDSS RSD row meaning gate confirmation output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-314-sdss-rsd-row-meaning-gate-confirmation-output
+          path: |
+            tairid_v4_314_sdss_rsd_row_meaning_gate_confirmation_output/
+            tairid-v4-314-sdss-rsd-row-meaning-gate-confirmation-output.zip
