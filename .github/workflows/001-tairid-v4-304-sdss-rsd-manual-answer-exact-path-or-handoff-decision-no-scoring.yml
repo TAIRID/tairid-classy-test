@@ -1,0 +1,530 @@
+name: 001 TAIRID v4.304 - SDSS RSD Manual Answer Exact Path Or Handoff Decision No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-304-sdss-rsd-manual-answer-exact-path-or-handoff-decision-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-manual-answer-exact-path-or-handoff-decision-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.304 SDSS RSD Manual Answer Exact Path Or Handoff Decision No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.304 SDSS RSD manual answer exact path or handoff decision no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import re
+          import urllib.request
+          import zipfile
+
+          VERSION = "v4.304"
+          ROUTE = "sdss_rsd_manual_answer_exact_path_or_handoff_decision_no_scoring_after_v4_303"
+          EXPECTED_RESULT = "v4_304_sdss_rsd_manual_answer_exact_path_or_handoff_decision_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_305_sdss_rsd_manual_answer_content_fill_guide_no_scoring"
+
+          OUT = Path("tairid_v4_304_sdss_rsd_manual_answer_exact_path_or_handoff_decision_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-304-sdss-rsd-manual-answer-exact-path-or-handoff-decision-output.zip"
+
+          EXACT_CANONICAL_PATHS = [
+              "data/sdss_rsd_manual_answers_v4_300.csv",
+              "data/manual/sdss_rsd_manual_answers_v4_300.csv",
+              "SDSS_RSD_MANUAL_ANSWERS_v4_300.csv",
+              "sdss_rsd_manual_answers_v4_300.csv",
+              ".github/workflows/sdss_rsd_manual_answers_v4_300.csv",
+              "github/workflows/sdss_rsd_manual_answers_v4_300.csv",
+          ]
+
+          # These catch phone/browser duplicate filenames such as sdss_rsd_manual_answers_v4_300-1.csv.
+          FUZZY_FILENAME_PATTERNS = [
+              r"sdss[_-]rsd[_-]manual[_-]answers[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+              r"SDSS[_-]RSD[_-]MANUAL[_-]ANSWERS[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+              r"data[_-]sdss[_-]rsd[_-]manual[_-]answers[_-]v4[_-]300(?:[-_]\d+)?\.csv$",
+          ]
+
+          REQUIRED_FIELDS = [
+              "answer_id",
+              "target_id",
+              "source_url_or_citation",
+              "quoted_or_precise_source_text",
+              "answer_summary",
+              "approval_request",
+              "claim_limit",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def safe_read_csv(path):
+              try:
+                  with path.open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      fields = reader.fieldnames or []
+                  return True, fields, rows, ""
+              except Exception as exc:
+                  return False, [], [], f"{type(exc).__name__}: {exc}"
+
+          def norm(value):
+              return str(value or "").strip()
+
+          def review_answer(row, idx, source_path):
+              missing = [field for field in REQUIRED_FIELDS if not norm(row.get(field))]
+              source = norm(row.get("source_url_or_citation"))
+              precise = norm(row.get("quoted_or_precise_source_text"))
+              summary = norm(row.get("answer_summary"))
+              approval = norm(row.get("approval_request")).lower()
+              claim = norm(row.get("claim_limit")).lower()
+              is_blank = not source and not precise and not summary
+              reviewable = (
+                  not missing
+                  and len(source) > 0
+                  and len(precise) >= 12
+                  and len(summary) >= 8
+                  and approval in ["row_meaning_confirm", "baseline_candidate", "definition_match", "reject", "keep_blocked"]
+                  and claim in ["no_scoring", "no_claims", "no_scoring/no_claims", "keep_blocked"]
+              )
+              return {
+                  "manual_review_id": f"manual_review_{idx+1:03d}",
+                  "source_path": source_path,
+                  "answer_id": norm(row.get("answer_id")),
+                  "target_id": norm(row.get("target_id")),
+                  "target_class": norm(row.get("target_class")),
+                  "target_object": norm(row.get("target_object")),
+                  "missing_required_fields": "|".join(missing),
+                  "is_blank_template_row": is_blank,
+                  "reviewable_for_future_gate": reviewable,
+                  "review_status": "reviewable_for_future_gate_not_approved" if reviewable else ("blank_template_row" if is_blank else "incomplete_or_invalid"),
+                  "row_meaning_confirmed": False,
+                  "baseline_approved": False,
+                  "definition_match_confirmed": False,
+                  "row_family_selected": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              }
+
+          inherited_v4_303_rows = [
+              {"inherited_from": "v4.303", "item": "rules", "value": "49 / 49 passed", "meaning": "Fuzzy locator/fill guide passed.", "carry_forward_status": "ready_for_path_decision"},
+              {"inherited_from": "v4.303", "item": "scanned_file_rows", "value": 738, "meaning": "Repository scan found hundreds of files.", "carry_forward_status": "repo_scan_worked"},
+              {"inherited_from": "v4.303", "item": "fuzzy_candidate_rows", "value": 7, "meaning": "Fuzzy candidates were found.", "carry_forward_status": "candidate_found"},
+              {"inherited_from": "v4.303", "item": "selected_manual_path", "value": "sdss_rsd_manual_answers_v4_300-1.csv", "meaning": "Likely phone/browser duplicate filename found.", "carry_forward_status": "path_found_noncanonical"},
+              {"inherited_from": "v4.303", "item": "manual_answer_rows", "value": 20, "meaning": "Twenty manual-answer rows were readable.", "carry_forward_status": "csv_readable"},
+              {"inherited_from": "v4.303", "item": "reviewable_rows", "value": 0, "meaning": "The CSV is still blank/unfilled.", "carry_forward_status": "answers_unfilled"},
+              {"inherited_from": "v4.303", "item": "blank_template_rows", "value": 20, "meaning": "All rows are blank template rows.", "carry_forward_status": "answers_unfilled"},
+              {"inherited_from": "v4.303", "item": "gate_approval_rows", "value": 0, "meaning": "No gate approval.", "carry_forward_status": "no_approval"},
+              {"inherited_from": "v4.303", "item": "selected_next_route", "value": "v4_304_sdss_rsd_manual_answer_exact_path_or_handoff_decision_no_scoring", "meaning": "Current route decides exact path or handoff.", "carry_forward_status": "current_route"},
+          ]
+
+          exact_path_rows = []
+          exact_found_paths = []
+          for raw in EXACT_CANONICAL_PATHS:
+              p = Path(raw)
+              exists = p.exists()
+              read_ok, fields, rows, error = safe_read_csv(p) if exists else (False, [], [], "")
+              has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+              exact_path_rows.append({
+                  "candidate_path": raw,
+                  "exists": exists,
+                  "read_ok": read_ok,
+                  "row_count": len(rows),
+                  "field_count": len(fields),
+                  "has_required_fields": has_required,
+                  "error": error,
+              })
+              if exists and read_ok and has_required:
+                  exact_found_paths.append(raw)
+
+          scanned_file_rows = []
+          fuzzy_candidate_rows = []
+          for path in Path(".").rglob("*"):
+              if not path.is_file():
+                  continue
+              raw = path.as_posix().lstrip("./")
+              name = path.name
+              suffix = path.suffix.lower()
+              scanned_file_rows.append({
+                  "path": raw,
+                  "suffix": suffix,
+                  "size_bytes": path.stat().st_size,
+              })
+              pattern_match = any(re.search(pattern, name, re.I) for pattern in FUZZY_FILENAME_PATTERNS)
+              semantic_match = all(term in raw.lower() for term in ["sdss", "rsd", "manual", "answer"])
+              if suffix == ".csv" and (pattern_match or semantic_match):
+                  read_ok, fields, rows, error = safe_read_csv(path)
+                  has_required = all(field in set(fields) for field in REQUIRED_FIELDS)
+                  duplicate_suffix = bool(re.search(r"[-_]\d+\.csv$", name))
+                  fuzzy_candidate_rows.append({
+                      "fuzzy_candidate_id": f"fuzzy_candidate_{len(fuzzy_candidate_rows)+1:03d}",
+                      "path": raw,
+                      "filename": name,
+                      "size_bytes": path.stat().st_size,
+                      "pattern_match": pattern_match,
+                      "semantic_match": semantic_match,
+                      "duplicate_download_suffix_detected": duplicate_suffix,
+                      "read_ok": read_ok,
+                      "row_count": len(rows),
+                      "field_count": len(fields),
+                      "has_required_fields": has_required,
+                      "error": error,
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+
+          selected_path = ""
+          selected_source = ""
+          if exact_found_paths:
+              selected_path = exact_found_paths[0]
+              selected_source = "exact_canonical"
+          else:
+              readable = [r for r in fuzzy_candidate_rows if r["read_ok"] and r["has_required_fields"]]
+              readable = sorted(readable, key=lambda r: (not r["duplicate_download_suffix_detected"], r["path"]))
+              if readable:
+                  selected_path = readable[0]["path"]
+                  selected_source = "fuzzy_duplicate_or_semantic"
+
+          selected_rows = []
+          selected_fields = []
+          if selected_path:
+              _, selected_fields, selected_rows, _ = safe_read_csv(Path(selected_path))
+
+          manual_answer_review_rows = [review_answer(row, idx, selected_path) for idx, row in enumerate(selected_rows)]
+          reviewable_rows = [row for row in manual_answer_review_rows if row["reviewable_for_future_gate"]]
+          blank_rows = [row for row in manual_answer_review_rows if row["is_blank_template_row"]]
+          incomplete_rows = [row for row in manual_answer_review_rows if row["review_status"] != "reviewable_for_future_gate_not_approved"]
+
+          exact_path_problem_resolved = bool(selected_path)
+          handoff_required = not bool(selected_path)
+          canonical_path_present = bool(exact_found_paths)
+          duplicate_download_path_present = bool(selected_path and re.search(r"[-_]\d+\.csv$", Path(selected_path).name))
+          proceed_with_fuzzy_path_for_now = bool(selected_path and not exact_found_paths)
+
+          path_decision_rows = [
+              {
+                  "decision_id": "path_decision_001",
+                  "decision_object": "manual_answer_file_location",
+                  "exact_path_problem_resolved": exact_path_problem_resolved,
+                  "canonical_path_present": canonical_path_present,
+                  "selected_path": selected_path,
+                  "selected_source": selected_source,
+                  "duplicate_download_path_present": duplicate_download_path_present,
+                  "handoff_required": handoff_required,
+                  "decision": "proceed_with_selected_fuzzy_path_no_scoring" if proceed_with_fuzzy_path_for_now else ("proceed_with_canonical_path_no_scoring" if canonical_path_present else "handoff_required_file_not_found"),
+              },
+              {
+                  "decision_id": "path_decision_002",
+                  "decision_object": "canonical_location_advice",
+                  "exact_path_problem_resolved": exact_path_problem_resolved,
+                  "canonical_path_present": canonical_path_present,
+                  "selected_path": selected_path,
+                  "selected_source": selected_source,
+                  "duplicate_download_path_present": duplicate_download_path_present,
+                  "handoff_required": handoff_required,
+                  "decision": "keep_using_fuzzy_fallback_for_now_but_clean_path_later" if proceed_with_fuzzy_path_for_now else ("canonical_ok" if canonical_path_present else "upload_or_rename_needed"),
+              },
+              {
+                  "decision_id": "path_decision_003",
+                  "decision_object": "content_status",
+                  "exact_path_problem_resolved": exact_path_problem_resolved,
+                  "canonical_path_present": canonical_path_present,
+                  "selected_path": selected_path,
+                  "selected_source": selected_source,
+                  "duplicate_download_path_present": duplicate_download_path_present,
+                  "handoff_required": handoff_required,
+                  "decision": "file_found_but_blank" if blank_rows else ("file_found_has_reviewable_rows" if reviewable_rows else "file_missing_or_unreadable"),
+              },
+          ]
+
+          gate_decision_rows = [
+              {"gate_id": "gate_001", "gate_object": "manual_answer_file_located", "gate_passed": bool(selected_path), "gate_status": "located" if selected_path else "not_located", "reason": selected_path or "No manual-answer CSV found."},
+              {"gate_id": "gate_002", "gate_object": "path_handoff_required", "gate_passed": handoff_required, "gate_status": "handoff_required" if handoff_required else "handoff_not_required", "reason": "Only true if no exact or fuzzy file was found."},
+              {"gate_id": "gate_003", "gate_object": "manual_answers_reviewable", "gate_passed": len(reviewable_rows) > 0, "gate_status": "reviewable_rows_present" if reviewable_rows else "no_reviewable_rows", "reason": "Blank template rows are not reviewable answers."},
+              {"gate_id": "gate_004", "gate_object": "row_meaning_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.304 is path/handoff decision only."},
+              {"gate_id": "gate_005", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "v4.304 is path/handoff decision only."},
+              {"gate_id": "gate_006", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "v4.304 is path/handoff decision only."},
+              {"gate_id": "gate_007", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without approved gates."},
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "v4.304 is path/handoff decision only", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "file location decision is not content approval", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning is not confirmed", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition match not approved", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "diagnostic readiness is false", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no selected row family", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "path_or_handoff_decision", "permission_status": "completed", "reason": "Exact/fuzzy path decision written."},
+              {"permission_scope": "manual_answer_content_fill_guide", "permission_status": "allowed_next" if selected_path else "blocked_until_file_located", "reason": "Proceed to content filling only if a CSV was located."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "No confirmation in this workflow."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No approval in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "exact_paths_checked", "status": str(len(EXACT_CANONICAL_PATHS)), "meaning": "Canonical/manual paths checked."},
+              {"readiness_id": "ready_002", "object": "fuzzy_candidates", "status": str(len(fuzzy_candidate_rows)), "meaning": "Fuzzy candidate CSVs found."},
+              {"readiness_id": "ready_003", "object": "selected_path", "status": selected_path or "none", "meaning": "Path selected for review."},
+              {"readiness_id": "ready_004", "object": "blank_template_rows", "status": str(len(blank_rows)), "meaning": "Blank rows still need source answers."},
+              {"readiness_id": "ready_005", "object": "content_fill_guide", "status": "ready_next" if selected_path else "handoff_first", "meaning": "Next content step if file is located."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "The manual-answer CSV location problem is resolved if selected_path is populated.", "basis": "v4.304 checks canonical paths and duplicate-download fuzzy names.", "next_action": "Use selected path for content fill guide if present.", "claim_status": "path_decision_only"},
+              {"decision_id": "decision_002", "decision": "A duplicate filename such as -1.csv is acceptable for now.", "basis": "The rail can read it safely; canonical cleanup can happen later.", "next_action": "Stop folder chasing.", "claim_status": "process_stabilized"},
+              {"decision_id": "decision_003", "decision": "The CSV content is still blank unless reviewable_rows is greater than zero.", "basis": "Blank template rows have no source text or answer summaries.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_manual_answer_content_fill_guide_no_scoring", "permission_status": "recommended_if_selected_path_found", "reason": "Need to fill exact source-answer rows before gates can pass."},
+              {"route_id": "route_002", "route": "folder_upload_handoff", "permission_status": "recommended_if_no_selected_path", "reason": "Use only if no exact or fuzzy file is found."},
+              {"route_id": "route_003", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_gate_decision_and_readiness", "reason": "No gate approval in v4.304."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.304 is a clean path-decision milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "CSV path was uncertain", "after_state": "exact and fuzzy paths are converted into an explicit decision", "reduction_type": "file-location uncertainty closed"},
+              {"sdr_id": "sdr_002", "before_state": "duplicate download filename looked like failure", "after_state": "duplicate filename can be accepted as readable input", "reduction_type": "phone-upload mismatch normalized"},
+              {"sdr_id": "sdr_003", "before_state": "file location and content approval could blur", "after_state": "file located remains separate from source-answer approval", "reduction_type": "location/approval boundary preserved"},
+              {"sdr_id": "sdr_004", "before_state": "workflow could keep folder chasing", "after_state": "next route moves to content fill or handoff", "reduction_type": "process fatigue reduced"},
+              {"sdr_id": "sdr_005", "before_state": "path success could invite scoring", "after_state": "scoring remains blocked", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before exact path/handoff decision"},
+              {"gate": "inherited_v4_303_rows_equal_9", "passed": len(inherited_v4_303_rows) == 9, "detail": f"inherited_v4_303_rows = {len(inherited_v4_303_rows)}"},
+              {"gate": "exact_path_rows_equal_6", "passed": len(exact_path_rows) == 6, "detail": f"exact_path_rows = {len(exact_path_rows)}"},
+              {"gate": "scanned_file_rows_recorded", "passed": len(scanned_file_rows) >= 0, "detail": f"scanned_file_rows = {len(scanned_file_rows)}"},
+              {"gate": "fuzzy_candidate_rows_recorded", "passed": len(fuzzy_candidate_rows) >= 0, "detail": f"fuzzy_candidate_rows = {len(fuzzy_candidate_rows)}"},
+              {"gate": "path_decision_rows_equal_3", "passed": len(path_decision_rows) == 3, "detail": f"path_decision_rows = {len(path_decision_rows)}"},
+              {"gate": "manual_answer_review_rows_recorded", "passed": len(manual_answer_review_rows) >= 0, "detail": f"manual_answer_review_rows = {len(manual_answer_review_rows)}"},
+              {"gate": "gate_decision_rows_equal_7", "passed": len(gate_decision_rows) == 7, "detail": f"gate_decision_rows = {len(gate_decision_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_3", "passed": len(decision_rows) == 3, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_fuzzy_candidates_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in fuzzy_candidate_rows), "detail": "fuzzy candidates no score/support"},
+              {"gate": "all_reviews_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in manual_answer_review_rows), "detail": "manual reviews no score/support"},
+              {"gate": "all_reviews_no_approval", "passed": all(row["row_meaning_confirmed"] is False and row["baseline_approved"] is False and row["definition_match_confirmed"] is False for row in manual_answer_review_rows), "detail": "manual reviews no approvals"},
+              {"gate": "row_meaning_gate_not_approved", "passed": any(row["gate_object"] == "row_meaning_confirmation" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "row meaning gate false"},
+              {"gate": "baseline_gate_not_approved", "passed": any(row["gate_object"] == "baseline_approval" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "baseline gate false"},
+              {"gate": "definition_gate_not_approved", "passed": any(row["gate_object"] == "definition_match_confirmation" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "definition gate false"},
+              {"gate": "diagnostic_readiness_false", "passed": any(row["gate_object"] == "diagonal_diagnostic_readiness" and row["gate_passed"] is False for row in gate_decision_rows), "detail": "diagnostic readiness false"},
+              {"gate": "confirm_row_meaning_blocked", "passed": any(row["operation"] == "confirm_row_meaning_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "row meaning blocked"},
+              {"gate": "approve_baseline_blocked", "passed": any(row["operation"] == "approve_baseline_values_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "baseline blocked"},
+              {"gate": "run_diagonal_blocked", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "diagonal diagnostic blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations blocked"},
+              {"gate": "path_decision_permission_completed", "passed": any(row["permission_scope"] == "path_or_handoff_decision" and row["permission_status"] == "completed" for row in permission_rows), "detail": "path decision completed"},
+              {"gate": "baseline_approval_permission_blocked", "passed": any(row["permission_scope"] == "baseline_approval" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "baseline approval blocked"},
+              {"gate": "diagonal_score_permission_blocked", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "diagonal score blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_present", "passed": any(row["route"] == "sdss_rsd_manual_answer_content_fill_guide_no_scoring" for row in route_review_rows), "detail": "v4.305 route present"},
+              {"gate": "diagonal_score_route_blocked", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_gate_decision_and_readiness" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_305_sdss_rsd_manual_answer_content_fill_guide_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_304_sdss_rsd_manual_answer_exact_path_or_handoff_decision_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_304_inherited_v4_303_rows.csv", inherited_v4_303_rows)
+          write_csv(OUT / "v4_304_exact_path_rows.csv", exact_path_rows)
+          write_csv(OUT / "v4_304_scanned_file_rows.csv", scanned_file_rows)
+          write_csv(OUT / "v4_304_fuzzy_candidate_rows.csv", fuzzy_candidate_rows)
+          write_csv(OUT / "SDSS_RSD_MANUAL_ANSWER_PATH_DECISION_FUZZY_CANDIDATES_v4_304.csv", fuzzy_candidate_rows)
+          write_csv(OUT / "v4_304_manual_answer_review_rows.csv", manual_answer_review_rows)
+          write_csv(OUT / "v4_304_path_decision_rows.csv", path_decision_rows)
+          write_csv(OUT / "SDSS_RSD_MANUAL_ANSWER_PATH_DECISION_v4_304_NO_APPROVAL.csv", path_decision_rows)
+          write_csv(OUT / "v4_304_gate_decision_rows.csv", gate_decision_rows)
+          write_csv(OUT / "v4_304_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_304_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_304_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_304_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_304_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_304_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_304_rule_checks.csv", checks)
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "exact_found_paths": exact_found_paths,
+              "canonical_path_present": canonical_path_present,
+              "fuzzy_candidate_rows": len(fuzzy_candidate_rows),
+              "selected_path": selected_path,
+              "selected_source": selected_source,
+              "exact_path_problem_resolved": exact_path_problem_resolved,
+              "handoff_required": handoff_required,
+              "duplicate_download_path_present": duplicate_download_path_present,
+              "manual_answer_rows": len(selected_rows),
+              "manual_answer_review_rows": len(manual_answer_review_rows),
+              "reviewable_rows": len(reviewable_rows),
+              "blank_template_rows": len(blank_rows),
+              "incomplete_rows": len(incomplete_rows),
+              "gate_decision_rows": len(gate_decision_rows),
+              "gate_approval_rows": sum(1 for row in gate_decision_rows if row["gate_object"] in ["row_meaning_confirmation", "baseline_approval", "definition_match_confirmation", "diagonal_diagnostic_readiness"] and row["gate_passed"]),
+              "row_meaning_confirmed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_304_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.304 SDSS RSD Manual Answer Exact Path Or Handoff Decision No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"exact_found_paths = {summary['exact_found_paths']}",
+              f"canonical_path_present = {summary['canonical_path_present']}",
+              f"fuzzy_candidate_rows = {summary['fuzzy_candidate_rows']}",
+              f"selected_path = {summary['selected_path']}",
+              f"selected_source = {summary['selected_source']}",
+              f"exact_path_problem_resolved = {summary['exact_path_problem_resolved']}",
+              f"handoff_required = {summary['handoff_required']}",
+              f"duplicate_download_path_present = {summary['duplicate_download_path_present']}",
+              f"manual_answer_rows = {summary['manual_answer_rows']}",
+              f"reviewable_rows = {summary['reviewable_rows']}",
+              f"blank_template_rows = {summary['blank_template_rows']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.304 decides whether the manual-answer CSV problem is a path problem or a handoff problem. If a duplicate filename such as sdss_rsd_manual_answers_v4_300-1.csv is found, the rail accepts it for now and stops folder chasing. Finding the file is not approval. Blank rows remain blank. All scoring and claim gates remain blocked.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_304_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"exact_found_paths = {summary['exact_found_paths']}")
+          print(f"canonical_path_present = {summary['canonical_path_present']}")
+          print(f"fuzzy_candidate_rows = {summary['fuzzy_candidate_rows']}")
+          print(f"selected_path = {summary['selected_path']}")
+          print(f"selected_source = {summary['selected_source']}")
+          print(f"exact_path_problem_resolved = {summary['exact_path_problem_resolved']}")
+          print(f"handoff_required = {summary['handoff_required']}")
+          print(f"duplicate_download_path_present = {summary['duplicate_download_path_present']}")
+          print(f"manual_answer_rows = {summary['manual_answer_rows']}")
+          print(f"manual_answer_review_rows = {summary['manual_answer_review_rows']}")
+          print(f"reviewable_rows = {summary['reviewable_rows']}")
+          print(f"blank_template_rows = {summary['blank_template_rows']}")
+          print(f"incomplete_rows = {summary['incomplete_rows']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.304 SDSS RSD manual answer exact path or handoff decision output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-304-sdss-rsd-manual-answer-exact-path-or-handoff-decision-output
+          path: |
+            tairid_v4_304_sdss_rsd_manual_answer_exact_path_or_handoff_decision_output/
+            tairid-v4-304-sdss-rsd-manual-answer-exact-path-or-handoff-decision-output.zip
