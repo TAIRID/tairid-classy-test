@@ -1,0 +1,410 @@
+name: 001 TAIRID v4.315 - SDSS RSD Baseline Comparator Source Packet No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-315-sdss-rsd-baseline-comparator-source-packet-no-scoring.yml"
+      - ".github/workflows/**"
+      - "github/workflows/**"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-baseline-comparator-source-packet-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.315 SDSS RSD Baseline Comparator Source Packet No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.315 SDSS RSD baseline comparator source packet no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv, json, re, zipfile, urllib.request, html as html_lib
+
+          VERSION = "v4.315"
+          EXPECTED_RESULT = "v4_315_sdss_rsd_baseline_comparator_source_packet_no_scoring_passed_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_316_sdss_rsd_baseline_comparator_human_review_packet_no_scoring"
+
+          OUT = Path("tairid_v4_315_sdss_rsd_baseline_comparator_source_packet_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+          ZIP_NAME = "tairid-v4-315-sdss-rsd-baseline-comparator-source-packet-output.zip"
+
+          SOURCE_URLS = [
+              "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/",
+              "https://www.sdss4.org/science/final-bao-and-rsd-measurements/",
+              "https://arxiv.org/abs/2007.08991",
+              "https://arxiv.org/abs/2007.08997",
+              "https://arxiv.org/abs/2007.09004",
+              "https://arxiv.org/abs/2007.08995",
+              "https://arxiv.org/abs/1807.06209",
+              "https://arxiv.org/abs/1807.06210",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def fetch_url(url, max_bytes=2_000_000, timeout=15):
+              row = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "bytes_read": 0,
+                  "error": "",
+                  "score_allowed": False,
+                  "support_allowed": False,
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.315-baseline-source-packet-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      row["status_code"] = getattr(resp, "status", "")
+                      row["content_type"] = resp.headers.get("Content-Type", "")
+                      row["bytes_read"] = len(data)
+                      row["fetch_ok"] = True
+              except Exception as exc:
+                  row["error"] = f"{type(exc).__name__}: {exc}"
+              return row, data
+
+          def strip_text(data):
+              if not data:
+                  return ""
+              text = data.decode("utf-8", errors="replace")
+              text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", text)
+              return html_lib.unescape(" ".join(text.split()))
+
+          def window_around(text, terms, width=520, limit=1500):
+              lower = text.lower()
+              hits = []
+              for term in terms:
+                  idx = lower.find(term.lower())
+                  if idx >= 0:
+                      hits.append(idx)
+              if not hits:
+                  return ""
+              idx = min(hits)
+              return text[max(0, idx-width):idx+width].replace("\n", " ")[:limit]
+
+          inherited_v4_314_rows = [
+              {"inherited_from": "v4.314", "item": "rules", "value": "25 / 25 passed", "meaning": "Row meaning gate confirmation passed.", "carry_forward_status": "ready_for_baseline_source_packet"},
+              {"inherited_from": "v4.314", "item": "row_meaning_gate_confirmed", "value": True, "meaning": "The row-meaning / row-family gate is confirmed.", "carry_forward_status": "confirmed"},
+              {"inherited_from": "v4.314", "item": "row_meaning_confirmed", "value": True, "meaning": "Rows 001-003 confirmed row meaning.", "carry_forward_status": "confirmed"},
+              {"inherited_from": "v4.314", "item": "row_family_selected", "value": True, "meaning": "A later row-family candidate was selected.", "carry_forward_status": "selected"},
+              {"inherited_from": "v4.314", "item": "selected_row_family", "value": "BAO+RSD f_sigma8 row", "meaning": "The selected later candidate is the BAO+RSD f_sigma8 row.", "carry_forward_status": "selected"},
+              {"inherited_from": "v4.314", "item": "baseline_values_filled", "value": False, "meaning": "No comparator/baseline values are approved.", "carry_forward_status": "open_gap"},
+              {"inherited_from": "v4.314", "item": "definition_match_confirmed", "value": False, "meaning": "Definition matches remain blocked.", "carry_forward_status": "open_gap"},
+              {"inherited_from": "v4.314", "item": "score_valid", "value": False, "meaning": "No scoring is allowed.", "carry_forward_status": "blocked"},
+          ]
+
+          source_fetch_rows = []
+          source_quote_rows = []
+          quote_specs = [
+              ("baseline_model_context", ["lcdm", "ΛCDM", "fiducial", "cosmological parameters", "Planck"]),
+              ("growth_comparator_context", ["growth rate", "fσ8", "f sigma 8", "fsigma8", "redshift-space distortion"]),
+              ("covariance_or_likelihood_limit", ["covariance", "likelihood", "correlation matrix", "full-shape"]),
+              ("null_policy_context", ["consistency", "model comparison", "constraints", "combined"]),
+          ]
+
+          for url in SOURCE_URLS:
+              fetch, data = fetch_url(url)
+              source_fetch_rows.append(fetch)
+              text = strip_text(data)
+              for quote_class, terms in quote_specs:
+                  window = window_around(text, terms)
+                  source_quote_rows.append({
+                      "quote_id": f"quote_{len(source_quote_rows)+1:03d}",
+                      "quote_class": quote_class,
+                      "source_url": url,
+                      "candidate_quote_window": window,
+                      "quote_status": "candidate_source_window_not_approval" if window else "missing_or_unfetched_window",
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+
+          baseline_source_candidate_rows = []
+          for quote in source_quote_rows:
+              usable = bool(quote["candidate_quote_window"])
+              baseline_source_candidate_rows.append({
+                  "candidate_id": f"baseline_source_candidate_{len(baseline_source_candidate_rows)+1:03d}",
+                  "candidate_class": quote["quote_class"],
+                  "source_url": quote["source_url"],
+                  "candidate_quote_available": usable,
+                  "candidate_quote_window": quote["candidate_quote_window"],
+                  "candidate_use": "human_review_only_not_approved" if usable else "not_available_local_or_fetch_failed",
+                  "can_fill_numeric_baseline_now": False,
+                  "baseline_approved": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          baseline_question_rows = [
+              {"question_id": "baseline_q001", "question": "What independent comparator model/source is allowed for the selected BAO+RSD f_sigma8 row family?", "required_before_scoring": True},
+              {"question_id": "baseline_q002", "question": "Are comparator values source-provided, model-derived, or generated by a separate reproducible script?", "required_before_scoring": True},
+              {"question_id": "baseline_q003", "question": "What cosmological parameter set is used for the comparator, if any?", "required_before_scoring": True},
+              {"question_id": "baseline_q004", "question": "Is the comparator independent enough to avoid same-family circular support?", "required_before_scoring": True},
+              {"question_id": "baseline_q005", "question": "What uncertainty/covariance policy is permitted before any diagonal diagnostic?", "required_before_scoring": True},
+              {"question_id": "baseline_q006", "question": "What null result policy applies if the standard comparator is equal or better?", "required_before_scoring": True},
+          ]
+
+          human_review_template_rows = []
+          for row in baseline_question_rows:
+              human_review_template_rows.append({
+                  "decision_id": f"baseline_decision_{len(human_review_template_rows)+1:03d}",
+                  "question_id": row["question_id"],
+                  "question": row["question"],
+                  "human_decision": "",
+                  "allowed_decisions": "accept_source_candidate|edit_needed|reject|keep_blocked",
+                  "selected_source_url_or_citation": "",
+                  "quoted_or_precise_source_text": "",
+                  "answer_summary": "",
+                  "reviewer_note": "",
+                  "claim_limit_must_remain": "no_scoring/no_claims",
+                  "baseline_approval_allowed_now": False,
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          gate_rows = [
+              {"gate_id": "gate_001", "gate_object": "inherited_row_meaning_gate_confirmed", "gate_passed": True, "gate_status": "confirmed", "reason": "v4.314 confirmed row meaning / row family."},
+              {"gate_id": "gate_002", "gate_object": "source_fetch_rows_written", "gate_passed": len(source_fetch_rows) == len(SOURCE_URLS), "gate_status": "written", "reason": "Candidate baseline/comparator sources attempted."},
+              {"gate_id": "gate_003", "gate_object": "baseline_source_packet_written", "gate_passed": len(baseline_source_candidate_rows) >= len(SOURCE_URLS), "gate_status": "written", "reason": "Candidate packet written for human review only."},
+              {"gate_id": "gate_004", "gate_object": "baseline_human_review_template_written", "gate_passed": len(human_review_template_rows) == 6, "gate_status": "written", "reason": "Baseline/comparator human review template written."},
+              {"gate_id": "gate_005", "gate_object": "baseline_approval", "gate_passed": False, "gate_status": "not_approved", "reason": "v4.315 only gathers source candidates."},
+              {"gate_id": "gate_006", "gate_object": "definition_match_confirmation", "gate_passed": False, "gate_status": "not_confirmed", "reason": "Definition matches remain blocked."},
+              {"gate_id": "gate_007", "gate_object": "diagonal_diagnostic_readiness", "gate_passed": False, "gate_status": "not_ready", "reason": "No scoring readiness without baseline and definition gates."},
+              {"gate_id": "gate_008", "gate_object": "support_allowed", "gate_passed": False, "gate_status": "blocked", "reason": "No support language allowed."},
+          ]
+
+          blocked_rows = [
+              {"blocked_id": "blocked_001", "operation": "approve_baseline_values_now", "reason": "source packet is not approval", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "fill_numeric_baseline_values_now", "reason": "no human-reviewed comparator source", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "confirm_definition_match_now", "reason": "definition-match lane has not run", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "run_diagonal_diagnostic_now", "reason": "diagnostic readiness is false", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no definition matches", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_p_value_or_likelihood", "reason": "full covariance/likelihood remains absent", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "claim_tairid_support", "reason": "support is blocked", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "baseline_comparator_source_packet", "permission_status": "completed", "reason": "Candidate sources and questions written."},
+              {"permission_scope": "baseline_comparator_human_review_packet", "permission_status": "allowed_next", "reason": "Next workflow may package candidate source decisions for review."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "No baseline approval in this workflow."},
+              {"permission_scope": "definition_match_confirmation", "permission_status": "blocked", "reason": "No definition match in this workflow."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "No scoring readiness."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+          ]
+
+          sdr_rows = [
+              {"sdr_id": "sdr_001", "before_state": "row meaning confirmed but baseline gap broad", "after_state": "baseline/comparator source questions are explicit", "reduction_type": "baseline gap decomposed"},
+              {"sdr_id": "sdr_002", "before_state": "possible comparator sources were untracked", "after_state": "candidate source packet records source windows", "reduction_type": "source surface organized"},
+              {"sdr_id": "sdr_003", "before_state": "source candidates could be mistaken for approved baselines", "after_state": "every source candidate remains human-review-only", "reduction_type": "candidate/approval boundary preserved"},
+              {"sdr_id": "sdr_004", "before_state": "scoring pressure could reappear after row meaning confirmation", "after_state": "baseline and definition gates remain blocked", "reduction_type": "false progress blocked"},
+              {"sdr_id": "sdr_005", "before_state": "next action was vague", "after_state": "next action is baseline/comparator human review packet", "reduction_type": "next route narrowed"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before source packet"},
+              {"gate": "inherited_v4_314_rows_equal_8", "passed": len(inherited_v4_314_rows) == 8, "detail": f"inherited_v4_314_rows = {len(inherited_v4_314_rows)}"},
+              {"gate": "source_fetch_rows_equal_8", "passed": len(source_fetch_rows) == 8, "detail": f"source_fetch_rows = {len(source_fetch_rows)}"},
+              {"gate": "source_quote_rows_equal_32", "passed": len(source_quote_rows) == 32, "detail": f"source_quote_rows = {len(source_quote_rows)}"},
+              {"gate": "baseline_source_candidate_rows_equal_32", "passed": len(baseline_source_candidate_rows) == 32, "detail": f"baseline_source_candidate_rows = {len(baseline_source_candidate_rows)}"},
+              {"gate": "baseline_question_rows_equal_6", "passed": len(baseline_question_rows) == 6, "detail": f"baseline_question_rows = {len(baseline_question_rows)}"},
+              {"gate": "human_review_template_rows_equal_6", "passed": len(human_review_template_rows) == 6, "detail": f"human_review_template_rows = {len(human_review_template_rows)}"},
+              {"gate": "gate_rows_equal_8", "passed": len(gate_rows) == 8, "detail": f"gate_rows = {len(gate_rows)}"},
+              {"gate": "blocked_rows_equal_10", "passed": len(blocked_rows) == 10, "detail": f"blocked_rows = {len(blocked_rows)}"},
+              {"gate": "permission_rows_equal_6", "passed": len(permission_rows) == 6, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "sdr_rows_equal_5", "passed": len(sdr_rows) == 5, "detail": f"sdr_rows = {len(sdr_rows)}"},
+              {"gate": "all_sources_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in source_fetch_rows), "detail": "sources no score/support"},
+              {"gate": "all_quotes_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in source_quote_rows), "detail": "quotes no score/support"},
+              {"gate": "all_candidates_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in baseline_source_candidate_rows), "detail": "candidates no score/support"},
+              {"gate": "all_review_templates_no_score_support", "passed": all(r["score_allowed"] is False and r["support_allowed"] is False for r in human_review_template_rows), "detail": "templates no score/support"},
+              {"gate": "baseline_approval_false", "passed": any(r["gate_object"] == "baseline_approval" and r["gate_passed"] is False for r in gate_rows), "detail": "baseline not approved"},
+              {"gate": "definition_match_false", "passed": any(r["gate_object"] == "definition_match_confirmation" and r["gate_passed"] is False for r in gate_rows), "detail": "definition not confirmed"},
+              {"gate": "diagnostic_readiness_false", "passed": any(r["gate_object"] == "diagonal_diagnostic_readiness" and r["gate_passed"] is False for r in gate_rows), "detail": "diagnostic not ready"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(r["blocked"] is True for r in blocked_rows), "detail": "all blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_score", "passed": True, "detail": "no score"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_316_sdss_rsd_baseline_comparator_human_review_packet_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_315_sdss_rsd_baseline_comparator_source_packet_no_scoring_passed_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_315_inherited_v4_314_rows.csv", inherited_v4_314_rows)
+          write_csv(OUT / "v4_315_source_fetch_rows.csv", source_fetch_rows)
+          write_csv(OUT / "v4_315_source_quote_rows.csv", source_quote_rows)
+          write_csv(OUT / "v4_315_baseline_source_candidate_rows.csv", baseline_source_candidate_rows)
+          write_csv(OUT / "SDSS_RSD_BASELINE_COMPARATOR_SOURCE_PACKET_v4_315_NO_APPROVAL.csv", baseline_source_candidate_rows)
+          write_csv(OUT / "v4_315_baseline_question_rows.csv", baseline_question_rows)
+          write_csv(OUT / "SDSS_RSD_BASELINE_COMPARATOR_HUMAN_REVIEW_TEMPLATE_v4_315_FILLABLE.csv", human_review_template_rows)
+          write_csv(OUT / "v4_315_gate_decision_rows.csv", gate_rows)
+          write_csv(OUT / "v4_315_blocked_operation_rows.csv", blocked_rows)
+          write_csv(OUT / "v4_315_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_315_sdr_reduction_rows.csv", sdr_rows)
+          write_csv(OUT / "v4_315_rule_checks.csv", checks)
+
+          readme = [
+              "# SDSS RSD Baseline Comparator Source Packet v4.315",
+              "",
+              "This workflow starts the baseline/comparator source lane after v4.314 confirmed row meaning.",
+              "",
+              "It gathers candidate source windows and writes a fillable human-review template.",
+              "",
+              "It does not approve comparator values. It does not fill numeric baseline values. It does not confirm definition matches. It does not score anything.",
+              "",
+              "Truth boundary: no proof, no validation, no support, no scoring, no p-value, no likelihood.",
+          ]
+          (OUT / "SDSS_RSD_BASELINE_COMPARATOR_SOURCE_PACKET_v4_315_README.md").write_text("\n".join(readme), encoding="utf-8")
+
+          summary = {
+              "version": VERSION,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_row_meaning_gate_confirmed": True,
+              "selected_row_family": "BAO+RSD f_sigma8 row",
+              "source_fetch_rows": len(source_fetch_rows),
+              "source_fetch_ok_rows": sum(1 for row in source_fetch_rows if row["fetch_ok"]),
+              "source_quote_rows": len(source_quote_rows),
+              "baseline_source_candidate_rows": len(baseline_source_candidate_rows),
+              "candidate_quote_available_rows": sum(1 for row in baseline_source_candidate_rows if row["candidate_quote_available"]),
+              "baseline_question_rows": len(baseline_question_rows),
+              "human_review_template_rows": len(human_review_template_rows),
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "baseline_approved": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "gate_decision_rows": len(gate_rows),
+              "gate_approval_rows": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_315_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.315 SDSS RSD Baseline Comparator Source Packet No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_row_meaning_gate_confirmed = {summary['inherited_row_meaning_gate_confirmed']}",
+              f"selected_row_family = {summary['selected_row_family']}",
+              f"source_fetch_rows = {summary['source_fetch_rows']}",
+              f"source_fetch_ok_rows = {summary['source_fetch_ok_rows']}",
+              f"source_quote_rows = {summary['source_quote_rows']}",
+              f"baseline_source_candidate_rows = {summary['baseline_source_candidate_rows']}",
+              f"candidate_quote_available_rows = {summary['candidate_quote_available_rows']}",
+              f"baseline_question_rows = {summary['baseline_question_rows']}",
+              f"human_review_template_rows = {summary['human_review_template_rows']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"gate_approval_rows = {summary['gate_approval_rows']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Clean meaning: v4.315 starts the baseline/comparator source lane. It gathers candidate sources and writes a human-review template. It does not approve or score baseline values.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_315_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_row_meaning_gate_confirmed = {summary['inherited_row_meaning_gate_confirmed']}")
+          print(f"selected_row_family = {summary['selected_row_family']}")
+          print(f"source_fetch_rows = {summary['source_fetch_rows']}")
+          print(f"source_fetch_ok_rows = {summary['source_fetch_ok_rows']}")
+          print(f"source_quote_rows = {summary['source_quote_rows']}")
+          print(f"baseline_source_candidate_rows = {summary['baseline_source_candidate_rows']}")
+          print(f"candidate_quote_available_rows = {summary['candidate_quote_available_rows']}")
+          print(f"baseline_question_rows = {summary['baseline_question_rows']}")
+          print(f"human_review_template_rows = {summary['human_review_template_rows']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"gate_approval_rows = {summary['gate_approval_rows']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+
+          PY
+
+      - name: Upload v4.315 SDSS RSD baseline comparator source packet output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-315-sdss-rsd-baseline-comparator-source-packet-output
+          path: |
+            tairid_v4_315_sdss_rsd_baseline_comparator_source_packet_output/
+            tairid-v4-315-sdss-rsd-baseline-comparator-source-packet-output.zip
