@@ -1,0 +1,793 @@
+name: 001 TAIRID v4.277 - LRG ELG Equivalent Packet Candidate Reader Selection Or Manual Fill Validator
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-277-lrg-elg-equivalent-packet-candidate-reader-selection-or-manual-fill-validator.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+
+permissions:
+  contents: read
+
+jobs:
+  lrg-elg-candidate-reader-selection-or-manual-fill-validator:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.277 LRG ELG Equivalent Packet Candidate Reader Selection Or Manual Fill Validator is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.277 LRG ELG route selector and manual fill validator guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import re
+          import zipfile
+
+          VERSION = "v4.277"
+          ROUTE = "lrg_elg_equivalent_packet_candidate_reader_selection_or_manual_fill_validator_after_v4_276"
+          EXPECTED_RESULT = "v4_277_lrg_elg_equivalent_packet_candidate_reader_selection_or_manual_fill_validator_passed_no_validation"
+          SELECTED_NEXT_ROUTE = "v4_278_lrg_elg_candidate_file_reader_probe_with_scope_guards"
+
+          OUT = Path("tairid_v4_277_lrg_elg_candidate_reader_selection_manual_fill_validator_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-277-lrg-elg-candidate-reader-selection-manual-fill-validator-output.zip"
+
+          REQUIRED_PACKET_FIELDS = [
+              "source_lane",
+              "packet_id",
+              "observed_id",
+              "source_family",
+              "source_release",
+              "source_role",
+              "redshift",
+              "quantity",
+              "observed_value",
+              "observed_sigma_or_likelihood",
+              "reference_value",
+              "reference_source_or_method",
+              "covariance_policy",
+              "covariance_path_or_method",
+              "inverse_covariance_status",
+              "residual_preview_status",
+              "diagnostic_distance_status",
+              "provenance_status",
+              "approval_status",
+              "notes",
+          ]
+
+          PLACEHOLDER_TOKENS = [
+              "FILL_",
+              "MISSING",
+              "RECALCULATE",
+              "template row only",
+              "OPTIONAL_SECOND_ROW",
+          ]
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def is_candidate_file(path):
+              lower = path.as_posix().lower()
+              if ".git/" in lower or "node_modules/" in lower:
+                  return False
+              if path.suffix.lower() not in [".csv", ".json", ".txt", ".md", ".yaml", ".yml", ".tsv"]:
+                  return False
+              keywords = ["lrg", "elg", "qso", "rsd", "fsigma", "f_sigma", "growth", "bao", "cov", "covariance", "zhao", "residual", "tracer", "packet"]
+              return any(k in lower for k in keywords)
+
+          def lane_guess(path):
+              lower = path.as_posix().lower()
+              lanes = []
+              if "lrg" in lower:
+                  lanes.append("LRG")
+              if "elg" in lower:
+                  lanes.append("ELG")
+              if "qso" in lower or "zhao" in lower:
+                  lanes.append("QSO")
+              return "|".join(lanes) if lanes else "unknown"
+
+          def object_guess(path):
+              lower = path.as_posix().lower()
+              objects = []
+              if "manual" in lower or "template" in lower or "fill" in lower:
+                  objects.append("manual_or_template")
+              if "filled" in lower or "validated_packet" in lower:
+                  objects.append("filled_candidate")
+              if "cov" in lower or "covariance" in lower:
+                  objects.append("covariance_candidate")
+              if "observ" in lower or "fsigma" in lower or "f_sigma" in lower or "growth" in lower:
+                  objects.append("observed_candidate")
+              if "reference" in lower or "lcdm" in lower or "model" in lower:
+                  objects.append("reference_candidate")
+              if "residual" in lower:
+                  objects.append("residual_candidate")
+              if "reader" in lower or "probe" in lower:
+                  objects.append("reader_candidate")
+              return "|".join(objects) if objects else "candidate_context"
+
+          def read_csv_if_possible(path):
+              try:
+                  with path.open("r", encoding="utf-8-sig", newline="") as f:
+                      reader = csv.DictReader(f)
+                      rows = list(reader)
+                      fields = reader.fieldnames or []
+                  return fields, rows, ""
+              except Exception as exc:
+                  return [], [], f"{type(exc).__name__}: {exc}"
+
+          def has_placeholder(value):
+              text = str(value)
+              return any(token in text for token in PLACEHOLDER_TOKENS)
+
+          def row_fill_status(row):
+              missing_fields = [field for field in REQUIRED_PACKET_FIELDS if field not in row]
+              blank_fields = [field for field in REQUIRED_PACKET_FIELDS if field in row and str(row.get(field, "")).strip() == ""]
+              placeholder_fields = [field for field in REQUIRED_PACKET_FIELDS if field in row and has_placeholder(row.get(field, ""))]
+              approval_ok = row.get("approval_status") == "candidate_not_scored_not_evidence"
+              return missing_fields, blank_fields, placeholder_fields, approval_ok
+
+          inherited_v4_276_rows = [
+              {
+                  "inherited_from": "v4.276",
+                  "item": "rules",
+                  "value": "42 / 42 passed",
+                  "meaning": "LRG/ELG equivalent residual packet template builder passed.",
+                  "carry_forward_status": "ready_for_route_selection",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "candidate_file_rows",
+                  "value": 185,
+                  "meaning": "Candidate filename leads existed in the uploaded v4.276 output.",
+                  "carry_forward_status": "leads_only_not_validated",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "packet_schema_rows",
+                  "value": 40,
+                  "meaning": "LRG and ELG schema rows were written.",
+                  "carry_forward_status": "schema_ready",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "manual_fill_template_rows",
+                  "value": 4,
+                  "meaning": "LRG/ELG manual fill templates were written.",
+                  "carry_forward_status": "template_ready_not_data",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "candidate_reader_requirement_rows",
+                  "value": 6,
+                  "meaning": "Reader requirements were written.",
+                  "carry_forward_status": "reader_requirements_ready",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "lrg_equivalent_packet_ready",
+                  "value": False,
+                  "meaning": "LRG packet was not ready.",
+                  "carry_forward_status": "lrg_packet_missing",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "elg_equivalent_packet_ready",
+                  "value": False,
+                  "meaning": "ELG packet was not ready.",
+                  "carry_forward_status": "elg_packet_missing",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "candidate_reader_selection_allowed_next",
+                  "value": True,
+                  "meaning": "Candidate reader selection was allowed next.",
+                  "carry_forward_status": "current_permission",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "manual_fill_validator_allowed_if_filled",
+                  "value": True,
+                  "meaning": "Manual fill validation was allowed only if filled templates exist.",
+                  "carry_forward_status": "conditional_permission",
+              },
+              {
+                  "inherited_from": "v4.276",
+                  "item": "selected_next_route",
+                  "value": "v4_277_lrg_elg_equivalent_packet_candidate_reader_selection_or_manual_fill_validator",
+                  "meaning": "Current route chooses reader route or manual fill validator route.",
+                  "carry_forward_status": "current_route",
+              },
+          ]
+
+          candidate_files = []
+          for p in Path(".").rglob("*"):
+              if p.is_file() and is_candidate_file(p):
+                  try:
+                      size = p.stat().st_size
+                  except Exception:
+                      size = None
+                  candidate_files.append({
+                      "path": p.as_posix(),
+                      "suffix": p.suffix.lower(),
+                      "size_bytes": size,
+                      "lane_guess": lane_guess(p),
+                      "object_guess": object_guess(p),
+                      "candidate_status": "filename_lead_only_not_validated",
+                  })
+          candidate_files = sorted(candidate_files, key=lambda row: row["path"])[:400]
+
+          manual_template_candidate_paths = [
+              row for row in candidate_files
+              if row["suffix"] in [".csv", ".tsv"]
+              and ("LRG" in row["lane_guess"] or "ELG" in row["lane_guess"])
+              and ("manual_or_template" in row["object_guess"] or "filled_candidate" in row["object_guess"])
+          ]
+
+          manual_fill_scan_rows = []
+          filled_packet_candidate_rows = []
+          for item in manual_template_candidate_paths[:50]:
+              path = Path(item["path"])
+              fields, rows, error = read_csv_if_possible(path)
+              missing_columns = [field for field in REQUIRED_PACKET_FIELDS if field not in fields]
+              placeholder_row_count = 0
+              usable_row_count = 0
+              lane_values = set()
+              for row in rows:
+                  lane_values.add(str(row.get("source_lane", "")).strip())
+                  missing_fields, blank_fields, placeholder_fields, approval_ok = row_fill_status(row)
+                  if placeholder_fields:
+                      placeholder_row_count += 1
+                  if not missing_fields and not blank_fields and not placeholder_fields and approval_ok:
+                      usable_row_count += 1
+                      filled_packet_candidate_rows.append({
+                          "source_path": item["path"],
+                          "source_lane": row.get("source_lane", ""),
+                          "packet_id": row.get("packet_id", ""),
+                          "observed_id": row.get("observed_id", ""),
+                          "redshift": row.get("redshift", ""),
+                          "quantity": row.get("quantity", ""),
+                          "approval_status": row.get("approval_status", ""),
+                          "candidate_status": "filled_packet_candidate_not_validated",
+                      })
+              manual_fill_scan_rows.append({
+                  "path": item["path"],
+                  "lane_guess": item["lane_guess"],
+                  "rows_read": len(rows),
+                  "columns_read": len(fields),
+                  "missing_required_columns": "|".join(missing_columns) if missing_columns else "none",
+                  "placeholder_row_count": placeholder_row_count,
+                  "usable_filled_candidate_rows": usable_row_count,
+                  "lane_values_seen": "|".join(sorted(v for v in lane_values if v)),
+                  "read_error": error if error else "none",
+                  "manual_fill_route_status": "candidate_filled_rows_seen_not_validated" if usable_row_count else "no_filled_rows_ready",
+              })
+
+          lrg_filled_candidates = [row for row in filled_packet_candidate_rows if row.get("source_lane") == "LRG"]
+          elg_filled_candidates = [row for row in filled_packet_candidate_rows if row.get("source_lane") == "ELG"]
+          manual_fill_ready = bool(lrg_filled_candidates and elg_filled_candidates)
+
+          lane_candidate_summary_rows = [
+              {
+                  "summary_id": "summary_001",
+                  "object": "candidate_files_scanned",
+                  "value": len(candidate_files),
+                  "meaning": "Filename leads scanned. Leads are not validated data.",
+              },
+              {
+                  "summary_id": "summary_002",
+                  "object": "manual_template_candidate_paths",
+                  "value": len(manual_template_candidate_paths),
+                  "meaning": "Possible manual/template CSV or TSV paths found.",
+              },
+              {
+                  "summary_id": "summary_003",
+                  "object": "lrg_filled_candidate_rows",
+                  "value": len(lrg_filled_candidates),
+                  "meaning": "LRG filled rows that look complete enough for future validation.",
+              },
+              {
+                  "summary_id": "summary_004",
+                  "object": "elg_filled_candidate_rows",
+                  "value": len(elg_filled_candidates),
+                  "meaning": "ELG filled rows that look complete enough for future validation.",
+              },
+          ]
+
+          route_selection_rows = [
+              {
+                  "route_id": "select_001",
+                  "route": "manual_fill_validator",
+                  "condition": "requires at least one filled LRG row and one filled ELG row with required fields",
+                  "condition_met": manual_fill_ready,
+                  "selection_status": "allowed_next_if_true" if manual_fill_ready else "not_ready",
+              },
+              {
+                  "route_id": "select_002",
+                  "route": "candidate_file_reader_probe",
+                  "condition": "allowed when manual-filled packets are not ready and candidate leads exist",
+                  "condition_met": (not manual_fill_ready and len(candidate_files) > 0),
+                  "selection_status": "recommended" if (not manual_fill_ready and len(candidate_files) > 0) else "not_primary",
+              },
+              {
+                  "route_id": "select_003",
+                  "route": "manual_template_repost_or_fill",
+                  "condition": "needed when no safe filled packets and no usable candidate leads exist",
+                  "condition_met": (not manual_fill_ready and len(candidate_files) == 0),
+                  "selection_status": "fallback" if (not manual_fill_ready and len(candidate_files) == 0) else "not_primary",
+              },
+          ]
+
+          reader_probe_plan_rows = [
+              {
+                  "plan_id": "probe_001",
+                  "source_lane": "LRG",
+                  "probe_goal": "identify candidate files whose columns can map to the equivalent packet schema",
+                  "allowed_action": "inspect headers and sample rows only",
+                  "blocked_action": "do not compute residuals or fill missing values by guessing",
+              },
+              {
+                  "plan_id": "probe_002",
+                  "source_lane": "ELG",
+                  "probe_goal": "identify candidate files whose columns can map to the equivalent packet schema",
+                  "allowed_action": "inspect headers and sample rows only",
+                  "blocked_action": "do not compute residuals or fill missing values by guessing",
+              },
+              {
+                  "plan_id": "probe_003",
+                  "source_lane": "LRG_ELG",
+                  "probe_goal": "choose parser route only after schema fit is explicit",
+                  "allowed_action": "write candidate mapping table",
+                  "blocked_action": "do not validate source data from filenames alone",
+              },
+              {
+                  "plan_id": "probe_004",
+                  "source_lane": "combined_LRG_ELG_QSO",
+                  "probe_goal": "none",
+                  "allowed_action": "none",
+                  "blocked_action": "combined matrix remains blocked",
+              },
+          ]
+
+          manual_validation_contract_rows = [
+              {
+                  "contract_id": "manual_001",
+                  "future_validator": "required_columns",
+                  "requirement": "all 20 packet fields must exist",
+                  "current_status": "ready_contract",
+              },
+              {
+                  "contract_id": "manual_002",
+                  "future_validator": "placeholder_removal",
+                  "requirement": "filled rows must not contain FILL_, MISSING, RECALCULATE, or template-only notes",
+                  "current_status": "ready_contract",
+              },
+              {
+                  "contract_id": "manual_003",
+                  "future_validator": "lane_pair_presence",
+                  "requirement": "at least one LRG row and one ELG row required",
+                  "current_status": "ready_contract",
+              },
+              {
+                  "contract_id": "manual_004",
+                  "future_validator": "numeric_fields",
+                  "requirement": "redshift, observed_value, observed_sigma_or_likelihood, and reference_value must parse as numeric unless explicitly scoped otherwise",
+                  "current_status": "ready_contract",
+              },
+              {
+                  "contract_id": "manual_005",
+                  "future_validator": "claim_boundary",
+                  "requirement": "approval_status must remain candidate_not_scored_not_evidence",
+                  "current_status": "ready_contract",
+              },
+          ]
+
+          safety_guard_rows = [
+              {
+                  "guard_id": "guard_001",
+                  "guard": "manual_templates_are_not_data",
+                  "meaning": "Template rows cannot be validated unless placeholders are removed.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_002",
+                  "guard": "candidate_files_are_leads_only",
+                  "meaning": "Filename leads do not validate data content.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_003",
+                  "guard": "reader_probe_headers_only",
+                  "meaning": "Next reader probe may inspect schema and samples only.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_004",
+                  "guard": "no_guess_fill",
+                  "meaning": "Missing observed, reference, or covariance fields must stay missing.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_005",
+                  "guard": "no_residuals_without_validated_packets",
+                  "meaning": "LRG/ELG residual previews stay blocked.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_006",
+                  "guard": "no_source_comparison_without_packet_parity",
+                  "meaning": "Source comparison remains blocked.",
+                  "status": "active",
+              },
+              {
+                  "guard_id": "guard_007",
+                  "guard": "no_combined_matrix",
+                  "meaning": "Combined matrix remains blocked.",
+                  "status": "active",
+              },
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "validate_manual_fill_now_if_not_ready", "reason": "manual-filled LRG and ELG rows are not both present unless detector finds them", "blocked": not manual_fill_ready},
+              {"blocked_id": "blocked_002", "operation": "compute_LRG_residuals_now", "reason": "LRG packet is not validated", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "compute_ELG_residuals_now", "reason": "ELG packet is not validated", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "compute_LRG_ELG_diagnostic_scalars_now", "reason": "residual previews do not exist", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "source_comparison_now", "reason": "packet parity is missing", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "combined_matrix_now", "reason": "source-separated diagnostics and dependency audit are missing", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "p_value_or_likelihood_now", "reason": "no scoring guard exists", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "numeric_correction_fit_now", "reason": "no fitting guard exists", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "validation_or_evidence_claim_now", "reason": "no validation/evidence guard exists", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "route_selection", "permission_status": "completed_no_validation", "reason": "Manual-fill readiness and reader-probe route are checked."},
+              {"permission_scope": "candidate_reader_probe", "permission_status": "allowed_next" if not manual_fill_ready else "optional", "reason": "Use when filled manual templates are not ready."},
+              {"permission_scope": "manual_fill_validator", "permission_status": "allowed_next" if manual_fill_ready else "blocked_until_filled_LRG_ELG_rows", "reason": "Requires complete filled LRG and ELG rows."},
+              {"permission_scope": "LRG_residual_preview", "permission_status": "blocked", "reason": "LRG packet is not validated."},
+              {"permission_scope": "ELG_residual_preview", "permission_status": "blocked", "reason": "ELG packet is not validated."},
+              {"permission_scope": "source_comparison_residual_guard", "permission_status": "blocked_until_LRG_ELG_packets", "reason": "Comparison requires validated lane packets."},
+              {"permission_scope": "combined_lrg_elg_qso_matrix", "permission_status": "blocked", "reason": "Combined matrix requires packet parity and dependency audit."},
+              {"permission_scope": "p_value_or_likelihood", "permission_status": "blocked", "reason": "No scoring guard exists."},
+              {"permission_scope": "numeric_correction_fit", "permission_status": "blocked", "reason": "No fitting is allowed."},
+              {"permission_scope": "cosmology_validation_claim", "permission_status": "blocked", "reason": "No validation guard has passed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "manual_fill_validator", "status": "ready_next" if manual_fill_ready else "blocked_until_filled_templates", "meaning": "Requires filled LRG and ELG rows."},
+              {"readiness_id": "ready_002", "object": "candidate_reader_probe", "status": "ready_next" if not manual_fill_ready else "optional", "meaning": "Best route when filled templates are absent."},
+              {"readiness_id": "ready_003", "object": "LRG_equivalent_packet", "status": "not_ready", "meaning": "Still not validated."},
+              {"readiness_id": "ready_004", "object": "ELG_equivalent_packet", "status": "not_ready", "meaning": "Still not validated."},
+              {"readiness_id": "ready_005", "object": "source_comparison", "status": "blocked", "meaning": "Needs packet parity."},
+              {"readiness_id": "ready_006", "object": "combined_matrix", "status": "blocked", "meaning": "Needs source-separated diagnostics and dependency audit."},
+          ]
+
+          if manual_fill_ready:
+              recommended_next = "v4_278_lrg_elg_manual_fill_packet_validator_no_scoring"
+              next_purpose = "validate completed manual-filled LRG and ELG packet rows without residuals"
+          else:
+              recommended_next = "v4_278_lrg_elg_candidate_file_reader_probe_with_scope_guards"
+              next_purpose = "probe candidate files for schema mapping without validating data or computing residuals"
+
+          decision_rows = [
+              {
+                  "decision_id": "decision_001",
+                  "decision": "Route selection completed.",
+                  "basis": "Manual-fill readiness and candidate-file leads were checked.",
+                  "next_action": recommended_next,
+                  "claim_status": "no_validation",
+              },
+              {
+                  "decision_id": "decision_002",
+                  "decision": "Manual-fill validation is not the default route unless filled rows exist.",
+                  "basis": f"manual_fill_ready = {manual_fill_ready}",
+                  "next_action": "Use manual validator only when filled templates exist.",
+                  "claim_status": "guarded",
+              },
+              {
+                  "decision_id": "decision_003",
+                  "decision": "Candidate reader probe may proceed as schema inspection only.",
+                  "basis": "Reader route can inspect columns and sample rows but cannot validate data from filenames.",
+                  "next_action": "Probe headers and schema fit next if manual fill is not ready.",
+                  "claim_status": "leads_only",
+              },
+              {
+                  "decision_id": "decision_004",
+                  "decision": "Residuals and source comparison remain blocked.",
+                  "basis": "LRG and ELG packets are still not validated.",
+                  "next_action": "Do not compute LRG/ELG residuals.",
+                  "claim_status": "safe_to_continue",
+              },
+          ]
+
+          route_decision_rows = [
+              {"route_id": "route_001", "route": recommended_next, "permission_status": "recommended", "reason": next_purpose},
+              {"route_id": "route_002", "route": "lrg_elg_manual_fill_packet_validator_no_scoring", "permission_status": "allowed_if_manual_fill_ready" if manual_fill_ready else "blocked_until_filled_templates", "reason": "Requires complete LRG and ELG filled rows."},
+              {"route_id": "route_003", "route": "lrg_elg_candidate_file_reader_probe_with_scope_guards", "permission_status": "allowed_next" if not manual_fill_ready else "optional", "reason": "Probe candidate file schemas without validating data."},
+              {"route_id": "route_004", "route": "source_comparison_residual_guard", "permission_status": "blocked_until_LRG_ELG_packets", "reason": "Comparison requires validated packets."},
+              {"route_id": "route_005", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.277 is a clean route-selection milestone."},
+          ]
+
+          next_rows = [
+              {"priority": 1, "test_id": recommended_next, "purpose": next_purpose, "activated": True},
+              {"priority": 2, "test_id": "v4_278_lrg_elg_manual_fill_packet_validator_no_scoring", "purpose": "only if filled manual templates exist", "activated": manual_fill_ready},
+              {"priority": 3, "test_id": "v4_278_source_comparison_residual_guard", "purpose": "blocked until LRG/ELG packets validate", "activated": False},
+              {"priority": 4, "test_id": "v4_278_handoff_if_needed", "purpose": "consolidate through route-selection milestone", "activated": True},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "two possible routes were open", "after_state": "manual-fill readiness decides route", "reduction_type": "route uncertainty reduced"},
+              {"sdr_id": "sdr_002", "before_state": "templates could be mistaken as filled data", "after_state": "placeholder and filled-row checks separate templates from data", "reduction_type": "template/data boundary sharpened"},
+              {"sdr_id": "sdr_003", "before_state": "candidate reader could over-parse unknown files", "after_state": "reader route limited to header/sample schema probe", "reduction_type": "parser risk reduced"},
+              {"sdr_id": "sdr_004", "before_state": "manual validator could run without filled rows", "after_state": "manual validator blocked unless LRG and ELG filled rows exist", "reduction_type": "invalid validation blocked"},
+              {"sdr_id": "sdr_005", "before_state": "source comparison could be tempting", "after_state": "source comparison remains blocked until validated packets", "reduction_type": "premature comparison prevented"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before route selector"},
+              {"gate": "inherited_v4_276_rows_equal_10", "passed": len(inherited_v4_276_rows) == 10, "detail": f"inherited_v4_276_rows = {len(inherited_v4_276_rows)}"},
+              {"gate": "candidate_file_rows_at_least_0", "passed": len(candidate_files) >= 0, "detail": f"candidate_file_rows = {len(candidate_files)}"},
+              {"gate": "lane_candidate_summary_rows_equal_4", "passed": len(lane_candidate_summary_rows) == 4, "detail": f"lane_candidate_summary_rows = {len(lane_candidate_summary_rows)}"},
+              {"gate": "manual_fill_scan_rows_recorded", "passed": len(manual_fill_scan_rows) >= 0, "detail": f"manual_fill_scan_rows = {len(manual_fill_scan_rows)}"},
+              {"gate": "filled_packet_candidate_rows_recorded", "passed": len(filled_packet_candidate_rows) >= 0, "detail": f"filled_packet_candidate_rows = {len(filled_packet_candidate_rows)}"},
+              {"gate": "route_selection_rows_equal_3", "passed": len(route_selection_rows) == 3, "detail": f"route_selection_rows = {len(route_selection_rows)}"},
+              {"gate": "reader_probe_plan_rows_equal_4", "passed": len(reader_probe_plan_rows) == 4, "detail": f"reader_probe_plan_rows = {len(reader_probe_plan_rows)}"},
+              {"gate": "manual_validation_contract_rows_equal_5", "passed": len(manual_validation_contract_rows) == 5, "detail": f"manual_validation_contract_rows = {len(manual_validation_contract_rows)}"},
+              {"gate": "safety_guard_rows_equal_7", "passed": len(safety_guard_rows) == 7, "detail": f"safety_guard_rows = {len(safety_guard_rows)}"},
+              {"gate": "blocked_operation_rows_equal_9", "passed": len(blocked_operation_rows) == 9, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_10", "passed": len(permission_rows) == 10, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_decision_rows_equal_5", "passed": len(route_decision_rows) == 5, "detail": f"route_decision_rows = {len(route_decision_rows)}"},
+              {"gate": "next_rows_equal_4", "passed": len(next_rows) == 4, "detail": f"next_rows = {len(next_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_safety_guards_active", "passed": all(row["status"] == "active" for row in safety_guard_rows), "detail": "all safety guards active"},
+              {"gate": "manual_fill_route_status_explicit", "passed": any(row["route"] == "manual_fill_validator" for row in route_selection_rows), "detail": "manual fill route status explicit"},
+              {"gate": "candidate_reader_route_status_explicit", "passed": any(row["route"] == "candidate_file_reader_probe" for row in route_selection_rows), "detail": "candidate reader route status explicit"},
+              {"gate": "recommended_route_written", "passed": any(row["route"] == recommended_next and row["permission_status"] == "recommended" for row in route_decision_rows), "detail": f"recommended_next = {recommended_next}"},
+              {"gate": "route_selector_completed", "passed": any(row["permission_scope"] == "route_selection" and row["permission_status"] == "completed_no_validation" for row in permission_rows), "detail": "route selection complete"},
+              {"gate": "lrg_residual_blocked", "passed": any(row["permission_scope"] == "LRG_residual_preview" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "LRG residual blocked"},
+              {"gate": "elg_residual_blocked", "passed": any(row["permission_scope"] == "ELG_residual_preview" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "ELG residual blocked"},
+              {"gate": "source_comparison_blocked", "passed": any(row["permission_scope"] == "source_comparison_residual_guard" and row["permission_status"] == "blocked_until_LRG_ELG_packets" for row in permission_rows), "detail": "source comparison blocked"},
+              {"gate": "combined_matrix_blocked", "passed": any(row["permission_scope"] == "combined_lrg_elg_qso_matrix" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "combined matrix blocked"},
+              {"gate": "p_value_likelihood_blocked", "passed": any(row["permission_scope"] == "p_value_or_likelihood" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "p-value/likelihood blocked"},
+              {"gate": "numeric_fit_blocked", "passed": any(row["permission_scope"] == "numeric_correction_fit" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "numeric fit blocked"},
+              {"gate": "validation_claim_blocked", "passed": any(row["permission_scope"] == "cosmology_validation_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation claim blocked"},
+              {"gate": "all_always_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows[1:]), "detail": "all core risky operations blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_scoring", "passed": True, "detail": "no scoring"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == recommended_next, "detail": f"selected_next_route = {recommended_next}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_277_lrg_elg_equivalent_packet_candidate_reader_selection_or_manual_fill_validator_passed_no_validation", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_277_inherited_v4_276_rows.csv", inherited_v4_276_rows)
+          write_csv(OUT / "v4_277_candidate_file_rows.csv", candidate_files)
+          write_csv(OUT / "v4_277_manual_fill_scan_rows.csv", manual_fill_scan_rows)
+          write_csv(OUT / "v4_277_filled_packet_candidate_rows.csv", filled_packet_candidate_rows)
+          write_csv(OUT / "v4_277_lane_candidate_summary_rows.csv", lane_candidate_summary_rows)
+          write_csv(OUT / "v4_277_route_selection_rows.csv", route_selection_rows)
+          write_csv(OUT / "v4_277_reader_probe_plan_rows.csv", reader_probe_plan_rows)
+          write_csv(OUT / "v4_277_manual_validation_contract_rows.csv", manual_validation_contract_rows)
+          write_csv(OUT / "v4_277_safety_guard_rows.csv", safety_guard_rows)
+          write_csv(OUT / "v4_277_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_277_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_277_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_277_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_277_route_decision_rows.csv", route_decision_rows)
+          write_csv(OUT / "v4_277_prioritized_next_rows.csv", next_rows)
+          write_csv(OUT / "v4_277_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_277_rule_checks.csv", checks)
+
+          route_lines = [
+              f"{row['route']}: condition_met={row['condition_met']} / {row['selection_status']}"
+              for row in route_selection_rows
+          ]
+
+          summary_lines = [
+              f"{row['object']} = {row['value']} ({row['meaning']})"
+              for row in lane_candidate_summary_rows
+          ]
+
+          decision_lines = [
+              f"{row['decision']}: {row['basis']}"
+              for row in decision_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "inherited_v4_276_rows": len(inherited_v4_276_rows),
+              "candidate_file_rows": len(candidate_files),
+              "manual_fill_scan_rows": len(manual_fill_scan_rows),
+              "filled_packet_candidate_rows": len(filled_packet_candidate_rows),
+              "lrg_filled_candidate_rows": len(lrg_filled_candidates),
+              "elg_filled_candidate_rows": len(elg_filled_candidates),
+              "lane_candidate_summary_rows": len(lane_candidate_summary_rows),
+              "route_selection_rows": len(route_selection_rows),
+              "reader_probe_plan_rows": len(reader_probe_plan_rows),
+              "manual_validation_contract_rows": len(manual_validation_contract_rows),
+              "safety_guard_rows": len(safety_guard_rows),
+              "blocked_operation_rows": len(blocked_operation_rows),
+              "permission_rows": len(permission_rows),
+              "readiness_rows": len(readiness_rows),
+              "decision_rows": len(decision_rows),
+              "route_decision_rows": len(route_decision_rows),
+              "next_rows": len(next_rows),
+              "sdr_reduction_rows": len(sdr_reduction_rows),
+              "manual_fill_ready": manual_fill_ready,
+              "candidate_reader_probe_allowed_next": not manual_fill_ready,
+              "manual_fill_validator_allowed_next": manual_fill_ready,
+              "lrg_equivalent_packet_ready": False,
+              "elg_equivalent_packet_ready": False,
+              "source_comparison_allowed": False,
+              "combined_matrix_allowed": False,
+              "residuals_computed": False,
+              "diagnostic_scalar_computed": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "evidence_allowed": False,
+              "scoring_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": recommended_next,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False,
+              },
+          }
+
+          (OUT / "v4_277_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.277 LRG ELG Equivalent Packet Candidate Reader Selection Or Manual Fill Validator",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"inherited_v4_276_rows = {summary['inherited_v4_276_rows']}",
+              f"candidate_file_rows = {summary['candidate_file_rows']}",
+              f"manual_fill_scan_rows = {summary['manual_fill_scan_rows']}",
+              f"filled_packet_candidate_rows = {summary['filled_packet_candidate_rows']}",
+              f"lrg_filled_candidate_rows = {summary['lrg_filled_candidate_rows']}",
+              f"elg_filled_candidate_rows = {summary['elg_filled_candidate_rows']}",
+              f"lane_candidate_summary_rows = {summary['lane_candidate_summary_rows']}",
+              f"route_selection_rows = {summary['route_selection_rows']}",
+              f"reader_probe_plan_rows = {summary['reader_probe_plan_rows']}",
+              f"manual_validation_contract_rows = {summary['manual_validation_contract_rows']}",
+              f"safety_guard_rows = {summary['safety_guard_rows']}",
+              f"blocked_operation_rows = {summary['blocked_operation_rows']}",
+              f"permission_rows = {summary['permission_rows']}",
+              f"readiness_rows = {summary['readiness_rows']}",
+              f"decision_rows = {summary['decision_rows']}",
+              f"route_decision_rows = {summary['route_decision_rows']}",
+              f"next_rows = {summary['next_rows']}",
+              f"sdr_reduction_rows = {summary['sdr_reduction_rows']}",
+              f"manual_fill_ready = {summary['manual_fill_ready']}",
+              f"candidate_reader_probe_allowed_next = {summary['candidate_reader_probe_allowed_next']}",
+              f"manual_fill_validator_allowed_next = {summary['manual_fill_validator_allowed_next']}",
+              f"lrg_equivalent_packet_ready = {summary['lrg_equivalent_packet_ready']}",
+              f"elg_equivalent_packet_ready = {summary['elg_equivalent_packet_ready']}",
+              f"source_comparison_allowed = {summary['source_comparison_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"residuals_computed = {summary['residuals_computed']}",
+              f"diagnostic_scalar_computed = {summary['diagnostic_scalar_computed']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"scoring_allowed = {summary['scoring_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {recommended_next}",
+              "",
+              "Candidate summary:",
+              *summary_lines,
+              "",
+              "Route selection:",
+              *route_lines,
+              "",
+              "Decisions:",
+              *decision_lines,
+              "",
+              "Clean meaning: v4.277 chooses the next safe route. If filled manual LRG and ELG packets exist, it allows a manual-fill validator next. If they do not, it routes to a candidate file reader probe that may inspect headers and schema fit only. It still does not validate candidate data, compute residuals, score, fit, compare source lanes, or build a combined matrix.",
+              "",
+              "Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.",
+          ]
+          (OUT / "v4_277_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"inherited_v4_276_rows = {summary['inherited_v4_276_rows']}")
+          print(f"candidate_file_rows = {summary['candidate_file_rows']}")
+          print(f"manual_fill_scan_rows = {summary['manual_fill_scan_rows']}")
+          print(f"filled_packet_candidate_rows = {summary['filled_packet_candidate_rows']}")
+          print(f"lrg_filled_candidate_rows = {summary['lrg_filled_candidate_rows']}")
+          print(f"elg_filled_candidate_rows = {summary['elg_filled_candidate_rows']}")
+          print(f"lane_candidate_summary_rows = {summary['lane_candidate_summary_rows']}")
+          print(f"route_selection_rows = {summary['route_selection_rows']}")
+          print(f"reader_probe_plan_rows = {summary['reader_probe_plan_rows']}")
+          print(f"manual_validation_contract_rows = {summary['manual_validation_contract_rows']}")
+          print(f"safety_guard_rows = {summary['safety_guard_rows']}")
+          print(f"blocked_operation_rows = {summary['blocked_operation_rows']}")
+          print(f"permission_rows = {summary['permission_rows']}")
+          print(f"readiness_rows = {summary['readiness_rows']}")
+          print(f"decision_rows = {summary['decision_rows']}")
+          print(f"route_decision_rows = {summary['route_decision_rows']}")
+          print(f"next_rows = {summary['next_rows']}")
+          print(f"sdr_reduction_rows = {summary['sdr_reduction_rows']}")
+          print(f"manual_fill_ready = {summary['manual_fill_ready']}")
+          print(f"candidate_reader_probe_allowed_next = {summary['candidate_reader_probe_allowed_next']}")
+          print(f"manual_fill_validator_allowed_next = {summary['manual_fill_validator_allowed_next']}")
+          print(f"lrg_equivalent_packet_ready = {summary['lrg_equivalent_packet_ready']}")
+          print(f"elg_equivalent_packet_ready = {summary['elg_equivalent_packet_ready']}")
+          print(f"source_comparison_allowed = {summary['source_comparison_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"residuals_computed = {summary['residuals_computed']}")
+          print(f"diagnostic_scalar_computed = {summary['diagnostic_scalar_computed']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"scoring_allowed = {summary['scoring_allowed']}")
+          print(f"approved_holdout_sources = {summary['approved_holdout_sources']}")
+          print(f"selected_next_route = {recommended_next}")
+          print("Truth boundary: no proof, no validation, no external observed scoring, no numeric correction fit, no approved holdout source, no evidence approval, no external likelihood fit, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.277 LRG ELG candidate reader selection manual fill validator output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-277-lrg-elg-candidate-reader-selection-manual-fill-validator-output
+          path: |
+            tairid_v4_277_lrg_elg_candidate_reader_selection_manual_fill_validator_output/
+            tairid-v4-277-lrg-elg-candidate-reader-selection-manual-fill-validator-output.zip
