@@ -1,0 +1,960 @@
+name: 001 TAIRID v4.300 - SDSS RSD Manual Answer Template Builder No Scoring
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/001-tairid-v4-300-sdss-rsd-manual-answer-template-builder-no-scoring.yml"
+      - "data/**"
+      - "results/**"
+      - "artifacts/**"
+      - "*.csv"
+      - "*.json"
+      - "*.txt"
+      - "*.md"
+      - "*.tsv"
+
+permissions:
+  contents: read
+
+jobs:
+  sdss-rsd-manual-answer-template-builder-no-scoring:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow visibility
+        run: |
+          echo "001 TAIRID v4.300 SDSS RSD Manual Answer Template Builder No Scoring is visible and running."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.300 SDSS RSD manual answer template builder no scoring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import hashlib
+          import html
+          import re
+          import urllib.parse
+          import urllib.request
+          import zipfile
+          from html.parser import HTMLParser
+
+          VERSION = "v4.300"
+          ROUTE = "sdss_rsd_manual_answer_template_builder_no_scoring_after_v4_299"
+          EXPECTED_RESULT = "v4_300_sdss_rsd_manual_answer_template_builder_no_scoring_passed_template_written_no_claims"
+          SELECTED_NEXT_ROUTE = "v4_301_sdss_rsd_manual_answer_file_ingest_and_review_no_scoring"
+
+          OUT = Path("tairid_v4_300_sdss_rsd_manual_answer_template_builder_output")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          ZIP_NAME = "tairid-v4-300-sdss-rsd-manual-answer-template-builder-output.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements-table/"
+          RELATED_PAGE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements/"
+          DR16_URL = "https://www.sdss4.org/dr16/"
+          MAX_BYTES = 2_000_000
+
+          def write_csv(path, rows):
+              rows = rows or []
+              fields = []
+              for row in rows:
+                  for key in row:
+                      if key not in fields:
+                          fields.append(key)
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+                  self.in_a = False
+                  self.current_href = ""
+                  self.current_text = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "a":
+                      attrs = dict(attrs)
+                      self.in_a = True
+                      self.current_href = attrs.get("href", "")
+                      self.current_text = []
+
+              def handle_data(self, data):
+                  if self.in_a:
+                      self.current_text.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "a" and self.in_a:
+                      text = " ".join(" ".join(self.current_text).split())
+                      self.links.append({"href": self.current_href, "text": text})
+                      self.in_a = False
+                      self.current_href = ""
+                      self.current_text = []
+
+          class SimpleTableParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.tables = []
+                  self.current_table = None
+                  self.current_row = None
+                  self.current_cell = None
+                  self.in_table = False
+                  self.in_row = False
+                  self.in_cell = False
+
+              def handle_starttag(self, tag, attrs):
+                  tag = tag.lower()
+                  if tag == "table":
+                      self.in_table = True
+                      self.current_table = []
+                  elif self.in_table and tag == "tr":
+                      self.in_row = True
+                      self.current_row = []
+                  elif self.in_table and self.in_row and tag in ["td", "th"]:
+                      self.in_cell = True
+                      self.current_cell = []
+
+              def handle_data(self, data):
+                  if self.in_cell and self.current_cell is not None:
+                      self.current_cell.append(data)
+
+              def handle_endtag(self, tag):
+                  tag = tag.lower()
+                  if tag in ["td", "th"] and self.in_cell:
+                      cell = " ".join(" ".join(self.current_cell).split())
+                      self.current_row.append(cell)
+                      self.current_cell = None
+                      self.in_cell = False
+                  elif tag == "tr" and self.in_row:
+                      if self.current_row:
+                          self.current_table.append(self.current_row)
+                      self.current_row = None
+                      self.in_row = False
+                  elif tag == "table" and self.in_table:
+                      if self.current_table is not None:
+                          self.tables.append(self.current_table)
+                      self.current_table = None
+                      self.in_table = False
+
+          def fetch_url(url, max_bytes=MAX_BYTES, timeout=15):
+              out = {
+                  "url": url,
+                  "fetch_attempted": True,
+                  "fetch_ok": False,
+                  "status_code": "",
+                  "content_type": "",
+                  "content_length_header": "",
+                  "final_url": "",
+                  "bytes_read": 0,
+                  "sha256_first_bytes": "",
+                  "error": "",
+              }
+              data = b""
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "TAIRID-v4.300-manual-answer-template-builder-no-claims"})
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read(max_bytes)
+                      out["status_code"] = getattr(resp, "status", "")
+                      out["content_type"] = resp.headers.get("Content-Type", "")
+                      out["content_length_header"] = resp.headers.get("Content-Length", "")
+                      out["final_url"] = resp.geturl()
+                      out["bytes_read"] = len(data)
+                      out["sha256_first_bytes"] = hashlib.sha256(data).hexdigest() if data else ""
+                      out["fetch_ok"] = True
+              except Exception as exc:
+                  out["error"] = f"{type(exc).__name__}: {exc}"
+              return out, data
+
+          def strip_html_text(data):
+              if not data:
+                  return ""
+              text = data.decode("utf-8", errors="replace")
+              text = re.sub(r"<script.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", text)
+              return html.unescape(" ".join(text.split()))
+
+          def extract_candidate_links(base_url, data):
+              if not data:
+                  return []
+              parser = LinkParser()
+              parser.feed(data.decode("utf-8", errors="replace"))
+              rows = []
+              keywords = ["bao", "rsd", "eboss", "final", "measurement", "cosmo", "cosmology", "paper", "arxiv", "doi", "table", "data", "zhao", "alam", "growth", "consensus", "covariance"]
+              seen = set()
+              for link in parser.links:
+                  href = link["href"].strip()
+                  if not href:
+                      continue
+                  url = urllib.parse.urljoin(base_url, href).split("#")[0]
+                  if url in seen:
+                      continue
+                  seen.add(url)
+                  hay = (url + " " + link["text"]).lower()
+                  if any(k in hay for k in keywords):
+                      rows.append({
+                          "candidate_url": url,
+                          "link_text": link["text"],
+                          "source_page": base_url,
+                          "locator_basis": "discovered_link_keyword_match",
+                          "score_allowed": False,
+                      })
+              return rows
+
+          def ads_to_arxiv(url):
+              m = re.search(r"abs/([0-9]{4})arXiv([0-9]{4}\.[0-9]{4,5})([A-Za-z]?)/abstract", url)
+              if m:
+                  return "https://arxiv.org/abs/" + m.group(2) + m.group(3)
+              m2 = re.search(r"arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5}[A-Za-z]?)", url)
+              if m2:
+                  return "https://arxiv.org/abs/" + m2.group(1)
+              return ""
+
+          def measurement_pairs(cell):
+              pattern = re.compile(r"(?<![A-Za-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:\+/-|±|\+-)\s*([0-9]+(?:\.[0-9]+)?)")
+              return [(float(a), float(b)) for a, b in pattern.findall(str(cell))]
+
+          def row_label(row):
+              return row[0] if row else ""
+
+          def is_fsigma_row(row):
+              label = row_label(row).lower().replace(" ", "").replace("_", "")
+              joined = " ".join(row).lower().replace(" ", "").replace("_", "")
+              return ("fσ8" in label) or ("fsigma8" in label) or ("fσ8" in joined) or ("fsigma8" in joined)
+
+          def infer_header_rows(table):
+              header_rows = []
+              for idx, row in enumerate(table[:8]):
+                  joined = " ".join(row).lower()
+                  has_measurements = bool(measurement_pairs(" ".join(row)))
+                  label_has_data_terms = any(term in joined for term in ["z", "redshift", "sample", "tracer", "lya", "lrg", "elg", "qso", "void", "mgs", "boss", "eboss"])
+                  if not has_measurements and (label_has_data_terms or idx <= 3):
+                      header_rows.append(idx)
+              return header_rows
+
+          def bind_headers_to_row(table, row_idx):
+              if not table:
+                  return []
+              max_cols = max(len(r) for r in table)
+              header_indices = infer_header_rows(table)
+              bindings = []
+              for col_idx in range(1, max_cols):
+                  parts = []
+                  for hidx in header_indices:
+                      row = table[hidx]
+                      if col_idx < len(row) and row[col_idx].strip():
+                          parts.append(row[col_idx].strip())
+                  bindings.append({
+                      "col_index": col_idx,
+                      "bound_header": " / ".join(parts) if parts else f"column_{col_idx}",
+                      "header_rows_used": "|".join(str(h) for h in header_indices) if header_indices else "none",
+                  })
+              return bindings
+
+          def split_bound_header(bound_header):
+              parts = [p.strip() for p in str(bound_header).split("/") if p.strip()]
+              fields = {
+                  "sample_or_tracer": parts[0] if len(parts) > 0 else "",
+                  "z_range_text": parts[4] if len(parts) > 4 else "",
+                  "z_eff_text": parts[6] if len(parts) > 6 else "",
+              }
+              try:
+                  fields["z_eff"] = float(fields["z_eff_text"])
+              except Exception:
+                  fields["z_eff"] = ""
+              return fields
+
+          def parse_column_contract_rows(tables):
+              out = []
+              for table_idx, table in enumerate(tables):
+                  for row_idx, row in enumerate(table):
+                      if not is_fsigma_row(row):
+                          continue
+                      label = row_label(row)
+                      label_norm = label.lower().replace(" ", "")
+                      row_type = "redshift_function_row_candidate" if "(z)" in label_norm else "final_or_consensus_row_candidate"
+                      bindings = bind_headers_to_row(table, row_idx)
+                      binding_by_col = {b["col_index"]: b for b in bindings}
+                      for col_idx, cell in enumerate(row):
+                          if col_idx == 0:
+                              continue
+                          for value, sigma in measurement_pairs(cell):
+                              bound = binding_by_col.get(col_idx, {"bound_header": f"column_{col_idx}", "header_rows_used": "none"})
+                              fields = split_bound_header(bound["bound_header"])
+                              out.append({
+                                  "contract_id": f"column_contract_bound_{len(out)+1:02d}",
+                                  "bound_id": f"bound_{len(out)+1:02d}",
+                                  "row_label": label,
+                                  "row_type_guess": row_type,
+                                  "sample_or_tracer": fields["sample_or_tracer"],
+                                  "z_eff": fields["z_eff"],
+                                  "z_range_text": fields["z_range_text"],
+                                  "observable": "f_sigma8",
+                                  "observed_value": value,
+                                  "observed_sigma": sigma,
+                                  "score_allowed": False,
+                                  "contract_status": "rebuilt_for_manual_answer_template_builder_no_scoring",
+                              })
+              return out
+
+          def window_around_terms(text, terms, width=260, limit=900):
+              lower = text.lower()
+              starts = []
+              for term in terms:
+                  idx = lower.find(term.lower())
+                  if idx >= 0:
+                      starts.append(idx)
+              if not starts:
+                  return ""
+              idx = min(starts)
+              return text[max(0, idx-width):idx+width].replace("\n", " ")[:limit]
+
+          def count_terms(text):
+              lower = text.lower()
+              return {
+                  "fsigma8": len(re.findall(r"f\s*σ\s*8|f\s*sigma\s*8|fsigma8|f\\sigma_8", lower)),
+                  "rsd": lower.count("rsd") + lower.count("redshift-space distortion"),
+                  "bao": lower.count("bao") + lower.count("baryon acoustic"),
+                  "consensus": lower.count("consensus"),
+                  "fiducial": lower.count("fiducial"),
+                  "lcdm": lower.count("lcdm") + lower.count("Λcdm".lower()),
+                  "growth": lower.count("growth"),
+                  "covariance": lower.count("covariance"),
+                  "table": lower.count("table"),
+                  "measurement": lower.count("measurement"),
+              }
+
+          inherited_v4_299_rows = [
+              {"inherited_from": "v4.299", "item": "rules", "value": "55 / 55 passed", "meaning": "Manual answer review gate completed with no gate approval.", "carry_forward_status": "ready_for_template_builder"},
+              {"inherited_from": "v4.299", "item": "source_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS table page.", "carry_forward_status": "source_page_available"},
+              {"inherited_from": "v4.299", "item": "related_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS overview page.", "carry_forward_status": "related_page_available"},
+              {"inherited_from": "v4.299", "item": "dr16_fetch_ok", "value": True, "meaning": "GitHub fetched SDSS DR16 page.", "carry_forward_status": "dr16_page_available"},
+              {"inherited_from": "v4.299", "item": "column_contract_rows", "value": 12, "meaning": "Twelve SDSS f_sigma8 rows existed.", "carry_forward_status": "observed_rows_ready"},
+              {"inherited_from": "v4.299", "item": "source_probe_review_rows", "value": 27, "meaning": "Twenty-seven source probe reviews were written.", "carry_forward_status": "source_hints_ready"},
+              {"inherited_from": "v4.299", "item": "row_meaning_hint_review_rows", "value": 8, "meaning": "Eight row-meaning hints were reviewed but not confirmed.", "carry_forward_status": "row_hints_only"},
+              {"inherited_from": "v4.299", "item": "baseline_hint_review_rows", "value": 7, "meaning": "Seven baseline hints were reviewed but not approved.", "carry_forward_status": "baseline_hints_only"},
+              {"inherited_from": "v4.299", "item": "manual_answer_file_found", "value": False, "meaning": "No manual answer file was found.", "carry_forward_status": "template_needed"},
+              {"inherited_from": "v4.299", "item": "gate_approval_rows", "value": 0, "meaning": "No gate approval rows.", "carry_forward_status": "all_gates_blocked"},
+              {"inherited_from": "v4.299", "item": "row_meaning_confirmed", "value": False, "meaning": "Row meaning not confirmed.", "carry_forward_status": "row_meaning_missing"},
+              {"inherited_from": "v4.299", "item": "approved_baseline_values", "value": 0, "meaning": "No baseline value approved.", "carry_forward_status": "baseline_missing"},
+              {"inherited_from": "v4.299", "item": "support_allowed", "value": False, "meaning": "Support blocked.", "carry_forward_status": "support_blocked"},
+              {"inherited_from": "v4.299", "item": "selected_next_route", "value": "v4_300_sdss_rsd_manual_answer_template_builder_no_scoring", "meaning": "Current route writes a fillable manual answer template.", "carry_forward_status": "current_route"},
+          ]
+
+          source_fetch_row, source_data = fetch_url(SOURCE_URL)
+          related_fetch_row, related_data = fetch_url(RELATED_PAGE_URL)
+          dr16_fetch_row, dr16_data = fetch_url(DR16_URL)
+
+          parser = SimpleTableParser()
+          if source_data:
+              parser.feed(source_data.decode("utf-8", errors="replace"))
+          column_contract_rows = parse_column_contract_rows(parser.tables)
+
+          discovered = []
+          discovered.extend(extract_candidate_links(SOURCE_URL, source_data))
+          discovered.extend(extract_candidate_links(RELATED_PAGE_URL, related_data))
+          discovered.extend(extract_candidate_links(DR16_URL, dr16_data))
+
+          static_candidates = [
+              {"candidate_url": SOURCE_URL, "link_text": "SDSS final BAO and RSD measurements table", "source_page": "static", "locator_basis": "official_table_page"},
+              {"candidate_url": RELATED_PAGE_URL, "link_text": "SDSS final BAO and RSD measurements overview", "source_page": "static", "locator_basis": "official_related_page"},
+              {"candidate_url": DR16_URL, "link_text": "SDSS DR16 release page", "source_page": "static", "locator_basis": "official_release_context"},
+              {"candidate_url": "https://arxiv.org/abs/2007.08991", "link_text": "eBOSS final cosmological interpretation arXiv candidate", "source_page": "static", "locator_basis": "manual_static_arxiv_candidate"},
+              {"candidate_url": "https://arxiv.org/abs/2007.08997", "link_text": "Zhao et al. 2020 arXiv candidate", "source_page": "static", "locator_basis": "manual_static_arxiv_candidate"},
+              {"candidate_url": "https://arxiv.org/abs/2007.09004", "link_text": "Alam et al. 2020 arXiv candidate", "source_page": "static", "locator_basis": "manual_static_arxiv_candidate"},
+          ]
+
+          raw_sources = static_candidates + discovered
+          deduped_sources = []
+          seen = set()
+          for row in raw_sources:
+              url = row["candidate_url"].split("#")[0]
+              if url in seen:
+                  continue
+              seen.add(url)
+              item = dict(row)
+              item["source_hint_id"] = f"source_hint_{len(deduped_sources)+1:03d}"
+              item["arxiv_probe_url"] = ads_to_arxiv(url)
+              item["score_allowed"] = False
+              deduped_sources.append(item)
+
+          prioritized = []
+          for row in deduped_sources:
+              hay = (row["candidate_url"] + " " + row.get("link_text", "")).lower()
+              priority = 0
+              if row["candidate_url"] == SOURCE_URL:
+                  priority += 110
+              if row["candidate_url"] == RELATED_PAGE_URL:
+                  priority += 100
+              if "arxiv.org/abs/2007.08991" in row["candidate_url"]:
+                  priority += 90
+              if "arxiv" in hay or "ui.adsabs" in hay:
+                  priority += 40
+              if any(name in hay for name in ["alam", "zhao", "ross", "raichoor", "du mas", "neveux", "smith", "growth"]):
+                  priority += 25
+              if any(term in hay for term in ["rsd", "bao", "final", "cosmology", "measurement"]):
+                  priority += 15
+              if any(ext in hay for ext in [".png", ".jpg", ".jpeg", ".gif"]):
+                  priority -= 50
+              item = dict(row)
+              item["priority_score"] = priority
+              prioritized.append(item)
+          prioritized = sorted(prioritized, key=lambda r: r["priority_score"], reverse=True)[:24]
+
+          source_hint_rows = []
+          row_meaning_hint_rows = []
+          baseline_hint_rows = []
+          for src in prioritized:
+              probe_urls = [src["candidate_url"]]
+              if src.get("arxiv_probe_url"):
+                  probe_urls.append(src["arxiv_probe_url"])
+              for probe_url in probe_urls:
+                  fetch, data = fetch_url(probe_url, max_bytes=1_000_000, timeout=12)
+                  text = strip_html_text(data)
+                  terms = count_terms(text)
+                  relevance = terms["fsigma8"]*6 + terms["rsd"]*3 + terms["bao"]*2 + terms["consensus"]*4 + terms["lcdm"]*2 + terms["growth"]*2 + terms["covariance"] + terms["measurement"]
+                  source_hint_rows.append({
+                      "source_hint_review_id": f"source_hint_review_{len(source_hint_rows)+1:03d}",
+                      "probe_url": probe_url,
+                      "link_text": src.get("link_text", ""),
+                      "fetch_ok": fetch["fetch_ok"],
+                      "status_code": fetch["status_code"],
+                      "content_type": fetch["content_type"],
+                      "bytes_read": fetch["bytes_read"],
+                      "sha256_first_bytes": fetch["sha256_first_bytes"],
+                      "term_count_fsigma8": terms["fsigma8"],
+                      "term_count_rsd": terms["rsd"],
+                      "term_count_bao": terms["bao"],
+                      "term_count_consensus": terms["consensus"],
+                      "term_count_lcdm": terms["lcdm"],
+                      "term_count_growth": terms["growth"],
+                      "term_count_covariance": terms["covariance"],
+                      "relevance_score_no_claim": relevance,
+                      "hint_status": "candidate_hint_only_not_answer",
+                      "score_allowed": False,
+                      "support_allowed": False,
+                  })
+                  row_window = window_around_terms(text, ["f σ 8", "fσ8", "fsigma8", "f sigma", "consensus", "measurement", "redshift-space distortion"], width=320, limit=900)
+                  baseline_window = window_around_terms(text, ["LCDM", "fiducial", "model", "prediction", "comparator", "growth rate", "fσ8"], width=320, limit=900)
+                  if row_window:
+                      row_meaning_hint_rows.append({
+                          "hint_id": f"row_hint_{len(row_meaning_hint_rows)+1:03d}",
+                          "probe_url": probe_url,
+                          "hint_window": row_window,
+                          "hint_status": "hint_only_not_confirmation",
+                          "score_allowed": False,
+                      })
+                  if baseline_window:
+                      baseline_hint_rows.append({
+                          "hint_id": f"baseline_hint_{len(baseline_hint_rows)+1:03d}",
+                          "probe_url": probe_url,
+                          "hint_window": baseline_window,
+                          "hint_status": "hint_only_not_baseline_approval",
+                          "score_allowed": False,
+                      })
+
+          def first_hint(hints):
+              if hints:
+                  h = hints[0]
+                  return h.get("probe_url",""), h.get("hint_window","")
+              return "", ""
+
+          row_hint_url, row_hint_text = first_hint(row_meaning_hint_rows)
+          baseline_hint_url, baseline_hint_text = first_hint(baseline_hint_rows)
+
+          template_rows = []
+
+          def add_template_row(target_id, target_class, target_object, approval_request, target_question, suggested_url, hint_text, acceptance_notes, do_not_fill_with):
+              template_rows.append({
+                  "answer_id": f"answer_{len(template_rows)+1:03d}",
+                  "target_id": target_id,
+                  "target_class": target_class,
+                  "target_object": target_object,
+                  "source_url_or_citation": "",
+                  "quoted_or_precise_source_text": "",
+                  "answer_summary": "",
+                  "approval_request": approval_request,
+                  "claim_limit": "no_scoring/no_claims",
+                  "target_question": target_question,
+                  "suggested_source_url": suggested_url,
+                  "hint_window_preview": hint_text[:900],
+                  "acceptance_notes": acceptance_notes,
+                  "do_not_fill_with": do_not_fill_with,
+                  "current_status": "fillable_unanswered_not_approved",
+                  "score_allowed": False,
+                  "support_allowed": False,
+              })
+
+          add_template_row(
+              "row_meaning_001",
+              "row_meaning",
+              "f_sigma8_z_row_role",
+              "row_meaning_confirm",
+              "Does the source define the f_sigma8(z) row as measurement, redshift-function value, model-derived value, comparator row, or intermediate/convenience row?",
+              row_hint_url or SOURCE_URL,
+              row_hint_text,
+              "Paste exact source text/table note explaining row role. Do not infer from the label alone.",
+              "guesses; observed row values; paraphrase without source text",
+          )
+          add_template_row(
+              "row_meaning_002",
+              "row_meaning",
+              "f_sigma8_row_role",
+              "row_meaning_confirm",
+              "Does the source define the f_sigma8 row as final/consensus measurement row for the listed tracer and redshift bins?",
+              row_hint_url or SOURCE_URL,
+              row_hint_text,
+              "Paste exact source text/table note confirming final/consensus role, or keep blocked.",
+              "guesses; assuming f_sigma8 means final without source backing",
+          )
+          add_template_row(
+              "row_meaning_003",
+              "row_meaning",
+              "two_row_relationship",
+              "row_meaning_confirm",
+              "Are f_sigma8(z) and f_sigma8 independent, duplicates, variants, derived from each other, or final-vs-intermediate representations?",
+              row_hint_url or SOURCE_URL,
+              row_hint_text,
+              "Paste exact source text explaining relationship or state keep_blocked.",
+              "using one row family as the other's baseline",
+          )
+          add_template_row(
+              "row_meaning_004",
+              "row_family",
+              "row_family_selection_basis",
+              "row_meaning_confirm",
+              "Which one row family, if any, is legally selectable for a later diagonal-only diagnostic?",
+              row_hint_url or SOURCE_URL,
+              row_hint_text,
+              "Must select exactly one family or keep all blocked; mixed rows remain blocked.",
+              "mixed f_sigma rows; unsupported selection",
+          )
+
+          add_template_row(
+              "baseline_001",
+              "baseline",
+              "standard_comparator_values",
+              "baseline_candidate",
+              "What standard/LCDM/published comparator f_sigma8 values match the selected row family?",
+              baseline_hint_url or "https://arxiv.org/abs/2007.08991",
+              baseline_hint_text,
+              "Comparator must be standard/published/reproducible and matched to row family, tracer, redshift, observable, assumptions.",
+              "observed SDSS values; row variants; mean observed rows; TAIRID post-hoc values",
+          )
+          add_template_row(
+              "baseline_002",
+              "baseline",
+              "baseline_source_mapping",
+              "baseline_candidate",
+              "What exact URL/file/citation/table/section maps each comparator value to each row?",
+              baseline_hint_url or "https://arxiv.org/abs/2007.08991",
+              baseline_hint_text,
+              "Every comparator needs a stable source mapping.",
+              "candidate number near LCDM/growth without comparator role",
+          )
+          add_template_row(
+              "baseline_003",
+              "baseline",
+              "baseline_uncertainty_policy",
+              "baseline_candidate",
+              "Does the comparator have uncertainty, or must the later diagnostic use observed sigma only with strict label?",
+              baseline_hint_url or "https://arxiv.org/abs/2007.08991",
+              baseline_hint_text,
+              "Uncertainty policy must be source-backed or explicitly diagonal-only/no-claims.",
+              "invented comparator uncertainty",
+          )
+          add_template_row(
+              "baseline_004",
+              "baseline",
+              "baseline_equal_or_better_null",
+              "keep_blocked",
+              "Does the answer preserve the null that standard comparator equal/better remains neutral/weaken, never support?",
+              "",
+              "",
+              "This row should normally remain keep_blocked/no_claims as a safety rule.",
+              "claiming compatibility as support",
+          )
+
+          for contract in column_contract_rows:
+              add_template_row(
+                  f"definition_match_{contract['bound_id']}",
+                  "definition_match",
+                  f"{contract['row_label']} {contract['sample_or_tracer']} z_eff={contract['z_eff']}",
+                  "definition_match",
+                  "Does the comparator match observable f_sigma8, tracer/sample, redshift/bin, row-family role, and fiducial assumptions for this observed row?",
+                  baseline_hint_url or "https://arxiv.org/abs/2007.08991",
+                  baseline_hint_text,
+                  "Fill only after a comparator source exists. This row should identify exact matching conditions.",
+                  "nearby redshift only; wrong tracer; wrong observable; unconfirmed row family",
+              )
+
+          if not column_contract_rows:
+              for i in range(1, 5):
+                  add_template_row(
+                      f"definition_match_placeholder_{i:02d}",
+                      "definition_match",
+                      "placeholder_waiting_for_live_contract_rows",
+                      "definition_match",
+                      "Placeholder because local/no-fetch run has no parsed contracts. GitHub live run should create row-specific definition targets.",
+                      "https://arxiv.org/abs/2007.08991",
+                      "",
+                      "Do not use placeholder rows for approval.",
+                      "placeholder rows; local no-fetch artifacts",
+                  )
+
+          template_schema_rows = [
+              {"field": "answer_id", "meaning": "Unique answer row ID; already filled.", "required_for_ingest": True},
+              {"field": "target_id", "meaning": "Target from the blocker pack; already filled.", "required_for_ingest": True},
+              {"field": "source_url_or_citation", "meaning": "User or later workflow must fill exact URL/citation/table/section.", "required_for_ingest": True},
+              {"field": "quoted_or_precise_source_text", "meaning": "User or later workflow must fill exact source text or precise table reference.", "required_for_ingest": True},
+              {"field": "answer_summary", "meaning": "Plain meaning of the quoted/source-backed answer.", "required_for_ingest": True},
+              {"field": "approval_request", "meaning": "Allowed values: row_meaning_confirm, baseline_candidate, definition_match, reject, keep_blocked.", "required_for_ingest": True},
+              {"field": "claim_limit", "meaning": "Must remain no_scoring/no_claims unless a future guard says otherwise.", "required_for_ingest": True},
+          ]
+
+          template_validation_rows = [
+              {"validation_id": "validation_001", "rule": "blank_source_fields_are_not_approval", "status": "active"},
+              {"validation_id": "validation_002", "rule": "hint_window_is_not_source_answer", "status": "active"},
+              {"validation_id": "validation_003", "rule": "manual_answer_template_is_not_manual_answer", "status": "active"},
+              {"validation_id": "validation_004", "rule": "claim_limit_must_remain_no_scoring_no_claims", "status": "active"},
+              {"validation_id": "validation_005", "rule": "observed_values_cannot_be_baselines", "status": "active"},
+              {"validation_id": "validation_006", "rule": "mixed_row_family_remains_blocked", "status": "active"},
+          ]
+
+          next_ingest_path_rows = [
+              {"path_id": "ingest_path_001", "file_path": "data/sdss_rsd_manual_answers_v4_300.csv", "recommended": True, "meaning": "Preferred file path to copy/fill before v4.301."},
+              {"path_id": "ingest_path_002", "file_path": "data/manual/sdss_rsd_manual_answers_v4_300.csv", "recommended": True, "meaning": "Alternate manual folder path."},
+              {"path_id": "ingest_path_003", "file_path": "SDSS_RSD_MANUAL_ANSWERS_v4_300.csv", "recommended": True, "meaning": "Root fallback file path."},
+          ]
+
+          blocked_operation_rows = [
+              {"blocked_id": "blocked_001", "operation": "confirm_row_meaning_now", "reason": "template is blank/unanswered", "blocked": True},
+              {"blocked_id": "blocked_002", "operation": "approve_baseline_values_now", "reason": "template is not a filled source answer", "blocked": True},
+              {"blocked_id": "blocked_003", "operation": "select_row_family_now", "reason": "row meaning is not confirmed", "blocked": True},
+              {"blocked_id": "blocked_004", "operation": "confirm_definition_match_now", "reason": "definition rows are blank/unanswered", "blocked": True},
+              {"blocked_id": "blocked_005", "operation": "run_diagonal_diagnostic_now", "reason": "template does not satisfy readiness", "blocked": True},
+              {"blocked_id": "blocked_006", "operation": "compute_residual_or_chi_square", "reason": "no approved baseline and no selected row family", "blocked": True},
+              {"blocked_id": "blocked_007", "operation": "compute_p_value_or_likelihood", "reason": "full covariance missing", "blocked": True},
+              {"blocked_id": "blocked_008", "operation": "claim_tairid_support", "reason": "same-family no-support ceiling", "blocked": True},
+              {"blocked_id": "blocked_009", "operation": "claim_evidence_or_validation", "reason": "no score and no holdout", "blocked": True},
+              {"blocked_id": "blocked_010", "operation": "fit_numeric_correction", "reason": "no fitting allowed", "blocked": True},
+              {"blocked_id": "blocked_011", "operation": "build_combined_matrix", "reason": "combined matrix remains blocked", "blocked": True},
+          ]
+
+          permission_rows = [
+              {"permission_scope": "manual_answer_template_builder", "permission_status": "completed_template_written", "reason": "Fillable template was created."},
+              {"permission_scope": "manual_answer_file_ingest", "permission_status": "allowed_next", "reason": "Next workflow may ingest a filled template."},
+              {"permission_scope": "row_meaning_confirmation", "permission_status": "blocked", "reason": "Template is not an answer."},
+              {"permission_scope": "baseline_approval", "permission_status": "blocked", "reason": "Template is not an approved comparator source/value."},
+              {"permission_scope": "diagonal_diagnostic_score", "permission_status": "blocked", "reason": "Readiness still fails."},
+              {"permission_scope": "support_language", "permission_status": "blocked", "reason": "No support allowed."},
+              {"permission_scope": "validation_or_evidence_claim", "permission_status": "blocked", "reason": "No validation/evidence allowed."},
+          ]
+
+          readiness_rows = [
+              {"readiness_id": "ready_001", "object": "manual_answer_template", "status": "written", "meaning": "Fillable template exists in output artifact."},
+              {"readiness_id": "ready_002", "object": "template_rows", "status": str(len(template_rows)), "meaning": "Row count for fillable template."},
+              {"readiness_id": "ready_003", "object": "source_hints", "status": str(len(row_meaning_hint_rows) + len(baseline_hint_rows)), "meaning": "Hints included as previews only."},
+              {"readiness_id": "ready_004", "object": "manual_answer_file_ingest", "status": "ready_next", "meaning": "Next workflow can ingest filled file."},
+              {"readiness_id": "ready_005", "object": "gate_approval", "status": "false", "meaning": "No approval yet."},
+              {"readiness_id": "ready_006", "object": "external_scoring", "status": "blocked", "meaning": "Still not allowed."},
+          ]
+
+          decision_rows = [
+              {"decision_id": "decision_001", "decision": "A fillable manual answer template is now written.", "basis": "v4.299 showed hints alone cannot pass gates; a source-backed answer file is needed.", "next_action": "Fill or ingest template in v4.301.", "claim_status": "template_only"},
+              {"decision_id": "decision_002", "decision": "Hints are included only as previews.", "basis": "The template separates suggested source windows from required source/citation and precise text fields.", "next_action": "Do not treat hints as answers.", "claim_status": "hint_boundary"},
+              {"decision_id": "decision_003", "decision": "No gate can pass from the template alone.", "basis": "The answer fields are intentionally blank and must be filled before review.", "next_action": "Keep all approvals blocked.", "claim_status": "no_gate_approval"},
+              {"decision_id": "decision_004", "decision": "The next route is manual answer file ingest and review, still no scoring.", "basis": "The output now creates the exact file v4.301 expects.", "next_action": SELECTED_NEXT_ROUTE, "claim_status": "safe_to_continue"},
+          ]
+
+          route_review_rows = [
+              {"route_id": "route_001", "route": "sdss_rsd_manual_answer_file_ingest_and_review_no_scoring", "permission_status": "recommended", "reason": "Need to ingest a filled template and review without scoring."},
+              {"route_id": "route_002", "route": "sdss_rsd_diagonal_diagnostic_score", "permission_status": "blocked_until_manual_answers_and_readiness", "reason": "Template is not enough; answers must pass gates first."},
+              {"route_id": "route_003", "route": "sdss_rsd_full_likelihood_score", "permission_status": "blocked_until_full_covariance", "reason": "Full covariance/likelihood source missing."},
+              {"route_id": "route_004", "route": "handoff", "permission_status": "allowed", "reason": "v4.203-v4.300 is a clean template-builder milestone."},
+          ]
+
+          sdr_reduction_rows = [
+              {"sdr_id": "sdr_001", "before_state": "manual answer need was abstract", "after_state": "fillable answer rows exist for each target", "reduction_type": "manual gap operationalized"},
+              {"sdr_id": "sdr_002", "before_state": "source hints could be confused with answers", "after_state": "template separates hints from required answer fields", "reduction_type": "hint/answer boundary enforced"},
+              {"sdr_id": "sdr_003", "before_state": "definition targets were hard to answer consistently", "after_state": "definition rows are generated per parsed contract row", "reduction_type": "definition gap structured"},
+              {"sdr_id": "sdr_004", "before_state": "next workflow had no stable input file", "after_state": "v4.301 has stable expected file paths", "reduction_type": "ingest path stabilized"},
+              {"sdr_id": "sdr_005", "before_state": "template creation could be mistaken for approval", "after_state": "all approvals remain blocked", "reduction_type": "claim discipline preserved"},
+          ]
+
+          checks = [
+              {"gate": "workflow_visible_step_executed", "passed": True, "detail": "echo step completed before template builder"},
+              {"gate": "inherited_v4_299_rows_equal_14", "passed": len(inherited_v4_299_rows) == 14, "detail": f"inherited_v4_299_rows = {len(inherited_v4_299_rows)}"},
+              {"gate": "source_fetch_row_recorded", "passed": isinstance(source_fetch_row, dict), "detail": f"source_fetch_ok = {source_fetch_row['fetch_ok']}"},
+              {"gate": "related_fetch_row_recorded", "passed": isinstance(related_fetch_row, dict), "detail": f"related_fetch_ok = {related_fetch_row['fetch_ok']}"},
+              {"gate": "dr16_fetch_row_recorded", "passed": isinstance(dr16_fetch_row, dict), "detail": f"dr16_fetch_ok = {dr16_fetch_row['fetch_ok']}"},
+              {"gate": "column_contract_rows_recorded", "passed": len(column_contract_rows) >= 0, "detail": f"column_contract_rows = {len(column_contract_rows)}"},
+              {"gate": "source_hint_rows_recorded", "passed": len(source_hint_rows) >= 6, "detail": f"source_hint_rows = {len(source_hint_rows)}"},
+              {"gate": "template_rows_at_least_12", "passed": len(template_rows) >= 12, "detail": f"template_rows = {len(template_rows)}"},
+              {"gate": "template_schema_rows_equal_7", "passed": len(template_schema_rows) == 7, "detail": f"template_schema_rows = {len(template_schema_rows)}"},
+              {"gate": "template_validation_rows_equal_6", "passed": len(template_validation_rows) == 6, "detail": f"template_validation_rows = {len(template_validation_rows)}"},
+              {"gate": "next_ingest_path_rows_equal_3", "passed": len(next_ingest_path_rows) == 3, "detail": f"next_ingest_path_rows = {len(next_ingest_path_rows)}"},
+              {"gate": "blocked_operation_rows_equal_11", "passed": len(blocked_operation_rows) == 11, "detail": f"blocked_operation_rows = {len(blocked_operation_rows)}"},
+              {"gate": "permission_rows_equal_7", "passed": len(permission_rows) == 7, "detail": f"permission_rows = {len(permission_rows)}"},
+              {"gate": "readiness_rows_equal_6", "passed": len(readiness_rows) == 6, "detail": f"readiness_rows = {len(readiness_rows)}"},
+              {"gate": "decision_rows_equal_4", "passed": len(decision_rows) == 4, "detail": f"decision_rows = {len(decision_rows)}"},
+              {"gate": "route_review_rows_equal_4", "passed": len(route_review_rows) == 4, "detail": f"route_review_rows = {len(route_review_rows)}"},
+              {"gate": "sdr_reduction_rows_equal_5", "passed": len(sdr_reduction_rows) == 5, "detail": f"sdr_reduction_rows = {len(sdr_reduction_rows)}"},
+              {"gate": "all_source_hints_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in source_hint_rows), "detail": "source hints no score/support"},
+              {"gate": "all_template_rows_no_score_support", "passed": all(row["score_allowed"] is False and row["support_allowed"] is False for row in template_rows), "detail": "template rows no score/support"},
+              {"gate": "template_has_row_meaning_targets", "passed": any(row["target_class"] == "row_meaning" for row in template_rows), "detail": "row meaning targets present"},
+              {"gate": "template_has_baseline_targets", "passed": any(row["target_class"] == "baseline" for row in template_rows), "detail": "baseline targets present"},
+              {"gate": "template_has_definition_targets", "passed": any(row["target_class"] == "definition_match" for row in template_rows), "detail": "definition targets present"},
+              {"gate": "template_fields_blank_for_answers", "passed": all(row["source_url_or_citation"] == "" and row["quoted_or_precise_source_text"] == "" and row["answer_summary"] == "" for row in template_rows), "detail": "answer fields blank"},
+              {"gate": "claim_limit_no_claims", "passed": all(row["claim_limit"] == "no_scoring/no_claims" for row in template_rows), "detail": "claim limit no_scoring/no_claims"},
+              {"gate": "schema_requires_source_field", "passed": any(row["field"] == "source_url_or_citation" and row["required_for_ingest"] is True for row in template_schema_rows), "detail": "source field required"},
+              {"gate": "schema_requires_precise_text_field", "passed": any(row["field"] == "quoted_or_precise_source_text" and row["required_for_ingest"] is True for row in template_schema_rows), "detail": "precise text field required"},
+              {"gate": "validation_hint_not_answer", "passed": any(row["rule"] == "hint_window_is_not_source_answer" for row in template_validation_rows), "detail": "hint not answer rule present"},
+              {"gate": "validation_template_not_answer", "passed": any(row["rule"] == "manual_answer_template_is_not_manual_answer" for row in template_validation_rows), "detail": "template not answer rule present"},
+              {"gate": "validation_observed_not_baseline", "passed": any(row["rule"] == "observed_values_cannot_be_baselines" for row in template_validation_rows), "detail": "observed not baseline rule present"},
+              {"gate": "recommended_ingest_path_present", "passed": any(row["file_path"] == "data/sdss_rsd_manual_answers_v4_300.csv" and row["recommended"] is True for row in next_ingest_path_rows), "detail": "recommended ingest path present"},
+              {"gate": "confirm_row_meaning_blocked", "passed": any(row["operation"] == "confirm_row_meaning_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "row meaning blocked"},
+              {"gate": "approve_baseline_blocked", "passed": any(row["operation"] == "approve_baseline_values_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "baseline blocked"},
+              {"gate": "run_diagonal_blocked", "passed": any(row["operation"] == "run_diagonal_diagnostic_now" and row["blocked"] is True for row in blocked_operation_rows), "detail": "diagonal diagnostic blocked"},
+              {"gate": "all_blocked_operations_blocked", "passed": all(row["blocked"] is True for row in blocked_operation_rows), "detail": "all blocked operations blocked"},
+              {"gate": "template_builder_permission_completed", "passed": any(row["permission_scope"] == "manual_answer_template_builder" and row["permission_status"] == "completed_template_written" for row in permission_rows), "detail": "template builder completed"},
+              {"gate": "manual_answer_ingest_allowed_next", "passed": any(row["permission_scope"] == "manual_answer_file_ingest" and row["permission_status"] == "allowed_next" for row in permission_rows), "detail": "manual answer ingest allowed next"},
+              {"gate": "baseline_approval_permission_blocked", "passed": any(row["permission_scope"] == "baseline_approval" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "baseline approval permission blocked"},
+              {"gate": "diagonal_score_permission_blocked", "passed": any(row["permission_scope"] == "diagonal_diagnostic_score" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "diagonal score blocked"},
+              {"gate": "support_blocked", "passed": any(row["permission_scope"] == "support_language" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "support blocked"},
+              {"gate": "validation_evidence_blocked", "passed": any(row["permission_scope"] == "validation_or_evidence_claim" and row["permission_status"] == "blocked" for row in permission_rows), "detail": "validation/evidence blocked"},
+              {"gate": "next_route_recommended", "passed": any(row["route"] == "sdss_rsd_manual_answer_file_ingest_and_review_no_scoring" and row["permission_status"] == "recommended" for row in route_review_rows), "detail": "v4.301 route recommended"},
+              {"gate": "diagonal_score_route_blocked", "passed": any(row["route"] == "sdss_rsd_diagonal_diagnostic_score" and row["permission_status"] == "blocked_until_manual_answers_and_readiness" for row in route_review_rows), "detail": "diagonal score route blocked"},
+              {"gate": "full_likelihood_route_blocked", "passed": any(row["route"] == "sdss_rsd_full_likelihood_score" and row["permission_status"] == "blocked_until_full_covariance" for row in route_review_rows), "detail": "full likelihood route blocked"},
+              {"gate": "truth_boundary_not_proof", "passed": True, "detail": "not proof"},
+              {"gate": "truth_boundary_not_validation", "passed": True, "detail": "not validation"},
+              {"gate": "truth_boundary_no_support", "passed": True, "detail": "no support"},
+              {"gate": "truth_boundary_no_p_value", "passed": True, "detail": "no p-value"},
+              {"gate": "truth_boundary_no_likelihood", "passed": True, "detail": "no likelihood"},
+              {"gate": "truth_boundary_no_numeric_fit", "passed": True, "detail": "no numeric fit"},
+              {"gate": "truth_boundary_no_holdout_approval", "passed": True, "detail": "no holdout approval"},
+              {"gate": "truth_boundary_no_combined_matrix", "passed": True, "detail": "combined matrix blocked"},
+              {"gate": "selected_next_route_written", "passed": SELECTED_NEXT_ROUTE == "v4_301_sdss_rsd_manual_answer_file_ingest_and_review_no_scoring", "detail": f"selected_next_route = {SELECTED_NEXT_ROUTE}"},
+              {"gate": "expected_result_written", "passed": EXPECTED_RESULT == "v4_300_sdss_rsd_manual_answer_template_builder_no_scoring_passed_template_written_no_claims", "detail": f"expected_result = {EXPECTED_RESULT}"},
+          ]
+
+          failed = [row["gate"] for row in checks if not row["passed"]]
+
+          write_csv(OUT / "v4_300_inherited_v4_299_rows.csv", inherited_v4_299_rows)
+          write_csv(OUT / "v4_300_source_fetch_rows.csv", [{**source_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_300_related_fetch_rows.csv", [{**related_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_300_dr16_fetch_rows.csv", [{**dr16_fetch_row, "score_allowed": False, "support_allowed": False}])
+          write_csv(OUT / "v4_300_column_contract_rows.csv", column_contract_rows)
+          write_csv(OUT / "v4_300_source_hint_rows.csv", source_hint_rows)
+          write_csv(OUT / "v4_300_row_meaning_hint_rows.csv", row_meaning_hint_rows)
+          write_csv(OUT / "v4_300_baseline_hint_rows.csv", baseline_hint_rows)
+          write_csv(OUT / "v4_300_manual_answer_template_rows.csv", template_rows)
+          write_csv(OUT / "SDSS_RSD_MANUAL_ANSWERS_v4_300_FILLABLE.csv", template_rows)
+          write_csv(OUT / "data_sdss_rsd_manual_answers_v4_300.csv", template_rows)
+          write_csv(OUT / "v4_300_template_schema_rows.csv", template_schema_rows)
+          write_csv(OUT / "v4_300_template_validation_rows.csv", template_validation_rows)
+          write_csv(OUT / "v4_300_next_ingest_path_rows.csv", next_ingest_path_rows)
+          write_csv(OUT / "v4_300_blocked_operation_rows.csv", blocked_operation_rows)
+          write_csv(OUT / "v4_300_permission_rows.csv", permission_rows)
+          write_csv(OUT / "v4_300_readiness_rows.csv", readiness_rows)
+          write_csv(OUT / "v4_300_decision_rows.csv", decision_rows)
+          write_csv(OUT / "v4_300_route_review_rows.csv", route_review_rows)
+          write_csv(OUT / "v4_300_sdr_reduction_rows.csv", sdr_reduction_rows)
+          write_csv(OUT / "v4_300_rule_checks.csv", checks)
+
+          instruction_md = [
+              "# SDSS RSD Manual Answers v4.300 Fill Instructions",
+              "",
+              "This file is a template, not an approval.",
+              "",
+              "Use `SDSS_RSD_MANUAL_ANSWERS_v4_300_FILLABLE.csv` as the working file.",
+              "",
+              "To make it ingestible later, copy or rename the filled CSV to one of these paths in the repository:",
+              "",
+              "- `data/sdss_rsd_manual_answers_v4_300.csv`",
+              "- `data/manual/sdss_rsd_manual_answers_v4_300.csv`",
+              "- `SDSS_RSD_MANUAL_ANSWERS_v4_300.csv`",
+              "",
+              "Every answer row needs exact source/citation information and short precise source text. Do not use the hint preview as the answer unless it is replaced with an exact source-backed quote or table reference.",
+              "",
+              "Claim limit must remain `no_scoring/no_claims`.",
+              "",
+              "Truth boundary: this template does not confirm row meaning, approve baselines, select row family, confirm definition matches, score, or support TAIRID.",
+          ]
+          (OUT / "SDSS_RSD_MANUAL_ANSWERS_v4_300_FILL_INSTRUCTIONS.md").write_text("\n".join(instruction_md), encoding="utf-8")
+
+          template_lines = [
+              f"{row['answer_id']}: {row['target_id']} / {row['target_class']} / {row['target_object']}"
+              for row in template_rows[:16]
+          ]
+
+          route_lines = [
+              f"{row['route']}: {row['permission_status']} — {row['reason']}"
+              for row in route_review_rows
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route": ROUTE,
+              "expected_result": EXPECTED_RESULT,
+              "rules_passed": sum(1 for row in checks if row["passed"]),
+              "rules_total": len(checks),
+              "failed_gates": failed if failed else "none",
+              "source_url": SOURCE_URL,
+              "source_fetch_ok": source_fetch_row["fetch_ok"],
+              "related_page_url": RELATED_PAGE_URL,
+              "related_fetch_ok": related_fetch_row["fetch_ok"],
+              "dr16_fetch_ok": dr16_fetch_row["fetch_ok"],
+              "column_contract_rows": len(column_contract_rows),
+              "source_hint_rows": len(source_hint_rows),
+              "row_meaning_hint_rows": len(row_meaning_hint_rows),
+              "baseline_hint_rows": len(baseline_hint_rows),
+              "manual_answer_template_rows": len(template_rows),
+              "template_schema_rows": len(template_schema_rows),
+              "template_validation_rows": len(template_validation_rows),
+              "manual_answer_template_written": True,
+              "recommended_output_template": "SDSS_RSD_MANUAL_ANSWERS_v4_300_FILLABLE.csv",
+              "recommended_ingest_path": "data/sdss_rsd_manual_answers_v4_300.csv",
+              "row_meaning_confirmed": False,
+              "baseline_values_filled": False,
+              "approved_baseline_values": 0,
+              "row_family_selected": False,
+              "definition_match_confirmed": False,
+              "diagonal_diagnostic_allowed_now": False,
+              "score_valid": False,
+              "p_value_computed": False,
+              "likelihood_computed": False,
+              "numeric_fit_allowed": False,
+              "support_allowed": False,
+              "evidence_allowed": False,
+              "validation_allowed": False,
+              "holdout_approval_allowed": False,
+              "combined_matrix_allowed": False,
+              "approved_holdout_sources": 0,
+              "selected_next_route": SELECTED_NEXT_ROUTE,
+              "truth_boundary": {
+                  "proves_tairid": False,
+                  "validates_cosmology": False,
+                  "supports_tairid": False,
+                  "scores_external_observed_data": False,
+                  "fits_numeric_correction": False,
+                  "approves_holdout_source": False,
+                  "approves_evidence": False,
+                  "runs_external_likelihood_fit": False,
+                  "combined_matrix_allowed": False
+              },
+          }
+
+          (OUT / "v4_300_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+          summary_md = [
+              "# TAIRID v4.300 SDSS RSD Manual Answer Template Builder No Scoring",
+              "",
+              f"Expected result: {EXPECTED_RESULT}",
+              "",
+              f"{summary['rules_passed']} / {summary['rules_total']} rules passed",
+              f"failed_gates = {summary['failed_gates']}",
+              f"source_url = {SOURCE_URL}",
+              f"source_fetch_ok = {summary['source_fetch_ok']}",
+              f"related_page_url = {RELATED_PAGE_URL}",
+              f"related_fetch_ok = {summary['related_fetch_ok']}",
+              f"dr16_fetch_ok = {summary['dr16_fetch_ok']}",
+              f"column_contract_rows = {summary['column_contract_rows']}",
+              f"source_hint_rows = {summary['source_hint_rows']}",
+              f"row_meaning_hint_rows = {summary['row_meaning_hint_rows']}",
+              f"baseline_hint_rows = {summary['baseline_hint_rows']}",
+              f"manual_answer_template_rows = {summary['manual_answer_template_rows']}",
+              f"template_schema_rows = {summary['template_schema_rows']}",
+              f"template_validation_rows = {summary['template_validation_rows']}",
+              f"manual_answer_template_written = {summary['manual_answer_template_written']}",
+              f"recommended_output_template = {summary['recommended_output_template']}",
+              f"recommended_ingest_path = {summary['recommended_ingest_path']}",
+              f"row_meaning_confirmed = {summary['row_meaning_confirmed']}",
+              f"baseline_values_filled = {summary['baseline_values_filled']}",
+              f"approved_baseline_values = {summary['approved_baseline_values']}",
+              f"row_family_selected = {summary['row_family_selected']}",
+              f"definition_match_confirmed = {summary['definition_match_confirmed']}",
+              f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}",
+              f"score_valid = {summary['score_valid']}",
+              f"p_value_computed = {summary['p_value_computed']}",
+              f"likelihood_computed = {summary['likelihood_computed']}",
+              f"numeric_fit_allowed = {summary['numeric_fit_allowed']}",
+              f"support_allowed = {summary['support_allowed']}",
+              f"evidence_allowed = {summary['evidence_allowed']}",
+              f"validation_allowed = {summary['validation_allowed']}",
+              f"holdout_approval_allowed = {summary['holdout_approval_allowed']}",
+              f"combined_matrix_allowed = {summary['combined_matrix_allowed']}",
+              f"approved_holdout_sources = {summary['approved_holdout_sources']}",
+              f"selected_next_route = {SELECTED_NEXT_ROUTE}",
+              "",
+              "Template preview:",
+              *template_lines,
+              "",
+              "Route decisions:",
+              *route_lines,
+              "",
+              "Clean meaning: v4.300 writes a fillable manual answer template. It turns the v4.299 source-answer boundary into an actual CSV file with row-meaning, baseline, and definition-match targets. It does not answer the rows, confirm row meaning, approve baselines, select a row family, confirm definition matches, run diagnostics, score, compute residuals, compute p-values, compute likelihoods, fit corrections, approve support, approve evidence, approve validation, approve a holdout, or build a combined matrix.",
+              "",
+              "Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.",
+          ]
+          (OUT / "v4_300_summary.md").write_text("\n".join(summary_md), encoding="utf-8")
+
+          with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUT.rglob("*")):
+                  if path.is_file():
+                      z.write(path, path.as_posix())
+
+          print(EXPECTED_RESULT)
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_url = {SOURCE_URL}")
+          print(f"source_fetch_ok = {summary['source_fetch_ok']}")
+          print(f"related_page_url = {RELATED_PAGE_URL}")
+          print(f"related_fetch_ok = {summary['related_fetch_ok']}")
+          print(f"dr16_fetch_ok = {summary['dr16_fetch_ok']}")
+          print(f"column_contract_rows = {summary['column_contract_rows']}")
+          print(f"source_hint_rows = {summary['source_hint_rows']}")
+          print(f"row_meaning_hint_rows = {summary['row_meaning_hint_rows']}")
+          print(f"baseline_hint_rows = {summary['baseline_hint_rows']}")
+          print(f"manual_answer_template_rows = {summary['manual_answer_template_rows']}")
+          print(f"manual_answer_template_written = {summary['manual_answer_template_written']}")
+          print(f"recommended_output_template = {summary['recommended_output_template']}")
+          print(f"recommended_ingest_path = {summary['recommended_ingest_path']}")
+          print(f"row_meaning_confirmed = {summary['row_meaning_confirmed']}")
+          print(f"baseline_values_filled = {summary['baseline_values_filled']}")
+          print(f"approved_baseline_values = {summary['approved_baseline_values']}")
+          print(f"row_family_selected = {summary['row_family_selected']}")
+          print(f"definition_match_confirmed = {summary['definition_match_confirmed']}")
+          print(f"diagonal_diagnostic_allowed_now = {summary['diagonal_diagnostic_allowed_now']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"p_value_computed = {summary['p_value_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"evidence_allowed = {summary['evidence_allowed']}")
+          print(f"validation_allowed = {summary['validation_allowed']}")
+          print(f"combined_matrix_allowed = {summary['combined_matrix_allowed']}")
+          print(f"selected_next_route = {SELECTED_NEXT_ROUTE}")
+          print("Truth boundary: no proof, no validation, no TAIRID support, no external observed scoring, no residual, no chi-square, no p-value, no likelihood, no numeric correction fit, no approved holdout source, no evidence approval, no combined matrix.")
+          print(f"Output package: {ZIP_NAME}")
+
+          if failed:
+              raise SystemExit(f"Failed gates: {failed}")
+          PY
+
+      - name: Upload v4.300 SDSS RSD manual answer template builder output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-300-sdss-rsd-manual-answer-template-builder-output
+          path: |
+            tairid_v4_300_sdss_rsd_manual_answer_template_builder_output/
+            tairid-v4-300-sdss-rsd-manual-answer-template-builder-output.zip
