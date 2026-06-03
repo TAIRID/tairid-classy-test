@@ -1,0 +1,305 @@
+name: "!!! AAA CURRENT - TAIRID v4.326 SDSS RSD decision readiness no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-326-decision-readiness-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.326 decision readiness no scoring"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.325D input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.325D output ZIP by pattern..."
+          INPUT_ZIP="$(ls tairid-v4-325d-sdss-rsd-numeric-baseline-parameter-human-review-packet-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_ZIP" ]; then
+            echo "Could not find a v4.325D output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-325d-sdss-rsd-numeric-baseline-parameter-human-review-packet-no-scoring-output.zip"
+            echo "or a GitHub-renamed version ending in -1.zip, -2.zip, etc."
+            exit 1
+          fi
+
+          echo "Found input ZIP:"
+          echo "$INPUT_ZIP"
+
+          echo "INPUT_ZIP=$INPUT_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.326 readiness script
+        run: |
+          cat > run_v4_326_decision_readiness_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          from pathlib import Path
+
+          import pandas as pd
+
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+
+          def clean_text(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+
+          def bool_false_series(series):
+              return series.fillna(False).astype(str).str.lower().isin(["false", "0", "", "nan"]).all()
+
+
+          def find_input_dir(path: Path) -> Path:
+              if not path.exists():
+                  raise FileNotFoundError(f"Input does not exist: {path}")
+
+              if path.is_dir():
+                  matches = list(path.rglob("v4_325d_summary.json"))
+                  if not matches:
+                      raise FileNotFoundError("Could not find v4_325d_summary.json in input directory.")
+                  return matches[0].parent
+
+              if path.suffix.lower() == ".zip":
+                  tmp = Path(tempfile.mkdtemp(prefix="tairid_v4_326_input_"))
+                  with zipfile.ZipFile(path, "r") as z:
+                      z.extractall(tmp)
+
+                  nested_zips = list(tmp.rglob("*.zip"))
+                  for nested_zip in nested_zips:
+                      try:
+                          nested_out = tmp / (nested_zip.stem + "_unzipped")
+                          nested_out.mkdir(exist_ok=True)
+                          with zipfile.ZipFile(nested_zip, "r") as z2:
+                              z2.extractall(nested_out)
+                      except zipfile.BadZipFile:
+                          pass
+
+                  matches = list(tmp.rglob("v4_325d_summary.json"))
+                  if not matches:
+                      raise FileNotFoundError("Could not find v4_325d_summary.json inside input ZIP.")
+
+                  return matches[0].parent
+
+              raise ValueError("Input must be a ZIP file or directory.")
+
+
+          def main():
+              input_zip = Path(__import__("os").environ["INPUT_ZIP"])
+              outdir = Path("tairid_v4_326_sdss_rsd_decision_readiness_no_scoring_output")
+
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base = find_input_dir(input_zip)
+
+              summary_path = base / "v4_325d_summary.json"
+              decision_path = base / "SDSS_RSD_NUMERIC_BASELINE_PARAMETER_CANDIDATE_DECISION_TEMPLATE_v4_325D_FILLABLE_NO_VALUES.csv"
+              review_path = base / "SDSS_RSD_NUMERIC_BASELINE_PARAMETER_HUMAN_REVIEW_PACKET_v4_325D_NO_APPROVAL_NO_SCORING.csv"
+
+              if not summary_path.exists():
+                  raise FileNotFoundError(f"Missing required summary file: {summary_path}")
+              if not decision_path.exists():
+                  raise FileNotFoundError(f"Missing required decision template: {decision_path}")
+              if not review_path.exists():
+                  raise FileNotFoundError(f"Missing required human-review packet: {review_path}")
+
+              summary_325d = json.loads(summary_path.read_text())
+              decisions = pd.read_csv(decision_path)
+              review = pd.read_csv(review_path)
+
+              allowed_decisions = {
+                  "select_candidate_for_later_value_review",
+                  "needs_better_source",
+                  "reject_all",
+                  "keep_blocked",
+              }
+
+              decisions["human_decision_clean"] = decisions["human_decision"].apply(clean_text)
+              decisions["human_selected_candidate_ids_clean"] = decisions["human_selected_candidate_ids"].apply(clean_text)
+              decisions["reviewer_note_clean"] = decisions["reviewer_note"].apply(clean_text)
+
+              filled_rows = decisions["human_decision_clean"] != ""
+              filled_count = int(filled_rows.sum())
+              total_rows = int(len(decisions))
+              blank_count = int(total_rows - filled_count)
+
+              invalid_decision_rows = decisions.loc[
+                  filled_rows & ~decisions["human_decision_clean"].isin(allowed_decisions),
+                  ["decision_id_v4_325", "question_id", "parameter_or_method", "human_decision_clean"],
+              ]
+
+              selected_without_decision = decisions.loc[
+                  (decisions["human_decision_clean"] == "") &
+                  (decisions["human_selected_candidate_ids_clean"] != ""),
+                  ["decision_id_v4_325", "question_id", "parameter_or_method", "human_selected_candidate_ids_clean"],
+              ]
+
+              if filled_count == 0:
+                  readiness_status = "blocked_pending_human_template_fill"
+                  selected_next_route = "fill_v4_325d_decision_template_before_v4_326_decision_ingest"
+              elif blank_count > 0:
+                  readiness_status = "blocked_partial_human_template_fill"
+                  selected_next_route = "finish_v4_325d_decision_template_before_v4_326_decision_ingest"
+              else:
+                  readiness_status = "ready_for_later_candidate_decision_ingest_no_values_no_scoring"
+                  selected_next_route = "v4_326b_sdss_rsd_candidate_decision_ingest_no_values_no_scoring"
+
+              rules = []
+
+              def add(gate, passed):
+                  rules.append({"gate": gate, "passed": bool(passed)})
+
+              add("input_v4_325d_summary_found", summary_325d.get("version") == "v4.325D")
+              add("input_v4_325d_rules_passed_17_of_17", summary_325d.get("rules_passed") == 17 and summary_325d.get("rules_total") == 17)
+              add("input_v4_325d_failed_gates_none", summary_325d.get("failed_gates") == "none")
+              add("input_v4_325d_no_parameter_approval", summary_325d.get("parameter_values_approved") is False)
+              add("input_v4_325d_no_numeric_baseline_approval", summary_325d.get("numeric_baseline_values_filled") is False and summary_325d.get("approved_baseline_values") == 0)
+              add("input_v4_325d_no_observed_values_loaded", summary_325d.get("observed_values_loaded") is False)
+              add("input_v4_325d_no_definition_match_confirmed", summary_325d.get("definition_match_confirmed") is False)
+              add("input_v4_325d_no_scoring", summary_325d.get("score_valid") is False)
+              add("input_v4_325d_no_support_allowed", summary_325d.get("support_allowed") is False)
+              add("decision_template_rows_equal_6", total_rows == 6)
+              add("human_review_packet_rows_equal_24", len(review) == 24)
+              add("no_invalid_human_decision_entries", len(invalid_decision_rows) == 0)
+              add("no_selected_candidates_without_human_decision", len(selected_without_decision) == 0)
+              add("decision_template_parameter_value_approval_false", bool_false_series(decisions["parameter_value_approval_allowed_now"]))
+              add("decision_template_numeric_baseline_approval_false", bool_false_series(decisions["numeric_baseline_approval_allowed_now"]))
+              add("decision_template_observed_values_loaded_false", bool_false_series(decisions["observed_values_loaded"]))
+              add("decision_template_definition_match_confirmed_false", bool_false_series(decisions["definition_match_confirmed"]))
+              add("decision_template_score_allowed_false", bool_false_series(decisions["score_allowed"]))
+              add("decision_template_support_allowed_false", bool_false_series(decisions["support_allowed"]))
+
+              rule_checks = pd.DataFrame(rules)
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              status_rows = []
+              for _, row in decisions.iterrows():
+                  status_rows.append({
+                      "decision_id_v4_325": row["decision_id_v4_325"],
+                      "question_id": row["question_id"],
+                      "parameter_or_method": row["parameter_or_method"],
+                      "human_decision_status": "filled" if clean_text(row["human_decision"]) else "blank",
+                      "human_decision": clean_text(row["human_decision"]),
+                      "human_selected_candidate_ids": clean_text(row["human_selected_candidate_ids"]),
+                      "v4_326_readiness_scope": "readiness_only_no_values_no_scoring",
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                  })
+
+              status_df = pd.DataFrame(status_rows)
+
+              summary_326 = {
+                  "version": "v4.326",
+                  "route_name": "v4_326_sdss_rsd_decision_template_readiness_status_no_scoring",
+                  "expected_result": "v4_326_sdss_rsd_decision_template_readiness_status_no_scoring_passed_no_claims",
+                  "input_version": "v4.325D",
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "decision_template_rows": total_rows,
+                  "human_decision_filled_rows": filled_count,
+                  "human_decision_blank_rows": blank_count,
+                  "readiness_status": readiness_status,
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              status_df.to_csv(outdir / "v4_326_decision_template_readiness_status_no_scoring.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_326_rule_checks.csv", index=False)
+              invalid_decision_rows.to_csv(outdir / "v4_326_invalid_human_decision_rows.csv", index=False)
+              selected_without_decision.to_csv(outdir / "v4_326_selected_without_decision_rows.csv", index=False)
+              (outdir / "v4_326_summary.json").write_text(json.dumps(summary_326, indent=2))
+
+              summary_md = f"""# TAIRID v4.326 SDSS RSD Decision Template Readiness No Scoring
+
+              Expected result: `{summary_326["expected_result"]}`
+
+              {summary_326["rules_passed"]} / {summary_326["rules_total"]} rules passed
+
+              failed_gates = {summary_326["failed_gates"]}
+
+              readiness_status = `{summary_326["readiness_status"]}`
+
+              human_decision_filled_rows = {filled_count}
+
+              human_decision_blank_rows = {blank_count}
+
+              Truth boundary: {TRUTH_BOUNDARY}.
+
+              This step does not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, compute chi-square, score TAIRID, or make support claims.
+
+              Next route: `{summary_326["selected_next_route"]}`
+              """
+              (outdir / "v4_326_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary_326, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_326_decision_readiness_no_scoring.py
+
+      - name: Run v4.326 decision readiness no scoring
+        run: |
+          python run_v4_326_decision_readiness_no_scoring.py
+
+      - name: Upload v4.326 no-scoring output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-326-sdss-rsd-decision-template-readiness-no-scoring-output
+          path: |
+            tairid_v4_326_sdss_rsd_decision_readiness_no_scoring_output/
+            tairid_v4_326_sdss_rsd_decision_readiness_no_scoring_output.zip
