@@ -1,0 +1,387 @@
+name: "!!! AAA CURRENT - TAIRID v4.340 repair readiness check no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-340-repair-readiness-check-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.340 repair readiness check"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.339 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.339 output ZIP by pattern..."
+          INPUT_339_ZIP="$(ls tairid-v4-339-parameter-exact-quote-repair-packet-no-approval-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_339_ZIP" ]; then
+            echo "Could not find v4.339 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-339-parameter-exact-quote-repair-packet-no-approval-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.339 ZIP:"
+          echo "$INPUT_339_ZIP"
+          echo "INPUT_339_ZIP=$INPUT_339_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.340 repair readiness script
+        run: |
+          cat > run_v4_340_repair_readiness_check_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def filled_count(df, col):
+              if col not in df.columns:
+                  return 0
+              return int(df[col].apply(clean).ne("").sum())
+
+          def blank_count(df, col):
+              if col not in df.columns:
+                  return len(df)
+              return int(df[col].apply(clean).eq("").sum())
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def main():
+              input_339 = Path(os.environ["INPUT_339_ZIP"])
+
+              outdir = Path("tairid_v4_340_repair_readiness_check_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base339 = extract_zip(input_339, "tairid_v4_340_339_")
+
+              summary339_path = find_one(base339, "v4_339_summary.json")
+              repair_packet_path = find_one(base339, "v4_339_HUMAN_FILL_exact_quote_repair_packet_NO_APPROVAL_NO_SCORING.csv")
+              repair_summary_path = find_one(base339, "v4_339_repair_summary_by_type_no_scoring.csv")
+              gap_update_path = find_one(base339, "v4_339_gap_update_after_repair_packet_no_scoring.csv")
+              rules339_path = find_one(base339, "v4_339_rule_checks.csv")
+              proposal_ledger_path = find_one(base339, "v4_339_input_v4_338_proposal_ledger_preserved.csv")
+              proposed_worksheet_path = find_one(base339, "v4_339_input_v4_338_proposed_worksheet_preserved.csv")
+
+              summary339 = json.loads(summary339_path.read_text())
+              repair_packet = pd.read_csv(repair_packet_path)
+              repair_summary = pd.read_csv(repair_summary_path)
+              gap_update = pd.read_csv(gap_update_path)
+              rules339 = pd.read_csv(rules339_path)
+              proposal_ledger = pd.read_csv(proposal_ledger_path)
+              proposed_worksheet = pd.read_csv(proposed_worksheet_path)
+
+              exact_quote_filled = filled_count(repair_packet, "human_exact_quote_to_add")
+              source_url_filled = filled_count(repair_packet, "human_source_url_to_add")
+              value_text_filled = filled_count(repair_packet, "human_candidate_value_text_to_add")
+              numeric_value_filled = filled_count(repair_packet, "human_candidate_numeric_value_to_add_if_applicable")
+              repair_decision_filled = filled_count(repair_packet, "human_repair_decision")
+
+              total_human_fill_signals = (
+                  exact_quote_filled
+                  + source_url_filled
+                  + value_text_filled
+                  + numeric_value_filled
+                  + repair_decision_filled
+              )
+
+              repair_targets = repair_packet[repair_packet["needs_repair_before_value_ingest"].astype(bool)].copy()
+              repair_target_rows = int(len(repair_targets))
+              repair_target_decisions_filled = filled_count(repair_targets, "human_repair_decision")
+
+              if total_human_fill_signals == 0:
+                  readiness_status = "blocked_pending_human_repair_fill"
+                  selected_next_route = "human_fill_v4_339_exact_quote_repair_packet_then_rerun_v4_340"
+              elif repair_target_decisions_filled < repair_target_rows:
+                  readiness_status = "blocked_partial_human_repair_fill"
+                  selected_next_route = "finish_v4_339_repair_packet_then_rerun_v4_340"
+              else:
+                  readiness_status = "ready_for_later_repair_ingest_no_value_approval_no_scoring"
+                  selected_next_route = "v4_341_repair_ingest_no_value_approval_no_scoring"
+
+              readiness_rows = []
+              for _, row in repair_packet.iterrows():
+                  readiness_rows.append({
+                      "v4_339_repair_id": row["v4_339_repair_id"],
+                      "v4_334_extraction_id": row["v4_334_extraction_id"],
+                      "question_id": row["question_id"],
+                      "parameter_or_method": row["parameter_or_method"],
+                      "v4_339_repair_type": row["v4_339_repair_type"],
+                      "repair_priority": row["repair_priority"],
+                      "needs_repair_before_value_ingest": bool(row["needs_repair_before_value_ingest"]),
+                      "human_exact_quote_filled": clean(row["human_exact_quote_to_add"]) != "",
+                      "human_source_url_filled": clean(row["human_source_url_to_add"]) != "",
+                      "human_candidate_value_text_filled": clean(row["human_candidate_value_text_to_add"]) != "",
+                      "human_candidate_numeric_value_filled": clean(row["human_candidate_numeric_value_to_add_if_applicable"]) != "",
+                      "human_repair_decision_filled": clean(row["human_repair_decision"]) != "",
+                      "row_ready_for_later_repair_ingest": (
+                          clean(row["human_repair_decision"]) != ""
+                          and (
+                              bool(row["needs_repair_before_value_ingest"]) is False
+                              or clean(row["human_exact_quote_to_add"]) != ""
+                              or clean(row["human_source_url_to_add"]) != ""
+                              or clean(row["human_repair_decision"]) in ["needs_better_source", "reject_candidate", "keep_blocked"]
+                          )
+                      ),
+                      "readiness_scope": "repair_readiness_only_no_value_approval_no_scoring",
+                      "repair_completed_now": False,
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              readiness = pd.DataFrame(readiness_rows)
+
+              updated_gaps = pd.DataFrame([
+                  {
+                      "gap_id": "REPAIR_READINESS_GAP_001",
+                      "gap": "Exact quote repair packet exists, but human repair fields are not complete.",
+                      "status_after_v4_340": readiness_status,
+                      "blocks": "repair_ingest",
+                  },
+                  {
+                      "gap_id": "REPAIR_READINESS_GAP_002",
+                      "gap": "Omega_m0 exact quote remains unavailable until human repair fill.",
+                      "status_after_v4_340": "open" if readiness_status != "ready_for_later_repair_ingest_no_value_approval_no_scoring" else "pending_ingest_review",
+                      "blocks": "omega_m0_value_review",
+                  },
+                  {
+                      "gap_id": "REPAIR_READINESS_GAP_003",
+                      "gap": "sigma8_0 exact quote remains unavailable until human repair fill.",
+                      "status_after_v4_340": "open" if readiness_status != "ready_for_later_repair_ingest_no_value_approval_no_scoring" else "pending_ingest_review",
+                      "blocks": "sigma8_0_value_review",
+                  },
+                  {
+                      "gap_id": "REPAIR_READINESS_GAP_004",
+                      "gap": "growth_index_gamma still needs better source or explicit block decision.",
+                      "status_after_v4_340": "open" if readiness_status != "ready_for_later_repair_ingest_no_value_approval_no_scoring" else "pending_ingest_review",
+                      "blocks": "growth_index_gamma_value_review",
+                  },
+                  {
+                      "gap_id": "REPAIR_READINESS_GAP_005",
+                      "gap": "Parameter approval, baseline approval, observed scoring, and support claims remain blocked.",
+                      "status_after_v4_340": "blocked_by_design",
+                      "blocks": "scoring_and_support_claims",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_339_summary_found": summary339.get("version") == "v4.339",
+                  "input_v4_339_rules_34_of_34": summary339.get("rules_passed") == 34 and summary339.get("rules_total") == 34,
+                  "input_v4_339_failed_gates_none": summary339.get("failed_gates") == "none",
+                  "input_v4_339_no_parameter_approval": summary339.get("parameter_values_approved") is False,
+                  "input_v4_339_no_numeric_baseline_approval": summary339.get("numeric_baseline_values_filled") is False and summary339.get("approved_baseline_values") == 0,
+                  "input_v4_339_no_observed_values_loaded": summary339.get("observed_values_loaded") is False,
+                  "input_v4_339_no_definition_match_confirmed": summary339.get("definition_match_confirmed") is False,
+                  "input_v4_339_no_score_valid": summary339.get("score_valid") is False,
+                  "input_v4_339_no_support_allowed": summary339.get("support_allowed") is False,
+
+                  "repair_packet_rows_equal_6": len(repair_packet) == 6,
+                  "repair_target_rows_equal_3": repair_target_rows == 3,
+                  "exact_quote_repair_rows_equal_2": int((repair_packet["v4_339_repair_type"] == "needs_exact_quote").sum()) == 2,
+                  "better_source_repair_rows_equal_1": int((repair_packet["v4_339_repair_type"] == "needs_better_source").sum()) == 1,
+                  "context_only_rows_equal_3": int((repair_packet["v4_339_repair_type"] == "context_only_confirm").sum()) == 3,
+                  "repair_summary_rows_at_least_3": len(repair_summary) >= 3,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+                  "rules339_all_passed": rules339["passed"].astype(bool).all(),
+                  "proposal_ledger_rows_equal_6": len(proposal_ledger) == 6,
+                  "proposed_worksheet_rows_equal_6": len(proposed_worksheet) == 6,
+                  "readiness_rows_equal_6": len(readiness) == 6,
+
+                  "human_exact_quote_fields_blank": exact_quote_filled == 0,
+                  "human_source_url_fields_blank": source_url_filled == 0,
+                  "human_candidate_value_fields_blank": value_text_filled == 0,
+                  "human_numeric_value_fields_blank": numeric_value_filled == 0,
+                  "human_repair_decision_fields_blank": repair_decision_filled == 0,
+
+                  "repair_completed_false": false_col(readiness, "repair_completed_now"),
+                  "parameter_value_approval_false": false_col(readiness, "parameter_value_approved_now"),
+                  "numeric_baseline_approval_false": false_col(readiness, "numeric_baseline_approved_now"),
+                  "observed_values_loaded_false": false_col(readiness, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(readiness, "definition_match_confirmed"),
+                  "score_valid_false": false_col(readiness, "score_valid"),
+                  "support_allowed_false": false_col(readiness, "support_allowed"),
+
+                  "updated_gap_rows_equal_5": len(updated_gaps) == 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary340 = {
+                  "version": "v4.340",
+                  "route_name": "v4_340_repair_readiness_check_no_approval_no_scoring",
+                  "expected_result": "v4_340_repair_readiness_check_no_approval_no_scoring_passed_no_claims",
+                  "input_version": "v4.339",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+
+                  "readiness_status": readiness_status,
+                  "repair_packet_rows": int(len(repair_packet)),
+                  "repair_target_rows": repair_target_rows,
+                  "readiness_rows": int(len(readiness)),
+                  "human_exact_quote_filled_rows": int(exact_quote_filled),
+                  "human_source_url_filled_rows": int(source_url_filled),
+                  "human_candidate_value_filled_rows": int(value_text_filled),
+                  "human_numeric_value_filled_rows": int(numeric_value_filled),
+                  "human_repair_decision_filled_rows": int(repair_decision_filled),
+
+                  "repair_completed_rows": 0,
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              readiness.to_csv(outdir / "v4_340_repair_readiness_status_no_approval_no_scoring.csv", index=False)
+              updated_gaps.to_csv(outdir / "v4_340_updated_repair_gap_status_no_scoring.csv", index=False)
+              repair_packet.to_csv(outdir / "v4_340_input_v4_339_repair_packet_preserved.csv", index=False)
+              repair_summary.to_csv(outdir / "v4_340_input_v4_339_repair_summary_preserved.csv", index=False)
+              gap_update.to_csv(outdir / "v4_340_input_v4_339_gap_update_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_340_rule_checks.csv", index=False)
+
+              (outdir / "v4_340_summary.json").write_text(json.dumps(summary340, indent=2))
+
+              summary_md = f"""# TAIRID v4.340 Repair Readiness Check — No Approval, No Scoring
+
+          Expected result: `{summary340["expected_result"]}`
+
+          {summary340["rules_passed"]} / {summary340["rules_total"]} rules passed
+
+          failed_gates = {summary340["failed_gates"]}
+
+          readiness_status = `{readiness_status}`
+
+          repair_target_rows = {repair_target_rows}
+
+          human_exact_quote_filled_rows = {exact_quote_filled}
+
+          human_source_url_filled_rows = {source_url_filled}
+
+          human_candidate_value_filled_rows = {value_text_filled}
+
+          human_numeric_value_filled_rows = {numeric_value_filled}
+
+          human_repair_decision_filled_rows = {repair_decision_filled}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This step checks whether the v4.339 repair packet has been filled.
+
+          It does **not** approve parameter values.
+
+          It does **not** approve a numeric baseline.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{selected_next_route}`
+          """
+              (outdir / "v4_340_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary340, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_340_repair_readiness_check_no_scoring.py
+
+      - name: Run v4.340 repair readiness check no scoring
+        run: |
+          python run_v4_340_repair_readiness_check_no_scoring.py
+
+      - name: Upload v4.340 repair readiness check artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-340-repair-readiness-check-no-approval-no-scoring-output
+          path: |
+            tairid_v4_340_repair_readiness_check_no_scoring_output/
+            tairid_v4_340_repair_readiness_check_no_scoring_output.zip
