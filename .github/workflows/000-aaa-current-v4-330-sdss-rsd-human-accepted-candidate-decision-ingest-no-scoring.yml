@@ -1,0 +1,325 @@
+name: "!!! AAA CURRENT - TAIRID v4.330 human accepted candidate decision ingest no scoring"
+
+on:
+  workflow_dispatch:
+    inputs:
+      human_accepts_v4_329_proposed_template:
+        description: "Human accepts v4.329 proposed filled template for candidate-decision ingest only? No values, no scoring."
+        required: true
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
+
+jobs:
+  run-v4-330-human-accepted-candidate-decision-ingest-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.330 accepted candidate decision ingest no scoring"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      HUMAN_ACCEPTS_V4_329: ${{ github.event.inputs.human_accepts_v4_329_proposed_template }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.329 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.329 output ZIP by pattern..."
+          INPUT_329_ZIP="$(ls tairid-v4-329-sdss-rsd-proposed-filled-decision-template-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_329_ZIP" ]; then
+            echo "Could not find v4.329 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-329-sdss-rsd-proposed-filled-decision-template-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Found v4.329 ZIP:"
+          echo "$INPUT_329_ZIP"
+
+          echo "INPUT_329_ZIP=$INPUT_329_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.330 ingest script
+        run: |
+          cat > run_v4_330_human_accepted_candidate_decision_ingest_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          from pathlib import Path
+          import pandas as pd
+          import os
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_series(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.lower().isin(["false", "0", "", "nan"]).all()
+
+          def main():
+              human_accepts = os.environ.get("HUMAN_ACCEPTS_V4_329", "no").strip().lower()
+              input_329 = Path(os.environ["INPUT_329_ZIP"])
+
+              outdir = Path("tairid_v4_330_sdss_rsd_human_accepted_candidate_decision_ingest_no_values_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base329 = extract_zip(input_329, "tairid_v4_330_329_")
+
+              summary329_path = find_one(base329, "v4_329_summary.json")
+              proposed_template_path = find_one(base329, "v4_329_PROPOSED_FILLED_decision_template_NOT_HUMAN_APPROVED_no_values_no_scoring.csv")
+              id_check_path = find_one(base329, "v4_329_selected_candidate_id_availability_check.csv")
+              acceptance_checklist_path = find_one(base329, "v4_329_human_acceptance_checklist_before_ingest.csv")
+
+              summary329 = json.loads(summary329_path.read_text())
+              proposed = pd.read_csv(proposed_template_path)
+              id_check = pd.read_csv(id_check_path)
+              acceptance_checklist = pd.read_csv(acceptance_checklist_path)
+
+              human_acceptance_recorded = human_accepts == "yes"
+
+              if human_acceptance_recorded:
+                  ingest_status = "human_accepted_candidate_decisions_ingested_no_values_no_scoring"
+                  accepted_decision_rows = int(len(proposed))
+              else:
+                  ingest_status = "blocked_pending_human_acceptance"
+                  accepted_decision_rows = 0
+
+              accepted = proposed.copy()
+              accepted["v4_330_human_acceptance_input"] = human_accepts
+              accepted["v4_330_human_acceptance_recorded"] = human_acceptance_recorded
+              accepted["v4_330_ingest_status"] = ingest_status
+
+              if human_acceptance_recorded:
+                  accepted["candidate_decision_ingested_for_later_value_review"] = True
+              else:
+                  accepted["candidate_decision_ingested_for_later_value_review"] = False
+
+              accepted["candidate_decision_scope"] = "source_candidate_decision_only_no_parameter_values_no_observed_scoring"
+              accepted["parameter_value_approved_now"] = False
+              accepted["numeric_baseline_approved_now"] = False
+              accepted["observed_values_loaded"] = False
+              accepted["definition_match_confirmed"] = False
+              accepted["score_valid"] = False
+              accepted["support_allowed"] = False
+
+              ledger_rows = []
+              for _, row in accepted.iterrows():
+                  ledger_rows.append({
+                      "question_id": row["question_id"],
+                      "parameter_or_method": row["parameter_or_method"],
+                      "accepted_human_decision": clean(row["human_decision"]) if human_acceptance_recorded else "",
+                      "accepted_candidate_ids_for_later_value_review": clean(row["human_selected_candidate_ids"]) if human_acceptance_recorded else "",
+                      "accepted_answer_summary_no_values": clean(row["human_answer_summary_no_values"]) if human_acceptance_recorded else "",
+                      "human_acceptance_recorded": human_acceptance_recorded,
+                      "ingest_status": ingest_status,
+                      "decision_scope": "candidate_source_triage_only_no_values_no_scoring",
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              ledger = pd.DataFrame(ledger_rows)
+
+              allowed_decisions = {
+                  "select_candidate_for_later_value_review",
+                  "needs_better_source",
+                  "reject_all",
+                  "keep_blocked",
+              }
+
+              proposed_decisions_filled = int((proposed["human_decision"].apply(clean) != "").sum())
+              proposed_candidate_ids_filled = int((proposed["human_selected_candidate_ids"].apply(clean) != "").sum())
+
+              rules = []
+
+              def add(gate, passed):
+                  rules.append({"gate": gate, "passed": bool(passed)})
+
+              add("input_v4_329_summary_found", summary329.get("version") == "v4.329")
+              add("input_v4_329_rules_passed_28_of_28", summary329.get("rules_passed") == 28 and summary329.get("rules_total") == 28)
+              add("input_v4_329_failed_gates_none", summary329.get("failed_gates") == "none")
+              add("input_v4_329_no_parameter_approval", summary329.get("parameter_values_approved") is False)
+              add("input_v4_329_no_numeric_baseline_approval", summary329.get("numeric_baseline_values_filled") is False and summary329.get("approved_baseline_values") == 0)
+              add("input_v4_329_no_observed_values_loaded", summary329.get("observed_values_loaded") is False)
+              add("input_v4_329_no_definition_match_confirmed", summary329.get("definition_match_confirmed") is False)
+              add("input_v4_329_no_scoring", summary329.get("score_valid") is False)
+              add("input_v4_329_no_support_allowed", summary329.get("support_allowed") is False)
+              add("input_v4_329_human_approval_status_not_approved_proposed_only", summary329.get("human_approval_status") == "not_approved_proposed_fill_only")
+              add("human_acceptance_input_is_valid_choice", human_accepts in ["yes", "no"])
+              add("proposed_template_rows_equal_6", len(proposed) == 6)
+              add("id_check_rows_equal_6", len(id_check) == 6)
+              add("acceptance_checklist_rows_equal_5", len(acceptance_checklist) == 5)
+              add("proposed_human_decision_rows_filled_equal_6", proposed_decisions_filled == 6)
+              add("proposed_candidate_id_rows_filled_equal_6", proposed_candidate_ids_filled == 6)
+              add("proposed_decisions_are_allowed", proposed["human_decision"].isin(allowed_decisions).all())
+              add("selected_candidate_ids_available", id_check["selected_ids_available"].astype(bool).all())
+              add("accepted_rows_equal_template_rows", len(accepted) == len(proposed))
+              add("ledger_rows_equal_template_rows", len(ledger) == len(proposed))
+              add("accepted_decision_rows_correct_for_human_input", accepted_decision_rows == (6 if human_acceptance_recorded else 0))
+              add("accepted_parameter_value_approval_false", not accepted["parameter_value_approved_now"].any())
+              add("accepted_numeric_baseline_approval_false", not accepted["numeric_baseline_approved_now"].any())
+              add("accepted_observed_values_loaded_false", not accepted["observed_values_loaded"].any())
+              add("accepted_definition_match_confirmed_false", not accepted["definition_match_confirmed"].any())
+              add("accepted_score_valid_false", not accepted["score_valid"].any())
+              add("accepted_support_allowed_false", not accepted["support_allowed"].any())
+              add("ledger_parameter_value_approval_false", not ledger["parameter_value_approved_now"].any())
+              add("ledger_numeric_baseline_approval_false", not ledger["numeric_baseline_approved_now"].any())
+              add("ledger_observed_values_loaded_false", not ledger["observed_values_loaded"].any())
+              add("ledger_definition_match_confirmed_false", not ledger["definition_match_confirmed"].any())
+              add("ledger_score_valid_false", not ledger["score_valid"].any())
+              add("ledger_support_allowed_false", not ledger["support_allowed"].any())
+              add("proposed_status_marked_from_v4_329", (proposed["v4_329_status"] == "proposed_filled_template_not_human_approved").all())
+
+              rule_checks = pd.DataFrame(rules)
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              if human_acceptance_recorded:
+                  expected_result = "v4_330_human_accepted_candidate_decision_ingest_no_values_no_scoring_passed_no_claims"
+                  selected_next_route = "v4_331_parameter_value_review_packet_from_accepted_sources_no_scoring_no_approval"
+              else:
+                  expected_result = "v4_330_blocked_pending_human_acceptance_no_values_no_scoring_passed_no_claims"
+                  selected_next_route = "rerun_v4_330_with_human_accepts_v4_329_proposed_template_yes_if_human_agrees"
+
+              summary330 = {
+                  "version": "v4.330",
+                  "route_name": "v4_330_sdss_rsd_human_accepted_candidate_decision_ingest_no_values_no_scoring",
+                  "expected_result": expected_result,
+                  "input_version": "v4.329",
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "human_acceptance_input": human_accepts,
+                  "human_acceptance_recorded": human_acceptance_recorded,
+                  "ingest_status": ingest_status,
+                  "candidate_decision_rows_available": int(len(proposed)),
+                  "accepted_candidate_decision_rows": int(accepted_decision_rows),
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              accepted.to_csv(outdir / "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv", index=False)
+              ledger.to_csv(outdir / "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv", index=False)
+              proposed.to_csv(outdir / "v4_330_input_proposed_template_preserved_no_values_no_scoring.csv", index=False)
+              id_check.to_csv(outdir / "v4_330_selected_candidate_id_availability_check_preserved.csv", index=False)
+              acceptance_checklist.to_csv(outdir / "v4_330_acceptance_checklist_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_330_rule_checks.csv", index=False)
+              (outdir / "v4_330_summary.json").write_text(json.dumps(summary330, indent=2))
+
+              summary_md = f"""# TAIRID v4.330 SDSS RSD Human Accepted Candidate Decision Ingest — No Values, No Scoring
+
+              Expected result: `{summary330["expected_result"]}`
+
+              {summary330["rules_passed"]} / {summary330["rules_total"]} rules passed
+
+              failed_gates = {summary330["failed_gates"]}
+
+              human_acceptance_input = `{human_accepts}`
+
+              human_acceptance_recorded = `{human_acceptance_recorded}`
+
+              ingest_status = `{ingest_status}`
+
+              accepted_candidate_decision_rows = {accepted_decision_rows}
+
+              Truth boundary: {TRUTH_BOUNDARY}.
+
+              This step only ingests candidate-source decisions for later review. It does not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.
+
+              Next route: `{selected_next_route}`
+              """
+              (outdir / "v4_330_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary330, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_330_human_accepted_candidate_decision_ingest_no_scoring.py
+
+      - name: Run v4.330 human accepted candidate decision ingest no scoring
+        run: |
+          python run_v4_330_human_accepted_candidate_decision_ingest_no_scoring.py
+
+      - name: Upload v4.330 no-scoring output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output
+          path: |
+            tairid_v4_330_sdss_rsd_human_accepted_candidate_decision_ingest_no_values_no_scoring_output/
+            tairid_v4_330_sdss_rsd_human_accepted_candidate_decision_ingest_no_values_no_scoring_output.zip
