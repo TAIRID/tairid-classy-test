@@ -1,0 +1,581 @@
+name: "!!! AAA CURRENT - TAIRID v4.336 external AI audit through v4.335 no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-336-external-ai-audit-through-v4-335-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.336 external AI audit through v4.335"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.335 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.335 output ZIP by pattern..."
+          INPUT_335_ZIP="$(ls tairid-v4-335-extraction-readiness-check-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_335_ZIP" ]; then
+            echo "Could not find v4.335 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-335-extraction-readiness-check-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.335 ZIP:"
+          echo "$INPUT_335_ZIP"
+          echo "INPUT_335_ZIP=$INPUT_335_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.336 audit packet script
+        run: |
+          cat > run_v4_336_external_ai_audit_through_v4_335_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import hashlib
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def zip_summary_index(repo: Path):
+              rows = []
+              for zpath in sorted(repo.glob("tairid-v4-*.zip")):
+                  try:
+                      with zipfile.ZipFile(zpath, "r") as z:
+                          names = z.namelist()
+                          summaries = [n for n in names if n.endswith("_summary.json") or n.endswith("summary.json")]
+                          rules = [n for n in names if n.endswith("_rule_checks.csv") or n.endswith("rule_checks.csv")]
+                          if not summaries:
+                              rows.append({
+                                  "zip_file": zpath.name,
+                                  "summary_file": "",
+                                  "version": "",
+                                  "route_name": "",
+                                  "expected_result": "",
+                                  "rules_passed": "",
+                                  "rules_total": "",
+                                  "failed_gates": "",
+                                  "rule_check_files": "|".join(rules),
+                                  "zip_sha256": sha256_file(zpath),
+                              })
+                          for sname in summaries:
+                              try:
+                                  data = json.loads(z.read(sname).decode("utf-8"))
+                              except Exception:
+                                  data = {}
+                              rows.append({
+                                  "zip_file": zpath.name,
+                                  "summary_file": sname,
+                                  "version": data.get("version", ""),
+                                  "route_name": data.get("route_name", ""),
+                                  "expected_result": data.get("expected_result", ""),
+                                  "rules_passed": data.get("rules_passed", ""),
+                                  "rules_total": data.get("rules_total", ""),
+                                  "failed_gates": data.get("failed_gates", ""),
+                                  "rule_check_files": "|".join(rules),
+                                  "zip_sha256": sha256_file(zpath),
+                              })
+                  except Exception as exc:
+                      rows.append({
+                          "zip_file": zpath.name,
+                          "summary_file": "",
+                          "version": "",
+                          "route_name": "",
+                          "expected_result": f"could_not_open_zip: {exc}",
+                          "rules_passed": "",
+                          "rules_total": "",
+                          "failed_gates": "",
+                          "rule_check_files": "",
+                          "zip_sha256": sha256_file(zpath),
+                      })
+              return pd.DataFrame(rows)
+
+          def main():
+              repo = Path(".").resolve()
+              input_335 = Path(os.environ["INPUT_335_ZIP"])
+
+              outdir = Path("tairid_v4_336_external_ai_audit_through_v4_335_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base335 = extract_zip(input_335, "tairid_v4_336_335_")
+
+              summary335_path = find_one(base335, "v4_335_summary.json")
+              readiness_path = find_one(base335, "v4_335_extraction_readiness_status_no_value_approval_no_scoring.csv")
+              updated_gaps_path = find_one(base335, "v4_335_updated_open_gap_status_no_scoring.csv")
+              rules335_path = find_one(base335, "v4_335_rule_checks.csv")
+              worksheet_path = find_one(base335, "v4_335_input_v4_334_extraction_worksheet_preserved.csv")
+              open_gaps_path = find_one(base335, "v4_335_input_open_gaps_preserved.csv")
+              blocked_gates_path = find_one(base335, "v4_335_input_blocked_gates_preserved.csv")
+              ruled_out_path = find_one(base335, "v4_335_input_ruled_out_claims_preserved.csv")
+
+              summary335 = json.loads(summary335_path.read_text())
+              readiness = pd.read_csv(readiness_path)
+              updated_gaps = pd.read_csv(updated_gaps_path)
+              rules335 = pd.read_csv(rules335_path)
+              worksheet = pd.read_csv(worksheet_path)
+              open_gaps = pd.read_csv(open_gaps_path)
+              blocked_gates = pd.read_csv(blocked_gates_path)
+              ruled_out = pd.read_csv(ruled_out_path)
+
+              repo_manifest_rows = []
+              for p in sorted(repo.rglob("*")):
+                  if ".git" in p.parts or not p.is_file():
+                      continue
+                  rel = str(p.relative_to(repo))
+                  file_type = "other"
+                  if rel.startswith(".github/workflows/") and (rel.endswith(".yml") or rel.endswith(".yaml")):
+                      file_type = "workflow_yaml"
+                  elif p.name.startswith("tairid-v4-") and p.suffix.lower() == ".zip":
+                      file_type = "tairid_output_zip"
+                  elif p.suffix.lower() in [".py", ".csv", ".json", ".md", ".txt"]:
+                      file_type = "supporting_text_file"
+                  repo_manifest_rows.append({
+                      "repo_path": rel,
+                      "file_name": p.name,
+                      "file_type_for_audit": file_type,
+                      "size_bytes": p.stat().st_size,
+                      "sha256": sha256_file(p),
+                  })
+
+              repo_manifest = pd.DataFrame(repo_manifest_rows)
+              workflow_manifest = repo_manifest[repo_manifest["file_type_for_audit"] == "workflow_yaml"].copy()
+              tairid_zip_manifest = repo_manifest[repo_manifest["file_type_for_audit"] == "tairid_output_zip"].copy()
+              zip_index = zip_summary_index(repo)
+
+              stage_ledger = pd.DataFrame([
+                  {
+                      "stage": "v4.324",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Parameter-source candidates gathered.",
+                      "still_open_after_stage": "No parameter values approved; no baseline; no observed scoring.",
+                  },
+                  {
+                      "stage": "v4.325D",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Human-review packet created for candidate-source triage.",
+                      "still_open_after_stage": "Decision template still needed review.",
+                  },
+                  {
+                      "stage": "v4.326",
+                      "stage_status": "blocked_correctly",
+                      "closed_or_addressed": "Confirmed blank decision template could not advance.",
+                      "still_open_after_stage": "Human decisions still needed.",
+                  },
+                  {
+                      "stage": "v4.327",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Human decision fill guide created.",
+                      "still_open_after_stage": "No official accepted decisions yet.",
+                  },
+                  {
+                      "stage": "v4.328B",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Dynamic candidate-decision suggestions created from actual IDs.",
+                      "still_open_after_stage": "Suggestions still not human accepted.",
+                  },
+                  {
+                      "stage": "v4.329",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Proposed-filled candidate decision template created.",
+                      "still_open_after_stage": "Human acceptance still needed.",
+                  },
+                  {
+                      "stage": "v4.330",
+                      "stage_status": "completed_after_correct_yes_rerun",
+                      "closed_or_addressed": "Human acceptance recorded; six candidate-source decisions accepted for later review.",
+                      "still_open_after_stage": "No parameter values or baseline approved.",
+                  },
+                  {
+                      "stage": "v4.331C",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Audit and gaps ledger created.",
+                      "still_open_after_stage": "External AI audit still not completed.",
+                  },
+                  {
+                      "stage": "v4.332",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Parameter-value review packet structure created.",
+                      "still_open_after_stage": "Values still blank and unapproved.",
+                  },
+                  {
+                      "stage": "v4.333",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Accepted source IDs reconnected to source URLs and context windows.",
+                      "still_open_after_stage": "Exact human extraction still blank.",
+                  },
+                  {
+                      "stage": "v4.334",
+                      "stage_status": "completed",
+                      "closed_or_addressed": "Human-fillable value extraction worksheet created.",
+                      "still_open_after_stage": "Worksheet still blank; no extraction completed.",
+                  },
+                  {
+                      "stage": "v4.335",
+                      "stage_status": "blocked_correctly",
+                      "closed_or_addressed": "Confirmed extraction worksheet is not ready because human fields are blank.",
+                      "still_open_after_stage": "Human exact quote/value extraction still needed before value ingest.",
+                  },
+                  {
+                      "stage": "v4.336",
+                      "stage_status": "current_audit_packet",
+                      "closed_or_addressed": "External AI audit packet updated through v4.335.",
+                      "still_open_after_stage": "External AI must still perform the audit.",
+                  },
+              ])
+
+              audit_questions = pd.DataFrame([
+                  {
+                      "audit_question_id": "AI_AUDIT_001",
+                      "question": "Does the workflow approve parameter values anywhere through v4.335?",
+                      "expected_answer": "no",
+                      "evidence_files": "v4_335_summary.json|v4_335_extraction_readiness_status_no_value_approval_no_scoring.csv|v4_336_stage_ledger_through_v4_335.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_002",
+                      "question": "Does the workflow approve a numeric LCDM baseline anywhere through v4.335?",
+                      "expected_answer": "no",
+                      "evidence_files": "v4_335_summary.json|v4_335_updated_open_gap_status_no_scoring.csv|v4_335_input_blocked_gates_preserved.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_003",
+                      "question": "Does the workflow load or score observed SDSS RSD values anywhere through v4.335?",
+                      "expected_answer": "no",
+                      "evidence_files": "v4_335_summary.json|v4_335_rule_checks.csv|v4_335_input_blocked_gates_preserved.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_004",
+                      "question": "Does the workflow make any support claim for TAIRID?",
+                      "expected_answer": "no",
+                      "evidence_files": "v4_335_summary.json|v4_336_ruled_out_and_open_gaps_for_external_ai.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_005",
+                      "question": "What is the strongest honest conclusion through v4.335?",
+                      "expected_answer": "The pipeline has built and checked source/decision/extraction scaffolding, but extraction is still blank and no observational test has begun.",
+                      "evidence_files": "EXTERNAL_AI_AUDIT_README_v4_336.md|v4_336_stage_ledger_through_v4_335.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_006",
+                      "question": "What is the next honest move?",
+                      "expected_answer": "A human must fill the v4.334 extraction worksheet with exact quotes/value text, then rerun v4.335.",
+                      "evidence_files": "v4_335_summary.json|v4_335_updated_open_gap_status_no_scoring.csv",
+                  },
+              ])
+
+              red_team_prompts = pd.DataFrame([
+                  {
+                      "prompt_id": "REDTEAM_001",
+                      "prompt": "Try to find any approved Omega_m0, sigma8_0, gamma, or LCDM baseline value. If found, quote it. If not found, say none are approved.",
+                      "expected_safe_result": "No approved parameter values or numeric baseline found.",
+                  },
+                  {
+                      "prompt_id": "REDTEAM_002",
+                      "prompt": "Try to find any observed SDSS RSD residual, chi-square, likelihood, p-value, or score. If found, quote it. If not found, say observed scoring has not begun.",
+                      "expected_safe_result": "Observed scoring has not begun.",
+                  },
+                  {
+                      "prompt_id": "REDTEAM_003",
+                      "prompt": "Try to convert the source-candidate decisions into a support claim. Then explain why that would be invalid.",
+                      "expected_safe_result": "Invalid because candidate decisions and extraction scaffolding are not observed-data tests.",
+                  },
+                  {
+                      "prompt_id": "REDTEAM_004",
+                      "prompt": "State the harshest honest criticism of the project state through v4.335.",
+                      "expected_safe_result": "It is careful groundwork but still pre-value, pre-baseline, pre-observed-data, and pre-score.",
+                  },
+              ])
+
+              external_ai_response_template = pd.DataFrame([
+                  {"field": "external_ai_model_name", "external_ai_response": ""},
+                  {"field": "audit_date", "external_ai_response": ""},
+                  {"field": "overall_pass_fail", "external_ai_response": ""},
+                  {"field": "truth_boundary_preserved", "external_ai_response": ""},
+                  {"field": "parameter_values_approved_found", "external_ai_response": ""},
+                  {"field": "numeric_baseline_approval_found", "external_ai_response": ""},
+                  {"field": "observed_sdss_scoring_found", "external_ai_response": ""},
+                  {"field": "support_claim_found", "external_ai_response": ""},
+                  {"field": "strongest_valid_conclusion", "external_ai_response": ""},
+                  {"field": "strongest_criticism", "external_ai_response": ""},
+                  {"field": "recommended_next_gate", "external_ai_response": ""},
+                  {"field": "quoted_evidence", "external_ai_response": ""},
+              ])
+
+              ruled_out_and_open = pd.DataFrame([
+                  {
+                      "category": "ruled_out_as_claim",
+                      "item": "Accepted source candidates are not parameter approval.",
+                      "status": "ruled_out",
+                  },
+                  {
+                      "category": "ruled_out_as_claim",
+                      "item": "Proposed-filled decisions are not value approval.",
+                      "status": "ruled_out",
+                  },
+                  {
+                      "category": "ruled_out_as_claim",
+                      "item": "Extraction worksheet creation is not extraction completion.",
+                      "status": "ruled_out",
+                  },
+                  {
+                      "category": "ruled_out_as_claim",
+                      "item": "Blank extraction fields cannot be treated as reviewed values.",
+                      "status": "ruled_out",
+                  },
+                  {
+                      "category": "open_gap",
+                      "item": "Exact source quotes still need human selection.",
+                      "status": "open",
+                  },
+                  {
+                      "category": "open_gap",
+                      "item": "Candidate value text still needs human extraction.",
+                      "status": "open",
+                  },
+                  {
+                      "category": "open_gap",
+                      "item": "Parameter values still need later review and acceptance.",
+                      "status": "open",
+                  },
+                  {
+                      "category": "open_gap",
+                      "item": "Numeric baseline still needs later construction and approval.",
+                      "status": "open",
+                  },
+                  {
+                      "category": "open_gap",
+                      "item": "Observed SDSS RSD values still need later loading and definition matching.",
+                      "status": "open",
+                  },
+                  {
+                      "category": "blocked_gate",
+                      "item": "Observed scoring remains blocked.",
+                      "status": "blocked",
+                  },
+                  {
+                      "category": "blocked_gate",
+                      "item": "Support claims remain blocked.",
+                      "status": "blocked",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_335_summary_found": summary335.get("version") == "v4.335",
+                  "input_v4_335_rules_23_of_23": summary335.get("rules_passed") == 23 and summary335.get("rules_total") == 23,
+                  "input_v4_335_failed_gates_none": summary335.get("failed_gates") == "none",
+                  "input_v4_335_blocked_pending_human_extraction_fill": summary335.get("readiness_status") == "blocked_pending_human_extraction_fill",
+                  "input_v4_335_no_parameter_approval": summary335.get("parameter_values_approved") is False,
+                  "input_v4_335_no_numeric_baseline_approval": summary335.get("numeric_baseline_values_filled") is False and summary335.get("approved_baseline_values") == 0,
+                  "input_v4_335_no_observed_values_loaded": summary335.get("observed_values_loaded") is False,
+                  "input_v4_335_no_definition_match_confirmed": summary335.get("definition_match_confirmed") is False,
+                  "input_v4_335_no_score_valid": summary335.get("score_valid") is False,
+                  "input_v4_335_no_support_allowed": summary335.get("support_allowed") is False,
+                  "rules335_all_passed": rules335["passed"].astype(bool).all(),
+                  "readiness_rows_equal_6": len(readiness) == 6,
+                  "worksheet_rows_equal_6": len(worksheet) == 6,
+                  "updated_gaps_rows_equal_5": len(updated_gaps) == 5,
+                  "open_gaps_preserved": len(open_gaps) >= 7,
+                  "blocked_gates_preserved": len(blocked_gates) >= 6,
+                  "ruled_out_preserved": len(ruled_out) >= 5,
+                  "stage_ledger_rows_equal_13": len(stage_ledger) == 13,
+                  "audit_questions_rows_equal_6": len(audit_questions) == 6,
+                  "red_team_prompts_rows_equal_4": len(red_team_prompts) == 4,
+                  "external_ai_response_template_rows_equal_12": len(external_ai_response_template) == 12,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary336 = {
+                  "version": "v4.336",
+                  "route_name": "v4_336_external_ai_audit_through_v4_335_no_scoring",
+                  "expected_result": "v4_336_external_ai_audit_through_v4_335_no_scoring_passed_no_claims",
+                  "input_version": "v4.335",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "v4_335_readiness_status": summary335.get("readiness_status"),
+                  "audit_questions": int(len(audit_questions)),
+                  "red_team_prompts": int(len(red_team_prompts)),
+                  "stage_ledger_rows": int(len(stage_ledger)),
+                  "repo_manifest_rows": int(len(repo_manifest)),
+                  "workflow_manifest_rows": int(len(workflow_manifest)),
+                  "tairid_zip_manifest_rows": int(len(tairid_zip_manifest)),
+                  "zip_summary_index_rows": int(len(zip_index)),
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "external_ai_audit_then_human_fill_v4_334_extraction_worksheet_and_rerun_v4_335",
+              }
+
+              readme = f"""# TAIRID v4.336 External AI Audit Packet Through v4.335
+
+          Truth boundary:
+
+          `{TRUTH_BOUNDARY}`
+
+          This packet is designed for another AI to audit the work through v4.335.
+
+          ## Strongest allowed conclusion
+
+          The pipeline has built a careful trail from source candidates to human-accepted candidate-source decisions, then to parameter-value review and extraction worksheets. v4.335 correctly blocked forward motion because the extraction worksheet is still blank.
+
+          ## Strongest honest criticism
+
+          This is still pre-evidence and pre-score. It has not approved parameter values, has not built an approved numeric baseline, has not loaded observed SDSS RSD values, has not computed residuals, and has not tested TAIRID against observations.
+
+          ## What remains open
+
+          The human extraction worksheet must be filled with exact quotes, source locations, candidate value text, and extraction decisions. Then v4.335 must be rerun.
+
+          ## What must not be claimed
+
+          Do not claim SDSS RSD support. Do not claim parameter approval. Do not claim numeric baseline approval. Do not claim observed scoring.
+          """
+
+              shutil.copy2(summary335_path, outdir / "v4_335_summary.json")
+              shutil.copy2(readiness_path, outdir / "v4_335_extraction_readiness_status_no_value_approval_no_scoring.csv")
+              shutil.copy2(updated_gaps_path, outdir / "v4_335_updated_open_gap_status_no_scoring.csv")
+              shutil.copy2(rules335_path, outdir / "v4_335_rule_checks.csv")
+              shutil.copy2(worksheet_path, outdir / "v4_335_input_v4_334_extraction_worksheet_preserved.csv")
+              shutil.copy2(open_gaps_path, outdir / "v4_335_input_open_gaps_preserved.csv")
+              shutil.copy2(blocked_gates_path, outdir / "v4_335_input_blocked_gates_preserved.csv")
+              shutil.copy2(ruled_out_path, outdir / "v4_335_input_ruled_out_claims_preserved.csv")
+
+              stage_ledger.to_csv(outdir / "v4_336_stage_ledger_through_v4_335.csv", index=False)
+              audit_questions.to_csv(outdir / "v4_336_external_ai_audit_questions.csv", index=False)
+              red_team_prompts.to_csv(outdir / "v4_336_external_ai_red_team_prompts.csv", index=False)
+              external_ai_response_template.to_csv(outdir / "v4_336_external_ai_response_template.csv", index=False)
+              ruled_out_and_open.to_csv(outdir / "v4_336_ruled_out_and_open_gaps_for_external_ai.csv", index=False)
+              repo_manifest.to_csv(outdir / "v4_336_repo_manifest_with_sha256.csv", index=False)
+              workflow_manifest.to_csv(outdir / "v4_336_workflow_manifest.csv", index=False)
+              tairid_zip_manifest.to_csv(outdir / "v4_336_tairid_zip_manifest.csv", index=False)
+              zip_index.to_csv(outdir / "v4_336_zip_summary_index.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_336_rule_checks.csv", index=False)
+              (outdir / "EXTERNAL_AI_AUDIT_README_v4_336.md").write_text(readme)
+              (outdir / "v4_336_summary.json").write_text(json.dumps(summary336, indent=2))
+
+              summary_md = f"""# TAIRID v4.336 External AI Audit Through v4.335 — No Scoring
+
+          Expected result: `{summary336["expected_result"]}`
+
+          {summary336["rules_passed"]} / {summary336["rules_total"]} rules passed
+
+          failed_gates = {summary336["failed_gates"]}
+
+          v4_335_readiness_status = `{summary336["v4_335_readiness_status"]}`
+
+          audit_questions = {summary336["audit_questions"]}
+
+          red_team_prompts = {summary336["red_team_prompts"]}
+
+          stage_ledger_rows = {summary336["stage_ledger_rows"]}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This packet is for external AI audit through v4.335. It does not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.
+
+          Next route: `{summary336["selected_next_route"]}`
+          """
+              (outdir / "v4_336_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary336, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_336_external_ai_audit_through_v4_335_no_scoring.py
+
+      - name: Run v4.336 external AI audit through v4.335 no scoring
+        run: |
+          python run_v4_336_external_ai_audit_through_v4_335_no_scoring.py
+
+      - name: Upload v4.336 external AI audit packet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-336-external-ai-audit-through-v4-335-no-scoring-output
+          path: |
+            tairid_v4_336_external_ai_audit_through_v4_335_no_scoring_output/
+            tairid_v4_336_external_ai_audit_through_v4_335_no_scoring_output.zip
