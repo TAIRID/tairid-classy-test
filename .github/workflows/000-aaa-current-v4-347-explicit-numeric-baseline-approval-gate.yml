@@ -1,0 +1,422 @@
+name: "!!! AAA CURRENT - TAIRID v4.347 explicit numeric baseline approval gate"
+
+on:
+  workflow_dispatch:
+    inputs:
+      human_approves_v4_346b_numeric_baseline_candidate:
+        description: "Human explicitly approves the v4.346B numeric baseline candidate? This approves baseline only, not observed scoring or support."
+        required: true
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
+
+jobs:
+  run-v4-347-explicit-numeric-baseline-approval-gate:
+    name: "!!! AAA CURRENT - Run v4.347 numeric baseline approval gate"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      HUMAN_APPROVES_V4_346B_BASELINE: ${{ github.event.inputs.human_approves_v4_346b_numeric_baseline_candidate }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.346B input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.346B output ZIP by pattern..."
+          INPUT_346B_ZIP="$(ls tairid-v4-346b-numeric-baseline-candidate-builder-no-observed-scoring-no-support-claims-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_346B_ZIP" ]; then
+            echo "Could not find v4.346B output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-346b-numeric-baseline-candidate-builder-no-observed-scoring-no-support-claims-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.346B ZIP:"
+          echo "$INPUT_346B_ZIP"
+          echo "INPUT_346B_ZIP=$INPUT_346B_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.347 baseline approval script
+        run: |
+          cat > run_v4_347_explicit_numeric_baseline_approval_gate.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline may be explicitly approved here; no observed scoring; no support claims"
+
+          REQUIRED_PARAMETERS = {"omega_m0", "sigma8_0", "growth_index_gamma"}
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def main():
+              input_346b = Path(os.environ["INPUT_346B_ZIP"])
+              human_approves = os.environ.get("HUMAN_APPROVES_V4_346B_BASELINE", "no").strip().lower()
+              human_approval_recorded = human_approves == "yes"
+
+              outdir = Path("tairid_v4_347_explicit_numeric_baseline_approval_gate_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base346b = extract_zip(input_346b, "tairid_v4_347_346b_")
+
+              summary346b_path = find_one(base346b, "v4_346b_summary.json")
+              candidate_path = find_one(base346b, "v4_346b_NUMERIC_BASELINE_CANDIDATE_NOT_APPROVED.csv")
+              calculator_staging_path = find_one(base346b, "v4_346b_calculator_input_staging_NOT_BASELINE_APPROVED.csv")
+              candidate_object_path = find_one(base346b, "v4_346b_numeric_baseline_candidate_object.json")
+              checklist_path = find_one(base346b, "v4_346b_numeric_baseline_review_checklist.csv")
+              gap_status_path = find_one(base346b, "v4_346b_gap_status_after_baseline_candidate_builder.csv")
+              rules346b_path = find_one(base346b, "v4_346b_rule_checks.csv")
+
+              summary346b = json.loads(summary346b_path.read_text())
+              candidate = pd.read_csv(candidate_path)
+              calculator_staging = pd.read_csv(calculator_staging_path)
+              candidate_object = json.loads(candidate_object_path.read_text())
+              checklist = pd.read_csv(checklist_path)
+              gap_status = pd.read_csv(gap_status_path)
+              rules346b = pd.read_csv(rules346b_path)
+
+              baseline_rows = []
+
+              for _, row in candidate.iterrows():
+                  parameter = clean(row["parameter_or_method"])
+
+                  if human_approval_recorded:
+                      approval_status = "numeric_baseline_value_approved"
+                      baseline_value = row["candidate_numeric_value"]
+                      baseline_value_text = clean(row["candidate_value_text"])
+                      baseline_uncertainty = clean(row["candidate_uncertainty_text"])
+                      baseline_source_url = clean(row["candidate_source_url"])
+                      baseline_source_quote = clean(row["candidate_source_quote"])
+                      baseline_definition_context = clean(row["candidate_definition_context"])
+                      numeric_baseline_approved_now = True
+                  else:
+                      approval_status = "blocked_pending_explicit_human_baseline_approval"
+                      baseline_value = ""
+                      baseline_value_text = ""
+                      baseline_uncertainty = ""
+                      baseline_source_url = ""
+                      baseline_source_quote = ""
+                      baseline_definition_context = ""
+                      numeric_baseline_approved_now = False
+
+                  baseline_rows.append({
+                      "v4_347_baseline_value_id": f"v4_347_baseline_value_{len(baseline_rows)+1:03d}",
+                      "parameter_or_method": parameter,
+                      "approved_baseline_value": baseline_value,
+                      "approved_baseline_value_text": baseline_value_text,
+                      "approved_baseline_uncertainty_text": baseline_uncertainty,
+                      "approved_baseline_source_url": baseline_source_url,
+                      "approved_baseline_source_quote": baseline_source_quote,
+                      "approved_baseline_definition_context": baseline_definition_context,
+                      "human_baseline_approval_input": human_approves,
+                      "human_baseline_approval_recorded": human_approval_recorded,
+                      "approval_status": approval_status,
+                      "approval_scope": "numeric_baseline_approval_only_no_observed_scoring_no_support",
+                      "parameter_value_approved": True,
+                      "numeric_baseline_approved_now": numeric_baseline_approved_now,
+                      "numeric_baseline_values_filled_now": numeric_baseline_approved_now,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              baseline_approval_ledger = pd.DataFrame(baseline_rows)
+              approved_baseline = baseline_approval_ledger[baseline_approval_ledger["numeric_baseline_approved_now"].astype(bool)].copy()
+
+              approved_baseline_object = {
+                  "baseline_object_id": "v4_347_approved_lcdm_growth_baseline" if human_approval_recorded else "v4_347_blocked_lcdm_growth_baseline",
+                  "omega_m0": float(approved_baseline.loc[approved_baseline["parameter_or_method"] == "omega_m0", "approved_baseline_value"].iloc[0]) if human_approval_recorded else None,
+                  "sigma8_0": float(approved_baseline.loc[approved_baseline["parameter_or_method"] == "sigma8_0", "approved_baseline_value"].iloc[0]) if human_approval_recorded else None,
+                  "growth_index_gamma": float(approved_baseline.loc[approved_baseline["parameter_or_method"] == "growth_index_gamma", "approved_baseline_value"].iloc[0]) if human_approval_recorded else None,
+                  "growth_model_form": candidate_object.get("growth_model_form", "f(z)=Omega_m(z)^gamma"),
+                  "status": "numeric_baseline_approved_no_observed_scoring" if human_approval_recorded else "blocked_pending_explicit_human_baseline_approval",
+                  "parameter_values_approved": True,
+                  "numeric_baseline_values_filled": bool(human_approval_recorded),
+                  "approved_baseline_values": int(len(approved_baseline)),
+                  "numeric_baseline_approved": bool(human_approval_recorded),
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              }
+
+              if human_approval_recorded:
+                  approved_calculator_input = pd.DataFrame([
+                      {
+                          "calculator_field": "omega_m0",
+                          "approved_baseline_value": approved_baseline_object["omega_m0"],
+                          "field_status": "approved_for_later_baseline_calculator_no_observed_scoring",
+                      },
+                      {
+                          "calculator_field": "sigma8_0",
+                          "approved_baseline_value": approved_baseline_object["sigma8_0"],
+                          "field_status": "approved_for_later_baseline_calculator_no_observed_scoring",
+                      },
+                      {
+                          "calculator_field": "growth_index_gamma",
+                          "approved_baseline_value": approved_baseline_object["growth_index_gamma"],
+                          "field_status": "approved_for_later_baseline_calculator_no_observed_scoring",
+                      },
+                  ])
+              else:
+                  approved_calculator_input = pd.DataFrame(columns=[
+                      "calculator_field",
+                      "approved_baseline_value",
+                      "field_status",
+                  ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_347_GAP_001",
+                      "gap": "Explicit numeric baseline approval gate.",
+                      "status_after_v4_347": "closed_numeric_baseline_approved" if human_approval_recorded else "blocked_pending_human_baseline_approval",
+                      "next_gate": "v4_348_observed_sdss_rsd_data_loading_readiness" if human_approval_recorded else "rerun_v4_347_with_human_approval_yes_if_accepted",
+                  },
+                  {
+                      "gap_id": "V4_347_GAP_002",
+                      "gap": "Observed SDSS RSD values loaded.",
+                      "status_after_v4_347": "still_blocked",
+                      "next_gate": "v4_348_observed_data_loading_readiness",
+                  },
+                  {
+                      "gap_id": "V4_347_GAP_003",
+                      "gap": "Definition/covariance match confirmed.",
+                      "status_after_v4_347": "still_blocked",
+                      "next_gate": "later_definition_covariance_gate",
+                  },
+                  {
+                      "gap_id": "V4_347_GAP_004",
+                      "gap": "Scoring valid.",
+                      "status_after_v4_347": "still_blocked",
+                      "next_gate": "later_scoring_gate",
+                  },
+                  {
+                      "gap_id": "V4_347_GAP_005",
+                      "gap": "Support claims.",
+                      "status_after_v4_347": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate_only_after_scoring",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_346b_summary_found": summary346b.get("version") == "v4.346B",
+                  "input_v4_346b_rules_all_passed": summary_rules_all_passed(summary346b),
+                  "input_v4_346b_failed_gates_none": summary346b.get("failed_gates") == "none",
+                  "input_v4_346b_parameter_values_approved_true": summary346b.get("parameter_values_approved") is True,
+                  "input_v4_346b_candidate_values_filled_true": summary346b.get("numeric_baseline_candidate_values_filled") is True,
+                  "input_v4_346b_baseline_not_approved_yet": summary346b.get("numeric_baseline_approved") is False,
+                  "input_v4_346b_no_observed_values_loaded": summary346b.get("observed_values_loaded") is False,
+                  "input_v4_346b_no_definition_match_confirmed": summary346b.get("definition_match_confirmed") is False,
+                  "input_v4_346b_no_score_valid": summary346b.get("score_valid") is False,
+                  "input_v4_346b_no_support_allowed": summary346b.get("support_allowed") is False,
+
+                  "rules346b_all_passed": rules346b["passed"].astype(bool).all(),
+                  "candidate_rows_equal_3": len(candidate) == 3,
+                  "calculator_staging_rows_equal_3": len(calculator_staging) == 3,
+                  "checklist_rows_equal_6": len(checklist) == 6,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+                  "all_required_parameters_present": REQUIRED_PARAMETERS.issubset(set(candidate["parameter_or_method"].apply(clean))),
+                  "candidate_numeric_values_present": candidate["candidate_numeric_value"].apply(clean).ne("").all(),
+                  "candidate_source_quotes_present": candidate["candidate_source_quote"].apply(clean).ne("").all(),
+                  "candidate_source_urls_present": candidate["candidate_source_url"].apply(clean).ne("").all(),
+
+                  "human_approval_input_valid": human_approves in ["yes", "no"],
+                  "baseline_approval_ledger_rows_equal_3": len(baseline_approval_ledger) == 3,
+                  "approved_baseline_rows_correct_for_input": len(approved_baseline) == (3 if human_approval_recorded else 0),
+                  "approved_baseline_has_all_required_parameters_if_yes": (REQUIRED_PARAMETERS.issubset(set(approved_baseline["parameter_or_method"])) if human_approval_recorded else True),
+                  "approved_calculator_input_rows_correct_for_input": len(approved_calculator_input) == (3 if human_approval_recorded else 0),
+
+                  "numeric_baseline_values_filled_matches_input": bool(approved_baseline_object["numeric_baseline_values_filled"]) == bool(human_approval_recorded),
+                  "numeric_baseline_approved_matches_input": bool(approved_baseline_object["numeric_baseline_approved"]) == bool(human_approval_recorded),
+                  "approved_baseline_values_count_matches_input": approved_baseline_object["approved_baseline_values"] == (3 if human_approval_recorded else 0),
+
+                  "observed_values_loaded_false": false_col(baseline_approval_ledger, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(baseline_approval_ledger, "definition_match_confirmed"),
+                  "score_valid_false": false_col(baseline_approval_ledger, "score_valid"),
+                  "support_allowed_false": false_col(baseline_approval_ledger, "support_allowed"),
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              if human_approval_recorded:
+                  expected_result = "v4_347_explicit_numeric_baseline_approval_gate_passed_baseline_approved_no_observed_scoring_no_claims"
+                  selected_next_route = "v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring_no_support_claims"
+              else:
+                  expected_result = "v4_347_blocked_pending_explicit_human_numeric_baseline_approval_no_scoring_no_claims"
+                  selected_next_route = "rerun_v4_347_with_human_approves_v4_346b_numeric_baseline_candidate_yes_if_human_accepts"
+
+              summary347 = {
+                  "version": "v4.347",
+                  "route_name": "v4_347_explicit_numeric_baseline_approval_gate_no_observed_scoring_no_support_claims",
+                  "expected_result": expected_result,
+                  "input_version": "v4.346B",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "human_baseline_approval_input": human_approves,
+                  "human_baseline_approval_recorded": bool(human_approval_recorded),
+                  "parameter_values_approved": True,
+                  "numeric_baseline_values_filled": bool(human_approval_recorded),
+                  "approved_baseline_values": int(len(approved_baseline)),
+                  "numeric_baseline_approved": bool(human_approval_recorded),
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              baseline_approval_ledger.to_csv(outdir / "v4_347_numeric_baseline_approval_ledger.csv", index=False)
+              approved_baseline.to_csv(outdir / "v4_347_APPROVED_NUMERIC_BASELINE_NO_OBSERVED_SCORING.csv", index=False)
+              approved_calculator_input.to_csv(outdir / "v4_347_APPROVED_CALCULATOR_INPUT_NO_OBSERVED_SCORING.csv", index=False)
+              gap_update.to_csv(outdir / "v4_347_gap_status_after_numeric_baseline_approval_gate.csv", index=False)
+              candidate.to_csv(outdir / "v4_347_input_v4_346b_baseline_candidate_preserved.csv", index=False)
+              calculator_staging.to_csv(outdir / "v4_347_input_v4_346b_calculator_staging_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_347_rule_checks.csv", index=False)
+
+              (outdir / "v4_347_numeric_baseline_object.json").write_text(json.dumps(approved_baseline_object, indent=2))
+              (outdir / "v4_347_summary.json").write_text(json.dumps(summary347, indent=2))
+
+              summary_md = f"""# TAIRID v4.347 Explicit Numeric Baseline Approval Gate
+
+          Expected result: `{summary347["expected_result"]}`
+
+          {summary347["rules_passed"]} / {summary347["rules_total"]} rules passed
+
+          failed_gates = {summary347["failed_gates"]}
+
+          human_baseline_approval_input = `{human_approves}`
+
+          human_baseline_approval_recorded = `{human_approval_recorded}`
+
+          parameter_values_approved = true
+
+          numeric_baseline_approved = {human_approval_recorded}
+
+          approved_baseline_values = {len(approved_baseline)}
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step may approve the numeric baseline only when the human input is `yes`.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{selected_next_route}`
+          """
+              (outdir / "v4_347_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary347, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_347_explicit_numeric_baseline_approval_gate.py
+
+      - name: Run v4.347 explicit numeric baseline approval gate
+        run: |
+          python run_v4_347_explicit_numeric_baseline_approval_gate.py
+
+      - name: Upload v4.347 numeric baseline approval artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-347-explicit-numeric-baseline-approval-gate-no-observed-scoring-no-support-claims-output
+          path: |
+            tairid_v4_347_explicit_numeric_baseline_approval_gate_output/
+            tairid_v4_347_explicit_numeric_baseline_approval_gate_output.zip
