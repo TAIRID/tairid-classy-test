@@ -1,0 +1,339 @@
+name: "!!! AAA CURRENT - TAIRID v4.327 SDSS RSD human decision fill guide no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-327-human-decision-fill-guide-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.327 fill guide no scoring"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.325D and v4.326 input ZIPs
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.325D human review packet ZIP..."
+          INPUT_325D_ZIP="$(ls tairid-v4-325d-sdss-rsd-numeric-baseline-parameter-human-review-packet-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_325D_ZIP" ]; then
+            echo "Could not find v4.325D input ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-325d-sdss-rsd-numeric-baseline-parameter-human-review-packet-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Finding v4.326 readiness output ZIP..."
+          INPUT_326_ZIP="$(ls tairid-v4-326-sdss-rsd-decision-template-readiness-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_326_ZIP" ]; then
+            echo "Could not find v4.326 input ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-326-sdss-rsd-decision-template-readiness-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Found v4.325D ZIP:"
+          echo "$INPUT_325D_ZIP"
+
+          echo "Found v4.326 ZIP:"
+          echo "$INPUT_326_ZIP"
+
+          echo "INPUT_325D_ZIP=$INPUT_325D_ZIP" >> "$GITHUB_ENV"
+          echo "INPUT_326_ZIP=$INPUT_326_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.327 fill guide script
+        run: |
+          cat > run_v4_327_fill_guide_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          from pathlib import Path
+
+          import pandas as pd
+
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+
+          def all_false(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.lower().isin(["false", "0", "", "nan"]).all()
+
+
+          def main():
+              import os
+
+              input_325d = Path(os.environ["INPUT_325D_ZIP"])
+              input_326 = Path(os.environ["INPUT_326_ZIP"])
+
+              outdir = Path("tairid_v4_327_sdss_rsd_human_decision_fill_guide_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base325 = extract_zip(input_325d, "tairid_v4_327_325d_")
+              base326 = extract_zip(input_326, "tairid_v4_327_326_")
+
+              summary325_path = find_one(base325, "v4_325d_summary.json")
+              decision_path = find_one(base325, "SDSS_RSD_NUMERIC_BASELINE_PARAMETER_CANDIDATE_DECISION_TEMPLATE_v4_325D_FILLABLE_NO_VALUES.csv")
+              review_path = find_one(base325, "SDSS_RSD_NUMERIC_BASELINE_PARAMETER_HUMAN_REVIEW_PACKET_v4_325D_NO_APPROVAL_NO_SCORING.csv")
+              summary326_path = find_one(base326, "v4_326_summary.json")
+
+              summary325 = json.loads(summary325_path.read_text())
+              summary326 = json.loads(summary326_path.read_text())
+              decisions = pd.read_csv(decision_path)
+              review = pd.read_csv(review_path)
+
+              for col in ["human_decision", "human_selected_candidate_ids", "reviewer_note"]:
+                  if col not in decisions.columns:
+                      decisions[col] = ""
+
+              decisions["human_decision_clean"] = decisions["human_decision"].apply(clean)
+              blank_decisions = int((decisions["human_decision_clean"] == "").sum())
+              filled_decisions = int((decisions["human_decision_clean"] != "").sum())
+
+              fill_guide_rows = []
+              markdown = []
+              markdown.append("# TAIRID v4.327 SDSS RSD Human Decision Fill Guide — No Scoring")
+              markdown.append("")
+              markdown.append("This packet is a fill guide only. It does not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.")
+              markdown.append("")
+              markdown.append(f"Truth boundary: {TRUTH_BOUNDARY}.")
+              markdown.append("")
+              markdown.append("Allowed human decisions for each row:")
+              markdown.append("")
+              markdown.append("```text")
+              markdown.append("select_candidate_for_later_value_review")
+              markdown.append("needs_better_source")
+              markdown.append("reject_all")
+              markdown.append("keep_blocked")
+              markdown.append("```")
+              markdown.append("")
+
+              for _, drow in decisions.iterrows():
+                  qid = drow["question_id"]
+                  param = drow["parameter_or_method"]
+                  question = drow["review_question"]
+                  candidate_ids = clean(drow["allowed_candidate_ids_from_packet"]).split("|")
+
+                  markdown.append(f"## {qid} — {param}")
+                  markdown.append("")
+                  markdown.append(f"Review question: {question}")
+                  markdown.append("")
+                  markdown.append("Candidate source rows to review:")
+                  markdown.append("")
+
+                  subset = review[review["question_id"] == qid].copy()
+
+                  if subset.empty:
+                      markdown.append("- No candidate rows found for this question.")
+                      markdown.append("")
+                  else:
+                      for _, rrow in subset.iterrows():
+                          cid = clean(rrow.get("candidate_id", ""))
+                          source_url = clean(rrow.get("source_url", ""))
+                          candidate_class = clean(rrow.get("candidate_class", ""))
+                          quote = clean(rrow.get("candidate_quote_window", ""))
+
+                          markdown.append(f"- Candidate ID: `{cid}`")
+                          markdown.append(f"  - Candidate class: `{candidate_class}`")
+                          markdown.append(f"  - Source URL: {source_url}")
+                          if quote:
+                              markdown.append(f"  - Quote/context window: {quote[:900]}")
+                          else:
+                              markdown.append("  - Quote/context window: blank")
+                          markdown.append("")
+
+                          fill_guide_rows.append({
+                              "question_id": qid,
+                              "parameter_or_method": param,
+                              "review_question": question,
+                              "candidate_id": cid,
+                              "candidate_class": candidate_class,
+                              "source_url": source_url,
+                              "candidate_quote_window_short": quote[:1200],
+                              "allowed_human_decisions": "select_candidate_for_later_value_review|needs_better_source|reject_all|keep_blocked",
+                              "v4_327_scope": "fill_guide_only_no_values_no_scoring",
+                              "parameter_value_approved_now": False,
+                              "numeric_baseline_approved_now": False,
+                              "observed_values_loaded": False,
+                              "definition_match_confirmed": False,
+                              "score_valid": False,
+                              "support_allowed": False,
+                          })
+
+                  markdown.append("Decision row to fill later:")
+                  markdown.append("")
+                  markdown.append("```text")
+                  markdown.append("human_decision =")
+                  markdown.append("human_selected_candidate_ids =")
+                  markdown.append("human_answer_summary_no_values =")
+                  markdown.append("reviewer_note =")
+                  markdown.append("```")
+                  markdown.append("")
+
+              fill_guide = pd.DataFrame(fill_guide_rows)
+
+              rules = []
+
+              def add(gate, passed):
+                  rules.append({"gate": gate, "passed": bool(passed)})
+
+              add("input_v4_325d_summary_found", summary325.get("version") == "v4.325D")
+              add("input_v4_325d_rules_passed_17_of_17", summary325.get("rules_passed") == 17 and summary325.get("rules_total") == 17)
+              add("input_v4_325d_failed_gates_none", summary325.get("failed_gates") == "none")
+              add("input_v4_326_summary_found", summary326.get("version") == "v4.326")
+              add("input_v4_326_rules_passed_19_of_19", summary326.get("rules_passed") == 19 and summary326.get("rules_total") == 19)
+              add("input_v4_326_failed_gates_none", summary326.get("failed_gates") == "none")
+              add("input_v4_326_readiness_blocked_pending_human_template_fill", summary326.get("readiness_status") == "blocked_pending_human_template_fill")
+              add("decision_template_rows_equal_6", len(decisions) == 6)
+              add("human_review_rows_equal_24", len(review) == 24)
+              add("fill_guide_candidate_rows_equal_24", len(fill_guide) == 24)
+              add("decision_template_still_blank", blank_decisions == 6 and filled_decisions == 0)
+              add("decision_template_parameter_value_approval_false", all_false(decisions, "parameter_value_approval_allowed_now"))
+              add("decision_template_numeric_baseline_approval_false", all_false(decisions, "numeric_baseline_approval_allowed_now"))
+              add("decision_template_observed_values_loaded_false", all_false(decisions, "observed_values_loaded"))
+              add("decision_template_definition_match_confirmed_false", all_false(decisions, "definition_match_confirmed"))
+              add("decision_template_score_allowed_false", all_false(decisions, "score_allowed"))
+              add("decision_template_support_allowed_false", all_false(decisions, "support_allowed"))
+
+              rule_checks = pd.DataFrame(rules)
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary327 = {
+                  "version": "v4.327",
+                  "route_name": "v4_327_sdss_rsd_human_decision_fill_guide_no_scoring",
+                  "expected_result": "v4_327_sdss_rsd_human_decision_fill_guide_no_scoring_passed_no_claims",
+                  "input_versions": "v4.325D|v4.326",
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "decision_template_rows": int(len(decisions)),
+                  "human_review_candidate_rows": int(len(review)),
+                  "fill_guide_candidate_rows": int(len(fill_guide)),
+                  "human_decision_filled_rows": filled_decisions,
+                  "human_decision_blank_rows": blank_decisions,
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_325d_decision_template_then_v4_328_candidate_decision_ingest_no_values_no_scoring",
+              }
+
+              fill_guide.to_csv(outdir / "v4_327_human_decision_fill_guide_candidate_rows_no_scoring.csv", index=False)
+              decisions.drop(columns=["human_decision_clean"], errors="ignore").to_csv(outdir / "v4_327_copy_of_blank_decision_template_to_fill_no_values.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_327_rule_checks.csv", index=False)
+              (outdir / "v4_327_human_decision_fill_guide.md").write_text("\n".join(markdown))
+              (outdir / "v4_327_summary.json").write_text(json.dumps(summary327, indent=2))
+
+              summary_md = f"""# TAIRID v4.327 SDSS RSD Human Decision Fill Guide No Scoring
+
+              Expected result: `{summary327["expected_result"]}`
+
+              {summary327["rules_passed"]} / {summary327["rules_total"]} rules passed
+
+              failed_gates = {summary327["failed_gates"]}
+
+              human_decision_filled_rows = {filled_decisions}
+
+              human_decision_blank_rows = {blank_decisions}
+
+              Truth boundary: {TRUTH_BOUNDARY}.
+
+              This step created a human-readable fill guide only. It did not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.
+
+              Next route: `{summary327["selected_next_route"]}`
+              """
+              (outdir / "v4_327_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary327, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_327_fill_guide_no_scoring.py
+
+      - name: Run v4.327 human decision fill guide no scoring
+        run: |
+          python run_v4_327_fill_guide_no_scoring.py
+
+      - name: Upload v4.327 no-scoring output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-327-sdss-rsd-human-decision-fill-guide-no-scoring-output
+          path: |
+            tairid_v4_327_sdss_rsd_human_decision_fill_guide_no_scoring_output/
+            tairid_v4_327_sdss_rsd_human_decision_fill_guide_no_scoring_output.zip
