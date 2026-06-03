@@ -1,0 +1,483 @@
+name: "!!! AAA CURRENT - TAIRID v4.350 observed data schema column map no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-350-observed-data-schema-column-map-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.350 observed schema map"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.349 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.349 output ZIP by pattern..."
+          INPUT_349_ZIP="$(ls tairid-v4-349-observed-sdss-rsd-source-inventory-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_349_ZIP" ]; then
+            echo "Could not find v4.349 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-349-observed-sdss-rsd-source-inventory-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.349 ZIP:"
+          echo "$INPUT_349_ZIP"
+          echo "INPUT_349_ZIP=$INPUT_349_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.350 schema map script
+        run: |
+          cat > run_v4_350_observed_data_schema_column_map_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; observed schema mapping may be prepared here; no observed values loaded; no scoring; no support claims"
+
+          REQUIRED_SCHEMA_FIELDS = [
+              "survey_or_source",
+              "tracer_or_sample",
+              "redshift_z",
+              "observed_fsigma8",
+              "observed_fsigma8_uncertainty",
+              "covariance_or_error_model",
+              "source_reference",
+          ]
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def find_existing_repo_file(repo_path_text):
+              repo = Path(".").resolve()
+              raw = clean(repo_path_text)
+              candidates = [
+                  repo / raw,
+                  repo / Path(raw).name,
+              ]
+              for p in candidates:
+                  if p.exists() and p.is_file():
+                      return p
+              return None
+
+          def read_header_only(path):
+              if path is None:
+                  return []
+              if path.suffix.lower() == ".csv":
+                  try:
+                      return list(pd.read_csv(path, nrows=0).columns)
+                  except Exception:
+                      return []
+              return []
+
+          def pick_column(columns, terms):
+              lowered = [(c, c.lower()) for c in columns]
+              for term in terms:
+                  t = term.lower()
+                  for original, lower in lowered:
+                      if t == lower or t in lower:
+                          return original
+              return ""
+
+          def main():
+              input_349 = Path(os.environ["INPUT_349_ZIP"])
+
+              outdir = Path("tairid_v4_350_observed_data_schema_column_map_no_values_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base349 = extract_zip(input_349, "tairid_v4_350_349_")
+
+              summary349_path = find_one(base349, "v4_349_summary.json")
+              source_inventory_path = find_one(base349, "v4_349_observed_source_inventory_NO_VALUES_LOADED.csv")
+              schema_candidates_path = find_one(base349, "v4_349_schema_mapping_candidate_files_NO_VALUES_LOADED.csv")
+              priority_summary_path = find_one(base349, "v4_349_source_inventory_priority_summary.csv")
+              schema_plan_path = find_one(base349, "v4_349_schema_mapping_plan_no_values_no_scoring.csv")
+              baseline_path = find_one(base349, "v4_349_input_v4_348_approved_baseline_preserved.csv")
+              rules349_path = find_one(base349, "v4_349_rule_checks.csv")
+
+              summary349 = json.loads(summary349_path.read_text())
+              source_inventory = pd.read_csv(source_inventory_path)
+              schema_candidates = pd.read_csv(schema_candidates_path)
+              priority_summary = pd.read_csv(priority_summary_path)
+              schema_plan = pd.read_csv(schema_plan_path)
+              approved_baseline = pd.read_csv(baseline_path)
+              rules349 = pd.read_csv(rules349_path)
+
+              schema_rows = []
+              header_rows = []
+
+              for _, row in schema_candidates.iterrows():
+                  repo_path = clean(row["repo_path"])
+                  file_name = clean(row["file_name"])
+                  existing_path = find_existing_repo_file(repo_path)
+                  header_columns = read_header_only(existing_path)
+
+                  header_rows.append({
+                      "v4_350_header_probe_id": f"v4_350_header_probe_{len(header_rows)+1:03d}",
+                      "repo_path": repo_path,
+                      "file_name": file_name,
+                      "file_found_in_repo": existing_path is not None,
+                      "header_columns_found": len(header_columns),
+                      "header_columns_pipe": "|".join(header_columns),
+                      "probe_scope": "header_only_no_observed_rows_loaded",
+                      "observed_values_loaded": False,
+                      "observed_rows_loaded": 0,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+                  redshift_col = pick_column(header_columns, ["redshift_z", "redshift", "z", "zeff", "z_eff"])
+                  fsigma_col = pick_column(header_columns, ["fsigma8", "f_sigma8", "fσ8", "fsig8"])
+                  sigma_col = pick_column(header_columns, ["sigma", "uncertainty", "error", "err", "fsigma8_err", "fsigma8_sigma"])
+                  source_col = pick_column(header_columns, ["source", "reference", "citation", "paper"])
+                  tracer_col = pick_column(header_columns, ["tracer", "sample", "survey"])
+
+                  schema_rows.append({
+                      "v4_350_schema_map_id": f"v4_350_schema_map_{len(schema_rows)+1:03d}",
+                      "source_inventory_id": clean(row["v4_349_inventory_id"]),
+                      "repo_path": repo_path,
+                      "file_name": file_name,
+                      "source_class": clean(row["source_class"]),
+                      "inventory_priority": clean(row["inventory_priority"]),
+                      "inventory_decision": clean(row["inventory_decision"]),
+                      "file_found_in_repo": existing_path is not None,
+                      "header_probe_available": len(header_columns) > 0,
+
+                      "schema_field_survey_or_source": tracer_col if tracer_col else "",
+                      "schema_field_tracer_or_sample": tracer_col if tracer_col else "",
+                      "schema_field_redshift_z": redshift_col,
+                      "schema_field_observed_fsigma8": fsigma_col,
+                      "schema_field_observed_fsigma8_uncertainty": sigma_col,
+                      "schema_field_covariance_or_error_model": "",
+                      "schema_field_source_reference": source_col,
+
+                      "schema_map_status": "schema_candidate_prepared_from_header_only" if len(header_columns) > 0 else "schema_candidate_needs_manual_column_mapping",
+                      "requires_human_schema_approval": True,
+                      "observed_values_loaded": False,
+                      "observed_rows_loaded": 0,
+                      "definition_match_confirmed": False,
+                      "covariance_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              schema_map = pd.DataFrame(schema_rows)
+              header_probe = pd.DataFrame(header_rows)
+
+              required_schema_template = pd.DataFrame([
+                  {
+                      "required_field": field,
+                      "required_before_observed_loading": True,
+                      "human_mapping_needed": True,
+                      "notes": "This field must be confirmed before observed values are loaded."
+                  }
+                  for field in REQUIRED_SCHEMA_FIELDS
+              ])
+
+              human_schema_review_packet = schema_map.copy()
+              for col in [
+                  "human_approved_survey_or_source_column",
+                  "human_approved_tracer_or_sample_column",
+                  "human_approved_redshift_z_column",
+                  "human_approved_observed_fsigma8_column",
+                  "human_approved_observed_fsigma8_uncertainty_column",
+                  "human_approved_covariance_or_error_model",
+                  "human_approved_source_reference_column",
+                  "human_schema_review_decision",
+                  "human_schema_review_note",
+              ]:
+                  human_schema_review_packet[col] = ""
+
+              human_schema_review_packet["allowed_human_schema_review_decisions"] = "approve_schema_for_later_observed_value_loading|needs_manual_column_mapping|needs_better_source_file|reject_source_file|keep_blocked"
+              human_schema_review_packet["schema_approved_now"] = False
+
+              schema_review_checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_350_CHECK_001",
+                      "check": "Does the source file contain a redshift column or a clear redshift mapping?",
+                      "required_before_observed_loading": True,
+                  },
+                  {
+                      "check_id": "V4_350_CHECK_002",
+                      "check": "Does the source file contain observed fσ8 or equivalent RSD growth measurement values?",
+                      "required_before_observed_loading": True,
+                  },
+                  {
+                      "check_id": "V4_350_CHECK_003",
+                      "check": "Does the source file contain uncertainty, covariance, or enough information to define the error model?",
+                      "required_before_observed_loading": True,
+                  },
+                  {
+                      "check_id": "V4_350_CHECK_004",
+                      "check": "Are survey/tracer/source-reference fields identifiable?",
+                      "required_before_observed_loading": True,
+                  },
+                  {
+                      "check_id": "V4_350_CHECK_005",
+                      "check": "Are observed values still not loaded?",
+                      "required_before_observed_loading": True,
+                  },
+                  {
+                      "check_id": "V4_350_CHECK_006",
+                      "check": "Are scoring and support claims still blocked?",
+                      "required_before_observed_loading": True,
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_350_GAP_001",
+                      "gap": "Observed data schema and column map packet created.",
+                      "status_after_v4_350": "schema_packet_prepared_not_approved",
+                      "next_gate": "human_schema_review_and_approval",
+                  },
+                  {
+                      "gap_id": "V4_350_GAP_002",
+                      "gap": "Observed values remain unloaded.",
+                      "status_after_v4_350": "still_blocked",
+                      "next_gate": "later_observed_value_loading_gate",
+                  },
+                  {
+                      "gap_id": "V4_350_GAP_003",
+                      "gap": "Definition matching remains unconfirmed.",
+                      "status_after_v4_350": "still_blocked",
+                      "next_gate": "later_definition_match_gate",
+                  },
+                  {
+                      "gap_id": "V4_350_GAP_004",
+                      "gap": "Covariance matching remains unconfirmed.",
+                      "status_after_v4_350": "still_blocked",
+                      "next_gate": "later_covariance_match_gate",
+                  },
+                  {
+                      "gap_id": "V4_350_GAP_005",
+                      "gap": "Scoring and support claims remain blocked.",
+                      "status_after_v4_350": "still_blocked",
+                      "next_gate": "later_scoring_and_support_gates",
+                  },
+              ])
+
+              schema_candidate_rows = int(len(schema_map))
+              header_probe_available_rows = int(schema_map["header_probe_available"].astype(bool).sum()) if len(schema_map) else 0
+
+              hard_checks = {
+                  "input_v4_349_summary_found": summary349.get("version") == "v4.349",
+                  "input_v4_349_rules_all_passed": summary_rules_all_passed(summary349),
+                  "input_v4_349_failed_gates_none": summary349.get("failed_gates") == "none",
+                  "input_v4_349_parameter_values_approved_true": summary349.get("parameter_values_approved") is True,
+                  "input_v4_349_numeric_baseline_approved_true": summary349.get("numeric_baseline_approved") is True,
+                  "input_v4_349_no_observed_values_loaded": summary349.get("observed_values_loaded") is False,
+                  "input_v4_349_no_definition_match_confirmed": summary349.get("definition_match_confirmed") is False,
+                  "input_v4_349_no_score_valid": summary349.get("score_valid") is False,
+                  "input_v4_349_no_support_allowed": summary349.get("support_allowed") is False,
+
+                  "rules349_all_passed": rules349["passed"].astype(bool).all(),
+                  "source_inventory_rows_match_summary": len(source_inventory) == int(summary349.get("source_inventory_rows")),
+                  "schema_candidates_have_rows": len(schema_candidates) >= 1,
+                  "priority_summary_has_rows": len(priority_summary) >= 1,
+                  "schema_plan_rows_equal_3": len(schema_plan) == 3,
+                  "approved_baseline_rows_equal_3": len(approved_baseline) == 3,
+
+                  "schema_map_rows_equal_schema_candidates": len(schema_map) == len(schema_candidates),
+                  "header_probe_rows_equal_schema_candidates": len(header_probe) == len(schema_candidates),
+                  "required_schema_template_rows_equal_7": len(required_schema_template) == 7,
+                  "human_schema_review_packet_rows_equal_schema_candidates": len(human_schema_review_packet) == len(schema_candidates),
+                  "schema_review_checklist_rows_equal_6": len(schema_review_checklist) == 6,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "schema_approval_false": false_col(human_schema_review_packet, "schema_approved_now"),
+                  "observed_values_loaded_false_schema_map": false_col(schema_map, "observed_values_loaded"),
+                  "definition_match_confirmed_false_schema_map": false_col(schema_map, "definition_match_confirmed"),
+                  "covariance_match_confirmed_false_schema_map": false_col(schema_map, "covariance_match_confirmed"),
+                  "score_valid_false_schema_map": false_col(schema_map, "score_valid"),
+                  "support_allowed_false_schema_map": false_col(schema_map, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              if schema_candidate_rows > 0:
+                  readiness_status = "schema_map_packet_created_pending_human_schema_review"
+                  next_route = "human_fill_v4_350_schema_review_then_v4_351_schema_review_ingest_no_values_no_scoring"
+              else:
+                  readiness_status = "blocked_no_schema_candidates"
+                  next_route = "return_to_v4_349_source_inventory_or_add_observed_source_file"
+              
+              summary350 = {
+                  "version": "v4.350",
+                  "route_name": "v4_350_observed_data_schema_and_column_map_no_values_no_scoring",
+                  "expected_result": "v4_350_observed_data_schema_column_map_passed_no_values_loaded_no_scoring_no_claims",
+                  "input_version": "v4.349",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": readiness_status,
+                  "schema_candidate_rows": schema_candidate_rows,
+                  "header_probe_available_rows": header_probe_available_rows,
+                  "parameter_values_approved": True,
+                  "numeric_baseline_values_filled": True,
+                  "approved_baseline_values": 3,
+                  "numeric_baseline_approved": True,
+                  "schema_approved": False,
+                  "observed_values_loaded": False,
+                  "observed_rows_loaded": 0,
+                  "definition_match_confirmed": False,
+                  "covariance_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": next_route,
+              }
+
+              schema_map.to_csv(outdir / "v4_350_observed_data_schema_map_candidate_NO_VALUES_LOADED.csv", index=False)
+              header_probe.to_csv(outdir / "v4_350_header_probe_ONLY_NO_VALUES_LOADED.csv", index=False)
+              required_schema_template.to_csv(outdir / "v4_350_required_observed_schema_template.csv", index=False)
+              human_schema_review_packet.to_csv(outdir / "v4_350_HUMAN_FILL_schema_review_packet_NO_VALUES_NO_SCORING.csv", index=False)
+              schema_review_checklist.to_csv(outdir / "v4_350_schema_review_checklist.csv", index=False)
+              gap_update.to_csv(outdir / "v4_350_gap_status_after_schema_map_packet.csv", index=False)
+              schema_candidates.to_csv(outdir / "v4_350_input_v4_349_schema_candidates_preserved.csv", index=False)
+              approved_baseline.to_csv(outdir / "v4_350_input_v4_349_approved_baseline_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_350_rule_checks.csv", index=False)
+
+              (outdir / "v4_350_summary.json").write_text(json.dumps(summary350, indent=2))
+
+              summary_md = f"""# TAIRID v4.350 Observed Data Schema and Column Map — No Values, No Scoring
+
+          Expected result: `{summary350["expected_result"]}`
+
+          {summary350["rules_passed"]} / {summary350["rules_total"]} rules passed
+
+          failed_gates = {summary350["failed_gates"]}
+
+          readiness_status = `{summary350["readiness_status"]}`
+
+          schema_candidate_rows = {summary350["schema_candidate_rows"]}
+
+          header_probe_available_rows = {summary350["header_probe_available_rows"]}
+
+          observed_values_loaded = false
+
+          observed_rows_loaded = 0
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step prepares a schema and column-map candidate packet.
+
+          It does **not** load observed values.
+
+          It does **not** approve the schema.
+
+          It does **not** confirm definition or covariance matching.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary350["selected_next_route"]}`
+          """
+              (outdir / "v4_350_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary350, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_350_observed_data_schema_column_map_no_scoring.py
+
+      - name: Run v4.350 observed data schema column map no scoring
+        run: |
+          python run_v4_350_observed_data_schema_column_map_no_scoring.py
+
+      - name: Upload v4.350 observed schema map artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-350-observed-data-schema-column-map-no-values-no-scoring-output
+          path: |
+            tairid_v4_350_observed_data_schema_column_map_no_values_no_scoring_output/
+            tairid_v4_350_observed_data_schema_column_map_no_values_no_scoring_output.zip
