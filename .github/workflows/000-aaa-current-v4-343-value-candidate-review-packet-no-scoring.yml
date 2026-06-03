@@ -1,0 +1,446 @@
+name: "!!! AAA CURRENT - TAIRID v4.343 value candidate review packet no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-343-value-candidate-review-packet-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.343 value candidate review packet"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.342 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.342 output ZIP by pattern..."
+          INPUT_342_ZIP="$(ls tairid-v4-342-repaired-extraction-readiness-no-parameter-approval-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_342_ZIP" ]; then
+            echo "Could not find v4.342 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-342-repaired-extraction-readiness-no-parameter-approval-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.342 ZIP:"
+          echo "$INPUT_342_ZIP"
+          echo "INPUT_342_ZIP=$INPUT_342_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.343 value candidate review packet script
+        run: |
+          cat > run_v4_343_value_candidate_review_packet_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          CORE_VALUE_PARAMETERS = {"omega_m0", "sigma8_0", "growth_index_gamma"}
+          CONTEXT_ONLY_PARAMETERS = {"lcdm_calculator_context", "rsd_definition_bridge", "calculator_limit_policy"}
+
+          ALLOWED_VALUE_REVIEW_DECISIONS = (
+              "accept_candidate_for_later_parameter_value_approval|"
+              "needs_human_correction|"
+              "needs_better_source|"
+              "reject_candidate|"
+              "keep_blocked"
+          )
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def main():
+              input_342 = Path(os.environ["INPUT_342_ZIP"])
+
+              outdir = Path("tairid_v4_343_value_candidate_review_packet_no_parameter_approval_no_baseline_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base342 = extract_zip(input_342, "tairid_v4_343_342_")
+
+              summary342_path = find_one(base342, "v4_342_summary.json")
+              readiness_path = find_one(base342, "v4_342_repaired_extraction_readiness_status_NO_APPROVAL_NO_SCORING.csv")
+              value_candidates_path = find_one(base342, "v4_342_value_candidate_rows_READY_FOR_REVIEW_NOT_APPROVED.csv")
+              context_only_path = find_one(base342, "v4_342_context_only_rows_NOT_NUMERIC_VALUES.csv")
+              gap_status_path = find_one(base342, "v4_342_updated_gap_status_no_scoring.csv")
+              rules342_path = find_one(base342, "v4_342_rule_checks.csv")
+
+              summary342 = json.loads(summary342_path.read_text())
+              readiness = pd.read_csv(readiness_path)
+              value_candidates = pd.read_csv(value_candidates_path)
+              context_only = pd.read_csv(context_only_path)
+              gap_status = pd.read_csv(gap_status_path)
+              rules342 = pd.read_csv(rules342_path)
+
+              review_rows = []
+              for _, row in value_candidates.iterrows():
+                  parameter = clean(row["parameter_or_method"])
+                  candidate_value_text = clean(row["human_candidate_value_text"])
+                  candidate_numeric_value = clean(row["human_candidate_numeric_value_if_applicable"])
+                  uncertainty = clean(row["human_uncertainty_if_applicable"])
+                  source_url = clean(row["human_source_url"])
+                  source_quote = clean(row["human_exact_quote"])
+                  source_section = clean(row["human_source_table_section"])
+                  definition_context = clean(row["human_definition_context"])
+
+                  review_rows.append({
+                      "v4_343_value_review_id": f"v4_343_value_review_{len(review_rows)+1:03d}",
+                      "v4_342_readiness_id": clean(row["v4_342_readiness_id"]),
+                      "question_id": clean(row["question_id"]),
+                      "parameter_or_method": parameter,
+                      "candidate_value_text_as_written": candidate_value_text,
+                      "candidate_numeric_value": candidate_numeric_value,
+                      "candidate_uncertainty_text": uncertainty,
+                      "candidate_source_url": source_url,
+                      "candidate_source_table_section": source_section,
+                      "candidate_exact_quote": source_quote,
+                      "candidate_definition_context": definition_context,
+                      "value_review_scope": "candidate_value_review_only_not_approval",
+
+                      "human_value_review_decision": "",
+                      "allowed_human_value_review_decisions": ALLOWED_VALUE_REVIEW_DECISIONS,
+                      "human_value_review_note": "",
+                      "human_corrected_value_text_if_needed": "",
+                      "human_corrected_numeric_value_if_needed": "",
+                      "human_corrected_uncertainty_if_needed": "",
+                      "human_acceptance_statement": "",
+
+                      "candidate_ready_for_review": True,
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              value_review_packet = pd.DataFrame(review_rows)
+
+              context_review_rows = []
+              for _, row in context_only.iterrows():
+                  context_review_rows.append({
+                      "v4_343_context_review_id": f"v4_343_context_review_{len(context_review_rows)+1:03d}",
+                      "v4_342_readiness_id": clean(row["v4_342_readiness_id"]),
+                      "question_id": clean(row["question_id"]),
+                      "parameter_or_method": clean(row["parameter_or_method"]),
+                      "context_source_url": clean(row["human_source_url"]),
+                      "context_exact_quote": clean(row["human_exact_quote"]),
+                      "context_definition": clean(row["human_definition_context"]),
+                      "context_review_status": "context_only_not_numeric_value",
+                      "must_not_enter_numeric_baseline": True,
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              context_review = pd.DataFrame(context_review_rows)
+
+              value_review_checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_343_CHECK_001",
+                      "check": "Does the exact quote support the candidate numeric value as written?",
+                      "required_before_parameter_value_approval": True,
+                  },
+                  {
+                      "check_id": "V4_343_CHECK_002",
+                      "check": "Is the candidate value copied exactly from the source, including uncertainty and definition context?",
+                      "required_before_parameter_value_approval": True,
+                  },
+                  {
+                      "check_id": "V4_343_CHECK_003",
+                      "check": "Is the value appropriate for the intended baseline field?",
+                      "required_before_parameter_value_approval": True,
+                  },
+                  {
+                      "check_id": "V4_343_CHECK_004",
+                      "check": "Are context-only rows kept out of numeric baseline values?",
+                      "required_before_parameter_value_approval": True,
+                  },
+                  {
+                      "check_id": "V4_343_CHECK_005",
+                      "check": "Does this step avoid observed SDSS RSD loading and scoring?",
+                      "required_before_parameter_value_approval": True,
+                  },
+                  {
+                      "check_id": "V4_343_CHECK_006",
+                      "check": "Does this step avoid all support claims?",
+                      "required_before_parameter_value_approval": True,
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_343_GAP_001",
+                      "gap": "Value candidates are now packaged for human review.",
+                      "status_after_v4_343": "packet_prepared_not_approved",
+                      "next_gate": "human_value_candidate_review",
+                  },
+                  {
+                      "gap_id": "V4_343_GAP_002",
+                      "gap": "Parameter value approval remains blocked until human review decisions are filled.",
+                      "status_after_v4_343": "still_blocked",
+                      "next_gate": "v4_344_human_value_review_decision_ingest",
+                  },
+                  {
+                      "gap_id": "V4_343_GAP_003",
+                      "gap": "Numeric baseline approval remains blocked.",
+                      "status_after_v4_343": "still_blocked",
+                      "next_gate": "later_baseline_candidate_builder",
+                  },
+                  {
+                      "gap_id": "V4_343_GAP_004",
+                      "gap": "Observed SDSS RSD values remain unloaded.",
+                      "status_after_v4_343": "still_blocked",
+                      "next_gate": "later_observed_data_gate",
+                  },
+                  {
+                      "gap_id": "V4_343_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_343": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate",
+                  },
+              ])
+
+              human_instructions = f"""# TAIRID v4.343 Value Candidate Review Packet — No Approval, No Baseline, No Scoring
+
+          Truth boundary:
+
+          `{TRUTH_BOUNDARY}`
+
+          This packet gives the human reviewer three candidate parameter values for review:
+
+          - omega_m0
+          - sigma8_0
+          - growth_index_gamma
+
+          It also preserves three context-only rows that must not become numeric baseline values:
+
+          - lcdm_calculator_context
+          - rsd_definition_bridge
+          - calculator_limit_policy
+
+          ## What to fill later
+
+          In `v4_343_HUMAN_FILL_value_candidate_review_packet_NO_APPROVAL_NO_SCORING.csv`, fill:
+
+          ```text
+          human_value_review_decision
+          human_value_review_note
+          human_corrected_value_text_if_needed
+          human_corrected_numeric_value_if_needed
+          human_corrected_uncertainty_if_needed
+          human_acceptance_statement
+          ```
+
+          Allowed decisions:
+
+          ```text
+          {ALLOWED_VALUE_REVIEW_DECISIONS.replace("|", chr(10))}
+          ```
+
+          This still does not approve values until the next explicit human decision-ingest gate.
+          """
+
+              hard_checks = {
+                  "input_v4_342_summary_found": summary342.get("version") == "v4.342",
+                  "input_v4_342_rules_35_of_35": summary342.get("rules_passed") == 35 and summary342.get("rules_total") == 35,
+                  "input_v4_342_failed_gates_none": summary342.get("failed_gates") == "none",
+                  "input_v4_342_no_parameter_approval": summary342.get("parameter_values_approved") is False,
+                  "input_v4_342_no_numeric_baseline_approval": summary342.get("numeric_baseline_values_filled") is False and summary342.get("approved_baseline_values") == 0,
+                  "input_v4_342_no_observed_values_loaded": summary342.get("observed_values_loaded") is False,
+                  "input_v4_342_no_definition_match_confirmed": summary342.get("definition_match_confirmed") is False,
+                  "input_v4_342_no_score_valid": summary342.get("score_valid") is False,
+                  "input_v4_342_no_support_allowed": summary342.get("support_allowed") is False,
+
+                  "rules342_all_passed": rules342["passed"].astype(bool).all(),
+                  "readiness_rows_equal_6": len(readiness) == 6,
+                  "value_candidate_input_rows_equal_3": len(value_candidates) == 3,
+                  "context_only_input_rows_equal_3": len(context_only) == 3,
+                  "value_review_packet_rows_equal_3": len(value_review_packet) == 3,
+                  "context_review_rows_equal_3": len(context_review) == 3,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+                  "checklist_rows_equal_6": len(value_review_checklist) == 6,
+
+                  "core_value_parameters_present": CORE_VALUE_PARAMETERS.issubset(set(value_review_packet["parameter_or_method"])),
+                  "context_only_parameters_present": CONTEXT_ONLY_PARAMETERS.issubset(set(context_review["parameter_or_method"])),
+
+                  "candidate_numeric_values_present_all_value_rows": value_review_packet["candidate_numeric_value"].apply(clean).ne("").all(),
+                  "candidate_exact_quotes_present_all_value_rows": value_review_packet["candidate_exact_quote"].apply(clean).ne("").all(),
+                  "candidate_source_urls_present_all_value_rows": value_review_packet["candidate_source_url"].apply(clean).ne("").all(),
+
+                  "human_value_review_decisions_blank": value_review_packet["human_value_review_decision"].apply(clean).eq("").all(),
+                  "human_acceptance_statements_blank": value_review_packet["human_acceptance_statement"].apply(clean).eq("").all(),
+
+                  "parameter_value_approval_false": false_col(value_review_packet, "parameter_value_approved_now") and false_col(context_review, "parameter_value_approved_now"),
+                  "numeric_baseline_approval_false": false_col(value_review_packet, "numeric_baseline_approved_now") and false_col(context_review, "numeric_baseline_approved_now"),
+                  "observed_values_loaded_false": false_col(value_review_packet, "observed_values_loaded") and false_col(context_review, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(value_review_packet, "definition_match_confirmed") and false_col(context_review, "definition_match_confirmed"),
+                  "score_valid_false": false_col(value_review_packet, "score_valid") and false_col(context_review, "score_valid"),
+                  "support_allowed_false": false_col(value_review_packet, "support_allowed") and false_col(context_review, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary343 = {
+                  "version": "v4.343",
+                  "route_name": "v4_343_value_candidate_review_packet_no_parameter_approval_no_baseline_no_scoring",
+                  "expected_result": "v4_343_value_candidate_review_packet_no_parameter_approval_no_baseline_no_scoring_passed_no_claims",
+                  "input_version": "v4.342",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "value_review_packet_rows": int(len(value_review_packet)),
+                  "context_only_rows": int(len(context_review)),
+                  "human_value_review_decisions_filled": 0,
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_343_value_candidate_review_then_v4_344_value_review_decision_ingest_no_baseline_no_scoring",
+              }
+
+              value_review_packet.to_csv(outdir / "v4_343_HUMAN_FILL_value_candidate_review_packet_NO_APPROVAL_NO_SCORING.csv", index=False)
+              context_review.to_csv(outdir / "v4_343_context_only_rows_NOT_NUMERIC_BASELINE_VALUES.csv", index=False)
+              value_review_checklist.to_csv(outdir / "v4_343_value_candidate_review_checklist.csv", index=False)
+              gap_update.to_csv(outdir / "v4_343_gap_status_after_value_review_packet_no_scoring.csv", index=False)
+              value_candidates.to_csv(outdir / "v4_343_input_v4_342_value_candidates_preserved.csv", index=False)
+              context_only.to_csv(outdir / "v4_343_input_v4_342_context_rows_preserved.csv", index=False)
+              readiness.to_csv(outdir / "v4_343_input_v4_342_readiness_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_343_rule_checks.csv", index=False)
+
+              (outdir / "v4_343_human_review_instructions.md").write_text(human_instructions)
+              (outdir / "v4_343_summary.json").write_text(json.dumps(summary343, indent=2))
+
+              summary_md = f"""# TAIRID v4.343 Value Candidate Review Packet — No Approval, No Baseline, No Scoring
+
+          Expected result: `{summary343["expected_result"]}`
+
+          {summary343["rules_passed"]} / {summary343["rules_total"]} rules passed
+
+          failed_gates = {summary343["failed_gates"]}
+
+          value_review_packet_rows = {summary343["value_review_packet_rows"]}
+
+          context_only_rows = {summary343["context_only_rows"]}
+
+          human_value_review_decisions_filled = 0
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This step builds a value-candidate review packet from repaired extraction rows.
+
+          It does **not** approve parameter values.
+
+          It does **not** approve a numeric baseline.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary343["selected_next_route"]}`
+          """
+              (outdir / "v4_343_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary343, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_343_value_candidate_review_packet_no_scoring.py
+
+      - name: Run v4.343 value candidate review packet no scoring
+        run: |
+          python run_v4_343_value_candidate_review_packet_no_scoring.py
+
+      - name: Upload v4.343 value candidate review packet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-343-value-candidate-review-packet-no-approval-no-baseline-no-scoring-output
+          path: |
+            tairid_v4_343_value_candidate_review_packet_no_parameter_approval_no_baseline_no_scoring_output/
+            tairid_v4_343_value_candidate_review_packet_no_parameter_approval_no_baseline_no_scoring_output.zip
