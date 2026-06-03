@@ -1,0 +1,404 @@
+name: "!!! AAA CURRENT - TAIRID v4.334 parameter value extraction worksheet no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-334-parameter-value-extraction-worksheet-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.334 value extraction worksheet"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.333 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.333 output ZIP by pattern..."
+          INPUT_333_ZIP="$(ls tairid-v4-333-parameter-source-context-fill-guide-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_333_ZIP" ]; then
+            echo "Could not find v4.333 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-333-parameter-source-context-fill-guide-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.333 ZIP:"
+          echo "$INPUT_333_ZIP"
+          echo "INPUT_333_ZIP=$INPUT_333_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.334 extraction worksheet script
+        run: |
+          cat > run_v4_334_parameter_value_extraction_worksheet_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          CORE_NUMERIC_PARAMETERS = {"omega_m0", "sigma8_0", "growth_index_gamma"}
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def all_blank(series):
+              return series.apply(clean).eq("").all()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def main():
+              input_333 = Path(os.environ["INPUT_333_ZIP"])
+
+              outdir = Path("tairid_v4_334_parameter_value_extraction_worksheet_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base333 = extract_zip(input_333, "tairid_v4_334_333_")
+
+              summary333_path = find_one(base333, "v4_333_summary.json")
+              fill_guide_path = find_one(base333, "v4_333_FILLABLE_parameter_value_context_review_with_source_quotes_NO_APPROVAL_NO_SCORING.csv")
+              context_rows_path = find_one(base333, "v4_333_accepted_source_context_detail_rows_no_value_approval_no_scoring.csv")
+              checklist333_path = find_one(base333, "v4_333_human_value_extraction_checklist.csv")
+              gaps333_path = find_one(base333, "v4_333_input_open_gaps_preserved.csv")
+              blocked333_path = find_one(base333, "v4_333_input_blocked_gates_preserved.csv")
+              ruled333_path = find_one(base333, "v4_333_input_ruled_out_claims_preserved.csv")
+
+              summary333 = json.loads(summary333_path.read_text())
+              fill_guide = pd.read_csv(fill_guide_path)
+              context_rows = pd.read_csv(context_rows_path)
+              checklist333 = pd.read_csv(checklist333_path)
+              open_gaps = pd.read_csv(gaps333_path)
+              blocked_gates = pd.read_csv(blocked333_path)
+              ruled_out = pd.read_csv(ruled333_path)
+
+              worksheet_rows = []
+
+              for _, row in fill_guide.iterrows():
+                  param = clean(row["parameter_or_method"])
+                  qid = clean(row["question_id"])
+                  review_id = clean(row["v4_332_review_id"])
+                  is_numeric = param in CORE_NUMERIC_PARAMETERS
+
+                  if is_numeric:
+                      extraction_category = "numeric_parameter_candidate_extraction"
+                      required_human_output = "exact_quote_plus_candidate_numeric_text_plus_definition_context"
+                  else:
+                      extraction_category = "method_policy_context_extraction"
+                      required_human_output = "exact_quote_plus_context_classification_no_numeric_value_required"
+
+                  worksheet_rows.append({
+                      "v4_334_extraction_id": f"v4_334_extract_{len(worksheet_rows)+1:03d}",
+                      "v4_333_fill_id": clean(row["v4_333_fill_id"]),
+                      "v4_332_review_id": review_id,
+                      "question_id": qid,
+                      "parameter_or_method": param,
+                      "extraction_category": extraction_category,
+                      "required_human_output": required_human_output,
+
+                      "accepted_candidate_ids_for_review": clean(row["accepted_candidate_ids_for_review"]),
+                      "source_urls_for_review": clean(row["source_urls_for_review"]),
+                      "source_context_blocks_for_human_review": clean(row["source_context_blocks_for_human_review"]),
+
+                      "human_exact_quote_selected": "",
+                      "human_source_url_for_selected_quote": "",
+                      "human_source_page_section_or_table": "",
+                      "human_candidate_value_text_as_written": "",
+                      "human_candidate_numeric_value_if_applicable": "",
+                      "human_candidate_uncertainty_if_applicable": "",
+                      "human_candidate_units_or_definition": "",
+                      "human_context_note": "",
+
+                      "human_extraction_decision": "",
+                      "allowed_human_extraction_decisions": "extract_candidate_for_later_value_review|needs_exact_quote|needs_better_source|context_only_not_value|reject_candidate|keep_blocked",
+                      "human_reviewer_note": "",
+
+                      "extraction_completed_now": False,
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              worksheet = pd.DataFrame(worksheet_rows)
+
+              gap_status = pd.DataFrame([
+                  {
+                      "gap_id": "VALUE_EXTRACTION_GAP_001",
+                      "gap": "Exact source quote for each candidate value/context has not been selected by a human.",
+                      "status_after_v4_334": "open",
+                      "blocks_next": "parameter_value_approval",
+                  },
+                  {
+                      "gap_id": "VALUE_EXTRACTION_GAP_002",
+                      "gap": "Candidate numeric value text has not been extracted for omega_m0, sigma8_0, or growth_index_gamma.",
+                      "status_after_v4_334": "open",
+                      "blocks_next": "numeric_baseline_approval",
+                  },
+                  {
+                      "gap_id": "VALUE_EXTRACTION_GAP_003",
+                      "gap": "Method/context rows have not been classified as value, context-only, or blocked.",
+                      "status_after_v4_334": "open",
+                      "blocks_next": "baseline_policy_review",
+                  },
+                  {
+                      "gap_id": "VALUE_EXTRACTION_GAP_004",
+                      "gap": "Observed SDSS RSD data remains intentionally unloaded.",
+                      "status_after_v4_334": "blocked_by_design",
+                      "blocks_next": "observed_scoring",
+                  },
+                  {
+                      "gap_id": "VALUE_EXTRACTION_GAP_005",
+                      "gap": "No support claim is allowed before parameter values, baseline, observed data, and scoring gates are complete.",
+                      "status_after_v4_334": "blocked_by_design",
+                      "blocks_next": "support_claims",
+                  },
+              ])
+
+              human_instructions = f"""# TAIRID v4.334 Human Parameter-Value Extraction Worksheet — No Scoring
+
+          Truth boundary:
+
+          `{TRUTH_BOUNDARY}`
+
+          This worksheet is for extracting exact source text only.
+
+          Do not approve values in this step.
+
+          Do not approve a numeric baseline in this step.
+
+          Do not load observed SDSS RSD values in this step.
+
+          Do not compute residuals, chi-square, likelihood, p-values, or model scores in this step.
+
+          Do not make support claims.
+
+          ## What the human reviewer should fill
+
+          For each row in `v4_334_HUMAN_FILL_parameter_value_extraction_worksheet_NO_APPROVAL_NO_SCORING.csv`, fill only:
+
+          ```text
+          human_exact_quote_selected
+          human_source_url_for_selected_quote
+          human_source_page_section_or_table
+          human_candidate_value_text_as_written
+          human_candidate_numeric_value_if_applicable
+          human_candidate_uncertainty_if_applicable
+          human_candidate_units_or_definition
+          human_context_note
+          human_extraction_decision
+          human_reviewer_note
+          ```
+
+          Allowed decisions:
+
+          ```text
+          extract_candidate_for_later_value_review
+          needs_exact_quote
+          needs_better_source
+          context_only_not_value
+          reject_candidate
+          keep_blocked
+          ```
+
+          This step prepares extraction. It does not accept the extracted values as approved.
+          """
+
+              hard_checks = {
+                  "input_v4_333_summary_found": summary333.get("version") == "v4.333",
+                  "input_v4_333_rules_34_of_34": summary333.get("rules_passed") == 34 and summary333.get("rules_total") == 34,
+                  "input_v4_333_failed_gates_none": summary333.get("failed_gates") == "none",
+                  "input_v4_333_no_parameter_approval": summary333.get("parameter_values_approved") is False,
+                  "input_v4_333_no_numeric_baseline_approval": summary333.get("numeric_baseline_values_filled") is False and summary333.get("approved_baseline_values") == 0,
+                  "input_v4_333_no_observed_values_loaded": summary333.get("observed_values_loaded") is False,
+                  "input_v4_333_no_definition_match_confirmed": summary333.get("definition_match_confirmed") is False,
+                  "input_v4_333_no_score_valid": summary333.get("score_valid") is False,
+                  "input_v4_333_no_support_allowed": summary333.get("support_allowed") is False,
+
+                  "fill_guide_rows_equal_6": len(fill_guide) == 6,
+                  "context_rows_equal_18": len(context_rows) == 18,
+                  "checklist333_rows_equal_6": len(checklist333) == 6,
+                  "worksheet_rows_equal_6": len(worksheet) == 6,
+                  "core_numeric_parameters_present": CORE_NUMERIC_PARAMETERS.issubset(set(worksheet["parameter_or_method"])),
+
+                  "human_exact_quote_fields_blank": all_blank(worksheet["human_exact_quote_selected"]),
+                  "human_candidate_value_text_fields_blank": all_blank(worksheet["human_candidate_value_text_as_written"]),
+                  "human_numeric_value_fields_blank": all_blank(worksheet["human_candidate_numeric_value_if_applicable"]),
+                  "human_extraction_decisions_blank": all_blank(worksheet["human_extraction_decision"]),
+
+                  "extraction_completed_false": false_col(worksheet, "extraction_completed_now"),
+                  "parameter_value_approved_false": false_col(worksheet, "parameter_value_approved_now"),
+                  "numeric_baseline_approved_false": false_col(worksheet, "numeric_baseline_approved_now"),
+                  "observed_values_loaded_false": false_col(worksheet, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(worksheet, "definition_match_confirmed"),
+                  "score_valid_false": false_col(worksheet, "score_valid"),
+                  "support_allowed_false": false_col(worksheet, "support_allowed"),
+
+                  "open_gaps_preserved": len(open_gaps) >= 7,
+                  "blocked_gates_preserved": len(blocked_gates) >= 6,
+                  "ruled_out_preserved": len(ruled_out) >= 5,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary334 = {
+                  "version": "v4.334",
+                  "route_name": "v4_334_parameter_value_extraction_worksheet_no_scoring",
+                  "expected_result": "v4_334_parameter_value_extraction_worksheet_no_scoring_passed_no_claims",
+                  "input_version": "v4.333",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+
+                  "worksheet_rows": int(len(worksheet)),
+                  "context_rows": int(len(context_rows)),
+                  "gap_status_rows": int(len(gap_status)),
+
+                  "extraction_completed_rows": 0,
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_334_extraction_worksheet_then_v4_335_extraction_readiness_no_value_approval_no_scoring",
+              }
+
+              worksheet.to_csv(outdir / "v4_334_HUMAN_FILL_parameter_value_extraction_worksheet_NO_APPROVAL_NO_SCORING.csv", index=False)
+              gap_status.to_csv(outdir / "v4_334_value_extraction_gap_status_no_scoring.csv", index=False)
+              fill_guide.to_csv(outdir / "v4_334_input_v4_333_fill_guide_preserved.csv", index=False)
+              context_rows.to_csv(outdir / "v4_334_input_v4_333_context_rows_preserved.csv", index=False)
+              open_gaps.to_csv(outdir / "v4_334_input_open_gaps_preserved.csv", index=False)
+              blocked_gates.to_csv(outdir / "v4_334_input_blocked_gates_preserved.csv", index=False)
+              ruled_out.to_csv(outdir / "v4_334_input_ruled_out_claims_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_334_rule_checks.csv", index=False)
+
+              (outdir / "v4_334_human_fill_instructions.md").write_text(human_instructions)
+              (outdir / "v4_334_summary.json").write_text(json.dumps(summary334, indent=2))
+
+              summary_md = f"""# TAIRID v4.334 Parameter Value Extraction Worksheet — No Scoring
+
+          Expected result: `{summary334["expected_result"]}`
+
+          {summary334["rules_passed"]} / {summary334["rules_total"]} rules passed
+
+          failed_gates = {summary334["failed_gates"]}
+
+          worksheet_rows = {summary334["worksheet_rows"]}
+
+          context_rows = {summary334["context_rows"]}
+
+          extraction_completed_rows = 0
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This packet creates a human-fillable extraction worksheet from v4.333 source context.
+
+          It does **not** approve parameter values.
+
+          It does **not** approve a numeric baseline.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary334["selected_next_route"]}`
+          """
+              (outdir / "v4_334_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary334, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_334_parameter_value_extraction_worksheet_no_scoring.py
+
+      - name: Run v4.334 parameter value extraction worksheet no scoring
+        run: |
+          python run_v4_334_parameter_value_extraction_worksheet_no_scoring.py
+
+      - name: Upload v4.334 parameter value extraction worksheet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-334-parameter-value-extraction-worksheet-no-scoring-output
+          path: |
+            tairid_v4_334_parameter_value_extraction_worksheet_no_scoring_output/
+            tairid_v4_334_parameter_value_extraction_worksheet_no_scoring_output.zip
