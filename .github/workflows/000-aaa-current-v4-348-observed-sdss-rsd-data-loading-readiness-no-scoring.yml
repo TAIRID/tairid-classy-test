@@ -1,0 +1,481 @@
+name: "!!! AAA CURRENT - TAIRID v4.348 observed SDSS RSD data loading readiness no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-348-observed-sdss-rsd-data-loading-readiness-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.348 observed data readiness"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.347 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.347 output ZIP by pattern..."
+          INPUT_347_ZIP="$(ls tairid-v4-347-explicit-numeric-baseline-approval-gate-no-observed-scoring-no-support-claims-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_347_ZIP" ]; then
+            echo "Could not find v4.347 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-347-explicit-numeric-baseline-approval-gate-no-observed-scoring-no-support-claims-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.347 ZIP:"
+          echo "$INPUT_347_ZIP"
+          echo "INPUT_347_ZIP=$INPUT_347_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.348 observed data readiness script
+        run: |
+          cat > run_v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import hashlib
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; observed data readiness may be checked here; no observed values loaded; no scoring; no support claims"
+
+          OBSERVED_KEYWORDS = [
+              "sdss", "rsd", "fsigma", "fsigma8", "f_sigma", "eboss",
+              "boss", "dr12", "lrg", "elg", "qso", "quasar", "growth",
+              "wigglez", "6df", "6dfgs", "vipers", "gama"
+          ]
+
+          REQUIRED_BASELINE_PARAMETERS = {"omega_m0", "sigma8_0", "growth_index_gamma"}
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def file_type_guess(path: Path) -> str:
+              suffix = path.suffix.lower()
+              if suffix == ".zip":
+                  return "zip_archive"
+              if suffix == ".csv":
+                  return "csv"
+              if suffix == ".json":
+                  return "json"
+              if suffix in [".txt", ".md"]:
+                  return "text"
+              if suffix in [".fits", ".fit"]:
+                  return "fits"
+              if suffix in [".dat", ".data"]:
+                  return "data_table"
+              if suffix in [".yml", ".yaml"]:
+                  return "workflow_yaml"
+              return "other"
+
+          def main():
+              repo = Path(".").resolve()
+              input_347 = Path(os.environ["INPUT_347_ZIP"])
+
+              outdir = Path("tairid_v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base347 = extract_zip(input_347, "tairid_v4_348_347_")
+
+              summary347_path = find_one(base347, "v4_347_summary.json")
+              approved_baseline_path = find_one(base347, "v4_347_APPROVED_NUMERIC_BASELINE_NO_OBSERVED_SCORING.csv")
+              approved_calculator_path = find_one(base347, "v4_347_APPROVED_CALCULATOR_INPUT_NO_OBSERVED_SCORING.csv")
+              baseline_object_path = find_one(base347, "v4_347_numeric_baseline_object.json")
+              gap_status_path = find_one(base347, "v4_347_gap_status_after_numeric_baseline_approval_gate.csv")
+              rules347_path = find_one(base347, "v4_347_rule_checks.csv")
+
+              summary347 = json.loads(summary347_path.read_text())
+              approved_baseline = pd.read_csv(approved_baseline_path)
+              approved_calculator = pd.read_csv(approved_calculator_path)
+              baseline_object = json.loads(baseline_object_path.read_text())
+              gap_status = pd.read_csv(gap_status_path)
+              rules347 = pd.read_csv(rules347_path)
+
+              repo_manifest_rows = []
+              observed_candidate_rows = []
+
+              for p in sorted(repo.rglob("*")):
+                  if ".git" in p.parts or not p.is_file():
+                      continue
+
+                  rel = str(p.relative_to(repo))
+                  lower = rel.lower()
+                  ftype = file_type_guess(p)
+                  sha = sha256_file(p)
+
+                  repo_manifest_rows.append({
+                      "repo_path": rel,
+                      "file_name": p.name,
+                      "file_type": ftype,
+                      "size_bytes": p.stat().st_size,
+                      "sha256": sha,
+                  })
+
+                  keyword_hits = [k for k in OBSERVED_KEYWORDS if k in lower]
+                  if keyword_hits and ftype in ["zip_archive", "csv", "json", "text", "fits", "data_table"]:
+                      observed_candidate_rows.append({
+                          "observed_candidate_file_id": f"v4_348_observed_candidate_{len(observed_candidate_rows)+1:03d}",
+                          "repo_path": rel,
+                          "file_name": p.name,
+                          "file_type": ftype,
+                          "size_bytes": p.stat().st_size,
+                          "sha256": sha,
+                          "keyword_hits": "|".join(keyword_hits),
+                          "candidate_status": "candidate_file_only_not_loaded_not_scored",
+                          "observed_values_loaded_now": False,
+                          "definition_match_confirmed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      })
+
+              repo_manifest = pd.DataFrame(repo_manifest_rows)
+              observed_candidates = pd.DataFrame(observed_candidate_rows)
+
+              if observed_candidates.empty:
+                  observed_candidates = pd.DataFrame(columns=[
+                      "observed_candidate_file_id",
+                      "repo_path",
+                      "file_name",
+                      "file_type",
+                      "size_bytes",
+                      "sha256",
+                      "keyword_hits",
+                      "candidate_status",
+                      "observed_values_loaded_now",
+                      "definition_match_confirmed",
+                      "score_valid",
+                      "support_allowed",
+                      "claim_boundary",
+                  ])
+
+              readiness_checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_348_CHECK_001",
+                      "check": "Approved numeric baseline exists before observed data loading.",
+                      "status": "passed",
+                      "required_before_observed_loading": True,
+                  },
+                  {
+                      "check_id": "V4_348_CHECK_002",
+                      "check": "Observed candidate files are inventoried but not parsed as observed values.",
+                      "status": "passed",
+                      "required_before_observed_loading": True,
+                  },
+                  {
+                      "check_id": "V4_348_CHECK_003",
+                      "check": "Definition matching is still blocked until a later gate.",
+                      "status": "blocked_for_later_gate",
+                      "required_before_scoring": True,
+                  },
+                  {
+                      "check_id": "V4_348_CHECK_004",
+                      "check": "Covariance handling is still blocked until a later gate.",
+                      "status": "blocked_for_later_gate",
+                      "required_before_scoring": True,
+                  },
+                  {
+                      "check_id": "V4_348_CHECK_005",
+                      "check": "Observed values are still not loaded.",
+                      "status": "blocked_by_design",
+                      "required_before_scoring": True,
+                  },
+                  {
+                      "check_id": "V4_348_CHECK_006",
+                      "check": "Scoring and support claims remain blocked.",
+                      "status": "blocked_by_design",
+                      "required_before_support_claims": True,
+                  },
+              ])
+
+              observed_loading_plan = pd.DataFrame([
+                  {
+                      "planned_stage": "v4.349",
+                      "planned_action": "Build observed SDSS/RSD source inventory from candidate files.",
+                      "allowed_now": True,
+                      "observed_values_loaded": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "planned_stage": "v4.350",
+                      "planned_action": "Create observed-data schema and required column map.",
+                      "allowed_now": False,
+                      "observed_values_loaded": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "planned_stage": "v4.351",
+                      "planned_action": "Human approve observed-data source/schema before loading values.",
+                      "allowed_now": False,
+                      "observed_values_loaded": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "planned_stage": "later",
+                      "planned_action": "Only after schema/source approval, load observed values without scoring.",
+                      "allowed_now": False,
+                      "observed_values_loaded": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_348_GAP_001",
+                      "gap": "Observed SDSS RSD candidate files need inventory before value loading.",
+                      "status_after_v4_348": "readiness_packet_created",
+                      "next_gate": "v4_349_observed_source_inventory_no_values_no_scoring",
+                  },
+                  {
+                      "gap_id": "V4_348_GAP_002",
+                      "gap": "Observed values remain unloaded.",
+                      "status_after_v4_348": "still_blocked",
+                      "next_gate": "later_observed_value_loading_gate",
+                  },
+                  {
+                      "gap_id": "V4_348_GAP_003",
+                      "gap": "Definition matching remains unconfirmed.",
+                      "status_after_v4_348": "still_blocked",
+                      "next_gate": "later_definition_match_gate",
+                  },
+                  {
+                      "gap_id": "V4_348_GAP_004",
+                      "gap": "Scoring remains blocked.",
+                      "status_after_v4_348": "still_blocked",
+                      "next_gate": "later_scoring_gate",
+                  },
+                  {
+                      "gap_id": "V4_348_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_348": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate_only_after_scoring",
+                  },
+              ])
+
+              observed_candidate_rows_count = int(len(observed_candidates))
+              observed_candidates_available = observed_candidate_rows_count > 0
+
+              hard_checks = {
+                  "input_v4_347_summary_found": summary347.get("version") == "v4.347",
+                  "input_v4_347_rules_all_passed": summary_rules_all_passed(summary347),
+                  "input_v4_347_failed_gates_none": summary347.get("failed_gates") == "none",
+                  "input_v4_347_parameter_values_approved_true": summary347.get("parameter_values_approved") is True,
+                  "input_v4_347_numeric_baseline_approved_true": summary347.get("numeric_baseline_approved") is True,
+                  "input_v4_347_baseline_values_filled_true": summary347.get("numeric_baseline_values_filled") is True,
+                  "input_v4_347_approved_baseline_values_3": summary347.get("approved_baseline_values") == 3,
+                  "input_v4_347_no_observed_values_loaded": summary347.get("observed_values_loaded") is False,
+                  "input_v4_347_no_definition_match_confirmed": summary347.get("definition_match_confirmed") is False,
+                  "input_v4_347_no_score_valid": summary347.get("score_valid") is False,
+                  "input_v4_347_no_support_allowed": summary347.get("support_allowed") is False,
+
+                  "rules347_all_passed": rules347["passed"].astype(bool).all(),
+                  "approved_baseline_rows_equal_3": len(approved_baseline) == 3,
+                  "approved_calculator_rows_equal_3": len(approved_calculator) == 3,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+                  "baseline_has_required_parameters": REQUIRED_BASELINE_PARAMETERS.issubset(set(approved_baseline["parameter_or_method"].apply(clean))),
+                  "baseline_object_approved_true": baseline_object.get("numeric_baseline_approved") is True,
+                  "baseline_object_no_observed_loaded": baseline_object.get("observed_values_loaded") is False,
+                  "baseline_object_no_score_valid": baseline_object.get("score_valid") is False,
+                  "baseline_object_no_support": baseline_object.get("support_allowed") is False,
+
+                  "repo_manifest_has_rows": len(repo_manifest) > 0,
+                  "observed_candidate_manifest_created": "observed_candidate_file_id" in observed_candidates.columns,
+                  "readiness_checklist_rows_equal_6": len(readiness_checklist) == 6,
+                  "observed_loading_plan_rows_equal_4": len(observed_loading_plan) == 4,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "observed_values_loaded_false_for_candidates": (false_col(observed_candidates, "observed_values_loaded_now") if len(observed_candidates) > 0 else True),
+                  "definition_match_confirmed_false_for_candidates": (false_col(observed_candidates, "definition_match_confirmed") if len(observed_candidates) > 0 else True),
+                  "score_valid_false_for_candidates": (false_col(observed_candidates, "score_valid") if len(observed_candidates) > 0 else True),
+                  "support_allowed_false_for_candidates": (false_col(observed_candidates, "support_allowed") if len(observed_candidates) > 0 else True),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              if observed_candidates_available:
+                  readiness_status = "observed_candidate_files_found_for_inventory_not_loaded"
+                  next_route = "v4_349_observed_sdss_rsd_source_inventory_no_values_no_scoring"
+              else:
+                  readiness_status = "blocked_no_observed_candidate_files_found"
+                  next_route = "add_observed_sdss_rsd_candidate_files_then_rerun_v4_348"
+
+              summary348 = {
+                  "version": "v4.348",
+                  "route_name": "v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring_no_support_claims",
+                  "expected_result": "v4_348_observed_sdss_rsd_data_loading_readiness_passed_no_values_loaded_no_scoring_no_claims",
+                  "input_version": "v4.347",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": readiness_status,
+                  "repo_manifest_rows": int(len(repo_manifest)),
+                  "observed_candidate_file_rows": observed_candidate_rows_count,
+                  "parameter_values_approved": True,
+                  "numeric_baseline_values_filled": True,
+                  "approved_baseline_values": 3,
+                  "numeric_baseline_approved": True,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": next_route,
+              }
+
+              repo_manifest.to_csv(outdir / "v4_348_repo_manifest_for_observed_data_readiness.csv", index=False)
+              observed_candidates.to_csv(outdir / "v4_348_observed_sdss_rsd_candidate_file_manifest_NO_VALUES_LOADED.csv", index=False)
+              readiness_checklist.to_csv(outdir / "v4_348_observed_data_loading_readiness_checklist.csv", index=False)
+              observed_loading_plan.to_csv(outdir / "v4_348_observed_data_loading_plan_no_values_no_scoring.csv", index=False)
+              gap_update.to_csv(outdir / "v4_348_gap_status_after_observed_data_readiness.csv", index=False)
+              approved_baseline.to_csv(outdir / "v4_348_input_v4_347_approved_baseline_preserved.csv", index=False)
+              approved_calculator.to_csv(outdir / "v4_348_input_v4_347_approved_calculator_input_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_348_rule_checks.csv", index=False)
+
+              (outdir / "v4_348_input_v4_347_baseline_object_preserved.json").write_text(json.dumps(baseline_object, indent=2))
+              (outdir / "v4_348_summary.json").write_text(json.dumps(summary348, indent=2))
+
+              summary_md = f"""# TAIRID v4.348 Observed SDSS RSD Data Loading Readiness — No Scoring
+
+          Expected result: `{summary348["expected_result"]}`
+
+          {summary348["rules_passed"]} / {summary348["rules_total"]} rules passed
+
+          failed_gates = {summary348["failed_gates"]}
+
+          readiness_status = `{summary348["readiness_status"]}`
+
+          observed_candidate_file_rows = {summary348["observed_candidate_file_rows"]}
+
+          parameter_values_approved = true
+
+          numeric_baseline_approved = true
+
+          observed_values_loaded = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step checks readiness for observed SDSS RSD data loading and inventories candidate files only.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** confirm definition or covariance matching.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary348["selected_next_route"]}`
+          """
+              (outdir / "v4_348_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary348, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring.py
+
+      - name: Run v4.348 observed SDSS RSD data loading readiness no scoring
+        run: |
+          python run_v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring.py
+
+      - name: Upload v4.348 observed data readiness artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-348-observed-sdss-rsd-data-loading-readiness-no-scoring-output
+          path: |
+            tairid_v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring_output/
+            tairid_v4_348_observed_sdss_rsd_data_loading_readiness_no_scoring_output.zip
