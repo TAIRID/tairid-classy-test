@@ -1,0 +1,448 @@
+name: "!!! AAA CURRENT - TAIRID v4.353 manual column repair ingest no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-353-manual-column-repair-ingest-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.353 manual column repair ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.352 output ZIP and human-filled repair ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.352 output ZIP..."
+          INPUT_352_ZIP="$(ls tairid-v4-352-manual-observed-source-column-repair-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_352_ZIP" ]; then
+            echo "Could not find v4.352 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-352-manual-observed-source-column-repair-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled v4.352 repair ZIP..."
+          HUMAN_FILLED_REPAIR_ZIP="$(ls tairid-v4-352-human-filled-manual-column-repair-for-v4-353-no-values-no-scoring*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$HUMAN_FILLED_REPAIR_ZIP" ]; then
+            echo "Could not find human-filled repair ZIP."
+            echo "Expected:"
+            echo "tairid-v4-352-human-filled-manual-column-repair-for-v4-353-no-values-no-scoring.zip"
+            exit 1
+          fi
+
+          echo "Using v4.352 ZIP:"
+          echo "$INPUT_352_ZIP"
+
+          echo "Using human-filled repair ZIP:"
+          echo "$HUMAN_FILLED_REPAIR_ZIP"
+
+          echo "INPUT_352_ZIP=$INPUT_352_ZIP" >> "$GITHUB_ENV"
+          echo "HUMAN_FILLED_REPAIR_ZIP=$HUMAN_FILLED_REPAIR_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.353 repair ingest script
+        run: |
+          cat > run_v4_353_manual_column_repair_ingest_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; manual column repair may be ingested here; no observed values loaded; no scoring; no support claims"
+
+          ALLOWED_REPAIR_DECISIONS = {
+              "approve_manual_column_mapping_for_later_schema_approval",
+              "provide_better_source_file",
+              "needs_manual_column_mapping",
+              "reject_source_file",
+              "keep_blocked",
+          }
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def main():
+              input_352 = Path(os.environ["INPUT_352_ZIP"])
+              human_zip = Path(os.environ["HUMAN_FILLED_REPAIR_ZIP"]
+
+              )
+
+              outdir = Path("tairid_v4_353_manual_column_repair_ingest_no_values_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base352 = extract_zip(input_352, "tairid_v4_353_352_")
+              basehuman = extract_zip(human_zip, "tairid_v4_353_human_")
+
+              summary352_path = find_one(base352, "v4_352_summary.json")
+              repair_packet_path = find_one(base352, "v4_352_HUMAN_FILL_manual_observed_column_repair_packet_NO_VALUES_NO_SCORING.csv")
+              required_matrix_path = find_one(base352, "v4_352_required_observed_schema_field_matrix.csv")
+              checklist_path = find_one(base352, "v4_352_manual_column_repair_checklist.csv")
+              gap_status_path = find_one(base352, "v4_352_gap_status_after_manual_column_repair_packet.csv")
+              header_probe_path = find_one(base352, "v4_352_input_v4_351_header_probe_preserved.csv")
+              rules352_path = find_one(base352, "v4_352_rule_checks.csv")
+
+              filled_repair_path = find_one_suffix(basehuman, "HUMAN_FILLED_manual_observed_column_repair_packet_NO_VALUES_NO_SCORING.csv")
+
+              summary352 = json.loads(summary352_path.read_text())
+              repair_packet = pd.read_csv(repair_packet_path)
+              required_matrix = pd.read_csv(required_matrix_path)
+              checklist = pd.read_csv(checklist_path)
+              gap_status = pd.read_csv(gap_status_path)
+              header_probe = pd.read_csv(header_probe_path)
+              rules352 = pd.read_csv(rules352_path)
+              filled_repair = pd.read_csv(filled_repair_path)
+
+              for col in [
+                  "human_repaired_survey_or_source_column",
+                  "human_repaired_tracer_or_sample_column",
+                  "human_repaired_redshift_z_column",
+                  "human_repaired_observed_fsigma8_column",
+                  "human_repaired_observed_fsigma8_uncertainty_column",
+                  "human_repaired_covariance_or_error_model",
+                  "human_repaired_source_reference_column",
+                  "human_better_source_file_name_if_needed",
+                  "human_better_source_repo_path_if_needed",
+                  "human_repair_decision",
+                  "human_repair_note",
+              ]:
+                  if col not in filled_repair.columns:
+                      filled_repair[col] = ""
+
+              ingest_rows = []
+
+              for _, row in filled_repair.iterrows():
+                  decision = clean(row["human_repair_decision"])
+
+                  if decision == "approve_manual_column_mapping_for_later_schema_approval":
+                      row_ingest_status = "manual_column_mapping_staged_for_schema_approval_not_values_loaded"
+                      schema_ready_for_next_gate = True
+                      better_source_needed = False
+                  elif decision == "provide_better_source_file":
+                      row_ingest_status = "blocked_needs_better_observed_value_source_file"
+                      schema_ready_for_next_gate = False
+                      better_source_needed = True
+                  elif decision == "needs_manual_column_mapping":
+                      row_ingest_status = "blocked_still_needs_manual_column_mapping"
+                      schema_ready_for_next_gate = False
+                      better_source_needed = False
+                  elif decision in ["reject_source_file", "keep_blocked"]:
+                      row_ingest_status = "blocked_or_rejected"
+                      schema_ready_for_next_gate = False
+                      better_source_needed = False
+                  else:
+                      row_ingest_status = "invalid_or_missing_repair_decision"
+                      schema_ready_for_next_gate = False
+                      better_source_needed = False
+
+                  ingest_rows.append({
+                      "v4_353_repair_ingest_id": f"v4_353_repair_ingest_{len(ingest_rows)+1:03d}",
+                      "v4_352_repair_id": clean(row["v4_352_repair_id"]),
+                      "source_inventory_id": clean(row["source_inventory_id"]),
+                      "repo_path": clean(row["repo_path"]),
+                      "file_name": clean(row["file_name"]),
+                      "source_class": clean(row["source_class"]),
+                      "human_repair_decision": decision,
+                      "human_repair_note": clean(row["human_repair_note"]),
+
+                      "human_repaired_survey_or_source_column": clean(row["human_repaired_survey_or_source_column"]),
+                      "human_repaired_tracer_or_sample_column": clean(row["human_repaired_tracer_or_sample_column"]),
+                      "human_repaired_redshift_z_column": clean(row["human_repaired_redshift_z_column"]),
+                      "human_repaired_observed_fsigma8_column": clean(row["human_repaired_observed_fsigma8_column"]),
+                      "human_repaired_observed_fsigma8_uncertainty_column": clean(row["human_repaired_observed_fsigma8_uncertainty_column"]),
+                      "human_repaired_covariance_or_error_model": clean(row["human_repaired_covariance_or_error_model"]),
+                      "human_repaired_source_reference_column": clean(row["human_repaired_source_reference_column"]),
+
+                      "human_better_source_file_name_if_needed": clean(row["human_better_source_file_name_if_needed"]),
+                      "human_better_source_repo_path_if_needed": clean(row["human_better_source_repo_path_if_needed"]),
+
+                      "row_ingest_status": row_ingest_status,
+                      "schema_ready_for_next_gate": schema_ready_for_next_gate,
+                      "better_observed_source_file_needed": better_source_needed,
+
+                      "schema_approved_now": False,
+                      "observed_values_loaded": False,
+                      "observed_rows_loaded": 0,
+                      "definition_match_confirmed": False,
+                      "covariance_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              ingest = pd.DataFrame(ingest_rows)
+
+              schema_ready_rows = ingest[ingest["schema_ready_for_next_gate"].astype(bool)].copy()
+              better_source_rows = ingest[ingest["better_observed_source_file_needed"].astype(bool)].copy()
+              still_manual_rows = ingest[ingest["row_ingest_status"] == "blocked_still_needs_manual_column_mapping"].copy()
+              blocked_or_rejected_rows = ingest[ingest["row_ingest_status"] == "blocked_or_rejected"].copy()
+              invalid_rows = ingest[ingest["row_ingest_status"] == "invalid_or_missing_repair_decision"].copy()
+
+              if len(schema_ready_rows) > 0:
+                  readiness_status = "manual_column_mapping_staged_for_schema_approval_not_values_loaded"
+                  selected_next_route = "v4_354_manual_schema_approval_gate_no_values_no_scoring"
+              elif len(better_source_rows) > 0:
+                  readiness_status = "blocked_needs_better_observed_value_source_file"
+                  selected_next_route = "add_better_direct_observed_value_file_then_return_to_v4_348_or_v4_349"
+              elif len(still_manual_rows) > 0:
+                  readiness_status = "blocked_still_needs_manual_column_mapping"
+                  selected_next_route = "fill_manual_column_mapping_then_rerun_v4_353"
+              else:
+                  readiness_status = "blocked_no_valid_schema_path"
+                  selected_next_route = "return_to_observed_source_inventory"
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_353_GAP_001",
+                      "gap": "Manual column repair decision ingested.",
+                      "status_after_v4_353": readiness_status,
+                      "next_gate": selected_next_route,
+                  },
+                  {
+                      "gap_id": "V4_353_GAP_002",
+                      "gap": "Observed schema remains unapproved.",
+                      "status_after_v4_353": "still_blocked",
+                      "next_gate": "schema_approval_only_after_valid_source_or_mapping",
+                  },
+                  {
+                      "gap_id": "V4_353_GAP_003",
+                      "gap": "Observed values remain unloaded.",
+                      "status_after_v4_353": "still_blocked",
+                      "next_gate": "later_observed_value_loading_gate",
+                  },
+                  {
+                      "gap_id": "V4_353_GAP_004",
+                      "gap": "Definition/covariance matching remains unconfirmed.",
+                      "status_after_v4_353": "still_blocked",
+                      "next_gate": "later_definition_covariance_gate",
+                  },
+                  {
+                      "gap_id": "V4_353_GAP_005",
+                      "gap": "Scoring and support claims remain blocked.",
+                      "status_after_v4_353": "still_blocked",
+                      "next_gate": "later_scoring_and_support_gates",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_352_summary_found": summary352.get("version") == "v4.352",
+                  "input_v4_352_rules_all_passed": summary_rules_all_passed(summary352),
+                  "input_v4_352_failed_gates_none": summary352.get("failed_gates") == "none",
+                  "input_v4_352_schema_approved_false": summary352.get("schema_approved") is False,
+                  "input_v4_352_no_observed_values_loaded": summary352.get("observed_values_loaded") is False,
+                  "input_v4_352_no_score_valid": summary352.get("score_valid") is False,
+                  "input_v4_352_no_support_allowed": summary352.get("support_allowed") is False,
+
+                  "rules352_all_passed": rules352["passed"].astype(bool).all(),
+                  "repair_packet_rows_equal_summary": len(repair_packet) == int(summary352.get("repair_packet_rows")),
+                  "filled_repair_rows_equal_repair_packet": len(filled_repair) == len(repair_packet),
+                  "required_matrix_rows_equal_7": len(required_matrix) == 7,
+                  "checklist_rows_equal_5": len(checklist) == 5,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+                  "header_probe_has_rows": len(header_probe) >= 1,
+
+                  "human_repair_decisions_filled_all_rows": filled_repair["human_repair_decision"].apply(clean).ne("").all(),
+                  "human_repair_decisions_allowed": filled_repair["human_repair_decision"].apply(clean).isin(ALLOWED_REPAIR_DECISIONS).all(),
+                  "ingest_rows_equal_filled_repair": len(ingest) == len(filled_repair),
+                  "invalid_rows_equal_0": len(invalid_rows) == 0,
+                  "better_source_rows_at_least_one": len(better_source_rows) >= 1,
+
+                  "schema_approved_false": false_col(ingest, "schema_approved_now"),
+                  "observed_values_loaded_false": false_col(ingest, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(ingest, "definition_match_confirmed"),
+                  "covariance_match_confirmed_false": false_col(ingest, "covariance_match_confirmed"),
+                  "score_valid_false": false_col(ingest, "score_valid"),
+                  "support_allowed_false": false_col(ingest, "support_allowed"),
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary353 = {
+                  "version": "v4.353",
+                  "route_name": "v4_353_manual_column_repair_ingest_no_values_no_scoring",
+                  "expected_result": "v4_353_manual_column_repair_ingest_passed_blocked_needs_better_source_no_values_loaded_no_scoring_no_claims",
+                  "input_version": "v4.352",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": readiness_status,
+                  "repair_ingest_rows": int(len(ingest)),
+                  "schema_ready_rows": int(len(schema_ready_rows)),
+                  "better_source_rows": int(len(better_source_rows)),
+                  "still_manual_mapping_rows": int(len(still_manual_rows)),
+                  "invalid_rows": int(len(invalid_rows)),
+                  "parameter_values_approved": True,
+                  "numeric_baseline_values_filled": True,
+                  "approved_baseline_values": 3,
+                  "numeric_baseline_approved": True,
+                  "schema_approved": False,
+                  "observed_values_loaded": False,
+                  "observed_rows_loaded": 0,
+                  "definition_match_confirmed": False,
+                  "covariance_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              ingest.to_csv(outdir / "v4_353_manual_column_repair_ingest_ledger_NO_VALUES_NO_SCORING.csv", index=False)
+              better_source_rows.to_csv(outdir / "v4_353_better_observed_source_needed_rows.csv", index=False)
+              schema_ready_rows.to_csv(outdir / "v4_353_schema_ready_rows_IF_ANY_NOT_APPROVED.csv", index=False)
+              gap_update.to_csv(outdir / "v4_353_gap_status_after_manual_column_repair_ingest.csv", index=False)
+              filled_repair.to_csv(outdir / "v4_353_input_human_filled_repair_preserved.csv", index=False)
+              repair_packet.to_csv(outdir / "v4_353_input_blank_v4_352_repair_packet_preserved.csv", index=False)
+              header_probe.to_csv(outdir / "v4_353_input_header_probe_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_353_rule_checks.csv", index=False)
+
+              (outdir / "v4_353_summary.json").write_text(json.dumps(summary353, indent=2))
+
+              summary_md = f"""# TAIRID v4.353 Manual Column Repair Ingest — No Values, No Scoring
+
+          Expected result: `{summary353["expected_result"]}`
+
+          {summary353["rules_passed"]} / {summary353["rules_total"]} rules passed
+
+          failed_gates = {summary353["failed_gates"]}
+
+          readiness_status = `{summary353["readiness_status"]}`
+
+          repair_ingest_rows = {summary353["repair_ingest_rows"]}
+
+          better_source_rows = {summary353["better_source_rows"]}
+
+          schema_ready_rows = {summary353["schema_ready_rows"]}
+
+          schema_approved = false
+
+          observed_values_loaded = false
+
+          observed_rows_loaded = 0
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step ingests the manual column repair decision.
+
+          It does **not** load observed values.
+
+          It does **not** approve the observed schema.
+
+          It does **not** confirm definition or covariance matching.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary353["selected_next_route"]}`
+          """
+              (outdir / "v4_353_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary353, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_353_manual_column_repair_ingest_no_scoring.py
+
+      - name: Run v4.353 manual column repair ingest no scoring
+        run: |
+          python run_v4_353_manual_column_repair_ingest_no_scoring.py
+
+      - name: Upload v4.353 manual column repair ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-353-manual-column-repair-ingest-no-values-no-scoring-output
+          path: |
+            tairid_v4_353_manual_column_repair_ingest_no_values_no_scoring_output/
+            tairid_v4_353_manual_column_repair_ingest_no_values_no_scoring_output.zip
