@@ -1,0 +1,459 @@
+name: "!!! AAA CURRENT - TAIRID v4.339 parameter exact quote repair no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-339-parameter-exact-quote-repair-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.339 exact quote repair packet"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.338 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.338 output ZIP by pattern..."
+          INPUT_338_ZIP="$(ls tairid-v4-338-proposed-extraction-fill-draft-no-approval-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_338_ZIP" ]; then
+            echo "Could not find v4.338 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-338-proposed-extraction-fill-draft-no-approval-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.338 ZIP:"
+          echo "$INPUT_338_ZIP"
+          echo "INPUT_338_ZIP=$INPUT_338_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.339 repair packet script
+        run: |
+          cat > run_v4_339_parameter_exact_quote_repair_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def repair_instruction(parameter, decision):
+              p = clean(parameter)
+              d = clean(decision)
+
+              if p == "omega_m0":
+                  return {
+                      "repair_type": "needs_exact_quote",
+                      "repair_priority": "high",
+                      "acceptable_source_target": "Planck 2018 cosmological parameters table or official Planck parameter result source.",
+                      "repair_search_terms": "Planck 2018 Omega_m Omega_m0 matter density parameter TTTEEE lowE lensing LCDM",
+                      "what_to_fill_next": "Exact quote containing the Omega_m / Ω_m value, uncertainty, source table or section, and model context.",
+                      "why_not_ready": "v4.338 found relevant context but did not safely extract an exact Omega_m0 value quote."
+                  }
+
+              if p == "sigma8_0":
+                  return {
+                      "repair_type": "needs_exact_quote",
+                      "repair_priority": "high",
+                      "acceptable_source_target": "Planck 2018 parameter table or official source containing sigma8 / σ8 value and uncertainty.",
+                      "repair_search_terms": "Planck 2018 sigma8 sigma_8 value uncertainty TTTEEE lowE lensing LCDM",
+                      "what_to_fill_next": "Exact quote containing sigma8 / σ8 value, uncertainty, source table or section, and model context.",
+                      "why_not_ready": "v4.338 did not safely preserve a clean exact sigma8_0 source quote for approval."
+                  }
+
+              if p == "growth_index_gamma":
+                  return {
+                      "repair_type": "needs_better_source",
+                      "repair_priority": "high",
+                      "acceptable_source_target": "A method source defining the growth-index gamma parameter, preferably gamma approximately 0.55 for GR/LCDM or the exact convention intended for the calculator.",
+                      "repair_search_terms": "growth index gamma 0.55 General Relativity LCDM f equals Omega_m gamma source",
+                      "what_to_fill_next": "Exact method quote defining gamma, its expected value or convention, and whether it is appropriate for an LCDM RSD baseline calculator.",
+                      "why_not_ready": "v4.338 found RSD/fσ8 context, but not a clean source approving a growth-index gamma value or convention."
+                  }
+
+              if d == "context_only_not_value":
+                  return {
+                      "repair_type": "context_only_confirm",
+                      "repair_priority": "medium",
+                      "acceptable_source_target": "Existing context may be enough for method/policy framing, but it must not be converted into a numeric parameter.",
+                      "repair_search_terms": "not applicable unless human reviewer wants stronger method-policy source",
+                      "what_to_fill_next": "Confirm context-only status or supply a clearer quote explaining the method/policy limitation.",
+                      "why_not_ready": "This row is not a numeric value row; it should remain context-only unless later human review changes that."
+                  }
+
+              return {
+                  "repair_type": "keep_blocked",
+                  "repair_priority": "medium",
+                  "acceptable_source_target": "No safe target identified.",
+                  "repair_search_terms": "manual review needed",
+                  "what_to_fill_next": "Human reviewer must decide what evidence is missing.",
+                  "why_not_ready": "No safe repair rule matched this row."
+              }
+
+          def main():
+              input_338 = Path(os.environ["INPUT_338_ZIP"])
+
+              outdir = Path("tairid_v4_339_parameter_exact_quote_repair_packet_no_approval_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base338 = extract_zip(input_338, "tairid_v4_339_338_")
+
+              summary338_path = find_one(base338, "v4_338_summary.json")
+              proposed_path = find_one(base338, "v4_338_PROPOSED_FILLED_extraction_worksheet_NOT_HUMAN_ACCEPTED_NO_APPROVAL_NO_SCORING.csv")
+              proposal_ledger_path = find_one(base338, "v4_338_proposed_extraction_fill_ledger_no_approval_no_scoring.csv")
+              checklist338_path = find_one(base338, "v4_338_human_acceptance_checklist_before_rerun_v4_335.csv")
+              blank_worksheet_path = find_one(base338, "v4_338_input_blank_v4_334_worksheet_preserved.csv")
+              context_rows_path = find_one(base338, "v4_338_input_v4_334_context_rows_preserved.csv")
+              gap_status_path = find_one(base338, "v4_338_input_v4_334_gap_status_preserved.csv")
+              rules338_path = find_one(base338, "v4_338_rule_checks.csv")
+
+              summary338 = json.loads(summary338_path.read_text())
+              proposed = pd.read_csv(proposed_path)
+              proposal_ledger = pd.read_csv(proposal_ledger_path)
+              checklist338 = pd.read_csv(checklist338_path)
+              blank_worksheet = pd.read_csv(blank_worksheet_path)
+              context_rows = pd.read_csv(context_rows_path)
+              gap_status = pd.read_csv(gap_status_path)
+              rules338 = pd.read_csv(rules338_path)
+
+              repair_rows = []
+
+              for _, row in proposed.iterrows():
+                  parameter = clean(row["parameter_or_method"])
+                  decision = clean(row["human_extraction_decision"])
+                  inst = repair_instruction(parameter, decision)
+
+                  needs_repair = decision in ["needs_exact_quote", "needs_better_source", "keep_blocked"]
+
+                  repair_rows.append({
+                      "v4_339_repair_id": f"v4_339_repair_{len(repair_rows)+1:03d}",
+                      "v4_334_extraction_id": clean(row["v4_334_extraction_id"]),
+                      "question_id": clean(row["question_id"]),
+                      "parameter_or_method": parameter,
+                      "v4_338_proposed_decision": decision,
+                      "v4_339_repair_type": inst["repair_type"],
+                      "repair_priority": inst["repair_priority"],
+                      "needs_repair_before_value_ingest": bool(needs_repair),
+                      "acceptable_source_target": inst["acceptable_source_target"],
+                      "repair_search_terms": inst["repair_search_terms"],
+                      "what_to_fill_next": inst["what_to_fill_next"],
+                      "why_not_ready": inst["why_not_ready"],
+
+                      "human_exact_quote_to_add": "",
+                      "human_source_url_to_add": "",
+                      "human_source_table_section_to_add": "",
+                      "human_candidate_value_text_to_add": "",
+                      "human_candidate_numeric_value_to_add_if_applicable": "",
+                      "human_uncertainty_to_add_if_applicable": "",
+                      "human_definition_context_to_add": "",
+                      "human_repair_decision": "",
+                      "allowed_human_repair_decisions": "ready_for_later_extraction_ingest|needs_exact_quote|needs_better_source|context_only_not_value|reject_candidate|keep_blocked",
+                      "human_reviewer_note": "",
+
+                      "repair_completed_now": False,
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              repair_packet = pd.DataFrame(repair_rows)
+
+              repair_summary = repair_packet.groupby(
+                  ["v4_339_repair_type", "repair_priority"],
+                  dropna=False
+              ).size().reset_index(name="rows")
+
+              blocked_gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "REPAIR_GAP_001",
+                      "gap": "Omega_m0 still needs exact source quote before value review.",
+                      "status_after_v4_339": "open",
+                      "blocks": "parameter_value_ingest",
+                  },
+                  {
+                      "gap_id": "REPAIR_GAP_002",
+                      "gap": "sigma8_0 still needs exact source quote before value review.",
+                      "status_after_v4_339": "open",
+                      "blocks": "parameter_value_ingest",
+                  },
+                  {
+                      "gap_id": "REPAIR_GAP_003",
+                      "gap": "growth_index_gamma needs a better method/value source.",
+                      "status_after_v4_339": "open",
+                      "blocks": "parameter_value_ingest",
+                  },
+                  {
+                      "gap_id": "REPAIR_GAP_004",
+                      "gap": "Context-only rows must not become numeric values.",
+                      "status_after_v4_339": "guarded",
+                      "blocks": "numeric_baseline_overreach",
+                  },
+                  {
+                      "gap_id": "REPAIR_GAP_005",
+                      "gap": "Observed scoring and support claims remain blocked.",
+                      "status_after_v4_339": "blocked_by_design",
+                      "blocks": "observed_scoring_and_support_claims",
+                  },
+              ])
+
+              human_instructions = f"""# TAIRID v4.339 Parameter Exact Quote Repair Packet — No Approval, No Scoring
+
+          Truth boundary:
+
+          `{TRUTH_BOUNDARY}`
+
+          This packet identifies the exact repair work needed after v4.338.
+
+          ## What v4.338 showed
+
+          - `omega_m0` needs an exact quote.
+          - `sigma8_0` needs an exact quote.
+          - `growth_index_gamma` needs a better source.
+          - `lcdm_calculator_context`, `rsd_definition_bridge`, and `calculator_limit_policy` are context-only rows, not numeric value rows.
+
+          ## What the human reviewer should do next
+
+          Fill the repair packet only where better evidence is available:
+
+          ```text
+          human_exact_quote_to_add
+          human_source_url_to_add
+          human_source_table_section_to_add
+          human_candidate_value_text_to_add
+          human_candidate_numeric_value_to_add_if_applicable
+          human_uncertainty_to_add_if_applicable
+          human_definition_context_to_add
+          human_repair_decision
+          human_reviewer_note
+          ```
+
+          Do not approve values here.
+
+          Do not approve a numeric baseline here.
+
+          Do not load observed SDSS RSD values here.
+
+          Do not make support claims here.
+          """
+
+              exact_quote_repair_rows = int((repair_packet["v4_339_repair_type"] == "needs_exact_quote").sum())
+              better_source_repair_rows = int((repair_packet["v4_339_repair_type"] == "needs_better_source").sum())
+              context_only_rows = int((repair_packet["v4_339_repair_type"] == "context_only_confirm").sum())
+              repair_target_rows = int(repair_packet["needs_repair_before_value_ingest"].astype(bool).sum())
+
+              hard_checks = {
+                  "input_v4_338_summary_found": summary338.get("version") == "v4.338",
+                  "input_v4_338_rules_30_of_30": summary338.get("rules_passed") == 30 and summary338.get("rules_total") == 30,
+                  "input_v4_338_failed_gates_none": summary338.get("failed_gates") == "none",
+                  "input_v4_338_human_acceptance_not_accepted": summary338.get("human_acceptance_status") == "not_accepted_proposed_fill_only",
+                  "input_v4_338_no_parameter_approval": summary338.get("parameter_values_approved") is False,
+                  "input_v4_338_no_numeric_baseline_approval": summary338.get("numeric_baseline_values_filled") is False and summary338.get("approved_baseline_values") == 0,
+                  "input_v4_338_no_observed_values_loaded": summary338.get("observed_values_loaded") is False,
+                  "input_v4_338_no_definition_match_confirmed": summary338.get("definition_match_confirmed") is False,
+                  "input_v4_338_no_score_valid": summary338.get("score_valid") is False,
+                  "input_v4_338_no_support_allowed": summary338.get("support_allowed") is False,
+
+                  "proposed_rows_equal_6": len(proposed) == 6,
+                  "proposal_ledger_rows_equal_6": len(proposal_ledger) == 6,
+                  "blank_worksheet_rows_equal_6": len(blank_worksheet) == 6,
+                  "context_rows_equal_18": len(context_rows) == 18,
+                  "v4_338_rules_all_passed": rules338["passed"].astype(bool).all(),
+
+                  "repair_packet_rows_equal_6": len(repair_packet) == 6,
+                  "exact_quote_repair_rows_equal_2": exact_quote_repair_rows == 2,
+                  "better_source_repair_rows_equal_1": better_source_repair_rows == 1,
+                  "context_only_rows_equal_3": context_only_rows == 3,
+                  "repair_target_rows_equal_3": repair_target_rows == 3,
+
+                  "human_exact_quote_repair_fields_blank": repair_packet["human_exact_quote_to_add"].apply(clean).eq("").all(),
+                  "human_candidate_value_fields_blank": repair_packet["human_candidate_value_text_to_add"].apply(clean).eq("").all(),
+                  "human_numeric_value_fields_blank": repair_packet["human_candidate_numeric_value_to_add_if_applicable"].apply(clean).eq("").all(),
+                  "human_repair_decision_fields_blank": repair_packet["human_repair_decision"].apply(clean).eq("").all(),
+
+                  "repair_completed_false": false_col(repair_packet, "repair_completed_now"),
+                  "parameter_value_approval_false": false_col(repair_packet, "parameter_value_approved_now"),
+                  "numeric_baseline_approval_false": false_col(repair_packet, "numeric_baseline_approved_now"),
+                  "observed_values_loaded_false": false_col(repair_packet, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(repair_packet, "definition_match_confirmed"),
+                  "score_valid_false": false_col(repair_packet, "score_valid"),
+                  "support_allowed_false": false_col(repair_packet, "support_allowed"),
+
+                  "repair_gap_update_rows_equal_5": len(blocked_gap_update) == 5,
+                  "checklist338_rows_equal_5": len(checklist338) == 5,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary339 = {
+                  "version": "v4.339",
+                  "route_name": "v4_339_parameter_exact_quote_repair_packet_no_approval_no_scoring",
+                  "expected_result": "v4_339_parameter_exact_quote_repair_packet_no_approval_no_scoring_passed_no_claims",
+                  "input_version": "v4.338",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+
+                  "repair_packet_rows": int(len(repair_packet)),
+                  "repair_target_rows": repair_target_rows,
+                  "exact_quote_repair_rows": exact_quote_repair_rows,
+                  "better_source_repair_rows": better_source_repair_rows,
+                  "context_only_rows": context_only_rows,
+
+                  "repair_completed_rows": 0,
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_339_exact_quote_repair_packet_then_v4_340_repair_readiness_no_value_approval_no_scoring",
+              }
+
+              repair_packet.to_csv(outdir / "v4_339_HUMAN_FILL_exact_quote_repair_packet_NO_APPROVAL_NO_SCORING.csv", index=False)
+              repair_summary.to_csv(outdir / "v4_339_repair_summary_by_type_no_scoring.csv", index=False)
+              blocked_gap_update.to_csv(outdir / "v4_339_gap_update_after_repair_packet_no_scoring.csv", index=False)
+              proposal_ledger.to_csv(outdir / "v4_339_input_v4_338_proposal_ledger_preserved.csv", index=False)
+              proposed.to_csv(outdir / "v4_339_input_v4_338_proposed_worksheet_preserved.csv", index=False)
+              context_rows.to_csv(outdir / "v4_339_input_context_rows_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_339_rule_checks.csv", index=False)
+
+              (outdir / "v4_339_human_repair_instructions.md").write_text(human_instructions)
+              (outdir / "v4_339_summary.json").write_text(json.dumps(summary339, indent=2))
+
+              summary_md = f"""# TAIRID v4.339 Parameter Exact Quote Repair Packet — No Approval, No Scoring
+
+          Expected result: `{summary339["expected_result"]}`
+
+          {summary339["rules_passed"]} / {summary339["rules_total"]} rules passed
+
+          failed_gates = {summary339["failed_gates"]}
+
+          repair_packet_rows = {summary339["repair_packet_rows"]}
+
+          repair_target_rows = {summary339["repair_target_rows"]}
+
+          exact_quote_repair_rows = {summary339["exact_quote_repair_rows"]}
+
+          better_source_repair_rows = {summary339["better_source_repair_rows"]}
+
+          context_only_rows = {summary339["context_only_rows"]}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This packet identifies missing exact quote/source repairs after v4.338.
+
+          It does **not** approve parameter values.
+
+          It does **not** approve a numeric baseline.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary339["selected_next_route"]}`
+          """
+              (outdir / "v4_339_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary339, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_339_parameter_exact_quote_repair_no_scoring.py
+
+      - name: Run v4.339 parameter exact quote repair packet no scoring
+        run: |
+          python run_v4_339_parameter_exact_quote_repair_no_scoring.py
+
+      - name: Upload v4.339 repair packet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-339-parameter-exact-quote-repair-packet-no-approval-no-scoring-output
+          path: |
+            tairid_v4_339_parameter_exact_quote_repair_packet_no_approval_no_scoring_output/
+            tairid_v4_339_parameter_exact_quote_repair_packet_no_approval_no_scoring_output.zip
