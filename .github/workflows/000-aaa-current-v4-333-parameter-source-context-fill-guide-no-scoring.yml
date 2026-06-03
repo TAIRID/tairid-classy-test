@@ -1,0 +1,437 @@
+name: "!!! AAA CURRENT - TAIRID v4.333 parameter source context fill guide no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-333-parameter-source-context-fill-guide-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.333 source context fill guide"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.332 and v4.324 input ZIPs
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.332 output ZIP..."
+          INPUT_332_ZIP="$(ls tairid-v4-332-parameter-value-review-packet-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_332_ZIP" ]; then
+            echo "Could not find v4.332 output ZIP."
+            exit 1
+          fi
+
+          echo "Finding v4.324 source packet ZIP..."
+          INPUT_324_ZIP="$(ls tairid-v4-324-sdss-rsd-numeric-baseline-parameter-source-packet-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_324_ZIP" ]; then
+            echo "Could not find v4.324 source packet ZIP."
+            echo "This file is needed so v4.333 can attach source URLs and quote/context windows to the accepted candidate IDs."
+            exit 1
+          fi
+
+          echo "Using v4.332 ZIP:"
+          echo "$INPUT_332_ZIP"
+
+          echo "Using v4.324 ZIP:"
+          echo "$INPUT_324_ZIP"
+
+          echo "INPUT_332_ZIP=$INPUT_332_ZIP" >> "$GITHUB_ENV"
+          echo "INPUT_324_ZIP=$INPUT_324_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.333 source context fill guide script
+        run: |
+          cat > run_v4_333_parameter_source_context_fill_guide_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def all_blank(series):
+              return series.apply(clean).eq("").all()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def main():
+              input_332 = Path(os.environ["INPUT_332_ZIP"])
+              input_324 = Path(os.environ["INPUT_324_ZIP"])
+
+              outdir = Path("tairid_v4_333_parameter_source_context_fill_guide_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base332 = extract_zip(input_332, "tairid_v4_333_332_")
+              base324 = extract_zip(input_324, "tairid_v4_333_324_")
+
+              summary332_path = find_one(base332, "v4_332_summary.json")
+              value_template_path = find_one(base332, "v4_332_PARAMETER_VALUE_REVIEW_TEMPLATE_FILLABLE_NO_APPROVAL_NO_SCORING.csv")
+              source_trace_path = find_one(base332, "v4_332_accepted_source_trace_for_value_review_no_approval.csv")
+              gaps332_path = find_one(base332, "v4_332_open_gap_status_update_no_scoring.csv")
+              blocked332_path = find_one(base332, "v4_332_input_blocked_gates_preserved.csv")
+              ruled332_path = find_one(base332, "v4_332_input_ruled_out_claims_preserved.csv")
+
+              summary324_path = find_one(base324, "v4_324_summary.json")
+              human324_path = find_one(base324, "SDSS_RSD_NUMERIC_BASELINE_PARAMETER_HUMAN_REVIEW_PACKET_v4_324_NO_APPROVAL.csv")
+              source324_path = find_one(base324, "SDSS_RSD_NUMERIC_BASELINE_PARAMETER_SOURCE_PACKET_v4_324_NO_APPROVAL.csv")
+
+              summary332 = json.loads(summary332_path.read_text())
+              summary324 = json.loads(summary324_path.read_text())
+
+              value_template = pd.read_csv(value_template_path)
+              source_trace = pd.read_csv(source_trace_path)
+              gaps332 = pd.read_csv(gaps332_path)
+              blocked332 = pd.read_csv(blocked332_path)
+              ruled332 = pd.read_csv(ruled332_path)
+              human324 = pd.read_csv(human324_path)
+              source324 = pd.read_csv(source324_path)
+
+              # Attach source URL and quote/context from v4.324 to the accepted v4.332 candidate IDs.
+              merged = source_trace.merge(
+                  human324,
+                  left_on=["question_id", "accepted_candidate_id"],
+                  right_on=["question_id", "candidate_id"],
+                  how="left",
+                  suffixes=("_trace", "_v4_324")
+              )
+
+              # Fallback join by candidate ID only if a row did not match the human review packet.
+              fallback = source324.set_index("candidate_id")
+              for idx, row in merged.iterrows():
+                  cid = clean(row.get("accepted_candidate_id", ""))
+                  if clean(row.get("source_url", "")) == "" and cid in fallback.index:
+                      frow = fallback.loc[cid]
+                      for col in ["candidate_class", "source_url", "candidate_quote_available", "candidate_quote_window", "candidate_use"]:
+                          if col in fallback.columns:
+                              merged.at[idx, col] = frow[col]
+
+              merged["source_context_found"] = merged["source_url"].apply(clean) != ""
+              merged["quote_context_found"] = merged["candidate_quote_window"].apply(clean) != ""
+              merged["v4_333_scope"] = "source_context_fill_guide_only_no_value_approval_no_scoring"
+              merged["value_extracted_now"] = False
+              merged["value_approved_now"] = False
+              merged["baseline_approved_now"] = False
+              merged["observed_values_loaded"] = False
+              merged["definition_match_confirmed"] = False
+              merged["score_valid"] = False
+              merged["support_allowed"] = False
+              merged["claim_boundary"] = TRUTH_BOUNDARY
+
+              fill_rows = []
+              for _, row in value_template.iterrows():
+                  review_id = clean(row["v4_332_review_id"])
+                  qid = clean(row["question_id"])
+                  param = clean(row["parameter_or_method"])
+                  subset = merged[merged["v4_332_review_id"] == review_id].copy()
+
+                  source_urls = "|".join(sorted(set([clean(x) for x in subset["source_url"].tolist() if clean(x)])))
+                  accepted_ids = "|".join([clean(x) for x in subset["accepted_candidate_id"].tolist() if clean(x)])
+                  quote_blocks = []
+                  for _, srow in subset.iterrows():
+                      cid = clean(srow["accepted_candidate_id"])
+                      url = clean(srow.get("source_url", ""))
+                      quote = clean(srow.get("candidate_quote_window", ""))
+                      quote_blocks.append(f"{cid} :: {url} :: {quote[:1200]}")
+
+                  if param in ["omega_m0", "sigma8_0", "growth_index_gamma"]:
+                      extraction_task = "Find the exact candidate numeric value text in the accepted source context. Do not approve it yet."
+                  else:
+                      extraction_task = "Find the exact method or policy context text. Do not approve it as a numeric value."
+
+                  fill_rows.append({
+                      "v4_333_fill_id": f"v4_333_fill_{len(fill_rows)+1:03d}",
+                      "v4_332_review_id": review_id,
+                      "question_id": qid,
+                      "parameter_or_method": param,
+                      "review_kind": clean(row["v4_332_review_kind"]),
+                      "accepted_candidate_ids_for_review": accepted_ids,
+                      "source_urls_for_review": source_urls,
+                      "source_context_blocks_for_human_review": "\n---\n".join(quote_blocks),
+                      "human_extraction_task": extraction_task,
+
+                      "source_quote_for_value_or_context": "",
+                      "source_page_or_section": "",
+                      "candidate_value_text_as_written_in_source": "",
+                      "candidate_numeric_value_to_review_later": "",
+                      "candidate_units_or_definition": "",
+                      "candidate_uncertainty_text_if_any": "",
+                      "candidate_prior_or_model_context": "",
+
+                      "human_value_review_decision": "",
+                      "allowed_human_value_review_decisions": "advance_value_candidate_to_later_baseline_review|needs_exact_quote|needs_better_source|reject_value_candidate|context_only_not_value|keep_blocked",
+                      "human_reviewer_note": "",
+
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              fill_guide = pd.DataFrame(fill_rows)
+
+              checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_333_CHECK_001",
+                      "human_check": "Does the attached source context directly contain the value or method context being reviewed?",
+                      "required": True,
+                  },
+                  {
+                      "check_id": "V4_333_CHECK_002",
+                      "human_check": "Is the exact quoted source text copied before any later value acceptance?",
+                      "required": True,
+                  },
+                  {
+                      "check_id": "V4_333_CHECK_003",
+                      "human_check": "Is the candidate value kept unapproved in this step?",
+                      "required": True,
+                  },
+                  {
+                      "check_id": "V4_333_CHECK_004",
+                      "human_check": "Is the numeric baseline still blocked?",
+                      "required": True,
+                  },
+                  {
+                      "check_id": "V4_333_CHECK_005",
+                      "human_check": "Are observed SDSS RSD values still not loaded?",
+                      "required": True,
+                  },
+                  {
+                      "check_id": "V4_333_CHECK_006",
+                      "human_check": "Are all support claims still blocked?",
+                      "required": True,
+                  },
+              ])
+
+              markdown = []
+              markdown.append("# TAIRID v4.333 Parameter Source Context Fill Guide — No Scoring")
+              markdown.append("")
+              markdown.append(f"Truth boundary: `{TRUTH_BOUNDARY}`")
+              markdown.append("")
+              markdown.append("This packet joins the accepted v4.332 source-candidate IDs back to the v4.324 source URLs and quote/context windows.")
+              markdown.append("")
+              markdown.append("It does not approve parameter values, approve a numeric baseline, load observed SDSS RSD values, compute scores, or make support claims.")
+              markdown.append("")
+
+              for _, row in fill_guide.iterrows():
+                  markdown.append(f"## {row['question_id']} — {row['parameter_or_method']}")
+                  markdown.append("")
+                  markdown.append(f"Accepted candidate IDs: `{row['accepted_candidate_ids_for_review']}`")
+                  markdown.append("")
+                  markdown.append(f"Source URLs: `{row['source_urls_for_review']}`")
+                  markdown.append("")
+                  markdown.append(f"Human extraction task: {row['human_extraction_task']}")
+                  markdown.append("")
+                  markdown.append("Source context blocks:")
+                  markdown.append("")
+                  markdown.append("```text")
+                  markdown.append(row["source_context_blocks_for_human_review"][:3500])
+                  markdown.append("```")
+                  markdown.append("")
+
+              hard_checks = {
+                  "input_v4_332_summary_found": summary332.get("version") == "v4.332",
+                  "input_v4_332_rules_30_of_30": summary332.get("rules_passed") == 30 and summary332.get("rules_total") == 30,
+                  "input_v4_332_failed_gates_none": summary332.get("failed_gates") == "none",
+                  "input_v4_332_no_parameter_approval": summary332.get("parameter_values_approved") is False,
+                  "input_v4_332_no_numeric_baseline_approval": summary332.get("numeric_baseline_values_filled") is False and summary332.get("approved_baseline_values") == 0,
+                  "input_v4_332_no_observed_values_loaded": summary332.get("observed_values_loaded") is False,
+                  "input_v4_332_no_definition_match_confirmed": summary332.get("definition_match_confirmed") is False,
+                  "input_v4_332_no_score_valid": summary332.get("score_valid") is False,
+                  "input_v4_332_no_support_allowed": summary332.get("support_allowed") is False,
+
+                  "input_v4_324_summary_found": summary324.get("version") == "v4.324",
+                  "input_v4_324_rules_8_of_8": summary324.get("rules_passed") == 8 and summary324.get("rules_total") == 8,
+                  "input_v4_324_no_scoring": summary324.get("score_valid") is False,
+                  "input_v4_324_no_support": summary324.get("support_allowed") is False,
+
+                  "value_template_rows_equal_6": len(value_template) == 6,
+                  "source_trace_rows_equal_18": len(source_trace) == 18,
+                  "human324_rows_equal_24": len(human324) == 24,
+                  "source324_rows_equal_48": len(source324) == 48,
+                  "merged_source_detail_rows_equal_18": len(merged) == 18,
+                  "all_source_context_found": merged["source_context_found"].astype(bool).all(),
+                  "all_quote_context_found": merged["quote_context_found"].astype(bool).all(),
+
+                  "fill_guide_rows_equal_6": len(fill_guide) == 6,
+                  "fill_guide_value_fields_blank": all_blank(fill_guide["candidate_numeric_value_to_review_later"]),
+                  "fill_guide_value_text_fields_blank": all_blank(fill_guide["candidate_value_text_as_written_in_source"]),
+                  "fill_guide_human_decisions_blank": all_blank(fill_guide["human_value_review_decision"]),
+
+                  "fill_guide_parameter_value_approved_false": false_col(fill_guide, "parameter_value_approved_now"),
+                  "fill_guide_numeric_baseline_approved_false": false_col(fill_guide, "numeric_baseline_approved_now"),
+                  "fill_guide_observed_values_loaded_false": false_col(fill_guide, "observed_values_loaded"),
+                  "fill_guide_definition_match_confirmed_false": false_col(fill_guide, "definition_match_confirmed"),
+                  "fill_guide_score_valid_false": false_col(fill_guide, "score_valid"),
+                  "fill_guide_support_allowed_false": false_col(fill_guide, "support_allowed"),
+
+                  "checklist_rows_equal_6": len(checklist) == 6,
+                  "open_gaps_preserved": len(gaps332) >= 7,
+                  "blocked_gates_preserved": len(blocked332) >= 6,
+                  "ruled_out_preserved": len(ruled332) >= 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary333 = {
+                  "version": "v4.333",
+                  "route_name": "v4_333_parameter_source_context_fill_guide_no_scoring",
+                  "expected_result": "v4_333_parameter_source_context_fill_guide_no_scoring_passed_no_claims",
+                  "input_versions": "v4.332|v4.324",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+
+                  "value_template_rows": int(len(value_template)),
+                  "source_trace_rows": int(len(source_trace)),
+                  "source_context_detail_rows": int(len(merged)),
+                  "fill_guide_rows": int(len(fill_guide)),
+
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "v4_334_human_parameter_value_extraction_template_no_value_approval_no_observed_scoring",
+              }
+
+              merged.to_csv(outdir / "v4_333_accepted_source_context_detail_rows_no_value_approval_no_scoring.csv", index=False)
+              fill_guide.to_csv(outdir / "v4_333_FILLABLE_parameter_value_context_review_with_source_quotes_NO_APPROVAL_NO_SCORING.csv", index=False)
+              checklist.to_csv(outdir / "v4_333_human_value_extraction_checklist.csv", index=False)
+              value_template.to_csv(outdir / "v4_333_input_v4_332_value_template_preserved.csv", index=False)
+              source_trace.to_csv(outdir / "v4_333_input_v4_332_source_trace_preserved.csv", index=False)
+              gaps332.to_csv(outdir / "v4_333_input_open_gaps_preserved.csv", index=False)
+              blocked332.to_csv(outdir / "v4_333_input_blocked_gates_preserved.csv", index=False)
+              ruled332.to_csv(outdir / "v4_333_input_ruled_out_claims_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_333_rule_checks.csv", index=False)
+
+              (outdir / "v4_333_human_fill_guide.md").write_text("\n".join(markdown))
+              (outdir / "v4_333_summary.json").write_text(json.dumps(summary333, indent=2))
+
+              summary_md = f"""# TAIRID v4.333 Parameter Source Context Fill Guide — No Scoring
+
+          Expected result: `{summary333["expected_result"]}`
+
+          {summary333["rules_passed"]} / {summary333["rules_total"]} rules passed
+
+          failed_gates = {summary333["failed_gates"]}
+
+          source_context_detail_rows = {summary333["source_context_detail_rows"]}
+
+          fill_guide_rows = {summary333["fill_guide_rows"]}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This packet attaches v4.324 source URLs and quote/context windows to the accepted v4.332 candidate IDs so a human can extract candidate value text later.
+
+          It does **not** approve parameter values.
+
+          It does **not** approve a numeric baseline.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary333["selected_next_route"]}`
+          """
+              (outdir / "v4_333_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary333, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_333_parameter_source_context_fill_guide_no_scoring.py
+
+      - name: Run v4.333 parameter source context fill guide no scoring
+        run: |
+          python run_v4_333_parameter_source_context_fill_guide_no_scoring.py
+
+      - name: Upload v4.333 parameter source context fill guide artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-333-parameter-source-context-fill-guide-no-scoring-output
+          path: |
+            tairid_v4_333_parameter_source_context_fill_guide_no_scoring_output/
+            tairid_v4_333_parameter_source_context_fill_guide_no_scoring_output.zip
