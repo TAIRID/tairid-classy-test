@@ -1,0 +1,337 @@
+name: "!!! AAA CURRENT - TAIRID v4.328B dynamic candidate decision draft no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-328b-candidate-decision-draft-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.328B dynamic decision draft no scoring"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.327 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.327 output ZIP by pattern..."
+          INPUT_327_ZIP="$(ls tairid-v4-327-sdss-rsd-human-decision-fill-guide-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_327_ZIP" ]; then
+            echo "Could not find v4.327 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-327-sdss-rsd-human-decision-fill-guide-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Found v4.327 ZIP:"
+          echo "$INPUT_327_ZIP"
+
+          echo "INPUT_327_ZIP=$INPUT_327_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.328B dynamic decision draft script
+        run: |
+          cat > run_v4_328b_dynamic_decision_draft_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          from pathlib import Path
+          import pandas as pd
+          import os
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_series(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.lower().isin(["false", "0", "", "nan"]).all()
+
+          def choose_candidate_ids(subset: pd.DataFrame) -> str:
+              if subset.empty:
+                  return ""
+
+              work = subset.copy()
+
+              if "candidate_quote_window_short" in work.columns:
+                  work["quote_len"] = work["candidate_quote_window_short"].apply(lambda x: len(clean(x)))
+              elif "candidate_quote_window" in work.columns:
+                  work["quote_len"] = work["candidate_quote_window"].apply(lambda x: len(clean(x)))
+              else:
+                  work["quote_len"] = 0
+
+              work = work.sort_values(["quote_len", "candidate_id"], ascending=[False, True])
+              ids = [clean(x) for x in work["candidate_id"].tolist() if clean(x)]
+
+              return "|".join(ids[:3])
+
+          def main():
+              input_327 = Path(os.environ["INPUT_327_ZIP"])
+
+              outdir = Path("tairid_v4_328b_sdss_rsd_dynamic_candidate_decision_draft_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base327 = extract_zip(input_327, "tairid_v4_328b_327_")
+
+              summary327_path = find_one(base327, "v4_327_summary.json")
+              decision_template_path = find_one(base327, "v4_327_copy_of_blank_decision_template_to_fill_no_values.csv")
+              guide_rows_path = find_one(base327, "v4_327_human_decision_fill_guide_candidate_rows_no_scoring.csv")
+
+              summary327 = json.loads(summary327_path.read_text())
+              decision_template = pd.read_csv(decision_template_path)
+              guide_rows = pd.read_csv(guide_rows_path)
+
+              for col in ["human_decision", "human_selected_candidate_ids", "human_answer_summary_no_values", "reviewer_note"]:
+                  if col not in decision_template.columns:
+                      decision_template[col] = ""
+
+              official_human_decision_blank = (decision_template["human_decision"].apply(clean) == "").all()
+              official_selected_blank = (decision_template["human_selected_candidate_ids"].apply(clean) == "").all()
+
+              proposal_rows = []
+
+              for _, row in decision_template.iterrows():
+                  qid = row["question_id"]
+                  param = row["parameter_or_method"]
+                  subset = guide_rows[guide_rows["question_id"] == qid].copy()
+                  proposed_candidate_ids = choose_candidate_ids(subset)
+
+                  if proposed_candidate_ids:
+                      proposed_decision = "select_candidate_for_later_value_review"
+                      reason = (
+                          "Dynamic v4.328B draft: candidate IDs were selected from the actual v4.327 packet "
+                          "because they contain available source/context rows for later human review. "
+                          "This is not value approval and not numeric-baseline approval."
+                      )
+                  else:
+                      proposed_decision = "needs_better_source"
+                      reason = (
+                          "Dynamic v4.328B draft: no usable candidate source rows were found in the actual packet, "
+                          "so this question should not move forward without better source material."
+                      )
+
+                  available_ids = set(clean(x) for x in subset["candidate_id"].tolist() if clean(x))
+                  proposed_ids = set(x for x in proposed_candidate_ids.split("|") if x)
+                  proposed_ids_available = proposed_ids.issubset(available_ids)
+
+                  proposal_rows.append({
+                      "question_id": qid,
+                      "parameter_or_method": param,
+                      "review_question": row["review_question"],
+                      "official_human_decision_still_blank": clean(row["human_decision"]) == "",
+                      "official_human_selected_candidate_ids_still_blank": clean(row["human_selected_candidate_ids"]) == "",
+                      "proposed_decision_for_human_review_only": proposed_decision,
+                      "proposed_candidate_ids_for_human_review_only": proposed_candidate_ids,
+                      "proposed_ids_available_in_actual_packet": proposed_ids_available,
+                      "available_candidate_ids_from_actual_packet": "|".join(sorted(available_ids)),
+                      "reason_no_values_no_scoring": reason,
+                      "copy_this_to_human_decision_only_if_human_agrees": proposed_decision,
+                      "copy_this_to_human_selected_candidate_ids_only_if_human_agrees": proposed_candidate_ids,
+                      "copy_this_to_human_answer_summary_no_values_only_if_human_agrees": reason,
+                      "draft_scope": "dynamic_proposal_only_not_approval_no_values_no_scoring",
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                  })
+
+              proposal_df = pd.DataFrame(proposal_rows)
+
+              human_edit_helper = decision_template.copy()
+              human_edit_helper["suggested_human_decision_not_approved"] = proposal_df["proposed_decision_for_human_review_only"]
+              human_edit_helper["suggested_human_selected_candidate_ids_not_approved"] = proposal_df["proposed_candidate_ids_for_human_review_only"]
+              human_edit_helper["suggested_human_answer_summary_no_values_not_approved"] = proposal_df["reason_no_values_no_scoring"]
+              human_edit_helper["warning"] = "Suggestions only. Human must review before copying into official human_decision fields. No values, no scoring, no support claims."
+
+              markdown = []
+              markdown.append("# TAIRID v4.328B Dynamic Candidate Decision Draft — No Scoring")
+              markdown.append("")
+              markdown.append("This packet uses the actual candidate IDs found inside the v4.327 packet. It does not hard-code candidate IDs.")
+              markdown.append("")
+              markdown.append("This is not parameter approval, not numeric-baseline approval, not observed scoring, and not a support claim.")
+              markdown.append("")
+              markdown.append(f"Truth boundary: {TRUTH_BOUNDARY}.")
+              markdown.append("")
+
+              for _, prow in proposal_df.iterrows():
+                  markdown.append(f"## {prow['question_id']} — {prow['parameter_or_method']}")
+                  markdown.append("")
+                  markdown.append(f"Suggested decision: `{prow['proposed_decision_for_human_review_only']}`")
+                  markdown.append("")
+                  markdown.append(f"Suggested candidate IDs: `{prow['proposed_candidate_ids_for_human_review_only']}`")
+                  markdown.append("")
+                  markdown.append(f"Available candidate IDs: `{prow['available_candidate_ids_from_actual_packet']}`")
+                  markdown.append("")
+                  markdown.append(f"Reason: {prow['reason_no_values_no_scoring']}")
+                  markdown.append("")
+
+              rules = []
+
+              def add(gate, passed):
+                  rules.append({"gate": gate, "passed": bool(passed)})
+
+              add("input_v4_327_summary_found", summary327.get("version") == "v4.327")
+              add("input_v4_327_rules_passed_17_of_17", summary327.get("rules_passed") == 17 and summary327.get("rules_total") == 17)
+              add("input_v4_327_failed_gates_none", summary327.get("failed_gates") == "none")
+              add("input_v4_327_no_parameter_approval", summary327.get("parameter_values_approved") is False)
+              add("input_v4_327_no_numeric_baseline_approval", summary327.get("numeric_baseline_values_filled") is False and summary327.get("approved_baseline_values") == 0)
+              add("input_v4_327_no_observed_values_loaded", summary327.get("observed_values_loaded") is False)
+              add("input_v4_327_no_definition_match_confirmed", summary327.get("definition_match_confirmed") is False)
+              add("input_v4_327_no_scoring", summary327.get("score_valid") is False)
+              add("input_v4_327_no_support_allowed", summary327.get("support_allowed") is False)
+              add("decision_template_rows_equal_6", len(decision_template) == 6)
+              add("guide_candidate_rows_equal_24", len(guide_rows) == 24)
+              add("proposal_rows_equal_6", len(proposal_df) == 6)
+              add("official_human_decisions_remain_blank", official_human_decision_blank)
+              add("official_human_selected_candidate_ids_remain_blank", official_selected_blank)
+              add("all_proposed_ids_exist_in_actual_packet", proposal_df["proposed_ids_available_in_actual_packet"].all())
+              add("all_proposals_are_allowed_source_triage_decisions", proposal_df["proposed_decision_for_human_review_only"].isin(["select_candidate_for_later_value_review", "needs_better_source", "reject_all", "keep_blocked"]).all())
+              add("proposal_parameter_value_approval_false", not proposal_df["parameter_value_approved_now"].any())
+              add("proposal_numeric_baseline_approval_false", not proposal_df["numeric_baseline_approved_now"].any())
+              add("proposal_observed_values_loaded_false", not proposal_df["observed_values_loaded"].any())
+              add("proposal_definition_match_confirmed_false", not proposal_df["definition_match_confirmed"].any())
+              add("proposal_score_valid_false", not proposal_df["score_valid"].any())
+              add("proposal_support_allowed_false", not proposal_df["support_allowed"].any())
+              add("decision_template_parameter_value_approval_false", false_series(decision_template, "parameter_value_approval_allowed_now"))
+              add("decision_template_numeric_baseline_approval_false", false_series(decision_template, "numeric_baseline_approval_allowed_now"))
+              add("decision_template_score_allowed_false", false_series(decision_template, "score_allowed"))
+              add("decision_template_support_allowed_false", false_series(decision_template, "support_allowed"))
+
+              rule_checks = pd.DataFrame(rules)
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary328b = {
+                  "version": "v4.328B",
+                  "route_name": "v4_328b_sdss_rsd_dynamic_candidate_decision_draft_no_values_no_scoring",
+                  "expected_result": "v4_328b_sdss_rsd_dynamic_candidate_decision_draft_no_values_no_scoring_passed_no_claims",
+                  "input_version": "v4.327",
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "decision_template_rows": int(len(decision_template)),
+                  "guide_candidate_rows": int(len(guide_rows)),
+                  "proposal_rows": int(len(proposal_df)),
+                  "official_human_decision_rows_filled": 0,
+                  "official_human_decision_rows_blank": int(len(decision_template)),
+                  "proposal_only_rows": int(len(proposal_df)),
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "human_review_accept_or_edit_v4_328b_suggestions_then_v4_329_create_filled_decision_template_no_values_no_scoring",
+              }
+
+              proposal_df.to_csv(outdir / "v4_328b_dynamic_candidate_decision_suggestions_for_human_review_only_no_values_no_scoring.csv", index=False)
+              human_edit_helper.to_csv(outdir / "v4_328b_human_edit_helper_with_dynamic_suggestions_NOT_APPROVED_no_values_no_scoring.csv", index=False)
+              decision_template.to_csv(outdir / "v4_328b_official_blank_decision_template_preserved_no_values_no_scoring.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_328b_rule_checks.csv", index=False)
+              (outdir / "v4_328b_dynamic_candidate_decision_draft.md").write_text("\n".join(markdown))
+              (outdir / "v4_328b_summary.json").write_text(json.dumps(summary328b, indent=2))
+
+              summary_md = f"""# TAIRID v4.328B Dynamic Candidate Decision Draft No Scoring
+
+              Expected result: `{summary328b["expected_result"]}`
+
+              {summary328b["rules_passed"]} / {summary328b["rules_total"]} rules passed
+
+              failed_gates = {summary328b["failed_gates"]}
+
+              proposal_rows = {summary328b["proposal_rows"]}
+
+              official_human_decision_rows_filled = 0
+
+              Truth boundary: {TRUTH_BOUNDARY}.
+
+              This step created dynamic source-candidate decision suggestions for human review only. It did not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.
+
+              Next route: `{summary328b["selected_next_route"]}`
+              """
+              (outdir / "v4_328b_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary328b, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_328b_dynamic_decision_draft_no_scoring.py
+
+      - name: Run v4.328B dynamic candidate decision draft no scoring
+        run: |
+          python run_v4_328b_dynamic_decision_draft_no_scoring.py
+
+      - name: Upload v4.328B no-scoring output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-328b-sdss-rsd-dynamic-candidate-decision-draft-no-values-no-scoring-output
+          path: |
+            tairid_v4_328b_sdss_rsd_dynamic_candidate_decision_draft_no_scoring_output/
+            tairid_v4_328b_sdss_rsd_dynamic_candidate_decision_draft_no_scoring_output.zip
