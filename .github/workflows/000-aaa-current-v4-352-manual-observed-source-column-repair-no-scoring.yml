@@ -1,0 +1,434 @@
+name: "!!! AAA CURRENT - TAIRID v4.352 manual observed source column repair no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-352-manual-observed-source-column-repair-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.352 manual column repair packet"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.351 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.351 output ZIP by pattern..."
+          INPUT_351_ZIP="$(ls tairid-v4-351-schema-review-ingest-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_351_ZIP" ]; then
+            echo "Could not find v4.351 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-351-schema-review-ingest-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.351 ZIP:"
+          echo "$INPUT_351_ZIP"
+          echo "INPUT_351_ZIP=$INPUT_351_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.352 manual column repair script
+        run: |
+          cat > run_v4_352_manual_observed_source_column_repair_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; manual observed-source column repair may be prepared here; no observed values loaded; no scoring; no support claims"
+
+          REQUIRED_SCHEMA_FIELDS = [
+              "survey_or_source",
+              "tracer_or_sample",
+              "redshift_z",
+              "observed_fsigma8",
+              "observed_fsigma8_uncertainty",
+              "covariance_or_error_model",
+              "source_reference",
+          ]
+
+          ALLOWED_REPAIR_DECISIONS = (
+              "approve_manual_column_mapping_for_later_schema_approval|"
+              "provide_better_source_file|"
+              "needs_manual_column_mapping|"
+              "reject_source_file|"
+              "keep_blocked"
+          )
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def main():
+              input_351 = Path(os.environ["INPUT_351_ZIP"])
+
+              outdir = Path("tairid_v4_352_manual_observed_source_column_repair_no_values_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base351 = extract_zip(input_351, "tairid_v4_352_351_")
+
+              summary351_path = find_one(base351, "v4_351_summary.json")
+              ingest_path = find_one(base351, "v4_351_schema_review_ingest_ledger_NO_VALUES_NO_SCORING.csv")
+              needs_manual_path = find_one(base351, "v4_351_needs_manual_column_mapping_rows.csv")
+              header_probe_path = find_one(base351, "v4_351_input_header_probe_preserved.csv")
+              gap_status_path = find_one(base351, "v4_351_gap_status_after_schema_review_ingest.csv")
+              rules351_path = find_one(base351, "v4_351_rule_checks.csv")
+
+              summary351 = json.loads(summary351_path.read_text())
+              ingest = pd.read_csv(ingest_path)
+              needs_manual = pd.read_csv(needs_manual_path)
+              header_probe = pd.read_csv(header_probe_path)
+              gap_status = pd.read_csv(gap_status_path)
+              rules351 = pd.read_csv(rules351_path)
+
+              repair_rows = []
+
+              for _, row in needs_manual.iterrows():
+                  repo_path = clean(row["repo_path"])
+                  file_name = clean(row["file_name"])
+
+                  matching_headers = header_probe[
+                      header_probe["file_name"].apply(clean) == file_name
+                  ].copy()
+
+                  header_columns = ""
+                  header_columns_found = 0
+                  if len(matching_headers) > 0:
+                      header_columns = clean(matching_headers.iloc[0].get("header_columns_pipe", ""))
+                      try:
+                          header_columns_found = int(matching_headers.iloc[0].get("header_columns_found", 0))
+                      except Exception:
+                          header_columns_found = 0
+
+                  repair_rows.append({
+                      "v4_352_repair_id": f"v4_352_manual_column_repair_{len(repair_rows)+1:03d}",
+                      "v4_351_schema_ingest_id": clean(row["v4_351_schema_ingest_id"]),
+                      "v4_350_schema_map_id": clean(row["v4_350_schema_map_id"]),
+                      "source_inventory_id": clean(row["source_inventory_id"]),
+                      "repo_path": repo_path,
+                      "file_name": file_name,
+                      "source_class": clean(row["source_class"]),
+                      "prior_human_schema_review_decision": clean(row["human_schema_review_decision"]),
+                      "prior_human_schema_review_note": clean(row["human_schema_review_note"]),
+                      "header_columns_found": header_columns_found,
+                      "header_columns_pipe": header_columns,
+
+                      "repair_problem": "candidate_source_needs_manual_column_mapping_or_better_direct_observed_value_file",
+                      "required_fields": "|".join(REQUIRED_SCHEMA_FIELDS),
+
+                      "human_repaired_survey_or_source_column": "",
+                      "human_repaired_tracer_or_sample_column": "",
+                      "human_repaired_redshift_z_column": "",
+                      "human_repaired_observed_fsigma8_column": "",
+                      "human_repaired_observed_fsigma8_uncertainty_column": "",
+                      "human_repaired_covariance_or_error_model": "",
+                      "human_repaired_source_reference_column": "",
+
+                      "human_better_source_file_name_if_needed": "",
+                      "human_better_source_repo_path_if_needed": "",
+                      "human_repair_decision": "",
+                      "allowed_human_repair_decisions": ALLOWED_REPAIR_DECISIONS,
+                      "human_repair_note": "",
+
+                      "repair_packet_status": "human_fill_needed_no_values_loaded",
+                      "schema_approved_now": False,
+                      "observed_values_loaded": False,
+                      "observed_rows_loaded": 0,
+                      "definition_match_confirmed": False,
+                      "covariance_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              repair_packet = pd.DataFrame(repair_rows)
+
+              required_field_matrix = pd.DataFrame([
+                  {
+                      "required_field": field,
+                      "why_needed": {
+                          "survey_or_source": "Needed to identify the source/survey family.",
+                          "tracer_or_sample": "Needed to distinguish LRG/ELG/QSO/BOSS/eBOSS/etc.",
+                          "redshift_z": "Needed to compare baseline prediction to observed redshift location.",
+                          "observed_fsigma8": "Needed as the observed RSD growth measurement.",
+                          "observed_fsigma8_uncertainty": "Needed before residual/chi-square scoring can be considered.",
+                          "covariance_or_error_model": "Needed before any valid scoring or likelihood claim.",
+                          "source_reference": "Needed for audit trail and reproducibility.",
+                      }.get(field, "Required before observed value loading."),
+                      "filled_now": False,
+                      "observed_values_loaded": False,
+                      "score_valid": False,
+                  }
+                  for field in REQUIRED_SCHEMA_FIELDS
+              ])
+
+              repair_checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_352_CHECK_001",
+                      "check": "Can the existing candidate file be mapped to redshift, fσ8, uncertainty, and source fields?",
+                      "required_before_schema_approval": True,
+                  },
+                  {
+                      "check_id": "V4_352_CHECK_002",
+                      "check": "If the existing file is only a citation/manual-answer file, is a better observed-value table needed?",
+                      "required_before_schema_approval": True,
+                  },
+                  {
+                      "check_id": "V4_352_CHECK_003",
+                      "check": "Does the human repair decision avoid loading observed rows in this step?",
+                      "required_before_schema_approval": True,
+                  },
+                  {
+                      "check_id": "V4_352_CHECK_004",
+                      "check": "Are definition and covariance matching still blocked?",
+                      "required_before_scoring": True,
+                  },
+                  {
+                      "check_id": "V4_352_CHECK_005",
+                      "check": "Are scoring and support claims still blocked?",
+                      "required_before_support_claims": True,
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_352_GAP_001",
+                      "gap": "Manual observed-source column repair packet created.",
+                      "status_after_v4_352": "repair_packet_prepared_not_filled",
+                      "next_gate": "human_fill_manual_column_repair_packet",
+                  },
+                  {
+                      "gap_id": "V4_352_GAP_002",
+                      "gap": "Observed source schema remains unapproved.",
+                      "status_after_v4_352": "still_blocked",
+                      "next_gate": "v4_353_manual_column_repair_ingest",
+                  },
+                  {
+                      "gap_id": "V4_352_GAP_003",
+                      "gap": "Observed values remain unloaded.",
+                      "status_after_v4_352": "still_blocked",
+                      "next_gate": "later_observed_value_loading_gate",
+                  },
+                  {
+                      "gap_id": "V4_352_GAP_004",
+                      "gap": "Definition/covariance matching remains unconfirmed.",
+                      "status_after_v4_352": "still_blocked",
+                      "next_gate": "later_definition_covariance_gate",
+                  },
+                  {
+                      "gap_id": "V4_352_GAP_005",
+                      "gap": "Scoring and support claims remain blocked.",
+                      "status_after_v4_352": "still_blocked",
+                      "next_gate": "later_scoring_and_support_gates",
+                  },
+              ])
+
+              repair_packet_rows = int(len(repair_packet))
+              header_available_rows = int((repair_packet["header_columns_found"] > 0).sum()) if repair_packet_rows else 0
+
+              hard_checks = {
+                  "input_v4_351_summary_found": summary351.get("version") == "v4.351",
+                  "input_v4_351_rules_all_passed": summary_rules_all_passed(summary351),
+                  "input_v4_351_failed_gates_none": summary351.get("failed_gates") == "none",
+                  "input_v4_351_readiness_blocked_needs_manual_mapping": summary351.get("readiness_status") == "blocked_needs_manual_column_mapping",
+                  "input_v4_351_parameter_values_approved_true": summary351.get("parameter_values_approved") is True,
+                  "input_v4_351_numeric_baseline_approved_true": summary351.get("numeric_baseline_approved") is True,
+                  "input_v4_351_schema_approved_false": summary351.get("schema_approved") is False,
+                  "input_v4_351_no_observed_values_loaded": summary351.get("observed_values_loaded") is False,
+                  "input_v4_351_no_score_valid": summary351.get("score_valid") is False,
+                  "input_v4_351_no_support_allowed": summary351.get("support_allowed") is False,
+
+                  "rules351_all_passed": rules351["passed"].astype(bool).all(),
+                  "ingest_rows_equal_summary": len(ingest) == int(summary351.get("schema_review_rows")),
+                  "needs_manual_rows_equal_summary": len(needs_manual) == int(summary351.get("needs_manual_mapping_rows")),
+                  "header_probe_has_rows": len(header_probe) >= 1,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+
+                  "repair_packet_rows_equal_needs_manual": len(repair_packet) == len(needs_manual),
+                  "repair_packet_rows_at_least_one": len(repair_packet) >= 1,
+                  "required_field_matrix_rows_equal_7": len(required_field_matrix) == 7,
+                  "repair_checklist_rows_equal_5": len(repair_checklist) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "human_repair_decisions_blank": repair_packet["human_repair_decision"].apply(clean).eq("").all(),
+                  "schema_approved_false": false_col(repair_packet, "schema_approved_now"),
+                  "observed_values_loaded_false": false_col(repair_packet, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(repair_packet, "definition_match_confirmed"),
+                  "covariance_match_confirmed_false": false_col(repair_packet, "covariance_match_confirmed"),
+                  "score_valid_false": false_col(repair_packet, "score_valid"),
+                  "support_allowed_false": false_col(repair_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary352 = {
+                  "version": "v4.352",
+                  "route_name": "v4_352_manual_observed_source_column_repair_packet_no_values_no_scoring",
+                  "expected_result": "v4_352_manual_observed_source_column_repair_packet_passed_no_values_loaded_no_scoring_no_claims",
+                  "input_version": "v4.351",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "repair_packet_rows": repair_packet_rows,
+                  "header_available_rows": header_available_rows,
+                  "parameter_values_approved": True,
+                  "numeric_baseline_values_filled": True,
+                  "approved_baseline_values": 3,
+                  "numeric_baseline_approved": True,
+                  "schema_approved": False,
+                  "observed_values_loaded": False,
+                  "observed_rows_loaded": 0,
+                  "definition_match_confirmed": False,
+                  "covariance_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_352_manual_column_repair_then_v4_353_manual_column_repair_ingest_no_values_no_scoring",
+              }
+
+              repair_packet.to_csv(outdir / "v4_352_HUMAN_FILL_manual_observed_column_repair_packet_NO_VALUES_NO_SCORING.csv", index=False)
+              required_field_matrix.to_csv(outdir / "v4_352_required_observed_schema_field_matrix.csv", index=False)
+              repair_checklist.to_csv(outdir / "v4_352_manual_column_repair_checklist.csv", index=False)
+              gap_update.to_csv(outdir / "v4_352_gap_status_after_manual_column_repair_packet.csv", index=False)
+              needs_manual.to_csv(outdir / "v4_352_input_v4_351_needs_manual_mapping_preserved.csv", index=False)
+              header_probe.to_csv(outdir / "v4_352_input_v4_351_header_probe_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_352_rule_checks.csv", index=False)
+
+              (outdir / "v4_352_summary.json").write_text(json.dumps(summary352, indent=2))
+
+              summary_md = f"""# TAIRID v4.352 Manual Observed Source Column Repair Packet — No Values, No Scoring
+
+          Expected result: `{summary352["expected_result"]}`
+
+          {summary352["rules_passed"]} / {summary352["rules_total"]} rules passed
+
+          failed_gates = {summary352["failed_gates"]}
+
+          repair_packet_rows = {summary352["repair_packet_rows"]}
+
+          header_available_rows = {summary352["header_available_rows"]}
+
+          schema_approved = false
+
+          observed_values_loaded = false
+
+          observed_rows_loaded = 0
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step creates a human-fillable manual column repair packet.
+
+          It does **not** load observed values.
+
+          It does **not** approve the observed schema.
+
+          It does **not** confirm definition or covariance matching.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary352["selected_next_route"]}`
+          """
+              (outdir / "v4_352_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary352, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_352_manual_observed_source_column_repair_no_scoring.py
+
+      - name: Run v4.352 manual observed source column repair no scoring
+        run: |
+          python run_v4_352_manual_observed_source_column_repair_no_scoring.py
+
+      - name: Upload v4.352 manual column repair artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-352-manual-observed-source-column-repair-no-values-no-scoring-output
+          path: |
+            tairid_v4_352_manual_observed_source_column_repair_no_values_no_scoring_output/
+            tairid_v4_352_manual_observed_source_column_repair_no_values_no_scoring_output.zip
