@@ -1,0 +1,525 @@
+name: "!!! AAA CURRENT - TAIRID v4.331C audit and gaps ledger no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-331c-audit-and-gaps-ledger-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.331C audit and gaps ledger"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find corrected v4.330 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Prefer corrected v4.330 output with -1.zip..."
+          if [ -f "tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output-1.zip" ]; then
+            INPUT_330_ZIP="tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output-1.zip"
+          else
+            INPUT_330_ZIP="$(ls tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output*.zip 2>/dev/null | tail -n 1 || true)"
+          fi
+
+          if [ -z "$INPUT_330_ZIP" ]; then
+            echo "Could not find corrected v4.330 output ZIP."
+            exit 1
+          fi
+
+          echo "Using v4.330 ZIP:"
+          echo "$INPUT_330_ZIP"
+          echo "INPUT_330_ZIP=$INPUT_330_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.331C audit and gaps ledger script
+        run: |
+          cat > run_v4_331c_audit_and_gaps_ledger_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import hashlib
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_optional(base: Path, filename: str):
+              matches = list(base.rglob(filename))
+              return matches[0] if matches else None
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def main():
+              input_330 = Path(os.environ["INPUT_330_ZIP"])
+
+              outdir = Path("tairid_v4_331c_audit_and_gaps_ledger_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base330 = extract_zip(input_330, "tairid_v4_331c_330_")
+
+              summary330_path = find_one(base330, "v4_330_summary.json")
+              ledger330_path = find_one(base330, "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv")
+              accepted330_path = find_one(base330, "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv")
+              rules330_path = find_one(base330, "v4_330_rule_checks.csv")
+              summary330_md_path = find_optional(base330, "v4_330_summary.md")
+
+              summary330 = json.loads(summary330_path.read_text())
+              ledger330 = pd.read_csv(ledger330_path)
+              accepted330 = pd.read_csv(accepted330_path)
+              rules330 = pd.read_csv(rules330_path)
+
+              repo = Path(".").resolve()
+
+              repo_manifest_rows = []
+              for p in sorted(repo.rglob("*")):
+                  if ".git" in p.parts or not p.is_file():
+                      continue
+                  rel = str(p.relative_to(repo))
+                  file_type = "other"
+                  if rel.startswith(".github/workflows/") and (rel.endswith(".yml") or rel.endswith(".yaml")):
+                      file_type = "workflow_yaml"
+                  elif p.name.startswith("tairid-v4-") and p.suffix.lower() == ".zip":
+                      file_type = "tairid_output_zip"
+                  elif p.suffix.lower() in [".py", ".csv", ".md", ".json", ".txt"]:
+                      file_type = "supporting_text_file"
+                  repo_manifest_rows.append({
+                      "repo_path": rel,
+                      "file_name": p.name,
+                      "file_type_for_audit": file_type,
+                      "size_bytes": p.stat().st_size,
+                      "sha256": sha256_file(p),
+                  })
+
+              repo_manifest = pd.DataFrame(repo_manifest_rows)
+              workflow_manifest = repo_manifest[repo_manifest["file_type_for_audit"] == "workflow_yaml"].copy()
+              zip_manifest = repo_manifest[repo_manifest["file_type_for_audit"] == "tairid_output_zip"].copy()
+
+              stage_ledger = pd.DataFrame([
+                  {
+                      "stage": "v4.324",
+                      "what_it_did": "Gathered parameter-source candidates and created a fillable human-review source packet.",
+                      "gap_addressed": "Needed source candidates before any parameter value review could be honest.",
+                      "ruled_out_or_blocked": "No parameter values approved; no numeric baseline approved; no observed values loaded; no scoring; no support claims.",
+                      "status": "completed_no_scoring",
+                  },
+                  {
+                      "stage": "v4.325D",
+                      "what_it_did": "Converted source candidates into a stricter human-review packet with six decision rows.",
+                      "gap_addressed": "Separated source-candidate triage from parameter-value approval.",
+                      "ruled_out_or_blocked": "Source candidates were not treated as values or evidence.",
+                      "status": "completed_no_scoring",
+                  },
+                  {
+                      "stage": "v4.326",
+                      "what_it_did": "Checked whether the decision template was filled.",
+                      "gap_addressed": "Prevented ingest before human decisions existed.",
+                      "ruled_out_or_blocked": "Blocked itself when the decision template was blank.",
+                      "status": "completed_blocked_correctly",
+                  },
+                  {
+                      "stage": "v4.327",
+                      "what_it_did": "Built a human decision fill guide.",
+                      "gap_addressed": "Made the six decision rows easier to review without approving values.",
+                      "ruled_out_or_blocked": "No decisions were automatically approved.",
+                      "status": "completed_no_scoring",
+                  },
+                  {
+                      "stage": "v4.328B",
+                      "what_it_did": "Created dynamic candidate-decision suggestions from actual packet IDs.",
+                      "gap_addressed": "Avoided hard-coded candidate IDs and reduced mismatch risk.",
+                      "ruled_out_or_blocked": "Suggestions remained non-approved and non-scoring.",
+                      "status": "completed_no_scoring",
+                  },
+                  {
+                      "stage": "v4.329",
+                      "what_it_did": "Created a proposed-filled decision template.",
+                      "gap_addressed": "Prepared candidate-source decisions for explicit human acceptance.",
+                      "ruled_out_or_blocked": "Proposed fill was marked not human-approved.",
+                      "status": "completed_no_scoring",
+                  },
+                  {
+                      "stage": "v4.330",
+                      "what_it_did": "Recorded human acceptance and ingested six candidate-source decisions for later value review only.",
+                      "gap_addressed": "Closed the acceptance gap before moving to parameter-value review.",
+                      "ruled_out_or_blocked": "Still no parameter values, no baseline approval, no observed values, no scoring, and no support claims.",
+                      "status": "completed_human_accepted_no_scoring",
+                  },
+                  {
+                      "stage": "v4.331C",
+                      "what_it_did": "Builds an external AI audit packet plus ruled-out/open-gaps/blocked-gates ledger.",
+                      "gap_addressed": "Makes the chain auditable by another AI without relying on conversation memory.",
+                      "ruled_out_or_blocked": "Does not advance to value approval or observed scoring.",
+                      "status": "current_no_scoring",
+                  },
+              ])
+
+              ruled_out_ledger = pd.DataFrame([
+                  {
+                      "ruling_id": "RULED_OUT_001",
+                      "ruling": "Source candidates are not parameter approval.",
+                      "why_it_matters": "A source can be relevant without approving a numeric value.",
+                      "current_status": "ruled_out_as_claim",
+                  },
+                  {
+                      "ruling_id": "RULED_OUT_002",
+                      "ruling": "Calculator dry-runs are not numeric baseline approval.",
+                      "why_it_matters": "A working calculator structure does not mean its real comparison values are approved.",
+                      "current_status": "ruled_out_as_claim",
+                  },
+                  {
+                      "ruling_id": "RULED_OUT_003",
+                      "ruling": "Human-accepted candidate-source decisions are not observed SDSS scoring.",
+                      "why_it_matters": "Accepted sources only allow a later value-review packet.",
+                      "current_status": "ruled_out_as_claim",
+                  },
+                  {
+                      "ruling_id": "RULED_OUT_004",
+                      "ruling": "No support claim for TAIRID is allowed from these runs.",
+                      "why_it_matters": "No observed residuals, likelihoods, or scores have been computed.",
+                      "current_status": "ruled_out_as_claim",
+                  },
+                  {
+                      "ruling_id": "RULED_OUT_005",
+                      "ruling": "The chain has not tested TAIRID against SDSS RSD observations yet.",
+                      "why_it_matters": "Everything so far is pre-scoring scaffolding.",
+                      "current_status": "ruled_out_as_claim",
+                  },
+              ])
+
+              open_gaps = pd.DataFrame([
+                  {
+                      "gap_id": "OPEN_GAP_001",
+                      "open_gap": "Approved parameter-value review packet not built yet.",
+                      "needed_before_scoring": True,
+                      "next_possible_stage": "v4.332",
+                  },
+                  {
+                      "gap_id": "OPEN_GAP_002",
+                      "open_gap": "No numeric LCDM baseline has been approved.",
+                      "needed_before_scoring": True,
+                      "next_possible_stage": "later_after_value_review",
+                  },
+                  {
+                      "gap_id": "OPEN_GAP_003",
+                      "open_gap": "Observed SDSS RSD data has not been loaded.",
+                      "needed_before_scoring": True,
+                      "next_possible_stage": "later_observed_data_gate",
+                  },
+                  {
+                      "gap_id": "OPEN_GAP_004",
+                      "open_gap": "Definition matching between observed fσ8 sources and calculator output has not been confirmed.",
+                      "needed_before_scoring": True,
+                      "next_possible_stage": "later_definition_match_gate",
+                  },
+                  {
+                      "gap_id": "OPEN_GAP_005",
+                      "open_gap": "Covariance and uncertainty handling are not approved for scoring.",
+                      "needed_before_scoring": True,
+                      "next_possible_stage": "later_covariance_gate",
+                  },
+                  {
+                      "gap_id": "OPEN_GAP_006",
+                      "open_gap": "Residuals, chi-square, likelihood, p-values, and model scores have not been computed.",
+                      "needed_before_support_claims": True,
+                      "next_possible_stage": "later_scoring_gate",
+                  },
+                  {
+                      "gap_id": "OPEN_GAP_007",
+                      "open_gap": "External AI audit has not yet been completed by another model.",
+                      "needed_before_public_confidence_claims": True,
+                      "next_possible_stage": "external_review",
+                  },
+              ])
+
+              blocked_gates = pd.DataFrame([
+                  {
+                      "gate_id": "BLOCKED_GATE_001",
+                      "gate": "parameter_value_approval",
+                      "current_state": False,
+                      "why_blocked": "Accepted sources exist, but no source-derived values have been reviewed or approved.",
+                  },
+                  {
+                      "gate_id": "BLOCKED_GATE_002",
+                      "gate": "numeric_baseline_approval",
+                      "current_state": False,
+                      "why_blocked": "No approved parameter values have been passed into a baseline builder.",
+                  },
+                  {
+                      "gate_id": "BLOCKED_GATE_003",
+                      "gate": "observed_values_loaded",
+                      "current_state": False,
+                      "why_blocked": "Observed SDSS RSD values are intentionally not loaded before baseline readiness.",
+                  },
+                  {
+                      "gate_id": "BLOCKED_GATE_004",
+                      "gate": "definition_match_confirmed",
+                      "current_state": False,
+                      "why_blocked": "No observed-data comparison definition has been matched yet.",
+                  },
+                  {
+                      "gate_id": "BLOCKED_GATE_005",
+                      "gate": "score_valid",
+                      "current_state": False,
+                      "why_blocked": "No residuals, chi-square, likelihood, or scoring run is permitted yet.",
+                  },
+                  {
+                      "gate_id": "BLOCKED_GATE_006",
+                      "gate": "support_allowed",
+                      "current_state": False,
+                      "why_blocked": "Support claims require observed scoring and later interpretation gates.",
+                  },
+              ])
+
+              external_ai_questions = pd.DataFrame([
+                  {
+                      "audit_question_id": "AI_AUDIT_001",
+                      "question": "Does this packet show that candidate-source decisions were human accepted in v4.330?",
+                      "expected_answer": "yes",
+                      "evidence": "v4_330_summary.json and v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_002",
+                      "question": "Does this packet approve any parameter values?",
+                      "expected_answer": "no",
+                      "evidence": "v4_330_summary.json, blocked gates ledger, and ruled-out ledger",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_003",
+                      "question": "Does this packet approve a numeric baseline?",
+                      "expected_answer": "no",
+                      "evidence": "v4_330_summary.json and open gaps ledger",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_004",
+                      "question": "Does this packet load or score observed SDSS RSD data?",
+                      "expected_answer": "no",
+                      "evidence": "v4_330_summary.json and blocked gates ledger",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_005",
+                      "question": "What is the strongest honest conclusion?",
+                      "expected_answer": "Candidate-source decisions were human accepted for later parameter-value review under a no-scoring boundary.",
+                      "evidence": "stage ledger and v4_331c_summary.md",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_006",
+                      "question": "What remains open before any support claim?",
+                      "expected_answer": "Parameter values, numeric baseline, observed data, definition match, covariance, scoring, and external audit.",
+                      "evidence": "open gaps ledger",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_330_version": summary330.get("version") == "v4.330",
+                  "input_v4_330_rules_34_of_34": summary330.get("rules_passed") == 34 and summary330.get("rules_total") == 34,
+                  "input_v4_330_failed_gates_none": summary330.get("failed_gates") == "none",
+                  "human_acceptance_recorded": summary330.get("human_acceptance_recorded") is True,
+                  "accepted_candidate_decision_rows_6": summary330.get("accepted_candidate_decision_rows") == 6,
+                  "parameter_values_approved_false": summary330.get("parameter_values_approved") is False,
+                  "numeric_baseline_values_filled_false": summary330.get("numeric_baseline_values_filled") is False,
+                  "approved_baseline_values_zero": summary330.get("approved_baseline_values") == 0,
+                  "observed_values_loaded_false": summary330.get("observed_values_loaded") is False,
+                  "definition_match_confirmed_false": summary330.get("definition_match_confirmed") is False,
+                  "score_valid_false": summary330.get("score_valid") is False,
+                  "support_allowed_false": summary330.get("support_allowed") is False,
+                  "ledger_rows_6": len(ledger330) == 6,
+                  "rules330_all_passed": rules330["passed"].astype(bool).all(),
+                  "stage_ledger_has_rows": len(stage_ledger) == 8,
+                  "ruled_out_ledger_has_rows": len(ruled_out_ledger) == 5,
+                  "open_gaps_has_rows": len(open_gaps) == 7,
+                  "blocked_gates_has_rows": len(blocked_gates) == 6,
+                  "external_ai_questions_has_rows": len(external_ai_questions) == 6,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary331c = {
+                  "version": "v4.331C",
+                  "route_name": "v4_331c_audit_and_gaps_ledger_no_scoring",
+                  "expected_result": "v4_331c_audit_and_gaps_ledger_no_scoring_passed_no_claims",
+                  "input_version": "v4.330",
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "stage_ledger_rows": int(len(stage_ledger)),
+                  "ruled_out_rows": int(len(ruled_out_ledger)),
+                  "open_gap_rows": int(len(open_gaps)),
+                  "blocked_gate_rows": int(len(blocked_gates)),
+                  "external_ai_questions": int(len(external_ai_questions)),
+                  "repo_manifest_rows": int(len(repo_manifest)),
+                  "workflow_manifest_rows": int(len(workflow_manifest)),
+                  "tairid_zip_manifest_rows": int(len(zip_manifest)),
+                  "human_acceptance_recorded": True,
+                  "accepted_candidate_decision_rows": 6,
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "v4_332_parameter_value_review_packet_from_accepted_sources_no_observed_scoring_no_baseline_approval",
+              }
+
+              readme = f"""# TAIRID v4.331C External AI Audit + Rulings / Open Gaps Ledger
+
+          This packet is for external AI audit.
+
+          Truth boundary:
+
+          `{TRUTH_BOUNDARY}`
+
+          Strongest allowed conclusion:
+
+          `Candidate-source decisions were human accepted for later parameter-value review under a no-values, no-scoring, no-support-claims boundary.`
+
+          Strongest honest criticism:
+
+          `This chain is still pre-evidence and pre-score. It has not approved parameter values, approved a numeric baseline, loaded observed SDSS RSD values, computed residuals, or tested TAIRID against observations.`
+
+          What this packet adds:
+
+          - what we have ruled out
+          - what remains open
+          - what gates are still blocked
+          - what each recent stage addressed
+          - what another AI should check
+          """
+
+              # Copy core v4.330 files.
+              shutil.copy2(summary330_path, outdir / "v4_330_summary.json")
+              if summary330_md_path:
+                  shutil.copy2(summary330_md_path, outdir / "v4_330_summary.md")
+              shutil.copy2(ledger330_path, outdir / "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv")
+              shutil.copy2(accepted330_path, outdir / "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv")
+              shutil.copy2(rules330_path, outdir / "v4_330_rule_checks.csv")
+
+              stage_ledger.to_csv(outdir / "v4_331c_stage_gap_resolution_ledger.csv", index=False)
+              ruled_out_ledger.to_csv(outdir / "v4_331c_ruled_out_claims_ledger.csv", index=False)
+              open_gaps.to_csv(outdir / "v4_331c_open_gaps_ledger.csv", index=False)
+              blocked_gates.to_csv(outdir / "v4_331c_blocked_gates_ledger.csv", index=False)
+              external_ai_questions.to_csv(outdir / "v4_331c_external_ai_audit_questions.csv", index=False)
+              repo_manifest.to_csv(outdir / "v4_331c_repo_manifest_with_sha256.csv", index=False)
+              workflow_manifest.to_csv(outdir / "v4_331c_workflow_manifest.csv", index=False)
+              zip_manifest.to_csv(outdir / "v4_331c_tairid_zip_manifest.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_331c_rule_checks.csv", index=False)
+              (outdir / "EXTERNAL_AI_AUDIT_README_v4_331C.md").write_text(readme)
+              (outdir / "v4_331c_summary.json").write_text(json.dumps(summary331c, indent=2))
+
+              summary_md = f"""# TAIRID v4.331C Audit and Gaps Ledger No Scoring
+
+          Expected result: `{summary331c["expected_result"]}`
+
+          {summary331c["rules_passed"]} / {summary331c["rules_total"]} rules passed
+
+          failed_gates = {summary331c["failed_gates"]}
+
+          human_acceptance_recorded = true
+
+          accepted_candidate_decision_rows = 6
+
+          ruled_out_rows = {summary331c["ruled_out_rows"]}
+
+          open_gap_rows = {summary331c["open_gap_rows"]}
+
+          blocked_gate_rows = {summary331c["blocked_gate_rows"]}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This packet is for external AI audit. It does not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.
+
+          Next route: `{summary331c["selected_next_route"]}`
+          """
+              (outdir / "v4_331c_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary331c, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_331c_audit_and_gaps_ledger_no_scoring.py
+
+      - name: Run v4.331C audit and gaps ledger no scoring
+        run: |
+          python run_v4_331c_audit_and_gaps_ledger_no_scoring.py
+
+      - name: Upload v4.331C audit and gaps ledger artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-331c-audit-and-gaps-ledger-no-scoring-output
+          path: |
+            tairid_v4_331c_audit_and_gaps_ledger_no_scoring_output/
+            tairid_v4_331c_audit_and_gaps_ledger_no_scoring_output.zip
