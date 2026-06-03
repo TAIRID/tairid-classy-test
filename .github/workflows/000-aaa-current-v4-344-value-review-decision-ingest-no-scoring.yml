@@ -1,0 +1,404 @@
+name: "!!! AAA CURRENT - TAIRID v4.344 value review decision ingest no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-344-value-review-decision-ingest-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.344 value review decision ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.343 output ZIP and human-filled value review ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.343 output ZIP..."
+          INPUT_343_ZIP="$(ls tairid-v4-343-value-candidate-review-packet-no-approval-no-baseline-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_343_ZIP" ]; then
+            echo "Could not find v4.343 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-343-value-candidate-review-packet-no-approval-no-baseline-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled value review ZIP..."
+          HUMAN_FILLED_VALUE_REVIEW_ZIP="$(ls tairid-v4-343-human-filled-value-candidate-review-for-v4-344-no-approval-no-scoring*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$HUMAN_FILLED_VALUE_REVIEW_ZIP" ]; then
+            echo "Could not find human-filled value review ZIP."
+            echo "Expected:"
+            echo "tairid-v4-343-human-filled-value-candidate-review-for-v4-344-no-approval-no-scoring.zip"
+            exit 1
+          fi
+
+          echo "Using v4.343 ZIP:"
+          echo "$INPUT_343_ZIP"
+
+          echo "Using human-filled value review ZIP:"
+          echo "$HUMAN_FILLED_VALUE_REVIEW_ZIP"
+
+          echo "INPUT_343_ZIP=$INPUT_343_ZIP" >> "$GITHUB_ENV"
+          echo "HUMAN_FILLED_VALUE_REVIEW_ZIP=$HUMAN_FILLED_VALUE_REVIEW_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.344 ingest script
+        run: |
+          cat > run_v4_344_value_review_decision_ingest_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          CORE_VALUE_PARAMETERS = {"omega_m0", "sigma8_0", "growth_index_gamma"}
+
+          ALLOWED_VALUE_REVIEW_DECISIONS = {
+              "accept_candidate_for_later_parameter_value_approval",
+              "needs_human_correction",
+              "needs_better_source",
+              "reject_candidate",
+              "keep_blocked",
+          }
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def main():
+              input_343 = Path(os.environ["INPUT_343_ZIP"])
+              human_zip = Path(os.environ["HUMAN_FILLED_VALUE_REVIEW_ZIP"])
+
+              outdir = Path("tairid_v4_344_value_review_decision_ingest_no_approval_no_baseline_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base343 = extract_zip(input_343, "tairid_v4_344_343_")
+              basehuman = extract_zip(human_zip, "tairid_v4_344_human_")
+
+              summary343_path = find_one(base343, "v4_343_summary.json")
+              value_packet_path = find_one(base343, "v4_343_HUMAN_FILL_value_candidate_review_packet_NO_APPROVAL_NO_SCORING.csv")
+              context_rows_path = find_one(base343, "v4_343_context_only_rows_NOT_NUMERIC_BASELINE_VALUES.csv")
+              gap_status_path = find_one(base343, "v4_343_gap_status_after_value_review_packet_no_scoring.csv")
+              rules343_path = find_one(base343, "v4_343_rule_checks.csv")
+              checklist343_path = find_one(base343, "v4_343_value_candidate_review_checklist.csv")
+
+              filled_value_path = find_one_suffix(basehuman, "HUMAN_FILLED_value_candidate_review_packet_NO_APPROVAL_NO_SCORING.csv")
+
+              summary343 = json.loads(summary343_path.read_text())
+              value_packet = pd.read_csv(value_packet_path)
+              context_rows = pd.read_csv(context_rows_path)
+              gap_status = pd.read_csv(gap_status_path)
+              rules343 = pd.read_csv(rules343_path)
+              checklist343 = pd.read_csv(checklist343_path)
+              filled_value = pd.read_csv(filled_value_path)
+
+              for col in [
+                  "human_value_review_decision",
+                  "human_value_review_note",
+                  "human_corrected_value_text_if_needed",
+                  "human_corrected_numeric_value_if_needed",
+                  "human_corrected_uncertainty_if_needed",
+                  "human_acceptance_statement",
+              ]:
+                  if col not in filled_value.columns:
+                      filled_value[col] = ""
+
+              ingest_rows = []
+
+              for _, row in filled_value.iterrows():
+                  parameter = clean(row["parameter_or_method"])
+                  decision = clean(row["human_value_review_decision"])
+                  candidate_numeric_value = clean(row["candidate_numeric_value"])
+                  candidate_value_text = clean(row["candidate_value_text_as_written"])
+                  candidate_uncertainty = clean(row["candidate_uncertainty_text"])
+                  exact_quote = clean(row["candidate_exact_quote"])
+                  source_url = clean(row["candidate_source_url"])
+                  acceptance_statement = clean(row["human_acceptance_statement"])
+
+                  if decision == "accept_candidate_for_later_parameter_value_approval":
+                      row_ingest_status = "accepted_for_parameter_value_approval_gate_not_approved"
+                      ready_for_next_gate = True
+                  elif decision in ["needs_human_correction", "needs_better_source", "reject_candidate", "keep_blocked"]:
+                      row_ingest_status = "not_ready_for_parameter_value_approval_gate"
+                      ready_for_next_gate = False
+                  else:
+                      row_ingest_status = "invalid_or_missing_value_review_decision"
+                      ready_for_next_gate = False
+
+                  ingest_rows.append({
+                      "v4_344_ingest_id": f"v4_344_ingest_{len(ingest_rows)+1:03d}",
+                      "v4_343_value_review_id": clean(row["v4_343_value_review_id"]),
+                      "question_id": clean(row["question_id"]),
+                      "parameter_or_method": parameter,
+                      "human_value_review_decision": decision,
+                      "human_value_review_note": clean(row["human_value_review_note"]),
+                      "human_acceptance_statement": acceptance_statement,
+                      "candidate_value_text_as_written": candidate_value_text,
+                      "candidate_numeric_value": candidate_numeric_value,
+                      "candidate_uncertainty_text": candidate_uncertainty,
+                      "candidate_source_url": source_url,
+                      "candidate_source_table_section": clean(row["candidate_source_table_section"]),
+                      "candidate_exact_quote": exact_quote,
+                      "candidate_definition_context": clean(row["candidate_definition_context"]),
+                      "row_ingest_status": row_ingest_status,
+                      "ready_for_v4_345_parameter_value_approval_gate": ready_for_next_gate,
+                      "ingest_scope": "value_review_decision_ingest_only_not_parameter_approval_not_baseline_not_scoring",
+                      "parameter_value_approved_now": False,
+                      "numeric_baseline_approved_now": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": TRUTH_BOUNDARY,
+                  })
+
+              ingest = pd.DataFrame(ingest_rows)
+
+              approval_gate_staging = ingest[ingest["ready_for_v4_345_parameter_value_approval_gate"].astype(bool)].copy()
+              approval_gate_staging["v4_344_staging_status"] = "ready_for_next_gate_not_approved"
+              approval_gate_staging["parameter_value_approved_now"] = False
+              approval_gate_staging["numeric_baseline_approved_now"] = False
+              approval_gate_staging["observed_values_loaded"] = False
+              approval_gate_staging["definition_match_confirmed"] = False
+              approval_gate_staging["score_valid"] = False
+              approval_gate_staging["support_allowed"] = False
+
+              invalid_rows = ingest[ingest["row_ingest_status"] == "invalid_or_missing_value_review_decision"].copy()
+              accepted_for_next_gate_rows = int(len(approval_gate_staging))
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_344_GAP_001",
+                      "gap": "Human value-candidate review decisions have been ingested.",
+                      "status_after_v4_344": "closed_for_review_decision_ingest",
+                      "next_gate": "v4_345_parameter_value_approval_gate",
+                  },
+                  {
+                      "gap_id": "V4_344_GAP_002",
+                      "gap": "Parameter values are staged for approval gate but not approved.",
+                      "status_after_v4_344": "staged_not_approved",
+                      "next_gate": "explicit_parameter_value_approval",
+                  },
+                  {
+                      "gap_id": "V4_344_GAP_003",
+                      "gap": "Numeric baseline remains unapproved.",
+                      "status_after_v4_344": "still_blocked",
+                      "next_gate": "later_numeric_baseline_builder",
+                  },
+                  {
+                      "gap_id": "V4_344_GAP_004",
+                      "gap": "Observed SDSS RSD values remain unloaded.",
+                      "status_after_v4_344": "still_blocked",
+                      "next_gate": "later_observed_data_gate",
+                  },
+                  {
+                      "gap_id": "V4_344_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_344": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_343_summary_found": summary343.get("version") == "v4.343",
+                  "input_v4_343_rules_30_of_30": summary343.get("rules_passed") == 30 and summary343.get("rules_total") == 30,
+                  "input_v4_343_failed_gates_none": summary343.get("failed_gates") == "none",
+                  "input_v4_343_no_parameter_approval": summary343.get("parameter_values_approved") is False,
+                  "input_v4_343_no_numeric_baseline_approval": summary343.get("numeric_baseline_values_filled") is False and summary343.get("approved_baseline_values") == 0,
+                  "input_v4_343_no_observed_values_loaded": summary343.get("observed_values_loaded") is False,
+                  "input_v4_343_no_definition_match_confirmed": summary343.get("definition_match_confirmed") is False,
+                  "input_v4_343_no_score_valid": summary343.get("score_valid") is False,
+                  "input_v4_343_no_support_allowed": summary343.get("support_allowed") is False,
+
+                  "rules343_all_passed": rules343["passed"].astype(bool).all(),
+                  "v4_343_value_packet_rows_equal_3": len(value_packet) == 3,
+                  "v4_343_context_rows_equal_3": len(context_rows) == 3,
+                  "v4_343_gap_status_rows_equal_5": len(gap_status) == 5,
+                  "v4_343_checklist_rows_equal_6": len(checklist343) == 6,
+
+                  "filled_value_rows_equal_3": len(filled_value) == 3,
+                  "all_core_value_parameters_present": CORE_VALUE_PARAMETERS.issubset(set(filled_value["parameter_or_method"].apply(clean))),
+                  "human_value_review_decisions_filled_all_rows": filled_value["human_value_review_decision"].apply(clean).ne("").all(),
+                  "human_value_review_decisions_are_allowed": filled_value["human_value_review_decision"].apply(clean).isin(ALLOWED_VALUE_REVIEW_DECISIONS).all(),
+                  "human_acceptance_statements_filled_all_rows": filled_value["human_acceptance_statement"].apply(clean).ne("").all(),
+                  "candidate_numeric_values_present_all_rows": filled_value["candidate_numeric_value"].apply(clean).ne("").all(),
+                  "candidate_exact_quotes_present_all_rows": filled_value["candidate_exact_quote"].apply(clean).ne("").all(),
+                  "candidate_source_urls_present_all_rows": filled_value["candidate_source_url"].apply(clean).ne("").all(),
+
+                  "ingest_rows_equal_3": len(ingest) == 3,
+                  "invalid_rows_equal_0": len(invalid_rows) == 0,
+                  "accepted_for_next_gate_rows_equal_3": accepted_for_next_gate_rows == 3,
+                  "approval_gate_staging_rows_equal_3": len(approval_gate_staging) == 3,
+
+                  "parameter_value_approval_false": false_col(ingest, "parameter_value_approved_now") and false_col(approval_gate_staging, "parameter_value_approved_now"),
+                  "numeric_baseline_approval_false": false_col(ingest, "numeric_baseline_approved_now") and false_col(approval_gate_staging, "numeric_baseline_approved_now"),
+                  "observed_values_loaded_false": false_col(ingest, "observed_values_loaded") and false_col(approval_gate_staging, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(ingest, "definition_match_confirmed") and false_col(approval_gate_staging, "definition_match_confirmed"),
+                  "score_valid_false": false_col(ingest, "score_valid") and false_col(approval_gate_staging, "score_valid"),
+                  "support_allowed_false": false_col(ingest, "support_allowed") and false_col(approval_gate_staging, "support_allowed"),
+
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary344 = {
+                  "version": "v4.344",
+                  "route_name": "v4_344_value_review_decision_ingest_no_parameter_approval_no_baseline_no_scoring",
+                  "expected_result": "v4_344_value_review_decision_ingest_no_parameter_approval_no_baseline_no_scoring_passed_no_claims",
+                  "input_version": "v4.343",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "filled_value_review_rows": int(len(filled_value)),
+                  "ingest_rows": int(len(ingest)),
+                  "accepted_for_parameter_value_approval_gate_not_approved_rows": int(accepted_for_next_gate_rows),
+                  "invalid_rows": int(len(invalid_rows)),
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "v4_345_explicit_parameter_value_approval_gate_no_baseline_no_observed_scoring",
+              }
+
+              ingest.to_csv(outdir / "v4_344_value_review_decision_ingest_ledger_NO_PARAMETER_APPROVAL_NO_SCORING.csv", index=False)
+              approval_gate_staging.to_csv(outdir / "v4_344_parameter_value_approval_gate_staging_NOT_APPROVED.csv", index=False)
+              gap_update.to_csv(outdir / "v4_344_gap_status_after_value_review_decision_ingest_no_scoring.csv", index=False)
+              filled_value.to_csv(outdir / "v4_344_input_human_filled_value_review_packet_preserved.csv", index=False)
+              value_packet.to_csv(outdir / "v4_344_input_blank_v4_343_value_review_packet_preserved.csv", index=False)
+              context_rows.to_csv(outdir / "v4_344_input_context_only_rows_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_344_rule_checks.csv", index=False)
+
+              (outdir / "v4_344_summary.json").write_text(json.dumps(summary344, indent=2))
+
+              summary_md = f"""# TAIRID v4.344 Value Review Decision Ingest — No Parameter Approval, No Baseline, No Scoring
+
+          Expected result: `{summary344["expected_result"]}`
+
+          {summary344["rules_passed"]} / {summary344["rules_total"]} rules passed
+
+          failed_gates = {summary344["failed_gates"]}
+
+          filled_value_review_rows = {summary344["filled_value_review_rows"]}
+
+          accepted_for_parameter_value_approval_gate_not_approved_rows = {summary344["accepted_for_parameter_value_approval_gate_not_approved_rows"]}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This step ingests human value-review decisions and stages the three candidate values for the next explicit parameter-value approval gate.
+
+          It does **not** approve parameter values.
+
+          It does **not** approve a numeric baseline.
+
+          It does **not** load observed SDSS RSD values.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary344["selected_next_route"]}`
+          """
+              (outdir / "v4_344_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary344, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_344_value_review_decision_ingest_no_scoring.py
+
+      - name: Run v4.344 value review decision ingest no scoring
+        run: |
+          python run_v4_344_value_review_decision_ingest_no_scoring.py
+
+      - name: Upload v4.344 value review decision ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-344-value-review-decision-ingest-no-parameter-approval-no-baseline-no-scoring-output
+          path: |
+            tairid_v4_344_value_review_decision_ingest_no_approval_no_baseline_no_scoring_output/
+            tairid_v4_344_value_review_decision_ingest_no_approval_no_baseline_no_scoring_output.zip
