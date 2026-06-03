@@ -1,0 +1,562 @@
+name: "!!! AAA CURRENT - TAIRID v4.331B repo-inclusive external AI audit no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-331b-repo-inclusive-external-ai-audit-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.331B repo-inclusive audit packet"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.330 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.330 output ZIP by pattern..."
+          INPUT_330_ZIP="$(ls tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_330_ZIP" ]; then
+            echo "Could not find v4.330 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Found v4.330 ZIP:"
+          echo "$INPUT_330_ZIP"
+
+          echo "INPUT_330_ZIP=$INPUT_330_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.331B audit packet script
+        run: |
+          cat > run_v4_331b_repo_inclusive_external_ai_audit_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import hashlib
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          import pandas as pd
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          FALSE_STRINGS = {"false", "0", "", "nan", "none", "null"}
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_optional(base: Path, filename: str):
+              matches = list(base.rglob(filename))
+              return matches[0] if matches else None
+
+          def field_is_false(obj, key):
+              value = obj.get(key, None)
+              if value is False:
+                  return True
+              return str(value).strip().lower() in FALSE_STRINGS
+
+          def field_is_zero(obj, key):
+              value = obj.get(key, None)
+              try:
+                  return float(value) == 0.0
+              except Exception:
+                  return str(value).strip() == "0"
+
+          def df_col_false(df, col):
+              if df is None or col not in df.columns:
+                  return True
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(FALSE_STRINGS).all()
+
+          def read_csv_optional(path):
+              if path is None or not path.exists():
+                  return None
+              return pd.read_csv(path)
+
+          def read_json_optional(path):
+              if path is None or not path.exists():
+                  return {}
+              return json.loads(path.read_text())
+
+          def safe_zip_summary_index(zip_path: Path):
+              rows = []
+              try:
+                  with zipfile.ZipFile(zip_path, "r") as z:
+                      names = z.namelist()
+                      summary_names = [n for n in names if n.endswith("_summary.json") or n.endswith("summary.json")]
+                      rule_names = [n for n in names if n.endswith("_rule_checks.csv") or n.endswith("rule_checks.csv")]
+                      for name in summary_names:
+                          summary_version = ""
+                          route_name = ""
+                          expected_result = ""
+                          failed_gates = ""
+                          rules_passed = ""
+                          rules_total = ""
+                          try:
+                              data = json.loads(z.read(name).decode("utf-8"))
+                              summary_version = data.get("version", "")
+                              route_name = data.get("route_name", "")
+                              expected_result = data.get("expected_result", "")
+                              failed_gates = data.get("failed_gates", "")
+                              rules_passed = data.get("rules_passed", "")
+                              rules_total = data.get("rules_total", "")
+                          except Exception as exc:
+                              expected_result = f"could_not_parse_summary_json: {exc}"
+
+                          rows.append({
+                              "zip_file": zip_path.name,
+                              "summary_file_inside_zip": name,
+                              "summary_version": summary_version,
+                              "route_name": route_name,
+                              "expected_result": expected_result,
+                              "rules_passed": rules_passed,
+                              "rules_total": rules_total,
+                              "failed_gates": failed_gates,
+                              "rule_check_files_inside_zip": "|".join(rule_names),
+                          })
+              except Exception as exc:
+                  rows.append({
+                      "zip_file": zip_path.name,
+                      "summary_file_inside_zip": "",
+                      "summary_version": "",
+                      "route_name": "",
+                      "expected_result": f"could_not_open_zip: {exc}",
+                      "rules_passed": "",
+                      "rules_total": "",
+                      "failed_gates": "",
+                      "rule_check_files_inside_zip": "",
+                  })
+              return rows
+
+          def main():
+              repo = Path(".").resolve()
+              input_330 = Path(os.environ["INPUT_330_ZIP"])
+
+              outdir = Path("tairid_v4_331b_repo_inclusive_external_ai_audit_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base330 = extract_zip(input_330, "tairid_v4_331b_330_")
+
+              summary330_path = find_optional(base330, "v4_330_summary.json")
+              ledger_path = find_optional(base330, "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv")
+              accepted_path = find_optional(base330, "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv")
+              rule_checks_330_path = find_optional(base330, "v4_330_rule_checks.csv")
+              id_check_path = find_optional(base330, "v4_330_selected_candidate_id_availability_check_preserved.csv")
+              summary330_md_path = find_optional(base330, "v4_330_summary.md")
+
+              summary330 = read_json_optional(summary330_path)
+              ledger = read_csv_optional(ledger_path)
+              accepted = read_csv_optional(accepted_path)
+              rule_checks_330 = read_csv_optional(rule_checks_330_path)
+
+              repo_manifest_rows = []
+              for p in sorted(repo.rglob("*")):
+                  if ".git" in p.parts:
+                      continue
+                  if not p.is_file():
+                      continue
+                  rel = str(p.relative_to(repo))
+                  include_type = "other"
+                  if rel.startswith(".github/workflows/") and (rel.endswith(".yml") or rel.endswith(".yaml")):
+                      include_type = "workflow_yaml"
+                  elif p.name.startswith("tairid-v4-") and p.suffix.lower() == ".zip":
+                      include_type = "tairid_output_zip"
+                  elif p.suffix.lower() in [".py", ".csv", ".md", ".json"]:
+                      include_type = "supporting_text_file"
+
+                  repo_manifest_rows.append({
+                      "repo_path": rel,
+                      "file_name": p.name,
+                      "file_type_for_audit": include_type,
+                      "size_bytes": p.stat().st_size,
+                      "sha256": sha256_file(p),
+                  })
+
+              repo_manifest = pd.DataFrame(repo_manifest_rows)
+
+              workflow_manifest = repo_manifest[repo_manifest["file_type_for_audit"] == "workflow_yaml"].copy()
+              zip_manifest = repo_manifest[repo_manifest["file_type_for_audit"] == "tairid_output_zip"].copy()
+
+              zip_summary_rows = []
+              for _, row in zip_manifest.iterrows():
+                  zip_summary_rows.extend(safe_zip_summary_index(repo / row["repo_path"]))
+              zip_summary_index = pd.DataFrame(zip_summary_rows)
+
+              audit_questions = pd.DataFrame([
+                  {
+                      "audit_question_id": "AI_AUDIT_001",
+                      "question_for_external_ai": "Does v4.330 or v4.331B approve any parameter values?",
+                      "expected_answer": "no",
+                      "files_to_check": "v4_330_summary.json|v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv|v4_331b_rule_checks.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_002",
+                      "question_for_external_ai": "Does v4.330 or v4.331B approve a numeric baseline?",
+                      "expected_answer": "no",
+                      "files_to_check": "v4_330_summary.json|v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv|v4_331b_rule_checks.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_003",
+                      "question_for_external_ai": "Does the packet load observed SDSS RSD values or compute scores?",
+                      "expected_answer": "no",
+                      "files_to_check": "v4_330_summary.json|v4_330_rule_checks.csv|v4_331b_summary.json",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_004",
+                      "question_for_external_ai": "What did v4.330 actually do?",
+                      "expected_answer": "It ingested human-accepted candidate-source decisions only, for later parameter-value review.",
+                      "files_to_check": "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv|v4_330_summary.md",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_005",
+                      "question_for_external_ai": "Does the repo-wide manifest include all workflow YAML files and TAIRID v4 ZIPs currently present in the repo?",
+                      "expected_answer": "yes, within what is present in the checked-out repository.",
+                      "files_to_check": "v4_331b_repo_manifest_with_sha256.csv|v4_331b_workflow_manifest.csv|v4_331b_tairid_zip_manifest.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_006",
+                      "question_for_external_ai": "Does this packet include old GitHub run logs?",
+                      "expected_answer": "no, unless those logs were committed as files; it includes repo files and output ZIP summaries.",
+                      "files_to_check": "v4_331b_repo_manifest_with_sha256.csv|v4_331b_zip_summary_index.csv",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_007",
+                      "question_for_external_ai": "What is the strongest honest conclusion?",
+                      "expected_answer": "Candidate-source decisions were accepted for later parameter-value review; no observed SDSS test has happened.",
+                      "files_to_check": "EXTERNAL_AI_AUDIT_README_v4_331B.md|v4_331b_summary.md",
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_008",
+                      "question_for_external_ai": "What is the strongest criticism?",
+                      "expected_answer": "This is still procedural. It has not approved values, built a numeric baseline, or tested TAIRID against SDSS RSD observations.",
+                      "files_to_check": "EXTERNAL_AI_AUDIT_README_v4_331B.md|v4_331b_summary.md",
+                  },
+              ])
+
+              red_team_prompts = pd.DataFrame([
+                  {
+                      "prompt_id": "REDTEAM_001",
+                      "prompt_text": "Try to find any TAIRID support claim. If found, quote it. If not found, state that support remains blocked.",
+                      "expected_safe_result": "No support claim found."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_002",
+                      "prompt_text": "Try to find any approved Omega_m0, sigma8_0, gamma, or LCDM numeric-baseline value.",
+                      "expected_safe_result": "No approved values found."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_003",
+                      "prompt_text": "Try to find any observed SDSS RSD scoring, residual, chi-square, p-value, likelihood, or fit claim.",
+                      "expected_safe_result": "No observed scoring found."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_004",
+                      "prompt_text": "Check whether the repo-wide manifest proves all historic GitHub run logs are included.",
+                      "expected_safe_result": "No. It only proves which committed repo files and ZIP summaries are included."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_005",
+                      "prompt_text": "Write the harshest honest audit summary.",
+                      "expected_safe_result": "The chain is careful and auditable, but still pre-evidence and pre-score."
+                  },
+              ])
+
+              ai_response_template = pd.DataFrame([
+                  {"field": "external_ai_model_name", "external_ai_response": ""},
+                  {"field": "audit_date", "external_ai_response": ""},
+                  {"field": "overall_pass_fail", "external_ai_response": ""},
+                  {"field": "truth_boundary_preserved", "external_ai_response": ""},
+                  {"field": "repo_manifest_reviewed", "external_ai_response": ""},
+                  {"field": "workflow_manifest_reviewed", "external_ai_response": ""},
+                  {"field": "zip_summary_index_reviewed", "external_ai_response": ""},
+                  {"field": "parameter_values_approved_found", "external_ai_response": ""},
+                  {"field": "numeric_baseline_approval_found", "external_ai_response": ""},
+                  {"field": "observed_sdss_scoring_found", "external_ai_response": ""},
+                  {"field": "support_claim_found", "external_ai_response": ""},
+                  {"field": "strongest_valid_conclusion", "external_ai_response": ""},
+                  {"field": "strongest_criticism", "external_ai_response": ""},
+                  {"field": "recommended_next_gate", "external_ai_response": ""},
+                  {"field": "quoted_evidence", "external_ai_response": ""},
+              ])
+
+              rule_rows = []
+              warning_rows = []
+
+              def add_rule(gate, passed, note=""):
+                  rule_rows.append({"gate": gate, "passed": bool(passed), "note": note})
+
+              def add_warning(warning_id, warning_text):
+                  warning_rows.append({"warning_id": warning_id, "warning_text": warning_text})
+
+              add_rule("input_v4_330_summary_found", bool(summary330_path), str(summary330_path) if summary330_path else "missing")
+              add_rule("input_v4_330_version_is_v4_330", summary330.get("version") == "v4.330", clean(summary330.get("version", "")))
+              add_rule("input_v4_330_failed_gates_none", summary330.get("failed_gates") == "none", clean(summary330.get("failed_gates", "")))
+              add_rule("input_v4_330_human_acceptance_recorded_true", summary330.get("human_acceptance_recorded") is True, clean(summary330.get("human_acceptance_recorded", "")))
+              add_rule("input_v4_330_accepted_candidate_decision_rows_6", summary330.get("accepted_candidate_decision_rows") == 6, clean(summary330.get("accepted_candidate_decision_rows", "")))
+
+              add_rule("summary_no_parameter_values_approved", field_is_false(summary330, "parameter_values_approved"), clean(summary330.get("parameter_values_approved", "")))
+              add_rule("summary_no_numeric_baseline_values_filled", field_is_false(summary330, "numeric_baseline_values_filled"), clean(summary330.get("numeric_baseline_values_filled", "")))
+              add_rule("summary_approved_baseline_values_zero", field_is_zero(summary330, "approved_baseline_values"), clean(summary330.get("approved_baseline_values", "")))
+              add_rule("summary_no_observed_values_loaded", field_is_false(summary330, "observed_values_loaded"), clean(summary330.get("observed_values_loaded", "")))
+              add_rule("summary_no_definition_match_confirmed", field_is_false(summary330, "definition_match_confirmed"), clean(summary330.get("definition_match_confirmed", "")))
+              add_rule("summary_no_score_valid", field_is_false(summary330, "score_valid"), clean(summary330.get("score_valid", "")))
+              add_rule("summary_no_support_allowed", field_is_false(summary330, "support_allowed"), clean(summary330.get("support_allowed", "")))
+
+              add_rule("ledger_found", ledger is not None, str(ledger_path) if ledger_path else "missing")
+              add_rule("accepted_file_found", accepted is not None, str(accepted_path) if accepted_path else "missing")
+              add_rule("v4_330_rule_checks_found", rule_checks_330 is not None, str(rule_checks_330_path) if rule_checks_330_path else "missing")
+
+              if ledger is not None:
+                  add_rule("ledger_rows_equal_6", len(ledger) == 6, str(len(ledger)))
+                  add_rule("ledger_no_parameter_value_approval", df_col_false(ledger, "parameter_value_approved_now"))
+                  add_rule("ledger_no_numeric_baseline_approval", df_col_false(ledger, "numeric_baseline_approved_now"))
+                  add_rule("ledger_no_observed_values_loaded", df_col_false(ledger, "observed_values_loaded"))
+                  add_rule("ledger_no_definition_match_confirmed", df_col_false(ledger, "definition_match_confirmed"))
+                  add_rule("ledger_no_score_valid", df_col_false(ledger, "score_valid"))
+                  add_rule("ledger_no_support_allowed", df_col_false(ledger, "support_allowed"))
+
+              if rule_checks_330 is not None and "passed" in rule_checks_330.columns:
+                  add_rule("v4_330_rule_checks_all_passed", rule_checks_330["passed"].astype(bool).all(), f"rows={len(rule_checks_330)}")
+              else:
+                  add_warning("WARN_RULE_CHECKS", "Could not fully inspect v4_330_rule_checks.csv.")
+
+              add_rule("workflow_manifest_has_rows", len(workflow_manifest) > 0, str(len(workflow_manifest)))
+              add_rule("zip_manifest_has_rows", len(zip_manifest) > 0, str(len(zip_manifest)))
+              add_rule("zip_summary_index_has_rows", len(zip_summary_index) > 0, str(len(zip_summary_index)))
+              add_rule("audit_questions_rows_equal_8", len(audit_questions) == 8, str(len(audit_questions)))
+              add_rule("red_team_prompt_rows_equal_5", len(red_team_prompts) == 5, str(len(red_team_prompts)))
+              add_rule("external_ai_response_template_rows_equal_15", len(ai_response_template) == 15, str(len(ai_response_template)))
+
+              if len(zip_manifest) < 5:
+                  add_warning("WARN_ZIP_COVERAGE", "Few TAIRID v4 ZIPs were found in the repo. The packet can only audit ZIPs that are committed to the repo.")
+              if len(workflow_manifest) < 5:
+                  add_warning("WARN_WORKFLOW_COVERAGE", "Few workflow YAMLs were found. Check whether the workflow files were created in .github/workflows.")
+
+              rule_checks = pd.DataFrame(rule_rows)
+              warnings = pd.DataFrame(warning_rows)
+
+              hard_boundary_rules = [
+                  "summary_no_parameter_values_approved",
+                  "summary_no_numeric_baseline_values_filled",
+                  "summary_approved_baseline_values_zero",
+                  "summary_no_observed_values_loaded",
+                  "summary_no_definition_match_confirmed",
+                  "summary_no_score_valid",
+                  "summary_no_support_allowed",
+              ]
+
+              hard_boundary_ok = rule_checks.loc[
+                  rule_checks["gate"].isin(hard_boundary_rules),
+                  "passed"
+              ].astype(bool).all()
+
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              audit_scope = {
+                  "audit_packet_version": "v4.331B",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "purpose": "Repo-inclusive external AI audit packet for TAIRID SDSS RSD v4.330 stage and committed repo artifacts.",
+                  "truth_boundary": TRUTH_BOUNDARY,
+                  "hard_boundary_ok": bool(hard_boundary_ok),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "important_limit": "This packet includes files present in the checked-out repository and summaries discoverable inside committed TAIRID ZIP files. It does not include GitHub web run logs unless they were committed as files.",
+                  "input_v4_330_zip": str(input_330),
+                  "input_v4_330_zip_sha256": sha256_file(input_330),
+              }
+
+              summary331b = {
+                  "version": "v4.331B",
+                  "route_name": "v4_331b_repo_inclusive_external_ai_audit_packet_no_scoring",
+                  "expected_result": "v4_331b_repo_inclusive_external_ai_audit_packet_no_scoring_written_for_external_review",
+                  "input_version": "v4.330",
+                  "rules_passed": int(rule_checks["passed"].astype(bool).sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "hard_boundary_ok": bool(hard_boundary_ok),
+                  "warnings": int(len(warnings)),
+                  "repo_manifest_rows": int(len(repo_manifest)),
+                  "workflow_manifest_rows": int(len(workflow_manifest)),
+                  "tairid_zip_manifest_rows": int(len(zip_manifest)),
+                  "zip_summary_index_rows": int(len(zip_summary_index)),
+                  "audit_questions": int(len(audit_questions)),
+                  "red_team_prompts": int(len(red_team_prompts)),
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "external_ai_audit_review_then_v4_332_parameter_value_review_packet_no_observed_scoring_no_baseline_approval"
+              }
+
+              readme = f"""# TAIRID v4.331B Repo-Inclusive External AI Audit Packet
+
+          This packet is built for another AI to audit the TAIRID SDSS RSD workflow work.
+
+          ## Truth boundary
+
+          `{TRUTH_BOUNDARY}`
+
+          ## What this packet includes
+
+          It includes direct v4.330 audit files, plus a repo-wide manifest of workflow YAML files and TAIRID v4 ZIP files currently present in the repository checkout.
+
+          ## What this packet does not include
+
+          It does not automatically include GitHub web run logs unless those logs were saved as files in the repo.
+
+          ## Strongest allowed conclusion
+
+          Candidate-source decisions were human-accepted for later parameter-value review under a no-values, no-scoring, no-support-claims boundary.
+
+          ## Strongest honest criticism
+
+          This still has not approved parameter values, built an approved numeric baseline, loaded observed SDSS RSD values, computed residuals, or tested TAIRID against observations.
+
+          ## External AI instruction
+
+          Review `v4_331b_external_ai_audit_questions.csv`, `v4_331b_external_ai_red_team_prompts.csv`, `v4_331b_repo_manifest_with_sha256.csv`, `v4_331b_workflow_manifest.csv`, `v4_331b_tairid_zip_manifest.csv`, `v4_331b_zip_summary_index.csv`, and the copied v4.330 files. Then fill `v4_331b_external_ai_response_template.csv`.
+          """
+
+              # Copy v4.330 direct source files when present.
+              if summary330_path:
+                  shutil.copy2(summary330_path, outdir / "v4_330_summary.json")
+              if summary330_md_path:
+                  shutil.copy2(summary330_md_path, outdir / "v4_330_summary.md")
+              if ledger_path:
+                  shutil.copy2(ledger_path, outdir / "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv")
+              if accepted_path:
+                  shutil.copy2(accepted_path, outdir / "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv")
+              if rule_checks_330_path:
+                  shutil.copy2(rule_checks_330_path, outdir / "v4_330_rule_checks.csv")
+              if id_check_path:
+                  shutil.copy2(id_check_path, outdir / "v4_330_selected_candidate_id_availability_check_preserved.csv")
+
+              repo_manifest.to_csv(outdir / "v4_331b_repo_manifest_with_sha256.csv", index=False)
+              workflow_manifest.to_csv(outdir / "v4_331b_workflow_manifest.csv", index=False)
+              zip_manifest.to_csv(outdir / "v4_331b_tairid_zip_manifest.csv", index=False)
+              zip_summary_index.to_csv(outdir / "v4_331b_zip_summary_index.csv", index=False)
+              audit_questions.to_csv(outdir / "v4_331b_external_ai_audit_questions.csv", index=False)
+              red_team_prompts.to_csv(outdir / "v4_331b_external_ai_red_team_prompts.csv", index=False)
+              ai_response_template.to_csv(outdir / "v4_331b_external_ai_response_template.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_331b_rule_checks.csv", index=False)
+              warnings.to_csv(outdir / "v4_331b_warnings.csv", index=False)
+              (outdir / "v4_331b_audit_scope.json").write_text(json.dumps(audit_scope, indent=2))
+              (outdir / "EXTERNAL_AI_AUDIT_README_v4_331B.md").write_text(readme)
+              (outdir / "v4_331b_summary.json").write_text(json.dumps(summary331b, indent=2))
+
+              summary_md = f"""# TAIRID v4.331B Repo-Inclusive External AI Audit Packet
+
+          Expected result: `{summary331b["expected_result"]}`
+
+          {summary331b["rules_passed"]} / {summary331b["rules_total"]} rules passed
+
+          failed_gates = {summary331b["failed_gates"]}
+
+          hard_boundary_ok = {summary331b["hard_boundary_ok"]}
+
+          warnings = {summary331b["warnings"]}
+
+          repo_manifest_rows = {summary331b["repo_manifest_rows"]}
+
+          workflow_manifest_rows = {summary331b["workflow_manifest_rows"]}
+
+          tairid_zip_manifest_rows = {summary331b["tairid_zip_manifest_rows"]}
+
+          zip_summary_index_rows = {summary331b["zip_summary_index_rows"]}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This packet is for external AI audit. It does not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.
+
+          Important limit: this packet includes committed repo files and summaries discoverable inside committed TAIRID ZIP files. It does not include old GitHub run logs unless those logs were committed as files.
+
+          Next route: `{summary331b["selected_next_route"]}`
+          """
+              (outdir / "v4_331b_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary331b, indent=2))
+              print(f"WROTE {zip_path}")
+
+              # Important: do not exit 1 here unless the input is impossible to process.
+              # The point of this packet is to upload audit evidence even if warnings exist.
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_331b_repo_inclusive_external_ai_audit_no_scoring.py
+
+      - name: Run v4.331B repo-inclusive external AI audit no scoring
+        run: |
+          python run_v4_331b_repo_inclusive_external_ai_audit_no_scoring.py
+
+      - name: Upload v4.331B external AI audit packet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-331b-repo-inclusive-external-ai-audit-packet-no-scoring-output
+          path: |
+            tairid_v4_331b_repo_inclusive_external_ai_audit_no_scoring_output/
+            tairid_v4_331b_repo_inclusive_external_ai_audit_no_scoring_output.zip
