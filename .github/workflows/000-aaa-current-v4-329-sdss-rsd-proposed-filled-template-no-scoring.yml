@@ -1,0 +1,333 @@
+name: "!!! AAA CURRENT - TAIRID v4.329 proposed filled decision template no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-329-proposed-filled-template-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.329 proposed filled template no scoring"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.328B input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.328B output ZIP by pattern..."
+          INPUT_328B_ZIP="$(ls tairid-v4-328b-sdss-rsd-dynamic-candidate-decision-draft-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_328B_ZIP" ]; then
+            echo "Could not find v4.328B output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-328b-sdss-rsd-dynamic-candidate-decision-draft-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Found v4.328B ZIP:"
+          echo "$INPUT_328B_ZIP"
+
+          echo "INPUT_328B_ZIP=$INPUT_328B_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.329 proposed filled template script
+        run: |
+          cat > run_v4_329_proposed_filled_template_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          from pathlib import Path
+          import pandas as pd
+          import os
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_series(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.lower().isin(["false", "0", "", "nan"]).all()
+
+          def main():
+              input_328b = Path(os.environ["INPUT_328B_ZIP"])
+
+              outdir = Path("tairid_v4_329_sdss_rsd_proposed_filled_decision_template_no_values_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base328b = extract_zip(input_328b, "tairid_v4_329_328b_")
+
+              summary328b_path = find_one(base328b, "v4_328b_summary.json")
+              suggestions_path = find_one(base328b, "v4_328b_dynamic_candidate_decision_suggestions_for_human_review_only_no_values_no_scoring.csv")
+              blank_template_path = find_one(base328b, "v4_328b_official_blank_decision_template_preserved_no_values_no_scoring.csv")
+
+              summary328b = json.loads(summary328b_path.read_text())
+              suggestions = pd.read_csv(suggestions_path)
+              blank_template = pd.read_csv(blank_template_path)
+
+              for col in ["human_decision", "human_selected_candidate_ids", "human_answer_summary_no_values", "reviewer_note"]:
+                  if col not in blank_template.columns:
+                      blank_template[col] = ""
+                  blank_template[col] = blank_template[col].astype("object")
+
+              official_blank = blank_template.copy()
+              proposed_filled = blank_template.copy()
+
+              for col in ["human_decision", "human_selected_candidate_ids", "human_answer_summary_no_values", "reviewer_note"]:
+                  proposed_filled[col] = proposed_filled[col].astype("object")
+
+              sug_index = suggestions.set_index("question_id")
+
+              filled_count = 0
+              for i, row in proposed_filled.iterrows():
+                  qid = row["question_id"]
+                  if qid in sug_index.index:
+                      srow = sug_index.loc[qid]
+                      proposed_filled.at[i, "human_decision"] = clean(srow["copy_this_to_human_decision_only_if_human_agrees"])
+                      proposed_filled.at[i, "human_selected_candidate_ids"] = clean(srow["copy_this_to_human_selected_candidate_ids_only_if_human_agrees"])
+                      proposed_filled.at[i, "human_answer_summary_no_values"] = clean(srow["copy_this_to_human_answer_summary_no_values_only_if_human_agrees"])
+                      proposed_filled.at[i, "reviewer_note"] = (
+                          "PROPOSED FILL ONLY from v4.328B dynamic suggestions. "
+                          "Not human-approved unless the human reviewer accepts this file."
+                      )
+                      filled_count += 1
+
+              proposed_filled["v4_329_status"] = "proposed_filled_template_not_human_approved"
+              proposed_filled["v4_329_truth_boundary"] = TRUTH_BOUNDARY
+              proposed_filled["parameter_value_approved_now"] = False
+              proposed_filled["numeric_baseline_approved_now"] = False
+              proposed_filled["observed_values_loaded"] = False
+              proposed_filled["definition_match_confirmed"] = False
+              proposed_filled["score_valid"] = False
+              proposed_filled["support_allowed"] = False
+
+              acceptance_checklist = pd.DataFrame([
+                  {
+                      "acceptance_item": "Review each proposed human_decision.",
+                      "required_before_ingest": True,
+                      "human_acceptance_status": "",
+                      "note": "Do not treat the proposed file as official until the human reviewer accepts it."
+                  },
+                  {
+                      "acceptance_item": "Review each proposed human_selected_candidate_ids list.",
+                      "required_before_ingest": True,
+                      "human_acceptance_status": "",
+                      "note": "Candidate IDs only move to later source review. They do not approve numeric values."
+                  },
+                  {
+                      "acceptance_item": "Confirm no parameter values were entered.",
+                      "required_before_ingest": True,
+                      "human_acceptance_status": "",
+                      "note": "This step must remain no-values/no-scoring."
+                  },
+                  {
+                      "acceptance_item": "Confirm no observed SDSS values were loaded or scored.",
+                      "required_before_ingest": True,
+                      "human_acceptance_status": "",
+                      "note": "Observed scoring remains blocked."
+                  },
+                  {
+                      "acceptance_item": "Confirm no support claims are made.",
+                      "required_before_ingest": True,
+                      "human_acceptance_status": "",
+                      "note": "Support remains blocked until later observed-data tests, if ever allowed."
+                  },
+              ])
+
+              official_blank_filled = int((official_blank["human_decision"].apply(clean) != "").sum())
+              proposed_decision_filled = int((proposed_filled["human_decision"].apply(clean) != "").sum())
+              proposed_candidate_ids_filled = int((proposed_filled["human_selected_candidate_ids"].apply(clean) != "").sum())
+
+              id_ok_rows = []
+              for _, row in proposed_filled.iterrows():
+                  selected = set([x for x in clean(row["human_selected_candidate_ids"]).split("|") if x])
+                  allowed = set([x for x in clean(row.get("allowed_candidate_ids_from_packet", "")).split("|") if x])
+                  id_ok_rows.append({
+                      "question_id": row["question_id"],
+                      "selected_candidate_ids": "|".join(sorted(selected)),
+                      "allowed_candidate_ids": "|".join(sorted(allowed)),
+                      "selected_ids_available": selected.issubset(allowed) if selected else True,
+                  })
+
+              id_check = pd.DataFrame(id_ok_rows)
+
+              rules = []
+
+              def add(gate, passed):
+                  rules.append({"gate": gate, "passed": bool(passed)})
+
+              add("input_v4_328b_summary_found", summary328b.get("version") == "v4.328B")
+              add("input_v4_328b_rules_passed_26_of_26", summary328b.get("rules_passed") == 26 and summary328b.get("rules_total") == 26)
+              add("input_v4_328b_failed_gates_none", summary328b.get("failed_gates") == "none")
+              add("input_v4_328b_no_parameter_approval", summary328b.get("parameter_values_approved") is False)
+              add("input_v4_328b_no_numeric_baseline_approval", summary328b.get("numeric_baseline_values_filled") is False and summary328b.get("approved_baseline_values") == 0)
+              add("input_v4_328b_no_observed_values_loaded", summary328b.get("observed_values_loaded") is False)
+              add("input_v4_328b_no_definition_match_confirmed", summary328b.get("definition_match_confirmed") is False)
+              add("input_v4_328b_no_scoring", summary328b.get("score_valid") is False)
+              add("input_v4_328b_no_support_allowed", summary328b.get("support_allowed") is False)
+              add("suggestion_rows_equal_6", len(suggestions) == 6)
+              add("blank_template_rows_equal_6", len(blank_template) == 6)
+              add("official_blank_template_still_blank", official_blank_filled == 0)
+              add("proposed_template_rows_equal_6", len(proposed_filled) == 6)
+              add("proposed_human_decision_rows_filled_equal_6", proposed_decision_filled == 6)
+              add("proposed_candidate_ids_rows_filled_equal_6", proposed_candidate_ids_filled == 6)
+              add("proposed_selected_ids_are_available_in_allowed_packet", id_check["selected_ids_available"].all())
+              add("proposed_decisions_are_allowed", proposed_filled["human_decision"].isin(["select_candidate_for_later_value_review", "needs_better_source", "reject_all", "keep_blocked"]).all())
+              add("proposed_file_marked_not_human_approved", (proposed_filled["v4_329_status"] == "proposed_filled_template_not_human_approved").all())
+              add("proposed_parameter_value_approval_false", not proposed_filled["parameter_value_approved_now"].any())
+              add("proposed_numeric_baseline_approval_false", not proposed_filled["numeric_baseline_approved_now"].any())
+              add("proposed_observed_values_loaded_false", not proposed_filled["observed_values_loaded"].any())
+              add("proposed_definition_match_confirmed_false", not proposed_filled["definition_match_confirmed"].any())
+              add("proposed_score_valid_false", not proposed_filled["score_valid"].any())
+              add("proposed_support_allowed_false", not proposed_filled["support_allowed"].any())
+              add("blank_template_parameter_value_approval_false", false_series(blank_template, "parameter_value_approval_allowed_now"))
+              add("blank_template_numeric_baseline_approval_false", false_series(blank_template, "numeric_baseline_approval_allowed_now"))
+              add("blank_template_score_allowed_false", false_series(blank_template, "score_allowed"))
+              add("blank_template_support_allowed_false", false_series(blank_template, "support_allowed"))
+
+              rule_checks = pd.DataFrame(rules)
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary329 = {
+                  "version": "v4.329",
+                  "route_name": "v4_329_sdss_rsd_proposed_filled_decision_template_no_values_no_scoring",
+                  "expected_result": "v4_329_sdss_rsd_proposed_filled_decision_template_no_values_no_scoring_passed_no_claims",
+                  "input_version": "v4.328B",
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "suggestion_rows": int(len(suggestions)),
+                  "official_blank_template_rows": int(len(official_blank)),
+                  "official_blank_human_decision_rows_filled": int(official_blank_filled),
+                  "proposed_filled_template_rows": int(len(proposed_filled)),
+                  "proposed_human_decision_rows_filled": int(proposed_decision_filled),
+                  "human_approval_status": "not_approved_proposed_fill_only",
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "human_accept_v4_329_proposed_filled_template_then_v4_330_ingest_candidate_decisions_no_values_no_scoring",
+              }
+
+              proposed_filled.to_csv(outdir / "v4_329_PROPOSED_FILLED_decision_template_NOT_HUMAN_APPROVED_no_values_no_scoring.csv", index=False)
+              official_blank.to_csv(outdir / "v4_329_official_blank_decision_template_preserved_no_values_no_scoring.csv", index=False)
+              suggestions.to_csv(outdir / "v4_329_input_suggestions_preserved_no_values_no_scoring.csv", index=False)
+              acceptance_checklist.to_csv(outdir / "v4_329_human_acceptance_checklist_before_ingest.csv", index=False)
+              id_check.to_csv(outdir / "v4_329_selected_candidate_id_availability_check.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_329_rule_checks.csv", index=False)
+              (outdir / "v4_329_summary.json").write_text(json.dumps(summary329, indent=2))
+
+              summary_md = f"""# TAIRID v4.329 SDSS RSD Proposed Filled Decision Template — No Values, No Scoring
+
+              Expected result: `{summary329["expected_result"]}`
+
+              {summary329["rules_passed"]} / {summary329["rules_total"]} rules passed
+
+              failed_gates = {summary329["failed_gates"]}
+
+              This step created a proposed-filled decision template from the v4.328B suggestions.
+
+              It is not human approved yet. It must be reviewed before any ingest step treats the decisions as accepted.
+
+              Truth boundary: {TRUTH_BOUNDARY}.
+
+              The following remain false:
+
+              ```text
+              parameter_values_approved = False
+              numeric_baseline_values_filled = False
+              approved_baseline_values = 0
+              observed_values_loaded = False
+              definition_match_confirmed = False
+              score_valid = False
+              support_allowed = False
+              ```
+
+              Next route: `{summary329["selected_next_route"]}`
+              """
+
+              (outdir / "v4_329_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary329, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_329_proposed_filled_template_no_scoring.py
+
+      - name: Run v4.329 proposed filled template no scoring
+        run: |
+          python run_v4_329_proposed_filled_template_no_scoring.py
+
+      - name: Upload v4.329 no-scoring output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-329-sdss-rsd-proposed-filled-decision-template-no-values-no-scoring-output
+          path: |
+            tairid_v4_329_sdss_rsd_proposed_filled_decision_template_no_values_no_scoring_output/
+            tairid_v4_329_sdss_rsd_proposed_filled_decision_template_no_values_no_scoring_output.zip
