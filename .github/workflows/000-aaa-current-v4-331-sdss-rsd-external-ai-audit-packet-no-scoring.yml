@@ -1,0 +1,508 @@
+name: "!!! AAA CURRENT - TAIRID v4.331 external AI audit packet no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-331-external-ai-audit-packet-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.331 external AI audit packet no scoring"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.330 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.330 output ZIP by pattern..."
+          INPUT_330_ZIP="$(ls tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_330_ZIP" ]; then
+            echo "Could not find v4.330 output ZIP."
+            echo "Expected a file like:"
+            echo "tairid-v4-330-sdss-rsd-human-accepted-candidate-decision-ingest-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Found v4.330 ZIP:"
+          echo "$INPUT_330_ZIP"
+
+          echo "INPUT_330_ZIP=$INPUT_330_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.331 external AI audit packet script
+        run: |
+          cat > run_v4_331_external_ai_audit_packet_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          from pathlib import Path
+          import pandas as pd
+          import os
+          import hashlib
+          from datetime import datetime, timezone
+
+          TRUTH_BOUNDARY = "no observed scoring; no parameter approval; no numeric baseline approval; no support claims"
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_series(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.lower().isin(["false", "0", "", "nan"]).all()
+
+          def main():
+              input_330 = Path(os.environ["INPUT_330_ZIP"])
+
+              outdir = Path("tairid_v4_331_sdss_rsd_external_ai_audit_packet_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base330 = extract_zip(input_330, "tairid_v4_331_330_")
+
+              summary330_path = find_one(base330, "v4_330_summary.json")
+              ledger_path = find_one(base330, "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv")
+              accepted_path = find_one(base330, "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv")
+              rule_checks_path = find_one(base330, "v4_330_rule_checks.csv")
+
+              summary330 = json.loads(summary330_path.read_text())
+              ledger = pd.read_csv(ledger_path)
+              accepted = pd.read_csv(accepted_path)
+              rule_checks_330 = pd.read_csv(rule_checks_path)
+
+              audit_scope = {
+                  "audit_packet_version": "v4.331",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "purpose": "External AI audit packet for TAIRID SDSS RSD v4.330 candidate-decision ingest stage.",
+                  "what_an_external_ai_should_check": [
+                      "Check whether v4.330 accurately preserved the no-scoring truth boundary.",
+                      "Check whether candidate decisions were ingested only as source-candidate decisions.",
+                      "Check whether any parameter values were approved. Expected answer: no.",
+                      "Check whether any numeric baseline was approved. Expected answer: no.",
+                      "Check whether any observed SDSS RSD values were loaded or scored. Expected answer: no.",
+                      "Check whether any support claim for TAIRID was made. Expected answer: no.",
+                      "Check whether the next route is only a later parameter-value review packet, not observed scoring."
+                  ],
+                  "truth_boundary": TRUTH_BOUNDARY,
+                  "hard_limits": {
+                      "parameter_values_approved": False,
+                      "numeric_baseline_values_filled": False,
+                      "approved_baseline_values": 0,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False
+                  },
+                  "input_zip_name_seen_by_workflow": str(input_330),
+                  "input_zip_sha256": sha256_file(input_330),
+                  "source_summary_file": summary330_path.name,
+                  "source_ledger_file": ledger_path.name,
+                  "source_accepted_file": accepted_path.name,
+                  "source_rule_checks_file": rule_checks_path.name
+              }
+
+              manifest_rows = []
+              for p in sorted(base330.rglob("*")):
+                  if p.is_file():
+                      rel = str(p.relative_to(base330))
+                      manifest_rows.append({
+                          "source_package_file": rel,
+                          "size_bytes": p.stat().st_size,
+                          "sha256": sha256_file(p),
+                          "included_in_external_ai_audit_packet": p.name in [
+                              "v4_330_summary.json",
+                              "v4_330_summary.md",
+                              "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv",
+                              "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv",
+                              "v4_330_rule_checks.csv",
+                              "v4_330_selected_candidate_id_availability_check_preserved.csv"
+                          ]
+                      })
+
+              manifest = pd.DataFrame(manifest_rows)
+
+              audit_questions = pd.DataFrame([
+                  {
+                      "audit_question_id": "AI_AUDIT_001",
+                      "question_for_external_ai": "Does the packet contain any approved parameter value for Omega_m0, sigma8_0, gamma, or any LCDM baseline?",
+                      "expected_answer": "no",
+                      "evidence_files_to_check": "v4_330_summary.json|v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv",
+                      "pass_condition": "All parameter/numeric-baseline approval fields remain false or zero."
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_002",
+                      "question_for_external_ai": "Does the packet load observed SDSS RSD data or compute residuals, chi-square, likelihood, p-values, or scores?",
+                      "expected_answer": "no",
+                      "evidence_files_to_check": "v4_330_summary.json|v4_330_rule_checks.csv",
+                      "pass_condition": "observed_values_loaded=false, definition_match_confirmed=false, score_valid=false."
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_003",
+                      "question_for_external_ai": "Does the packet make a TAIRID support claim?",
+                      "expected_answer": "no",
+                      "evidence_files_to_check": "v4_330_summary.json|v4_330_summary.md|v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv",
+                      "pass_condition": "support_allowed=false and claim boundary says no support claims."
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_004",
+                      "question_for_external_ai": "Were the accepted rows limited to source-candidate decisions for later review?",
+                      "expected_answer": "yes",
+                      "evidence_files_to_check": "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv",
+                      "pass_condition": "decision_scope is candidate_source_triage_only_no_values_no_scoring."
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_005",
+                      "question_for_external_ai": "Was human acceptance recorded before ingesting candidate decisions?",
+                      "expected_answer": "yes, if human_acceptance_input is yes",
+                      "evidence_files_to_check": "v4_330_summary.json|v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv",
+                      "pass_condition": "human_acceptance_recorded=true and accepted_candidate_decision_rows=6."
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_006",
+                      "question_for_external_ai": "Is the next route still pre-scoring and limited to parameter-value review packet preparation?",
+                      "expected_answer": "yes",
+                      "evidence_files_to_check": "v4_330_summary.json",
+                      "pass_condition": "selected_next_route does not permit observed SDSS scoring or TAIRID support claims."
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_007",
+                      "question_for_external_ai": "What would be the strongest criticism of this packet?",
+                      "expected_answer": "It has only accepted source-candidate decisions; it has not justified numeric parameter values or observational comparison.",
+                      "evidence_files_to_check": "all files",
+                      "pass_condition": "The external AI clearly states that this packet is pre-evidence and pre-score."
+                  },
+                  {
+                      "audit_question_id": "AI_AUDIT_008",
+                      "question_for_external_ai": "What is the allowed conclusion from v4.330?",
+                      "expected_answer": "Only that candidate-source decisions were accepted for later parameter-value review under a no-scoring boundary.",
+                      "evidence_files_to_check": "v4_330_summary.json|v4_330_summary.md",
+                      "pass_condition": "No stronger conclusion is stated."
+                  }
+              ])
+
+              red_team_prompts = pd.DataFrame([
+                  {
+                      "prompt_id": "REDTEAM_001",
+                      "prompt_text": "Try to find any sentence or field in this packet that implies TAIRID is supported by SDSS RSD data. If found, quote it and mark the packet unsafe. If not found, explain why support remains blocked.",
+                      "expected_safe_result": "No support claim found; support_allowed=false."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_002",
+                      "prompt_text": "Try to find any approved numerical value for Omega_m0, sigma8_0, gamma, or the LCDM baseline. If found, quote it. If not found, state that no parameter values are approved.",
+                      "expected_safe_result": "No approved parameter values found."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_003",
+                      "prompt_text": "Try to determine whether observed SDSS RSD values were loaded. If the packet only contains candidate decision ledgers, state that observed scoring has not begun.",
+                      "expected_safe_result": "Observed scoring has not begun."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_004",
+                      "prompt_text": "Try to identify the next legitimate step without skipping gates. Do not recommend observed scoring unless parameter-value review and numeric baseline approval have happened first.",
+                      "expected_safe_result": "Next step remains parameter-value review packet preparation, not observed scoring."
+                  },
+                  {
+                      "prompt_id": "REDTEAM_005",
+                      "prompt_text": "Write the harshest honest audit note for this packet.",
+                      "expected_safe_result": "This packet is procedurally useful but does not yet test TAIRID against SDSS RSD observations."
+                  }
+              ])
+
+              ai_response_template = pd.DataFrame([
+                  {
+                      "field": "external_ai_model_name",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "audit_date",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "overall_pass_fail",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "truth_boundary_preserved",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "parameter_values_approved_found",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "numeric_baseline_approval_found",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "observed_sdss_scoring_found",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "support_claim_found",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "strongest_valid_conclusion",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "strongest_criticism",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "recommended_next_gate",
+                      "external_ai_response": ""
+                  },
+                  {
+                      "field": "quoted_evidence",
+                      "external_ai_response": ""
+                  }
+              ])
+
+              external_ai_readme = f"""# TAIRID v4.331 External AI Audit Packet — No Scoring
+
+          You are being asked to audit a TAIRID SDSS RSD workflow packet.
+
+          This packet is **not** an observational result. It is not a parameter-value approval. It is not a numeric-baseline approval. It is not a TAIRID support claim.
+
+          ## Truth boundary
+
+          `{TRUTH_BOUNDARY}`
+
+          ## What happened before this packet
+
+          v4.330 ingested human-accepted candidate-source decisions from v4.329. The accepted decisions only say which source candidates can move forward into a later parameter-value review packet.
+
+          ## What you must check
+
+          Use these files:
+
+          - `v4_330_summary.json`
+          - `v4_330_summary.md`
+          - `v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv`
+          - `v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv`
+          - `v4_330_rule_checks.csv`
+          - `v4_331_external_ai_audit_questions.csv`
+          - `v4_331_external_ai_red_team_prompts.csv`
+
+          ## Required audit answer
+
+          You should answer whether the workflow preserved all of these:
+
+          ```text
+          parameter_values_approved = false
+          numeric_baseline_values_filled = false
+          approved_baseline_values = 0
+          observed_values_loaded = false
+          definition_match_confirmed = false
+          score_valid = false
+          support_allowed = false
+          ```
+
+          ## Strongest allowed conclusion
+
+          The strongest allowed conclusion is:
+
+          `Candidate-source decisions were human-accepted for later parameter-value review under a no-values, no-scoring, no-support-claims boundary.`
+
+          ## Strongest honest criticism
+
+          The strongest honest criticism is:
+
+          `This packet has not yet approved parameter values, built an approved numeric baseline, loaded observed SDSS RSD values, computed residuals, or tested TAIRID against observations. It is procedural groundwork only.`
+          """
+
+              # Rule checks for this audit packet.
+              rules = []
+
+              def add(gate, passed):
+                  rules.append({"gate": gate, "passed": bool(passed)})
+
+              add("input_v4_330_summary_found", summary330.get("version") == "v4.330")
+              add("input_v4_330_rules_passed_34_of_34", summary330.get("rules_passed") == 34 and summary330.get("rules_total") == 34)
+              add("input_v4_330_failed_gates_none", summary330.get("failed_gates") == "none")
+              add("input_v4_330_human_acceptance_recorded_true", summary330.get("human_acceptance_recorded") is True)
+              add("input_v4_330_accepted_candidate_decision_rows_6", summary330.get("accepted_candidate_decision_rows") == 6)
+              add("input_v4_330_no_parameter_approval", summary330.get("parameter_values_approved") is False)
+              add("input_v4_330_no_numeric_baseline_approval", summary330.get("numeric_baseline_values_filled") is False and summary330.get("approved_baseline_values") == 0)
+              add("input_v4_330_no_observed_values_loaded", summary330.get("observed_values_loaded") is False)
+              add("input_v4_330_no_definition_match_confirmed", summary330.get("definition_match_confirmed") is False)
+              add("input_v4_330_no_scoring", summary330.get("score_valid") is False)
+              add("input_v4_330_no_support_allowed", summary330.get("support_allowed") is False)
+              add("ledger_rows_equal_6", len(ledger) == 6)
+              add("accepted_rows_equal_6", len(accepted) == 6)
+              add("v4_330_rule_checks_rows_equal_34", len(rule_checks_330) == 34)
+              add("v4_330_rule_checks_all_passed", rule_checks_330["passed"].astype(bool).all())
+              add("ledger_no_parameter_value_approval", not ledger["parameter_value_approved_now"].astype(bool).any())
+              add("ledger_no_numeric_baseline_approval", not ledger["numeric_baseline_approved_now"].astype(bool).any())
+              add("ledger_no_observed_values_loaded", not ledger["observed_values_loaded"].astype(bool).any())
+              add("ledger_no_definition_match_confirmed", not ledger["definition_match_confirmed"].astype(bool).any())
+              add("ledger_no_score_valid", not ledger["score_valid"].astype(bool).any())
+              add("ledger_no_support_allowed", not ledger["support_allowed"].astype(bool).any())
+              add("audit_questions_rows_equal_8", len(audit_questions) == 8)
+              add("red_team_prompt_rows_equal_5", len(red_team_prompts) == 5)
+              add("external_ai_response_template_rows_equal_12", len(ai_response_template) == 12)
+              add("manifest_contains_files", len(manifest) > 0)
+              add("audit_scope_truth_boundary_matches", audit_scope["truth_boundary"] == TRUTH_BOUNDARY)
+
+              rule_checks = pd.DataFrame(rules)
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary331 = {
+                  "version": "v4.331",
+                  "route_name": "v4_331_sdss_rsd_external_ai_audit_packet_no_scoring",
+                  "expected_result": "v4_331_sdss_rsd_external_ai_audit_packet_no_scoring_passed_no_claims",
+                  "input_version": "v4.330",
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "audit_questions": int(len(audit_questions)),
+                  "red_team_prompts": int(len(red_team_prompts)),
+                  "external_ai_response_template_rows": int(len(ai_response_template)),
+                  "source_manifest_rows": int(len(manifest)),
+                  "parameter_values_approved": False,
+                  "numeric_baseline_values_filled": False,
+                  "approved_baseline_values": 0,
+                  "observed_values_loaded": False,
+                  "definition_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": TRUTH_BOUNDARY,
+                  "selected_next_route": "v4_332_parameter_value_review_packet_from_accepted_sources_no_observed_scoring_no_baseline_approval"
+              }
+
+              # Copy the v4.330 audit-source files into this packet.
+              shutil.copy2(summary330_path, outdir / "v4_330_summary.json")
+              summary330_md_matches = list(base330.rglob("v4_330_summary.md"))
+              if summary330_md_matches:
+                  shutil.copy2(summary330_md_matches[0], outdir / "v4_330_summary.md")
+              shutil.copy2(ledger_path, outdir / "v4_330_candidate_decision_ingest_ledger_no_values_no_scoring.csv")
+              shutil.copy2(accepted_path, outdir / "v4_330_candidate_decisions_human_acceptance_status_no_values_no_scoring.csv")
+              shutil.copy2(rule_checks_path, outdir / "v4_330_rule_checks.csv")
+
+              id_check_matches = list(base330.rglob("v4_330_selected_candidate_id_availability_check_preserved.csv"))
+              if id_check_matches:
+                  shutil.copy2(id_check_matches[0], outdir / "v4_330_selected_candidate_id_availability_check_preserved.csv")
+
+              manifest.to_csv(outdir / "v4_331_source_manifest_with_sha256.csv", index=False)
+              audit_questions.to_csv(outdir / "v4_331_external_ai_audit_questions.csv", index=False)
+              red_team_prompts.to_csv(outdir / "v4_331_external_ai_red_team_prompts.csv", index=False)
+              ai_response_template.to_csv(outdir / "v4_331_external_ai_response_template.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_331_rule_checks.csv", index=False)
+              (outdir / "v4_331_audit_scope.json").write_text(json.dumps(audit_scope, indent=2))
+              (outdir / "EXTERNAL_AI_AUDIT_README_v4_331.md").write_text(external_ai_readme)
+              (outdir / "v4_331_summary.json").write_text(json.dumps(summary331, indent=2))
+
+              summary_md = f"""# TAIRID v4.331 SDSS RSD External AI Audit Packet — No Scoring
+
+          Expected result: `{summary331["expected_result"]}`
+
+          {summary331["rules_passed"]} / {summary331["rules_total"]} rules passed
+
+          failed_gates = {summary331["failed_gates"]}
+
+          audit_questions = {summary331["audit_questions"]}
+
+          red_team_prompts = {summary331["red_team_prompts"]}
+
+          Truth boundary: {TRUTH_BOUNDARY}.
+
+          This packet is built so an external AI can audit the workflow boundary. It does not approve parameter values, approve numeric baselines, load observed SDSS RSD values, compute residuals, score TAIRID, or make support claims.
+
+          Strongest allowed conclusion:
+
+          `Candidate-source decisions were human-accepted for later parameter-value review under a no-values, no-scoring, no-support-claims boundary.`
+
+          Strongest criticism:
+
+          `This packet has not yet tested TAIRID against SDSS RSD observations.`
+
+          Next route: `{summary331["selected_next_route"]}`
+          """
+              (outdir / "v4_331_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary331, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_331_external_ai_audit_packet_no_scoring.py
+
+      - name: Run v4.331 external AI audit packet no scoring
+        run: |
+          python run_v4_331_external_ai_audit_packet_no_scoring.py
+
+      - name: Upload v4.331 external AI audit packet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-331-sdss-rsd-external-ai-audit-packet-no-scoring-output
+          path: |
+            tairid_v4_331_sdss_rsd_external_ai_audit_packet_no_scoring_output/
+            tairid_v4_331_sdss_rsd_external_ai_audit_packet_no_scoring_output.zip
