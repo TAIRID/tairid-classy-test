@@ -1,0 +1,529 @@
+name: "!!! AAA CURRENT - TAIRID v4.360 guarded scoring readiness no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-360-guarded-scoring-readiness-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.360 guarded scoring readiness"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.359 and v4.347 input ZIPs
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.359 output ZIP..."
+          INPUT_359_ZIP="$(ls tairid-v4-359-definition-covariance-review-ingest-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_359_ZIP" ]; then
+            echo "Could not find v4.359 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-359-definition-covariance-review-ingest-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Finding v4.347 approved baseline ZIP..."
+          INPUT_347_ZIP="$(ls tairid-v4-347-explicit-numeric-baseline-approval-gate-no-observed-scoring-no-support-claims-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_347_ZIP" ]; then
+            echo "Could not find v4.347 approved baseline ZIP."
+            echo "Expected:"
+            echo "tairid-v4-347-explicit-numeric-baseline-approval-gate-no-observed-scoring-no-support-claims-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.359 ZIP:"
+          echo "$INPUT_359_ZIP"
+
+          echo "Using v4.347 ZIP:"
+          echo "$INPUT_347_ZIP"
+
+          echo "INPUT_359_ZIP=$INPUT_359_ZIP" >> "$GITHUB_ENV"
+          echo "INPUT_347_ZIP=$INPUT_347_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.360 guarded scoring readiness script
+        run: |
+          cat > run_v4_360_guarded_scoring_readiness_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; observed values loaded; definition/covariance guarded readiness confirmed; guarded scoring readiness may be prepared here; no predictions; no residuals; no chi-square; no likelihood; no p-values; no scoring; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def main():
+              input_359 = Path(os.environ["INPUT_359_ZIP"])
+              input_347 = Path(os.environ["INPUT_347_ZIP"])
+
+              outdir = Path("tairid_v4_360_guarded_scoring_readiness_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base359 = extract_zip(input_359, "tairid_v4_360_359_")
+              base347 = extract_zip(input_347, "tairid_v4_360_347_")
+
+              summary359_path = find_one(base359, "v4_359_summary.json")
+              readiness_packet_path = find_one(base359, "v4_359_guarded_diagnostic_scoring_readiness_packet_NOT_SCORING.csv")
+              boundary_path = find_one(base359, "v4_359_scoring_boundary_and_limitations.csv")
+              gap359_path = find_one(base359, "v4_359_gap_status_after_definition_covariance_ingest.csv")
+              loaded_values_path = find_one(base359, "v4_359_input_v4_358_loaded_observed_values_preserved.csv")
+              rules359_path = find_one(base359, "v4_359_rule_checks.csv")
+
+              summary347_path = find_one(base347, "v4_347_summary.json")
+              approved_baseline_path = find_one(base347, "v4_347_APPROVED_NUMERIC_BASELINE_NO_OBSERVED_SCORING.csv")
+              approved_calculator_path = find_one(base347, "v4_347_APPROVED_CALCULATOR_INPUT_NO_OBSERVED_SCORING.csv")
+              baseline_object_path = find_one(base347, "v4_347_numeric_baseline_object.json")
+              rules347_path = find_one(base347, "v4_347_rule_checks.csv")
+
+              summary359 = json.loads(summary359_path.read_text())
+              readiness_packet = pd.read_csv(readiness_packet_path)
+              boundary359 = pd.read_csv(boundary_path)
+              gap359 = pd.read_csv(gap359_path)
+              loaded_values = pd.read_csv(loaded_values_path)
+              rules359 = pd.read_csv(rules359_path)
+
+              summary347 = json.loads(summary347_path.read_text())
+              approved_baseline = pd.read_csv(approved_baseline_path)
+              approved_calculator = pd.read_csv(approved_calculator_path)
+              baseline_object = json.loads(baseline_object_path.read_text())
+              rules347 = pd.read_csv(rules347_path)
+
+              omega_m0 = float(baseline_object["omega_m0"])
+              sigma8_0 = float(baseline_object["sigma8_0"])
+              growth_index_gamma = float(baseline_object["growth_index_gamma"])
+
+              scoring_rows = []
+
+              for _, row in readiness_packet.iterrows():
+                  scoring_rows.append({
+                      "v4_360_scoring_readiness_id": f"v4_360_scoring_ready_{len(scoring_rows)+1:03d}",
+                      "v4_359_match_ingest_id": clean(row["v4_359_match_ingest_id"]),
+                      "v4_357_observed_value_id": clean(row["v4_357_observed_value_id"]),
+
+                      "survey_or_source": clean(row["survey_or_source"]),
+                      "tracer_or_sample": clean(row["tracer_or_sample"]),
+                      "effective_redshift_z": float(row["effective_redshift_z"]),
+                      "observed_fsigma8": float(row["observed_fsigma8"]),
+                      "observed_fsigma8_uncertainty": float(row["observed_fsigma8_uncertainty"]),
+                      "covariance_or_error_model": clean(row["covariance_or_error_model"]),
+                      "covariance_scope": clean(row["covariance_scope"]),
+
+                      "approved_omega_m0": omega_m0,
+                      "approved_sigma8_0": sigma8_0,
+                      "approved_growth_index_gamma": growth_index_gamma,
+
+                      "definition_match_confirmed": bool(row["definition_match_confirmed_now"]),
+                      "covariance_match_confirmed": bool(row["covariance_match_confirmed_now"]),
+                      "guarded_diagonal_only": clean(row["covariance_scope"]) == "guarded_diagonal_diagnostic_only",
+                      "full_covariance_available": False,
+
+                      "baseline_prediction_formula_needed": "Omega_m(z), growth factor D(z), f(z)=Omega_m(z)^gamma, and f_sigma8(z) must be computed in a later dry-run gate.",
+                      "baseline_prediction_computed": False,
+                      "residuals_computed": False,
+                      "normalized_residuals_computed": False,
+                      "chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+
+                      "scoring_readiness_status": "ready_for_later_guarded_prediction_dry_run_not_scoring",
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              scoring_readiness = pd.DataFrame(scoring_rows)
+
+              formula_packet = pd.DataFrame([
+                  {
+                      "formula_id": "V4_360_FORMULA_001",
+                      "formula_name": "Omega_m_of_z",
+                      "formula_text": "Omega_m(z)=Omega_m0*(1+z)^3/(Omega_m0*(1+z)^3 + 1 - Omega_m0)",
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+                  {
+                      "formula_id": "V4_360_FORMULA_002",
+                      "formula_name": "growth_rate_f_of_z",
+                      "formula_text": "f(z)=Omega_m(z)^gamma",
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+                  {
+                      "formula_id": "V4_360_FORMULA_003",
+                      "formula_name": "growth_factor_D_of_z",
+                      "formula_text": "D(z) must be computed or defined in the later guarded prediction dry-run gate before f_sigma8(z) can be produced.",
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+                  {
+                      "formula_id": "V4_360_FORMULA_004",
+                      "formula_name": "baseline_fsigma8_of_z",
+                      "formula_text": "f_sigma8_baseline(z)=sigma8_0*D(z)*Omega_m(z)^gamma after D(z) convention is fixed.",
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+              ])
+
+              readiness_checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_360_CHECK_001",
+                      "check": "Approved baseline values are present and preserved.",
+                      "status": "passed",
+                      "required_before_guarded_prediction_dry_run": True,
+                  },
+                  {
+                      "check_id": "V4_360_CHECK_002",
+                      "check": "Observed rows are loaded and definition-matched.",
+                      "status": "passed",
+                      "required_before_guarded_prediction_dry_run": True,
+                  },
+                  {
+                      "check_id": "V4_360_CHECK_003",
+                      "check": "Covariance scope is guarded diagonal only; full covariance is not available.",
+                      "status": "guarded_only",
+                      "required_before_guarded_prediction_dry_run": True,
+                  },
+                  {
+                      "check_id": "V4_360_CHECK_004",
+                      "check": "Baseline prediction formulas are identified but not computed.",
+                      "status": "prepared_not_computed",
+                      "required_before_guarded_prediction_dry_run": True,
+                  },
+                  {
+                      "check_id": "V4_360_CHECK_005",
+                      "check": "Residuals, chi-square, likelihood, p-values, and scores remain uncomputed.",
+                      "status": "blocked_by_design",
+                      "required_before_support_claims": True,
+                  },
+                  {
+                      "check_id": "V4_360_CHECK_006",
+                      "check": "Support claims remain blocked.",
+                      "status": "blocked_by_design",
+                      "required_before_support_claims": True,
+                  },
+              ])
+
+              human_next_gate_packet = pd.DataFrame([
+                  {
+                      "v4_360_next_gate_packet_id": "v4_360_next_gate_001",
+                      "next_gate": "v4_361_guarded_baseline_prediction_dry_run_no_residuals_no_scoring",
+                      "human_guarded_prediction_dry_run_decision": "",
+                      "allowed_human_guarded_prediction_dry_run_decisions": "approve_later_guarded_prediction_dry_run|needs_formula_repair|needs_full_covariance_first|keep_blocked",
+                      "human_guarded_prediction_dry_run_note": "",
+                      "prediction_dry_run_approved_now": False,
+                      "baseline_prediction_computed": False,
+                      "residuals_computed": False,
+                      "chi_square_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  }
+              ])
+
+              boundary_update = pd.DataFrame([
+                  {
+                      "boundary_id": "V4_360_BOUNDARY_001",
+                      "boundary": "Guarded scoring readiness exists only for a diagonal diagnostic pathway.",
+                      "status": "guarded_only",
+                  },
+                  {
+                      "boundary_id": "V4_360_BOUNDARY_002",
+                      "boundary": "Full covariance is not available, so full likelihood/strong scientific scoring remains blocked.",
+                      "status": "blocked",
+                  },
+                  {
+                      "boundary_id": "V4_360_BOUNDARY_003",
+                      "boundary": "Baseline predictions are not computed in v4.360.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "boundary_id": "V4_360_BOUNDARY_004",
+                      "boundary": "Residuals and chi-square are not computed in v4.360.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "boundary_id": "V4_360_BOUNDARY_005",
+                      "boundary": "No support claim is allowed in v4.360.",
+                      "status": "blocked_by_design",
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_360_GAP_001",
+                      "gap": "Guarded scoring readiness packet created.",
+                      "status_after_v4_360": "readiness_packet_created_not_scoring",
+                      "next_gate": "v4_361_guarded_baseline_prediction_dry_run_no_residuals_no_scoring",
+                  },
+                  {
+                      "gap_id": "V4_360_GAP_002",
+                      "gap": "Baseline predictions remain uncomputed.",
+                      "status_after_v4_360": "still_blocked",
+                      "next_gate": "v4_361_guarded_baseline_prediction_dry_run",
+                  },
+                  {
+                      "gap_id": "V4_360_GAP_003",
+                      "gap": "Residuals and chi-square remain uncomputed.",
+                      "status_after_v4_360": "still_blocked",
+                      "next_gate": "later_guarded_residual_dry_run",
+                  },
+                  {
+                      "gap_id": "V4_360_GAP_004",
+                      "gap": "Full covariance remains unavailable.",
+                      "status_after_v4_360": "guarded_diagonal_only",
+                      "next_gate": "full_covariance_repair_lane_if_needed",
+                  },
+                  {
+                      "gap_id": "V4_360_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_360": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate_only_after_scoring",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_359_summary_found": summary359.get("version") == "v4.359",
+                  "input_v4_359_rules_all_passed": summary_rules_all_passed(summary359),
+                  "input_v4_359_failed_gates_none": summary359.get("failed_gates") == "none",
+                  "input_v4_359_readiness_guarded_available": summary359.get("readiness_status") == "guarded_diagnostic_scoring_readiness_available_not_scoring",
+                  "input_v4_359_definition_confirmed_true": summary359.get("definition_match_confirmed") is True,
+                  "input_v4_359_covariance_confirmed_true": summary359.get("covariance_match_confirmed") is True,
+                  "input_v4_359_no_score_valid": summary359.get("score_valid") is False,
+                  "input_v4_359_no_support_allowed": summary359.get("support_allowed") is False,
+
+                  "input_v4_347_summary_found": summary347.get("version") == "v4.347",
+                  "input_v4_347_rules_all_passed": summary_rules_all_passed(summary347),
+                  "input_v4_347_failed_gates_none": summary347.get("failed_gates") == "none",
+                  "input_v4_347_baseline_approved_true": summary347.get("numeric_baseline_approved") is True,
+                  "input_v4_347_approved_baseline_values_3": summary347.get("approved_baseline_values") == 3,
+
+                  "rules359_all_passed": rules359["passed"].astype(bool).all(),
+                  "rules347_all_passed": rules347["passed"].astype(bool).all(),
+                  "readiness_packet_rows_equal_loaded": len(readiness_packet) == int(summary359.get("loaded_observed_rows")),
+                  "loaded_values_rows_equal_readiness": len(loaded_values) == len(readiness_packet),
+                  "approved_baseline_rows_equal_3": len(approved_baseline) == 3,
+                  "approved_calculator_rows_equal_3": len(approved_calculator) == 3,
+                  "gap359_rows_equal_5": len(gap359) == 5,
+                  "boundary359_rows_equal_5": len(boundary359) == 5,
+
+                  "omega_m0_present": omega_m0 > 0,
+                  "sigma8_0_present": sigma8_0 > 0,
+                  "growth_index_gamma_present": growth_index_gamma > 0,
+                  "scoring_readiness_rows_equal_loaded": len(scoring_readiness) == len(loaded_values),
+                  "all_definition_confirmed": true_col(scoring_readiness, "definition_match_confirmed"),
+                  "all_covariance_confirmed": true_col(scoring_readiness, "covariance_match_confirmed"),
+                  "all_guarded_diagonal_only": true_col(scoring_readiness, "guarded_diagonal_only"),
+                  "formula_packet_rows_equal_4": len(formula_packet) == 4,
+                  "readiness_checklist_rows_equal_6": len(readiness_checklist) == 6,
+                  "human_next_gate_packet_rows_equal_1": len(human_next_gate_packet) == 1,
+                  "boundary_update_rows_equal_5": len(boundary_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "baseline_prediction_computed_false": false_col(scoring_readiness, "baseline_prediction_computed") and false_col(human_next_gate_packet, "baseline_prediction_computed"),
+                  "residuals_computed_false": false_col(scoring_readiness, "residuals_computed") and false_col(human_next_gate_packet, "residuals_computed"),
+                  "chi_square_computed_false": false_col(scoring_readiness, "chi_square_computed") and false_col(human_next_gate_packet, "chi_square_computed"),
+                  "likelihood_computed_false": false_col(scoring_readiness, "likelihood_computed"),
+                  "p_values_computed_false": false_col(scoring_readiness, "p_values_computed"),
+                  "score_valid_false": false_col(scoring_readiness, "score_valid") and false_col(human_next_gate_packet, "score_valid"),
+                  "support_allowed_false": false_col(scoring_readiness, "support_allowed") and false_col(human_next_gate_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary360 = {
+                  "version": "v4.360",
+                  "route_name": "v4_360_guarded_scoring_readiness_packet_no_scoring_no_support_claims",
+                  "expected_result": "v4_360_guarded_scoring_readiness_packet_passed_no_predictions_no_residuals_no_scoring_no_claims",
+                  "input_versions": "v4.359|v4.347",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": "guarded_scoring_readiness_packet_created_not_scoring",
+                  "guarded_scoring_readiness_rows": int(len(scoring_readiness)),
+                  "approved_baseline_values": 3,
+                  "loaded_observed_rows": int(len(loaded_values)),
+                  "definition_match_confirmed": True,
+                  "covariance_match_confirmed": True,
+                  "covariance_scope": "guarded_diagonal_diagnostic_only",
+                  "full_covariance_available": False,
+                  "baseline_prediction_computed": False,
+                  "residuals_computed": False,
+                  "chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_361_guarded_baseline_prediction_dry_run_no_residuals_no_scoring_no_support_claims",
+              }
+
+              scoring_readiness.to_csv(outdir / "v4_360_guarded_scoring_readiness_matrix_NOT_SCORING.csv", index=False)
+              formula_packet.to_csv(outdir / "v4_360_guarded_prediction_formula_packet_NOT_COMPUTED.csv", index=False)
+              readiness_checklist.to_csv(outdir / "v4_360_guarded_scoring_readiness_checklist.csv", index=False)
+              human_next_gate_packet.to_csv(outdir / "v4_360_HUMAN_FILL_guarded_prediction_dry_run_review_NO_SCORING.csv", index=False)
+              boundary_update.to_csv(outdir / "v4_360_scoring_boundary_and_limitations.csv", index=False)
+              gap_update.to_csv(outdir / "v4_360_gap_status_after_guarded_scoring_readiness.csv", index=False)
+              readiness_packet.to_csv(outdir / "v4_360_input_v4_359_scoring_readiness_packet_preserved.csv", index=False)
+              approved_baseline.to_csv(outdir / "v4_360_input_v4_347_approved_baseline_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_360_rule_checks.csv", index=False)
+
+              (outdir / "v4_360_input_v4_347_baseline_object_preserved.json").write_text(json.dumps(baseline_object, indent=2))
+              (outdir / "v4_360_summary.json").write_text(json.dumps(summary360, indent=2))
+
+              summary_md = f"""# TAIRID v4.360 Guarded Scoring Readiness Packet — No Scoring
+
+          Expected result: `{summary360["expected_result"]}`
+
+          {summary360["rules_passed"]} / {summary360["rules_total"]} rules passed
+
+          failed_gates = {summary360["failed_gates"]}
+
+          readiness_status = `{summary360["readiness_status"]}`
+
+          guarded_scoring_readiness_rows = {summary360["guarded_scoring_readiness_rows"]}
+
+          loaded_observed_rows = {summary360["loaded_observed_rows"]}
+
+          definition_match_confirmed = true
+
+          covariance_match_confirmed = true
+
+          covariance_scope = guarded_diagonal_diagnostic_only
+
+          full_covariance_available = false
+
+          baseline_prediction_computed = false
+
+          residuals_computed = false
+
+          chi_square_computed = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step prepares a guarded scoring-readiness packet only.
+
+          It does **not** compute baseline predictions.
+
+          It does **not** compute residuals.
+
+          It does **not** compute chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary360["selected_next_route"]}`
+          """
+              (outdir / "v4_360_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary360, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_360_guarded_scoring_readiness_no_scoring.py
+
+      - name: Run v4.360 guarded scoring readiness no scoring
+        run: |
+          python run_v4_360_guarded_scoring_readiness_no_scoring.py
+
+      - name: Upload v4.360 guarded scoring readiness artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-360-guarded-scoring-readiness-packet-no-scoring-output
+          path: |
+            tairid_v4_360_guarded_scoring_readiness_no_scoring_output/
+            tairid_v4_360_guarded_scoring_readiness_no_scoring_output.zip
