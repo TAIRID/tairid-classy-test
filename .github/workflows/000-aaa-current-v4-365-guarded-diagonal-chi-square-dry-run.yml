@@ -1,0 +1,506 @@
+name: "!!! AAA CURRENT - TAIRID v4.365 guarded diagonal chi-square dry run"
+
+on:
+  workflow_dispatch:
+    inputs:
+      human_approves_v4_364_guarded_chi_square_dry_run:
+        description: "Human explicitly approves the v4.364 guarded diagonal chi-square dry run? This computes guarded diagonal chi-square only, not likelihood, p-values, support, or full-covariance scoring."
+        required: true
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
+
+jobs:
+  run-v4-365-guarded-diagonal-chi-square-dry-run:
+    name: "!!! AAA CURRENT - Run v4.365 guarded diagonal chi-square dry run"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      HUMAN_APPROVES_V4_364_CHI_SQUARE_DRY_RUN: ${{ github.event.inputs.human_approves_v4_364_guarded_chi_square_dry_run }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.364 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.364 output ZIP by pattern..."
+          INPUT_364_ZIP="$(ls tairid-v4-364-guarded-chi-square-readiness-no-chi-square-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_364_ZIP" ]; then
+            echo "Could not find v4.364 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-364-guarded-chi-square-readiness-no-chi-square-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.364 ZIP:"
+          echo "$INPUT_364_ZIP"
+          echo "INPUT_364_ZIP=$INPUT_364_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.365 guarded chi-square script
+        run: |
+          cat > run_v4_365_guarded_diagonal_chi_square_dry_run.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          import math
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; observed values loaded; definition/covariance guarded readiness confirmed; baseline predictions computed; residuals approved; guarded diagonal chi-square may be dry-run computed here; no likelihood; no p-values; no full covariance; score_valid remains false; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def finite_series(series):
+              try:
+                  return series.astype(float).apply(math.isfinite).all()
+              except Exception:
+                  return False
+
+          def main():
+              input_364 = Path(os.environ["INPUT_364_ZIP"])
+              human_approves = os.environ.get("HUMAN_APPROVES_V4_364_CHI_SQUARE_DRY_RUN", "no").strip().lower()
+              human_approval_recorded = human_approves == "yes"
+
+              outdir = Path("tairid_v4_365_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base364 = extract_zip(input_364, "tairid_v4_365_364_")
+
+              summary364_path = find_one(base364, "v4_364_summary.json")
+              readiness_path = find_one(base364, "v4_364_guarded_chi_square_readiness_matrix_NOT_CHI_SQUARE_NOT_SCORING.csv")
+              formula_packet_path = find_one(base364, "v4_364_chi_square_formula_packet_NOT_COMPUTED.csv")
+              limitation_packet_path = find_one(base364, "v4_364_guarded_diagonal_limitations.csv")
+              next_gate_path = find_one(base364, "v4_364_HUMAN_FILL_guarded_chi_square_dry_run_review_NO_SCORING.csv")
+              checklist_path = find_one(base364, "v4_364_chi_square_readiness_checklist.csv")
+              gap364_path = find_one(base364, "v4_364_gap_status_after_chi_square_readiness.csv")
+              approved_residuals_path = find_one(base364, "v4_364_input_v4_363_approved_residuals_preserved.csv")
+              rules364_path = find_one(base364, "v4_364_rule_checks.csv")
+
+              summary364 = json.loads(summary364_path.read_text())
+              readiness = pd.read_csv(readiness_path)
+              formula_packet = pd.read_csv(formula_packet_path)
+              limitation_packet = pd.read_csv(limitation_packet_path)
+              next_gate = pd.read_csv(next_gate_path)
+              checklist = pd.read_csv(checklist_path)
+              gap364 = pd.read_csv(gap364_path)
+              approved_residuals = pd.read_csv(approved_residuals_path)
+              rules364 = pd.read_csv(rules364_path)
+
+              chi_rows = []
+
+              for _, row in readiness.iterrows():
+                  normalized_residual = float(row["normalized_residual_baseline_minus_observed"])
+
+                  if human_approval_recorded:
+                      chi_square_term = normalized_residual ** 2
+                      chi_status = "guarded_diagonal_chi_square_term_computed_no_likelihood_no_support"
+                      term_computed = True
+                  else:
+                      chi_square_term = ""
+                      chi_status = "blocked_pending_explicit_human_chi_square_dry_run_approval"
+                      term_computed = False
+
+                  chi_rows.append({
+                      "v4_365_chi_square_dry_run_id": f"v4_365_chi_square_dry_run_{len(chi_rows)+1:03d}",
+                      "v4_364_chi_square_readiness_id": clean(row["v4_364_chi_square_readiness_id"]),
+                      "v4_357_observed_value_id": clean(row["v4_357_observed_value_id"]),
+
+                      "survey_or_source": clean(row["survey_or_source"]),
+                      "tracer_or_sample": clean(row["tracer_or_sample"]),
+                      "effective_redshift_z": float(row["effective_redshift_z"]),
+                      "observed_fsigma8": float(row["observed_fsigma8"]),
+                      "observed_fsigma8_uncertainty": float(row["observed_fsigma8_uncertainty"]),
+                      "baseline_fsigma8_prediction": float(row["baseline_fsigma8_prediction"]),
+                      "residual_baseline_minus_observed": float(row["residual_baseline_minus_observed"]),
+                      "normalized_residual_baseline_minus_observed": normalized_residual,
+                      "absolute_normalized_residual": float(row["absolute_normalized_residual"]),
+
+                      "chi_square_term_guarded_diagonal": chi_square_term,
+                      "human_chi_square_dry_run_input": human_approves,
+                      "human_chi_square_dry_run_recorded": human_approval_recorded,
+                      "chi_square_term_status": chi_status,
+
+                      "chi_square_term_computed": term_computed,
+                      "chi_square_computed": bool(human_approval_recorded),
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "full_covariance_available": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              chi_square_terms = pd.DataFrame(chi_rows)
+              computed_terms = chi_square_terms[chi_square_terms["chi_square_term_computed"].astype(bool)].copy()
+
+              if human_approval_recorded:
+                  guarded_chi_square_sum = float(computed_terms["chi_square_term_guarded_diagonal"].astype(float).sum())
+                  n_rows = int(len(computed_terms))
+                  dof_candidate = n_rows
+                  chi_square_summary_status = "guarded_diagonal_chi_square_dry_run_computed_no_likelihood_no_p_values_no_support"
+              else:
+                  guarded_chi_square_sum = ""
+                  n_rows = 0
+                  dof_candidate = ""
+                  chi_square_summary_status = "blocked_pending_explicit_human_chi_square_dry_run_approval"
+
+              diagnostic_summary = pd.DataFrame([
+                  {
+                      "diagnostic_metric": "guarded_diagonal_chi_square_sum",
+                      "value": guarded_chi_square_sum,
+                      "computed": bool(human_approval_recorded),
+                      "status": chi_square_summary_status,
+                      "note": "Diagonal-only guarded diagnostic. Not full covariance. Not likelihood. Not support.",
+                  },
+                  {
+                      "diagnostic_metric": "chi_square_term_rows",
+                      "value": n_rows,
+                      "computed": bool(human_approval_recorded),
+                      "status": chi_square_summary_status,
+                      "note": "Number of rows contributing terms.",
+                  },
+                  {
+                      "diagnostic_metric": "degrees_of_freedom_candidate",
+                      "value": dof_candidate,
+                      "computed": bool(human_approval_recorded),
+                      "status": "candidate_only_no_p_value",
+                      "note": "Candidate only. No p-value is computed here.",
+                  },
+                  {
+                      "diagnostic_metric": "likelihood_computed",
+                      "value": 0,
+                      "computed": False,
+                      "status": "blocked_by_design",
+                      "note": "No likelihood is computed in v4.365.",
+                  },
+                  {
+                      "diagnostic_metric": "p_values_computed",
+                      "value": 0,
+                      "computed": False,
+                      "status": "blocked_by_design",
+                      "note": "No p-values are computed in v4.365.",
+                  },
+                  {
+                      "diagnostic_metric": "support_allowed",
+                      "value": 0,
+                      "computed": False,
+                      "status": "blocked_by_design",
+                      "note": "No support claim is allowed from v4.365.",
+                  },
+              ])
+
+              review_packet = pd.DataFrame([
+                  {
+                      "v4_365_review_packet_id": "v4_365_review_001",
+                      "next_gate": "v4_366_guarded_chi_square_diagnostic_review_no_support",
+                      "human_guarded_chi_square_review_decision": "",
+                      "allowed_human_guarded_chi_square_review_decisions": "approve_guarded_chi_square_diagnostic_for_external_audit|needs_residual_repair|needs_full_covariance_first|keep_blocked",
+                      "human_guarded_chi_square_review_note": "",
+                      "human_diagonal_only_warning_acknowledgement": "",
+                      "guarded_chi_square_diagnostic_review_approved_now": False,
+                      "chi_square_computed": bool(human_approval_recorded),
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  }
+              ])
+
+              boundary_update = pd.DataFrame([
+                  {
+                      "boundary_id": "V4_365_BOUNDARY_001",
+                      "boundary": "Guarded diagonal chi-square is computed only as a diagnostic dry run.",
+                      "status": "computed_if_human_approved",
+                  },
+                  {
+                      "boundary_id": "V4_365_BOUNDARY_002",
+                      "boundary": "Full covariance is unavailable.",
+                      "status": "active_limit",
+                  },
+                  {
+                      "boundary_id": "V4_365_BOUNDARY_003",
+                      "boundary": "No likelihood is computed.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "boundary_id": "V4_365_BOUNDARY_004",
+                      "boundary": "No p-values are computed.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "boundary_id": "V4_365_BOUNDARY_005",
+                      "boundary": "No support claim is allowed.",
+                      "status": "blocked_by_design",
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_365_GAP_001",
+                      "gap": "Guarded diagonal chi-square dry run.",
+                      "status_after_v4_365": "guarded_chi_square_computed_no_likelihood_no_support" if human_approval_recorded else "blocked_pending_human_chi_square_approval",
+                      "next_gate": "v4_366_guarded_chi_square_diagnostic_review_no_support" if human_approval_recorded else "rerun_v4_365_with_human_approval_yes_if_accepted",
+                  },
+                  {
+                      "gap_id": "V4_365_GAP_002",
+                      "gap": "Likelihood remains uncomputed.",
+                      "status_after_v4_365": "still_blocked",
+                      "next_gate": "later_likelihood_gate_only_if_allowed",
+                  },
+                  {
+                      "gap_id": "V4_365_GAP_003",
+                      "gap": "P-values remain uncomputed.",
+                      "status_after_v4_365": "still_blocked",
+                      "next_gate": "later_p_value_gate_only_if_allowed",
+                  },
+                  {
+                      "gap_id": "V4_365_GAP_004",
+                      "gap": "Full covariance remains unavailable.",
+                      "status_after_v4_365": "guarded_diagonal_only",
+                      "next_gate": "full_covariance_repair_lane_if_needed",
+                  },
+                  {
+                      "gap_id": "V4_365_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_365": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate_only_after_review",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_364_summary_found": summary364.get("version") == "v4.364",
+                  "input_v4_364_rules_all_passed": summary_rules_all_passed(summary364),
+                  "input_v4_364_failed_gates_none": summary364.get("failed_gates") == "none",
+                  "input_v4_364_readiness_status_correct": summary364.get("readiness_status") == "guarded_chi_square_readiness_packet_created_not_chi_square",
+                  "input_v4_364_residuals_computed_true": summary364.get("residuals_computed") is True,
+                  "input_v4_364_normalized_residuals_true": summary364.get("normalized_residuals_computed") is True,
+                  "input_v4_364_no_chi_square_yet": summary364.get("chi_square_computed") is False,
+                  "input_v4_364_no_likelihood": summary364.get("likelihood_computed") is False,
+                  "input_v4_364_no_p_values": summary364.get("p_values_computed") is False,
+                  "input_v4_364_no_score_valid": summary364.get("score_valid") is False,
+                  "input_v4_364_no_support_allowed": summary364.get("support_allowed") is False,
+
+                  "rules364_all_passed": rules364["passed"].astype(bool).all(),
+                  "readiness_rows_match_summary": len(readiness) == int(summary364.get("chi_square_readiness_rows")),
+                  "formula_packet_rows_equal_4": len(formula_packet) == 4,
+                  "limitation_packet_rows_equal_5": len(limitation_packet) == 5,
+                  "next_gate_rows_equal_1": len(next_gate) == 1,
+                  "checklist_rows_equal_6": len(checklist) == 6,
+                  "gap364_rows_equal_5": len(gap364) == 5,
+                  "approved_residuals_rows_match_readiness": len(approved_residuals) == len(readiness),
+
+                  "human_approval_input_valid": human_approves in ["yes", "no"],
+                  "chi_square_terms_rows_match_readiness": len(chi_square_terms) == len(readiness),
+                  "computed_terms_count_correct": len(computed_terms) == (len(readiness) if human_approval_recorded else 0),
+                  "chi_square_terms_finite_if_yes": (finite_series(computed_terms["chi_square_term_guarded_diagonal"]) if human_approval_recorded else True),
+                  "chi_square_terms_nonnegative_if_yes": (computed_terms["chi_square_term_guarded_diagonal"].astype(float).ge(0).all() if human_approval_recorded else True),
+                  "diagnostic_summary_rows_equal_6": len(diagnostic_summary) == 6,
+                  "review_packet_rows_equal_1": len(review_packet) == 1,
+                  "boundary_update_rows_equal_5": len(boundary_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "likelihood_computed_false": false_col(chi_square_terms, "likelihood_computed") and false_col(review_packet, "likelihood_computed"),
+                  "p_values_computed_false": false_col(chi_square_terms, "p_values_computed") and false_col(review_packet, "p_values_computed"),
+                  "full_covariance_available_false": false_col(chi_square_terms, "full_covariance_available"),
+                  "score_valid_false": false_col(chi_square_terms, "score_valid") and false_col(review_packet, "score_valid"),
+                  "support_allowed_false": false_col(chi_square_terms, "support_allowed") and false_col(review_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              if human_approval_recorded:
+                  expected_result = "v4_365_guarded_diagonal_chi_square_dry_run_passed_chi_square_computed_no_likelihood_no_p_values_no_support"
+                  readiness_status = "guarded_diagonal_chi_square_computed_no_likelihood_no_p_values_no_support"
+                  selected_next_route = "v4_366_guarded_chi_square_diagnostic_review_no_support_claims"
+              else:
+                  expected_result = "v4_365_blocked_pending_human_chi_square_dry_run_approval_no_support_claims"
+                  readiness_status = "blocked_pending_human_chi_square_dry_run_approval"
+                  selected_next_route = "rerun_v4_365_with_human_approval_yes_if_accepted"
+
+              summary365 = {
+                  "version": "v4.365",
+                  "route_name": "v4_365_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support_claims",
+                  "expected_result": expected_result,
+                  "input_version": "v4.364",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": readiness_status,
+                  "human_chi_square_dry_run_input": human_approves,
+                  "human_chi_square_dry_run_recorded": bool(human_approval_recorded),
+                  "chi_square_term_rows": int(len(chi_square_terms)),
+                  "chi_square_term_computed_rows": int(len(computed_terms)),
+                  "guarded_diagonal_chi_square_sum": guarded_chi_square_sum,
+                  "degrees_of_freedom_candidate": dof_candidate,
+                  "chi_square_computed": bool(human_approval_recorded),
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "full_covariance_available": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              chi_square_terms.to_csv(outdir / "v4_365_guarded_diagonal_chi_square_DRY_RUN_NO_LIKELIHOOD_NO_SUPPORT.csv", index=False)
+              computed_terms.to_csv(outdir / "v4_365_COMPUTED_CHI_SQUARE_TERMS_GUARDED_DIAGONAL_ONLY.csv", index=False)
+              diagnostic_summary.to_csv(outdir / "v4_365_guarded_diagonal_chi_square_summary_NO_P_VALUES_NO_SUPPORT.csv", index=False)
+              review_packet.to_csv(outdir / "v4_365_HUMAN_FILL_guarded_chi_square_diagnostic_review_NO_SUPPORT.csv", index=False)
+              boundary_update.to_csv(outdir / "v4_365_boundary_no_likelihood_no_p_values_no_support.csv", index=False)
+              gap_update.to_csv(outdir / "v4_365_gap_status_after_guarded_chi_square_dry_run.csv", index=False)
+              readiness.to_csv(outdir / "v4_365_input_v4_364_chi_square_readiness_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_365_rule_checks.csv", index=False)
+
+              (outdir / "v4_365_summary.json").write_text(json.dumps(summary365, indent=2))
+
+              summary_md = f"""# TAIRID v4.365 Guarded Diagonal Chi-Square Dry Run — No Likelihood, No P-Values, No Support
+
+          Expected result: `{summary365["expected_result"]}`
+
+          {summary365["rules_passed"]} / {summary365["rules_total"]} rules passed
+
+          failed_gates = {summary365["failed_gates"]}
+
+          readiness_status = `{summary365["readiness_status"]}`
+
+          human_chi_square_dry_run_input = `{human_approves}`
+
+          chi_square_computed = {summary365["chi_square_computed"]}
+
+          guarded_diagonal_chi_square_sum = {summary365["guarded_diagonal_chi_square_sum"]}
+
+          degrees_of_freedom_candidate = {summary365["degrees_of_freedom_candidate"]}
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          full_covariance_available = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step computes guarded diagonal chi-square only when the human input is `yes`.
+
+          It does **not** compute likelihood.
+
+          It does **not** compute p-values.
+
+          It does **not** use full covariance.
+
+          It does **not** create a general valid score.
+
+          It does **not** make support claims.
+
+          Next route: `{selected_next_route}`
+          """
+              (outdir / "v4_365_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary365, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_365_guarded_diagonal_chi_square_dry_run.py
+
+      - name: Run v4.365 guarded diagonal chi-square dry run
+        run: |
+          python run_v4_365_guarded_diagonal_chi_square_dry_run.py
+
+      - name: Upload v4.365 guarded diagonal chi-square artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-365-guarded-diagonal-chi-square-dry-run-no-likelihood-no-support-output
+          path: |
+            tairid_v4_365_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support_output/
+            tairid_v4_365_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support_output.zip
