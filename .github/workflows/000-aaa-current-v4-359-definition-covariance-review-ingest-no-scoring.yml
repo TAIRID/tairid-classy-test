@@ -1,0 +1,490 @@
+name: "!!! AAA CURRENT - TAIRID v4.359 definition covariance review ingest no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-359-definition-covariance-review-ingest-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.359 definition covariance review ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.358 output ZIP and human-filled review ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.358 output ZIP..."
+          INPUT_358_ZIP="$(ls tairid-v4-358-definition-covariance-match-readiness-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_358_ZIP" ]; then
+            echo "Could not find v4.358 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-358-definition-covariance-match-readiness-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled definition/covariance review ZIP..."
+          HUMAN_FILLED_REVIEW_ZIP="$(ls tairid-v4-358-human-filled-definition-covariance-review-for-v4-359-no-scoring*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$HUMAN_FILLED_REVIEW_ZIP" ]; then
+            echo "Could not find human-filled review ZIP."
+            echo "Expected:"
+            echo "tairid-v4-358-human-filled-definition-covariance-review-for-v4-359-no-scoring.zip"
+            exit 1
+          fi
+
+          echo "Using v4.358 ZIP:"
+          echo "$INPUT_358_ZIP"
+
+          echo "Using human-filled review ZIP:"
+          echo "$HUMAN_FILLED_REVIEW_ZIP"
+
+          echo "INPUT_358_ZIP=$INPUT_358_ZIP" >> "$GITHUB_ENV"
+          echo "HUMAN_FILLED_REVIEW_ZIP=$HUMAN_FILLED_REVIEW_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.359 definition covariance review ingest script
+        run: |
+          cat > run_v4_359_definition_covariance_review_ingest_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; observed values loaded; definition match and guarded diagonal covariance status may be ingested here; no residuals; no chi-square; no likelihood; no p-values; no scoring; no support claims"
+
+          ALLOWED_DEFINITION_DECISIONS = {
+              "approve_definition_match_for_later_scoring_readiness",
+              "needs_definition_repair",
+              "reject_observed_row",
+              "keep_blocked",
+          }
+
+          ALLOWED_COVARIANCE_DECISIONS = {
+              "approve_diagonal_error_model_for_guarded_diagnostic_only",
+              "requires_full_covariance_before_scoring",
+              "needs_covariance_repair",
+              "reject_observed_row",
+              "keep_blocked",
+          }
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def main():
+              input_358 = Path(os.environ["INPUT_358_ZIP"])
+              human_zip = Path(os.environ["HUMAN_FILLED_REVIEW_ZIP"])
+
+              outdir = Path("tairid_v4_359_definition_covariance_review_ingest_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base358 = extract_zip(input_358, "tairid_v4_359_358_")
+              basehuman = extract_zip(human_zip, "tairid_v4_359_human_")
+
+              summary358_path = find_one(base358, "v4_358_summary.json")
+              review_packet_path = find_one(base358, "v4_358_HUMAN_FILL_definition_covariance_review_NO_SCORING.csv")
+              definition_readiness_path = find_one(base358, "v4_358_definition_match_readiness_NOT_CONFIRMED.csv")
+              covariance_readiness_path = find_one(base358, "v4_358_covariance_match_readiness_NOT_CONFIRMED.csv")
+              readiness_summary_path = find_one(base358, "v4_358_readiness_summary_no_scoring.csv")
+              checklist_path = find_one(base358, "v4_358_definition_covariance_review_checklist.csv")
+              loaded_values_path = find_one(base358, "v4_358_input_v4_357_loaded_observed_values_preserved.csv")
+              gap_status_path = find_one(base358, "v4_358_gap_status_after_definition_covariance_readiness.csv")
+              rules358_path = find_one(base358, "v4_358_rule_checks.csv")
+
+              human_review_path = find_one_suffix(basehuman, "HUMAN_FILLED_definition_covariance_review_NO_SCORING.csv")
+
+              summary358 = json.loads(summary358_path.read_text())
+              review_packet = pd.read_csv(review_packet_path)
+              definition_readiness = pd.read_csv(definition_readiness_path)
+              covariance_readiness = pd.read_csv(covariance_readiness_path)
+              readiness_summary = pd.read_csv(readiness_summary_path)
+              checklist = pd.read_csv(checklist_path)
+              loaded_values = pd.read_csv(loaded_values_path)
+              gap_status = pd.read_csv(gap_status_path)
+              rules358 = pd.read_csv(rules358_path)
+              human_review = pd.read_csv(human_review_path)
+
+              for col in [
+                  "human_definition_match_decision",
+                  "human_definition_match_note",
+                  "human_covariance_match_decision",
+                  "human_covariance_match_note",
+                  "human_diagonal_only_warning_acknowledgement",
+              ]:
+                  if col not in human_review.columns:
+                      human_review[col] = ""
+
+              ingest_rows = []
+
+              for _, row in human_review.iterrows():
+                  definition_decision = clean(row["human_definition_match_decision"])
+                  covariance_decision = clean(row["human_covariance_match_decision"])
+                  diagonal_warning_ack = clean(row["human_diagonal_only_warning_acknowledgement"])
+
+                  definition_confirmed = definition_decision == "approve_definition_match_for_later_scoring_readiness"
+                  guarded_diagonal_confirmed = covariance_decision == "approve_diagonal_error_model_for_guarded_diagnostic_only"
+                  full_covariance_required = covariance_decision == "requires_full_covariance_before_scoring"
+
+                  if definition_confirmed and guarded_diagonal_confirmed:
+                      row_status = "definition_matched_guarded_diagonal_ready_for_scoring_readiness_not_scoring"
+                      row_ready_for_scoring_readiness = True
+                  elif definition_confirmed and full_covariance_required:
+                      row_status = "definition_matched_but_full_covariance_required_before_scoring"
+                      row_ready_for_scoring_readiness = False
+                  elif definition_decision in ["needs_definition_repair", "reject_observed_row", "keep_blocked"]:
+                      row_status = "blocked_by_definition_decision"
+                      row_ready_for_scoring_readiness = False
+                  elif covariance_decision in ["needs_covariance_repair", "reject_observed_row", "keep_blocked"]:
+                      row_status = "blocked_by_covariance_decision"
+                      row_ready_for_scoring_readiness = False
+                  else:
+                      row_status = "invalid_or_missing_definition_covariance_decision"
+                      row_ready_for_scoring_readiness = False
+
+                  ingest_rows.append({
+                      "v4_359_match_ingest_id": f"v4_359_match_ingest_{len(ingest_rows)+1:03d}",
+                      "v4_357_observed_value_id": clean(row["v4_357_observed_value_id"]),
+                      "survey_or_source": clean(row["survey_or_source"]),
+                      "tracer_or_sample": clean(row["tracer_or_sample"]),
+                      "effective_redshift_z": row["effective_redshift_z"],
+                      "observed_fsigma8": row["observed_fsigma8"],
+                      "observed_fsigma8_uncertainty": row["observed_fsigma8_uncertainty"],
+                      "source_reference": clean(row["source_reference"]),
+                      "source_url": clean(row["source_url"]),
+                      "covariance_or_error_model": clean(row["covariance_or_error_model"]),
+
+                      "human_definition_match_decision": definition_decision,
+                      "human_definition_match_note": clean(row["human_definition_match_note"]),
+                      "human_covariance_match_decision": covariance_decision,
+                      "human_covariance_match_note": clean(row["human_covariance_match_note"]),
+                      "human_diagonal_only_warning_acknowledgement": diagonal_warning_ack,
+
+                      "definition_match_confirmed_now": definition_confirmed,
+                      "covariance_match_confirmed_now": guarded_diagonal_confirmed,
+                      "covariance_scope": "guarded_diagonal_diagnostic_only" if guarded_diagonal_confirmed else "not_confirmed_or_full_covariance_required",
+                      "full_covariance_required_before_strong_scoring": full_covariance_required or guarded_diagonal_confirmed,
+                      "row_match_ingest_status": row_status,
+                      "row_ready_for_scoring_readiness_not_scoring": row_ready_for_scoring_readiness,
+
+                      "score_valid": False,
+                      "residuals_computed": False,
+                      "chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              ingest = pd.DataFrame(ingest_rows)
+
+              ready_rows = ingest[ingest["row_ready_for_scoring_readiness_not_scoring"].astype(bool)].copy()
+              invalid_rows = ingest[ingest["row_match_ingest_status"] == "invalid_or_missing_definition_covariance_decision"].copy()
+              blocked_rows = ingest[
+                  ~ingest["row_ready_for_scoring_readiness_not_scoring"].astype(bool)
+              ].copy()
+
+              definition_confirmed_all = len(ready_rows) == len(ingest)
+              covariance_confirmed_all = len(ready_rows) == len(ingest)
+
+              scoring_readiness_packet = ready_rows.copy()
+              scoring_readiness_packet["scoring_readiness_status"] = "ready_for_guarded_diagnostic_scoring_readiness_gate_not_scoring"
+              scoring_readiness_packet["score_valid"] = False
+              scoring_readiness_packet["support_allowed"] = False
+
+              scoring_boundary = pd.DataFrame([
+                  {
+                      "boundary_id": "V4_359_BOUNDARY_001",
+                      "boundary": "Definition match is confirmed only for later guarded scoring-readiness review.",
+                      "status": "closed_for_guarded_readiness" if definition_confirmed_all else "blocked_or_partial",
+                  },
+                  {
+                      "boundary_id": "V4_359_BOUNDARY_002",
+                      "boundary": "Diagonal error model is accepted only for guarded diagnostic readiness; it is not full covariance.",
+                      "status": "guarded_only",
+                  },
+                  {
+                      "boundary_id": "V4_359_BOUNDARY_003",
+                      "boundary": "Full likelihood / strong scoring remains blocked without full covariance.",
+                      "status": "blocked",
+                  },
+                  {
+                      "boundary_id": "V4_359_BOUNDARY_004",
+                      "boundary": "No residuals, chi-square, likelihood, p-values, or scores are computed here.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "boundary_id": "V4_359_BOUNDARY_005",
+                      "boundary": "No support claim is allowed here.",
+                      "status": "blocked_by_design",
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_359_GAP_001",
+                      "gap": "Definition/covariance human review ingested.",
+                      "status_after_v4_359": "guarded_diagnostic_readiness_available_not_scoring" if len(ready_rows) == len(ingest) else "blocked_or_partial",
+                      "next_gate": "v4_360_guarded_scoring_readiness_packet_no_scoring",
+                  },
+                  {
+                      "gap_id": "V4_359_GAP_002",
+                      "gap": "Residuals remain uncomputed.",
+                      "status_after_v4_359": "still_blocked",
+                      "next_gate": "later_guarded_scoring_dry_run",
+                  },
+                  {
+                      "gap_id": "V4_359_GAP_003",
+                      "gap": "Chi-square/likelihood/p-values remain uncomputed.",
+                      "status_after_v4_359": "still_blocked",
+                      "next_gate": "later_scoring_gate",
+                  },
+                  {
+                      "gap_id": "V4_359_GAP_004",
+                      "gap": "Full covariance remains unavailable.",
+                      "status_after_v4_359": "guarded_diagonal_only",
+                      "next_gate": "full_covariance_repair_lane_if_needed",
+                  },
+                  {
+                      "gap_id": "V4_359_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_359": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate_only_after_scoring",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_358_summary_found": summary358.get("version") == "v4.358",
+                  "input_v4_358_rules_all_passed": summary_rules_all_passed(summary358),
+                  "input_v4_358_failed_gates_none": summary358.get("failed_gates") == "none",
+                  "input_v4_358_observed_values_loaded_true": summary358.get("observed_values_loaded") is True,
+                  "input_v4_358_observed_rows_loaded_3": summary358.get("observed_rows_loaded") == 3,
+                  "input_v4_358_definition_not_confirmed_yet": summary358.get("definition_match_confirmed") is False,
+                  "input_v4_358_covariance_not_confirmed_yet": summary358.get("covariance_match_confirmed") is False,
+                  "input_v4_358_no_score_valid": summary358.get("score_valid") is False,
+                  "input_v4_358_no_support_allowed": summary358.get("support_allowed") is False,
+
+                  "rules358_all_passed": rules358["passed"].astype(bool).all(),
+                  "review_packet_rows_equal_loaded": len(review_packet) == len(loaded_values),
+                  "human_review_rows_equal_review_packet": len(human_review) == len(review_packet),
+                  "definition_readiness_rows_equal_loaded": len(definition_readiness) == len(loaded_values),
+                  "covariance_readiness_rows_equal_loaded": len(covariance_readiness) == len(loaded_values),
+                  "readiness_summary_rows_equal_6": len(readiness_summary) == 6,
+                  "checklist_rows_equal_6": len(checklist) == 6,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+
+                  "definition_decisions_filled_all_rows": human_review["human_definition_match_decision"].apply(clean).ne("").all(),
+                  "definition_decisions_allowed": human_review["human_definition_match_decision"].apply(clean).isin(ALLOWED_DEFINITION_DECISIONS).all(),
+                  "covariance_decisions_filled_all_rows": human_review["human_covariance_match_decision"].apply(clean).ne("").all(),
+                  "covariance_decisions_allowed": human_review["human_covariance_match_decision"].apply(clean).isin(ALLOWED_COVARIANCE_DECISIONS).all(),
+                  "diagonal_warning_acknowledged_all_rows": human_review["human_diagonal_only_warning_acknowledgement"].apply(clean).ne("").all(),
+
+                  "ingest_rows_equal_loaded": len(ingest) == len(loaded_values),
+                  "ready_rows_equal_loaded": len(ready_rows) == len(loaded_values),
+                  "invalid_rows_equal_0": len(invalid_rows) == 0,
+                  "blocked_rows_equal_0": len(blocked_rows) == 0,
+                  "definition_confirmed_all": bool(definition_confirmed_all),
+                  "covariance_confirmed_all": bool(covariance_confirmed_all),
+                  "scoring_readiness_packet_rows_equal_loaded": len(scoring_readiness_packet) == len(loaded_values),
+
+                  "score_valid_false": false_col(ingest, "score_valid") and false_col(scoring_readiness_packet, "score_valid"),
+                  "residuals_computed_false": false_col(ingest, "residuals_computed"),
+                  "chi_square_computed_false": false_col(ingest, "chi_square_computed"),
+                  "likelihood_computed_false": false_col(ingest, "likelihood_computed"),
+                  "p_values_computed_false": false_col(ingest, "p_values_computed"),
+                  "support_allowed_false": false_col(ingest, "support_allowed") and false_col(scoring_readiness_packet, "support_allowed"),
+                  "scoring_boundary_rows_equal_5": len(scoring_boundary) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              if len(ready_rows) == len(loaded_values):
+                  readiness_status = "guarded_diagnostic_scoring_readiness_available_not_scoring"
+                  selected_next_route = "v4_360_guarded_scoring_readiness_packet_no_scoring_no_support_claims"
+              else:
+                  readiness_status = "blocked_definition_or_covariance_review_incomplete"
+                  selected_next_route = "repair_v4_358_human_review_then_rerun_v4_359"
+
+              summary359 = {
+                  "version": "v4.359",
+                  "route_name": "v4_359_definition_covariance_review_ingest_no_scoring_no_support_claims",
+                  "expected_result": "v4_359_definition_covariance_review_ingest_passed_guarded_readiness_no_scoring_no_claims",
+                  "input_version": "v4.358",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": readiness_status,
+                  "loaded_observed_rows": int(len(loaded_values)),
+                  "definition_match_confirmed": bool(definition_confirmed_all),
+                  "covariance_match_confirmed": bool(covariance_confirmed_all),
+                  "covariance_scope": "guarded_diagonal_diagnostic_only",
+                  "full_covariance_available": False,
+                  "score_valid": False,
+                  "residuals_computed": False,
+                  "chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              ingest.to_csv(outdir / "v4_359_definition_covariance_review_ingest_ledger_NO_SCORING.csv", index=False)
+              scoring_readiness_packet.to_csv(outdir / "v4_359_guarded_diagnostic_scoring_readiness_packet_NOT_SCORING.csv", index=False)
+              scoring_boundary.to_csv(outdir / "v4_359_scoring_boundary_and_limitations.csv", index=False)
+              gap_update.to_csv(outdir / "v4_359_gap_status_after_definition_covariance_ingest.csv", index=False)
+              human_review.to_csv(outdir / "v4_359_input_human_filled_definition_covariance_review_preserved.csv", index=False)
+              loaded_values.to_csv(outdir / "v4_359_input_v4_358_loaded_observed_values_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_359_rule_checks.csv", index=False)
+
+              (outdir / "v4_359_summary.json").write_text(json.dumps(summary359, indent=2))
+
+              summary_md = f"""# TAIRID v4.359 Definition/Covariance Review Ingest — No Scoring
+
+          Expected result: `{summary359["expected_result"]}`
+
+          {summary359["rules_passed"]} / {summary359["rules_total"]} rules passed
+
+          failed_gates = {summary359["failed_gates"]}
+
+          readiness_status = `{summary359["readiness_status"]}`
+
+          definition_match_confirmed = {summary359["definition_match_confirmed"]}
+
+          covariance_match_confirmed = {summary359["covariance_match_confirmed"]}
+
+          covariance_scope = `{summary359["covariance_scope"]}`
+
+          full_covariance_available = false
+
+          score_valid = false
+
+          residuals_computed = false
+
+          chi_square_computed = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step ingests definition and covariance/error-model review decisions.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary359["selected_next_route"]}`
+          """
+              (outdir / "v4_359_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary359, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_359_definition_covariance_review_ingest_no_scoring.py
+
+      - name: Run v4.359 definition covariance review ingest no scoring
+        run: |
+          python run_v4_359_definition_covariance_review_ingest_no_scoring.py
+
+      - name: Upload v4.359 definition covariance review ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-359-definition-covariance-review-ingest-no-scoring-output
+          path: |
+            tairid_v4_359_definition_covariance_review_ingest_no_scoring_output/
+            tairid_v4_359_definition_covariance_review_ingest_no_scoring_output.zip
