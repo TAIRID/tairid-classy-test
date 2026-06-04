@@ -1,0 +1,567 @@
+name: "!!! AAA CURRENT - TAIRID v4.371 full covariance exact source locator no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-371-full-covariance-exact-source-locator-no-support:
+    name: "!!! AAA CURRENT - Run v4.371 exact covariance source locator"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.370 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.370 output ZIP by pattern..."
+          INPUT_370_ZIP="$(ls tairid-v4-370-full-covariance-source-candidate-review-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_370_ZIP" ]; then
+            echo "Could not find v4.370 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-370-full-covariance-source-candidate-review-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.370 ZIP:"
+          echo "$INPUT_370_ZIP"
+          echo "INPUT_370_ZIP=$INPUT_370_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.371 exact source locator script
+        run: |
+          cat > run_v4_371_full_covariance_exact_source_locator_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "exact covariance source locator/staging packet only; no exact covariance file approved; no covariance values loaded; no covariance dimensions confirmed; no row order matched; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          DATA_EXTENSIONS = {".txt", ".dat", ".csv", ".fits", ".fit", ".npy", ".npz", ".json", ".gz", ".zip"}
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def score_repo_candidate(row):
+              path = clean(row.get("repo_path", ""))
+              name = clean(row.get("file_name", ""))
+              hits = clean(row.get("keyword_hits", "")).lower()
+              lower = (path + " " + name + " " + hits).lower()
+              ext = Path(name).suffix.lower()
+
+              score = 0
+              if "covariance" in lower:
+                  score += 8
+              if "covmat" in lower:
+                  score += 8
+              if "cov" in lower:
+                  score += 4
+              if "dr12" in lower:
+                  score += 5
+              if "boss" in lower:
+                  score += 5
+              if "rsd" in lower:
+                  score += 4
+              if "fsigma" in lower or "fsigma8" in lower:
+                  score += 4
+              if "growth" in lower:
+                  score += 2
+              if "likelihood" in lower:
+                  score += 3
+              if ext in DATA_EXTENSIONS:
+                  score += 2
+
+              bad_terms = ["workflow", ".yml", ".yaml", "summary", "rule_checks", "human_fill", "audit", "readme", "output.zip"]
+              for term in bad_terms:
+                  if term in lower:
+                      score -= 3
+
+              return score
+
+          def main():
+              input_370 = Path(os.environ["INPUT_370_ZIP"])
+
+              outdir = Path("tairid_v4_371_full_covariance_exact_source_locator_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base370 = extract_zip(input_370, "tairid_v4_371_370_")
+
+              summary370_path = find_one(base370, "v4_370_summary.json")
+              review_ledger_path = find_one(base370, "v4_370_covariance_source_review_ingest_ledger_NO_SUPPORT.csv")
+              accepted_path = find_one(base370, "v4_370_ACCEPTED_covariance_source_candidates_FOR_LATER_SEARCH_NO_VALUES.csv")
+              blocked_path = find_one(base370, "v4_370_blocked_covariance_source_candidates.csv")
+              exact_search_packet_path = find_one(base370, "v4_370_exact_covariance_source_search_packet_NO_VALUES.csv")
+              route_status_path = find_one(base370, "v4_370_route_status_summary.csv")
+              limitations_path = find_one(base370, "v4_370_limitations_after_covariance_source_review.csv")
+              gap370_path = find_one(base370, "v4_370_gap_status_after_covariance_source_review.csv")
+              source_candidates_path = find_one(base370, "v4_370_input_v4_369_source_candidates_preserved.csv")
+              repo_scan_path = find_one(base370, "v4_370_input_v4_369_repo_candidate_scan_preserved.csv")
+              rules370_path = find_one(base370, "v4_370_rule_checks.csv")
+
+              summary370 = json.loads(summary370_path.read_text())
+              review_ledger = pd.read_csv(review_ledger_path)
+              accepted = pd.read_csv(accepted_path)
+              blocked = pd.read_csv(blocked_path)
+              exact_search_packet = pd.read_csv(exact_search_packet_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations = pd.read_csv(limitations_path)
+              gap370 = pd.read_csv(gap370_path)
+              source_candidates = pd.read_csv(source_candidates_path)
+              repo_scan = pd.read_csv(repo_scan_path)
+              rules370 = pd.read_csv(rules370_path)
+
+              repo_ranked = repo_scan.copy()
+              if "repo_path" not in repo_ranked.columns:
+                  repo_ranked["repo_path"] = ""
+              if "file_name" not in repo_ranked.columns:
+                  repo_ranked["file_name"] = ""
+              if "keyword_hits" not in repo_ranked.columns:
+                  repo_ranked["keyword_hits"] = ""
+
+              repo_ranked["v4_371_exact_source_candidate_score"] = repo_ranked.apply(score_repo_candidate, axis=1)
+              repo_ranked = repo_ranked.sort_values(
+                  by=["v4_371_exact_source_candidate_score", "repo_path"],
+                  ascending=[False, True]
+              ).reset_index(drop=True)
+
+              repo_ranked["v4_371_rank"] = range(1, len(repo_ranked) + 1)
+              top_repo_candidates = repo_ranked.head(25).copy()
+              top_repo_candidates["exact_source_locator_status"] = "repo_candidate_for_human_exact_source_review_not_staged"
+              top_repo_candidates["exact_covariance_file_approved"] = False
+              top_repo_candidates["full_covariance_file_staged"] = False
+              top_repo_candidates["full_covariance_available"] = False
+              top_repo_candidates["full_covariance_values_loaded"] = False
+              top_repo_candidates["covariance_dimension_confirmed"] = False
+              top_repo_candidates["observed_row_order_matched"] = False
+              top_repo_candidates["likelihood_computed"] = False
+              top_repo_candidates["p_values_computed"] = False
+              top_repo_candidates["score_valid"] = False
+              top_repo_candidates["support_allowed"] = False
+              top_repo_candidates["claim_boundary"] = CLAIM_BOUNDARY
+
+              locator_rows = []
+
+              for _, row in accepted.iterrows():
+                  locator_rows.append({
+                      "v4_371_locator_id": f"v4_371_accepted_source_direction_{len(locator_rows)+1:03d}",
+                      "locator_type": "accepted_source_direction",
+                      "source_candidate_id": clean(row["source_candidate_id"]),
+                      "candidate_name": clean(row["candidate_name"]),
+                      "candidate_role": clean(row["candidate_role"]),
+                      "candidate_or_repo_path": "",
+                      "candidate_file_name": "",
+                      "candidate_score": "",
+                      "locator_note": clean(row["human_covariance_source_url_or_file_note"]),
+                      "locator_status": "accepted_direction_needs_exact_file_or_url",
+                      "exact_covariance_file_approved": False,
+                      "full_covariance_file_staged": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              for _, row in top_repo_candidates.iterrows():
+                  locator_rows.append({
+                      "v4_371_locator_id": f"v4_371_repo_candidate_{len(locator_rows)+1:03d}",
+                      "locator_type": "repo_candidate_file",
+                      "source_candidate_id": clean(row.get("repo_candidate_id", "")),
+                      "candidate_name": "Repository covariance-like file candidate",
+                      "candidate_role": "possible_existing_repo_file_to_review",
+                      "candidate_or_repo_path": clean(row["repo_path"]),
+                      "candidate_file_name": clean(row["file_name"]),
+                      "candidate_score": row["v4_371_exact_source_candidate_score"],
+                      "locator_note": "Candidate selected from prior repo scan by covariance/DR12/BOSS/RSD keyword scoring. Human must approve before staging.",
+                      "locator_status": "repo_candidate_needs_human_exact_source_review_not_staged",
+                      "exact_covariance_file_approved": False,
+                      "full_covariance_file_staged": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              locator_rows.append({
+                  "v4_371_locator_id": "v4_371_manual_upload_placeholder",
+                  "locator_type": "manual_upload_placeholder",
+                  "source_candidate_id": "manual_exact_covariance_file",
+                  "candidate_name": "Manual exact covariance file upload placeholder",
+                  "candidate_role": "human_may_upload_exact_file_later",
+                  "candidate_or_repo_path": "",
+                  "candidate_file_name": "",
+                  "candidate_score": "",
+                  "locator_note": "Use only if the exact BOSS DR12 covariance/likelihood file is uploaded later.",
+                  "locator_status": "manual_upload_placeholder_not_staged",
+                  "exact_covariance_file_approved": False,
+                  "full_covariance_file_staged": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              })
+
+              locator_packet = pd.DataFrame(locator_rows)
+
+              human_exact_source_review = locator_packet.copy()
+              human_exact_source_review["human_exact_source_decision"] = ""
+              human_exact_source_review["allowed_human_exact_source_decisions"] = "stage_repo_candidate_header_only|stage_manual_file_after_upload|needs_web_source_search|reject_candidate|keep_blocked"
+              human_exact_source_review["human_exact_source_url_or_file_path"] = ""
+              human_exact_source_review["human_exact_source_note"] = ""
+              human_exact_source_review["exact_source_approved_now"] = False
+              human_exact_source_review["full_covariance_file_staged"] = False
+              human_exact_source_review["full_covariance_values_loaded"] = False
+              human_exact_source_review["support_allowed"] = False
+
+              search_plan = pd.DataFrame([
+                  {
+                      "search_step": "V4_371_SEARCH_001",
+                      "goal": "Check official BOSS DR12/SDSS release material for covariance or likelihood packages matching z=0.38,0.51,0.61.",
+                      "allowed_next_action": "human_exact_source_review",
+                      "loads_values_now": False,
+                  },
+                  {
+                      "search_step": "V4_371_SEARCH_002",
+                      "goal": "Check existing repo candidates from the v4.369 scan for exact covariance-like files.",
+                      "allowed_next_action": "human_exact_source_review",
+                      "loads_values_now": False,
+                  },
+                  {
+                      "search_step": "V4_371_SEARCH_003",
+                      "goal": "If an exact file is already in repo, stage it for header/integrity inspection only.",
+                      "allowed_next_action": "later_v4_372_or_v4_373",
+                      "loads_values_now": False,
+                  },
+                  {
+                      "search_step": "V4_371_SEARCH_004",
+                      "goal": "If exact file is not present, upload it later and rerun staging.",
+                      "allowed_next_action": "manual_upload",
+                      "loads_values_now": False,
+                  },
+                  {
+                      "search_step": "V4_371_SEARCH_005",
+                      "goal": "Do not treat any candidate as full covariance until dimensions and row order are verified.",
+                      "allowed_next_action": "truth_boundary_preserved",
+                      "loads_values_now": False,
+                  },
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {
+                      "limit_id": "V4_371_LIMIT_001",
+                      "limit": "This step locates exact-source candidates only.",
+                      "status": "active_limit",
+                  },
+                  {
+                      "limit_id": "V4_371_LIMIT_002",
+                      "limit": "No exact covariance file is approved in v4.371.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "limit_id": "V4_371_LIMIT_003",
+                      "limit": "No covariance values are loaded in v4.371.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "limit_id": "V4_371_LIMIT_004",
+                      "limit": "No covariance dimension or observed-row order match is confirmed.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "limit_id": "V4_371_LIMIT_005",
+                      "limit": "No likelihood, p-values, score, or support claim is allowed.",
+                      "status": "blocked_by_design",
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_371_GAP_001",
+                      "gap": "Exact covariance source locator packet created.",
+                      "status_after_v4_371": "locator_packet_created_no_exact_file_approved",
+                      "next_gate": "v4_372_exact_covariance_source_review_ingest_no_values_no_support",
+                  },
+                  {
+                      "gap_id": "V4_371_GAP_002",
+                      "gap": "Exact covariance file remains unapproved.",
+                      "status_after_v4_371": "still_open",
+                      "next_gate": "human_exact_source_review",
+                  },
+                  {
+                      "gap_id": "V4_371_GAP_003",
+                      "gap": "Covariance values remain unloaded.",
+                      "status_after_v4_371": "still_blocked",
+                      "next_gate": "later_after_exact_file_staged_and_checked",
+                  },
+                  {
+                      "gap_id": "V4_371_GAP_004",
+                      "gap": "Covariance dimensions and observed-row order remain unconfirmed.",
+                      "status_after_v4_371": "still_blocked",
+                      "next_gate": "later_shape_and_order_gate",
+                  },
+                  {
+                      "gap_id": "V4_371_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_371": "still_blocked",
+                      "next_gate": "no_support_claims_allowed_from_v4_371",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_370_summary_found": summary370.get("version") == "v4.370",
+                  "input_v4_370_rules_all_passed": summary_rules_all_passed(summary370),
+                  "input_v4_370_failed_gates_none": summary370.get("failed_gates") == "none",
+                  "input_v4_370_accepted_candidates_3": summary370.get("accepted_covariance_source_candidate_rows") == 3,
+                  "input_v4_370_no_file_staged": summary370.get("full_covariance_file_staged") is False,
+                  "input_v4_370_no_full_covariance": summary370.get("full_covariance_available") is False,
+                  "input_v4_370_no_values_loaded": summary370.get("full_covariance_values_loaded") is False,
+                  "input_v4_370_no_dimension_confirmed": summary370.get("covariance_dimension_confirmed") is False,
+                  "input_v4_370_no_row_order": summary370.get("observed_row_order_matched") is False,
+                  "input_v4_370_no_likelihood": summary370.get("likelihood_computed") is False,
+                  "input_v4_370_no_p_values": summary370.get("p_values_computed") is False,
+                  "input_v4_370_no_score_valid": summary370.get("score_valid") is False,
+                  "input_v4_370_no_support_allowed": summary370.get("support_allowed") is False,
+
+                  "rules370_all_passed": passed_column_all(rules370),
+                  "review_ledger_rows_equal_4": len(review_ledger) == 4,
+                  "accepted_rows_match_summary": len(accepted) == int(summary370.get("accepted_covariance_source_candidate_rows")),
+                  "blocked_rows_match_summary": len(blocked) == int(summary370.get("blocked_covariance_source_candidate_rows")),
+                  "exact_search_packet_rows_match_summary": len(exact_search_packet) == int(summary370.get("exact_source_search_packet_rows")),
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations_rows_equal_5": len(limitations) == 5,
+                  "gap370_rows_equal_5": len(gap370) == 5,
+                  "source_candidates_rows_equal_4": len(source_candidates) == 4,
+                  "repo_scan_has_rows": len(repo_scan) >= 1,
+
+                  "top_repo_candidates_has_rows": len(top_repo_candidates) >= 1,
+                  "locator_packet_has_rows": len(locator_packet) >= 1,
+                  "human_exact_source_review_rows_equal_locator": len(human_exact_source_review) == len(locator_packet),
+                  "manual_placeholder_present": (locator_packet["locator_type"] == "manual_upload_placeholder").any(),
+                  "search_plan_rows_equal_5": len(search_plan) == 5,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "no_exact_covariance_file_approved": false_col(locator_packet, "exact_covariance_file_approved"),
+                  "no_full_covariance_file_staged": false_col(locator_packet, "full_covariance_file_staged") and false_col(human_exact_source_review, "full_covariance_file_staged"),
+                  "no_full_covariance_available": false_col(locator_packet, "full_covariance_available"),
+                  "no_covariance_values_loaded": false_col(locator_packet, "full_covariance_values_loaded") and false_col(human_exact_source_review, "full_covariance_values_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(locator_packet, "covariance_dimension_confirmed"),
+                  "no_observed_row_order_matched": false_col(locator_packet, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(locator_packet, "likelihood_computed"),
+                  "no_p_values_computed": false_col(locator_packet, "p_values_computed"),
+                  "no_score_valid": false_col(locator_packet, "score_valid"),
+                  "no_support_allowed": false_col(locator_packet, "support_allowed") and false_col(human_exact_source_review, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary371 = {
+                  "version": "v4.371",
+                  "route_name": "v4_371_full_covariance_exact_source_locator_or_file_staging_no_values_no_support_claims",
+                  "expected_result": "v4_371_full_covariance_exact_source_locator_passed_no_exact_file_approved_no_values_no_support_claims",
+                  "input_version": "v4.370",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "accepted_source_directions": int(len(accepted)),
+                  "repo_ranked_candidate_rows": int(len(repo_ranked)),
+                  "top_repo_candidate_rows": int(len(top_repo_candidates)),
+                  "locator_packet_rows": int(len(locator_packet)),
+                  "human_exact_source_review_rows": int(len(human_exact_source_review)),
+                  "exact_covariance_file_approved": False,
+                  "full_covariance_file_staged": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_371_exact_source_review_then_v4_372_exact_covariance_source_review_ingest_no_values_no_support_claims",
+              }
+
+              repo_ranked.to_csv(outdir / "v4_371_repo_covariance_candidates_ranked_NO_VALUES_LOADED.csv", index=False)
+              top_repo_candidates.to_csv(outdir / "v4_371_top_repo_exact_source_candidates_NO_VALUES_LOADED.csv", index=False)
+              locator_packet.to_csv(outdir / "v4_371_exact_covariance_source_locator_packet_NO_VALUES_NO_SUPPORT.csv", index=False)
+              human_exact_source_review.to_csv(outdir / "v4_371_HUMAN_FILL_exact_covariance_source_review_NO_VALUES_NO_SUPPORT.csv", index=False)
+              search_plan.to_csv(outdir / "v4_371_exact_source_search_plan_NO_VALUES.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_371_limitations_after_exact_source_locator.csv", index=False)
+              gap_update.to_csv(outdir / "v4_371_gap_status_after_exact_source_locator.csv", index=False)
+              accepted.to_csv(outdir / "v4_371_input_v4_370_accepted_candidates_preserved.csv", index=False)
+              review_ledger.to_csv(outdir / "v4_371_input_v4_370_review_ledger_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_371_rule_checks.csv", index=False)
+
+              (outdir / "v4_371_summary.json").write_text(json.dumps(summary371, indent=2))
+
+              summary_md = f"""# TAIRID v4.371 Full Covariance Exact Source Locator — No Values, No Support Claims
+
+          Expected result: `{summary371["expected_result"]}`
+
+          {summary371["rules_passed"]} / {summary371["rules_total"]} rules passed
+
+          failed_gates = {summary371["failed_gates"]}
+
+          accepted_source_directions = {summary371["accepted_source_directions"]}
+
+          repo_ranked_candidate_rows = {summary371["repo_ranked_candidate_rows"]}
+
+          top_repo_candidate_rows = {summary371["top_repo_candidate_rows"]}
+
+          locator_packet_rows = {summary371["locator_packet_rows"]}
+
+          exact_covariance_file_approved = false
+
+          full_covariance_file_staged = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step creates an exact-source locator and human review packet.
+
+          It does **not** approve an exact covariance file.
+
+          It does **not** stage or load covariance values.
+
+          It does **not** confirm covariance dimensions or observed-row order.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary371["selected_next_route"]}`
+          """
+              (outdir / "v4_371_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary371, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_371_full_covariance_exact_source_locator_no_support.py
+
+      - name: Run v4.371 full covariance exact source locator no support
+        run: |
+          python run_v4_371_full_covariance_exact_source_locator_no_support.py
+
+      - name: Upload v4.371 exact covariance source locator artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-371-full-covariance-exact-source-locator-no-values-no-support-output
+          path: |
+            tairid_v4_371_full_covariance_exact_source_locator_no_support_output/
+            tairid_v4_371_full_covariance_exact_source_locator_no_support_output.zip
