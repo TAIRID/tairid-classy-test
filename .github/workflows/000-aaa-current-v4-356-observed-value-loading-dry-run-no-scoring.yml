@@ -1,0 +1,475 @@
+name: "!!! AAA CURRENT - TAIRID v4.356 observed value loading dry run no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-356-observed-value-loading-dry-run-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.356 observed value dry run"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.355 output ZIP and direct observed source CSV
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.355 output ZIP..."
+          INPUT_355_ZIP="$(ls tairid-v4-355-direct-source-schema-review-ingest-no-values-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_355_ZIP" ]; then
+            echo "Could not find v4.355 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-355-direct-source-schema-review-ingest-no-values-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Finding direct observed source CSV..."
+          DIRECT_SOURCE_CSV="$(ls sdss_rsd_boss_dr12_direct_observed_source_candidate_v4_354_NO_VALUES_LOADED_NO_SCORING*.csv 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$DIRECT_SOURCE_CSV" ]; then
+            echo "Could not find direct observed source CSV."
+            echo "Expected:"
+            echo "sdss_rsd_boss_dr12_direct_observed_source_candidate_v4_354_NO_VALUES_LOADED_NO_SCORING.csv"
+            exit 1
+          fi
+
+          echo "Using v4.355 ZIP:"
+          echo "$INPUT_355_ZIP"
+
+          echo "Using direct observed source CSV:"
+          echo "$DIRECT_SOURCE_CSV"
+
+          echo "INPUT_355_ZIP=$INPUT_355_ZIP" >> "$GITHUB_ENV"
+          echo "DIRECT_SOURCE_CSV=$DIRECT_SOURCE_CSV" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.356 dry run script
+        run: |
+          cat > run_v4_356_observed_value_loading_dry_run_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; observed source schema approved; observed values may be dry-run parsed here; observed values not loaded; no scoring; no support claims"
+
+          REQUIRED_SCHEMA_FIELDS = [
+              "schema_field_survey_or_source",
+              "schema_field_tracer_or_sample",
+              "schema_field_redshift_z",
+              "schema_field_observed_fsigma8",
+              "schema_field_observed_fsigma8_uncertainty",
+              "schema_field_covariance_or_error_model",
+              "schema_field_source_reference",
+              "schema_field_source_url",
+          ]
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def to_float_or_none(value):
+              text = clean(value)
+              if text == "":
+                  return None
+              try:
+                  return float(text)
+              except Exception:
+                  return None
+
+          def main():
+              input_355 = Path(os.environ["INPUT_355_ZIP"])
+              source_csv = Path(os.environ["DIRECT_SOURCE_CSV"])
+
+              outdir = Path("tairid_v4_356_observed_value_loading_dry_run_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base355 = extract_zip(input_355, "tairid_v4_356_355_")
+
+              summary355_path = find_one(base355, "v4_355_summary.json")
+              approved_schema_path = find_one(base355, "v4_355_APPROVED_SCHEMA_FOR_LATER_OBSERVED_VALUE_LOADING_NO_VALUES_LOADED.csv")
+              ingest_path = find_one(base355, "v4_355_direct_source_schema_review_ingest_ledger_NO_VALUES_NO_SCORING.csv")
+              source_stage_path = find_one(base355, "v4_355_input_v4_354_source_stage_preserved.csv")
+              schema_map_path = find_one(base355, "v4_355_input_v4_354_schema_map_preserved.csv")
+              gap_status_path = find_one(base355, "v4_355_gap_status_after_direct_source_schema_review_ingest.csv")
+              rules355_path = find_one(base355, "v4_355_rule_checks.csv")
+
+              summary355 = json.loads(summary355_path.read_text())
+              approved_schema = pd.read_csv(approved_schema_path)
+              ingest355 = pd.read_csv(ingest_path)
+              source_stage = pd.read_csv(source_stage_path)
+              schema_map = pd.read_csv(schema_map_path)
+              gap_status = pd.read_csv(gap_status_path)
+              rules355 = pd.read_csv(rules355_path)
+
+              source_df = pd.read_csv(source_csv)
+
+              schema_row = approved_schema.iloc[0]
+
+              col_survey = clean(schema_row["schema_field_survey_or_source"])
+              col_tracer = clean(schema_row["schema_field_tracer_or_sample"])
+              col_z = clean(schema_row["schema_field_redshift_z"])
+              col_fsigma8 = clean(schema_row["schema_field_observed_fsigma8"])
+              col_sigma = clean(schema_row["schema_field_observed_fsigma8_uncertainty"])
+              col_cov = clean(schema_row["schema_field_covariance_or_error_model"])
+              col_ref = clean(schema_row["schema_field_source_reference"])
+              col_url = clean(schema_row["schema_field_source_url"])
+
+              mapped_columns = [col_survey, col_tracer, col_z, col_fsigma8, col_sigma, col_cov, col_ref, col_url]
+              all_mapped_columns_present = all(c in source_df.columns for c in mapped_columns)
+
+              dry_rows = []
+              for idx, row in source_df.iterrows():
+                  z = to_float_or_none(row.get(col_z, ""))
+                  fs8 = to_float_or_none(row.get(col_fsigma8, ""))
+                  err = to_float_or_none(row.get(col_sigma, ""))
+
+                  dry_row_valid = (
+                      z is not None
+                      and fs8 is not None
+                      and err is not None
+                      and err > 0
+                  )
+
+                  dry_rows.append({
+                      "v4_356_dry_run_row_id": f"v4_356_dry_run_row_{len(dry_rows)+1:03d}",
+                      "source_row_index": int(idx),
+                      "survey_or_source": clean(row.get(col_survey, "")),
+                      "tracer_or_sample": clean(row.get(col_tracer, "")),
+                      "effective_redshift_z": z,
+                      "observed_fsigma8_candidate": fs8,
+                      "observed_fsigma8_uncertainty_candidate": err,
+                      "covariance_or_error_model": clean(row.get(col_cov, "")),
+                      "source_reference": clean(row.get(col_ref, "")),
+                      "source_url": clean(row.get(col_url, "")),
+                      "dry_run_row_valid": bool(dry_row_valid),
+                      "dry_run_scope": "parse_validation_only_not_observed_value_loading",
+                      "observed_value_accepted_as_loaded": False,
+                      "observed_values_loaded": False,
+                      "definition_match_confirmed": False,
+                      "covariance_match_confirmed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              dry_run_rows = pd.DataFrame(dry_rows)
+
+              dry_run_summary = pd.DataFrame([
+                  {
+                      "dry_run_metric": "source_rows_seen_for_dry_run",
+                      "value": int(len(source_df)),
+                      "note": "Rows were parsed for validation only; observed values were not loaded.",
+                  },
+                  {
+                      "dry_run_metric": "dry_run_valid_rows",
+                      "value": int(dry_run_rows["dry_run_row_valid"].astype(bool).sum()),
+                      "note": "Valid for later observed-value loading review, not scoring.",
+                  },
+                  {
+                      "dry_run_metric": "dry_run_invalid_rows",
+                      "value": int((~dry_run_rows["dry_run_row_valid"].astype(bool)).sum()),
+                      "note": "Invalid dry-run rows would block later loading.",
+                  },
+                  {
+                      "dry_run_metric": "observed_rows_loaded",
+                      "value": 0,
+                      "note": "This step intentionally loads zero observed rows.",
+                  },
+              ])
+
+              value_loading_review_packet = dry_run_rows.copy()
+              value_loading_review_packet["human_observed_value_loading_decision"] = ""
+              value_loading_review_packet["allowed_human_observed_value_loading_decisions"] = "approve_for_later_observed_value_loading|needs_definition_repair|needs_covariance_repair|reject_row|keep_blocked"
+              value_loading_review_packet["human_observed_value_loading_note"] = ""
+              value_loading_review_packet["human_definition_warning_acknowledgement"] = ""
+              value_loading_review_packet["human_covariance_warning_acknowledgement"] = ""
+              value_loading_review_packet["observed_value_loading_approved_now"] = False
+
+              loading_checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_356_CHECK_001",
+                      "check": "Approved schema maps to existing source CSV columns.",
+                      "required_before_observed_value_loading": True,
+                  },
+                  {
+                      "check_id": "V4_356_CHECK_002",
+                      "check": "Redshift, fσ8, and uncertainty fields parse numerically in the dry run.",
+                      "required_before_observed_value_loading": True,
+                  },
+                  {
+                      "check_id": "V4_356_CHECK_003",
+                      "check": "Observed rows are not accepted as loaded in this step.",
+                      "required_before_observed_value_loading": True,
+                  },
+                  {
+                      "check_id": "V4_356_CHECK_004",
+                      "check": "Definition matching remains unconfirmed.",
+                      "required_before_scoring": True,
+                  },
+                  {
+                      "check_id": "V4_356_CHECK_005",
+                      "check": "Covariance/error-model matching remains unconfirmed.",
+                      "required_before_scoring": True,
+                  },
+                  {
+                      "check_id": "V4_356_CHECK_006",
+                      "check": "Scoring and support claims remain blocked.",
+                      "required_before_support_claims": True,
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_356_GAP_001",
+                      "gap": "Observed-value loading dry run completed.",
+                      "status_after_v4_356": "dry_run_completed_no_values_loaded",
+                      "next_gate": "v4_357_explicit_observed_value_loading_approval_gate_no_scoring",
+                  },
+                  {
+                      "gap_id": "V4_356_GAP_002",
+                      "gap": "Observed values remain unloaded.",
+                      "status_after_v4_356": "still_blocked",
+                      "next_gate": "explicit_observed_value_loading_approval",
+                  },
+                  {
+                      "gap_id": "V4_356_GAP_003",
+                      "gap": "Definition matching remains unconfirmed.",
+                      "status_after_v4_356": "still_blocked",
+                      "next_gate": "later_definition_match_gate",
+                  },
+                  {
+                      "gap_id": "V4_356_GAP_004",
+                      "gap": "Covariance matching remains unconfirmed.",
+                      "status_after_v4_356": "still_blocked",
+                      "next_gate": "later_covariance_match_gate",
+                  },
+                  {
+                      "gap_id": "V4_356_GAP_005",
+                      "gap": "Scoring and support claims remain blocked.",
+                      "status_after_v4_356": "still_blocked",
+                      "next_gate": "later_scoring_and_support_gates",
+                  },
+              ])
+
+              dry_run_valid_rows = int(dry_run_rows["dry_run_row_valid"].astype(bool).sum())
+              dry_run_invalid_rows = int((~dry_run_rows["dry_run_row_valid"].astype(bool)).sum())
+
+              hard_checks = {
+                  "input_v4_355_summary_found": summary355.get("version") == "v4.355",
+                  "input_v4_355_rules_all_passed": summary_rules_all_passed(summary355),
+                  "input_v4_355_failed_gates_none": summary355.get("failed_gates") == "none",
+                  "input_v4_355_parameter_values_approved_true": summary355.get("parameter_values_approved") is True,
+                  "input_v4_355_numeric_baseline_approved_true": summary355.get("numeric_baseline_approved") is True,
+                  "input_v4_355_schema_approved_true": summary355.get("schema_approved") is True,
+                  "input_v4_355_no_observed_values_loaded": summary355.get("observed_values_loaded") is False,
+                  "input_v4_355_no_definition_match_confirmed": summary355.get("definition_match_confirmed") is False,
+                  "input_v4_355_no_score_valid": summary355.get("score_valid") is False,
+                  "input_v4_355_no_support_allowed": summary355.get("support_allowed") is False,
+
+                  "rules355_all_passed": rules355["passed"].astype(bool).all(),
+                  "approved_schema_rows_equal_1": len(approved_schema) == 1,
+                  "ingest355_rows_equal_1": len(ingest355) == 1,
+                  "source_stage_rows_equal_1": len(source_stage) == 1,
+                  "schema_map_rows_equal_1": len(schema_map) == 1,
+                  "gap_status_rows_equal_5": len(gap_status) == 5,
+
+                  "source_csv_exists": source_csv.exists(),
+                  "source_csv_rows_at_least_one": len(source_df) >= 1,
+                  "all_mapped_columns_present": bool(all_mapped_columns_present),
+                  "dry_run_rows_equal_source_rows": len(dry_run_rows) == len(source_df),
+                  "dry_run_valid_rows_at_least_one": dry_run_valid_rows >= 1,
+                  "dry_run_invalid_rows_equal_0": dry_run_invalid_rows == 0,
+                  "value_loading_review_packet_rows_equal_dry_run_rows": len(value_loading_review_packet) == len(dry_run_rows),
+                  "loading_checklist_rows_equal_6": len(loading_checklist) == 6,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "observed_value_loading_approval_false": false_col(value_loading_review_packet, "observed_value_loading_approved_now"),
+                  "observed_value_accepted_as_loaded_false": false_col(dry_run_rows, "observed_value_accepted_as_loaded"),
+                  "observed_values_loaded_false": false_col(dry_run_rows, "observed_values_loaded"),
+                  "definition_match_confirmed_false": false_col(dry_run_rows, "definition_match_confirmed"),
+                  "covariance_match_confirmed_false": false_col(dry_run_rows, "covariance_match_confirmed"),
+                  "score_valid_false": false_col(dry_run_rows, "score_valid"),
+                  "support_allowed_false": false_col(dry_run_rows, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              if dry_run_invalid_rows == 0 and dry_run_valid_rows > 0:
+                  readiness_status = "dry_run_passed_ready_for_explicit_observed_value_loading_approval"
+                  selected_next_route = "v4_357_explicit_observed_value_loading_approval_gate_no_scoring_no_support_claims"
+              else:
+                  readiness_status = "blocked_dry_run_parse_errors"
+                  selected_next_route = "repair_observed_source_rows_or_schema_then_rerun_v4_356"
+
+              summary356 = {
+                  "version": "v4.356",
+                  "route_name": "v4_356_observed_value_loading_dry_run_no_scoring_no_support_claims",
+                  "expected_result": "v4_356_observed_value_loading_dry_run_passed_no_values_loaded_no_scoring_no_claims",
+                  "input_version": "v4.355",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": readiness_status,
+                  "source_rows_seen_for_dry_run": int(len(source_df)),
+                  "dry_run_valid_rows": int(dry_run_valid_rows),
+                  "dry_run_invalid_rows": int(dry_run_invalid_rows),
+                  "parameter_values_approved": True,
+                  "numeric_baseline_values_filled": True,
+                  "approved_baseline_values": 3,
+                  "numeric_baseline_approved": True,
+                  "schema_approved": True,
+                  "observed_values_loaded": False,
+                  "observed_rows_loaded": 0,
+                  "definition_match_confirmed": False,
+                  "covariance_match_confirmed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": selected_next_route,
+              }
+
+              dry_run_rows.to_csv(outdir / "v4_356_observed_value_loading_DRY_RUN_ROWS_NOT_LOADED.csv", index=False)
+              dry_run_summary.to_csv(outdir / "v4_356_dry_run_summary_NO_VALUES_LOADED.csv", index=False)
+              value_loading_review_packet.to_csv(outdir / "v4_356_HUMAN_FILL_observed_value_loading_review_packet_NO_SCORING.csv", index=False)
+              loading_checklist.to_csv(outdir / "v4_356_observed_value_loading_checklist_no_scoring.csv", index=False)
+              gap_update.to_csv(outdir / "v4_356_gap_status_after_observed_value_dry_run.csv", index=False)
+              approved_schema.to_csv(outdir / "v4_356_input_v4_355_approved_schema_preserved.csv", index=False)
+              source_stage.to_csv(outdir / "v4_356_input_v4_355_source_stage_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_356_rule_checks.csv", index=False)
+
+              (outdir / "v4_356_summary.json").write_text(json.dumps(summary356, indent=2))
+
+              summary_md = f"""# TAIRID v4.356 Observed Value Loading Dry Run — No Scoring
+
+          Expected result: `{summary356["expected_result"]}`
+
+          {summary356["rules_passed"]} / {summary356["rules_total"]} rules passed
+
+          failed_gates = {summary356["failed_gates"]}
+
+          readiness_status = `{summary356["readiness_status"]}`
+
+          source_rows_seen_for_dry_run = {summary356["source_rows_seen_for_dry_run"]}
+
+          dry_run_valid_rows = {summary356["dry_run_valid_rows"]}
+
+          observed_values_loaded = false
+
+          observed_rows_loaded = 0
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step dry-run parses observed rows for validation only.
+
+          It does **not** accept observed values as loaded.
+
+          It does **not** confirm definition or covariance matching.
+
+          It does **not** compute residuals, chi-square, likelihood, p-values, or scores.
+
+          It does **not** make support claims.
+
+          Next route: `{summary356["selected_next_route"]}`
+          """
+              (outdir / "v4_356_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary356, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_356_observed_value_loading_dry_run_no_scoring.py
+
+      - name: Run v4.356 observed value loading dry run no scoring
+        run: |
+          python run_v4_356_observed_value_loading_dry_run_no_scoring.py
+
+      - name: Upload v4.356 observed value loading dry run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-356-observed-value-loading-dry-run-no-scoring-output
+          path: |
+            tairid_v4_356_observed_value_loading_dry_run_no_scoring_output/
+            tairid_v4_356_observed_value_loading_dry_run_no_scoring_output.zip
