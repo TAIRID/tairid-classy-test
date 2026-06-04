@@ -1,0 +1,490 @@
+name: "!!! AAA CURRENT - TAIRID v4.364 guarded chi-square readiness no scoring"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-364-guarded-chi-square-readiness-no-scoring:
+    name: "!!! AAA CURRENT - Run v4.364 guarded chi-square readiness"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.363 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.363 output ZIP by pattern..."
+          INPUT_363_ZIP="$(ls tairid-v4-363-guarded-residual-review-ingest-no-chi-square-no-scoring-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_363_ZIP" ]; then
+            echo "Could not find v4.363 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-363-guarded-residual-review-ingest-no-chi-square-no-scoring-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.363 ZIP:"
+          echo "$INPUT_363_ZIP"
+          echo "INPUT_363_ZIP=$INPUT_363_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.364 chi-square readiness script
+        run: |
+          cat > run_v4_364_guarded_chi_square_readiness_no_scoring.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          import math
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "parameter values approved; numeric baseline approved; observed values loaded; definition/covariance guarded readiness confirmed; baseline predictions computed; residuals approved; guarded chi-square readiness may be prepared here; no chi-square; no likelihood; no p-values; no scoring; no support claims"
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def finite_series(series):
+              try:
+                  return series.astype(float).apply(math.isfinite).all()
+              except Exception:
+                  return False
+
+          def main():
+              input_363 = Path(os.environ["INPUT_363_ZIP"])
+
+              outdir = Path("tairid_v4_364_guarded_chi_square_readiness_no_chi_square_no_scoring_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base363 = extract_zip(input_363, "tairid_v4_364_363_")
+
+              summary363_path = find_one(base363, "v4_363_summary.json")
+              residual_review_ledger_path = find_one(base363, "v4_363_guarded_residual_review_ingest_ledger_NO_CHI_SQUARE_NO_SCORING.csv")
+              approved_residuals_path = find_one(base363, "v4_363_RESIDUALS_APPROVED_FOR_CHI_SQUARE_READINESS_NOT_CHI_SQUARE.csv")
+              chi_square_readiness_input_path = find_one(base363, "v4_363_guarded_chi_square_readiness_packet_NOT_CHI_SQUARE_NOT_SCORING.csv")
+              boundary363_path = find_one(base363, "v4_363_boundary_no_chi_square_no_score.csv")
+              gap363_path = find_one(base363, "v4_363_gap_status_after_residual_review_ingest.csv")
+              computed_residuals_path = find_one(base363, "v4_363_input_v4_362_computed_residuals_preserved.csv")
+              rules363_path = find_one(base363, "v4_363_rule_checks.csv")
+
+              summary363 = json.loads(summary363_path.read_text())
+              residual_review_ledger = pd.read_csv(residual_review_ledger_path)
+              approved_residuals = pd.read_csv(approved_residuals_path)
+              chi_square_readiness_input = pd.read_csv(chi_square_readiness_input_path)
+              boundary363 = pd.read_csv(boundary363_path)
+              gap363 = pd.read_csv(gap363_path)
+              computed_residuals = pd.read_csv(computed_residuals_path)
+              rules363 = pd.read_csv(rules363_path)
+
+              readiness_rows = []
+
+              for _, row in chi_square_readiness_input.iterrows():
+                  readiness_rows.append({
+                      "v4_364_chi_square_readiness_id": f"v4_364_chi_square_ready_{len(readiness_rows)+1:03d}",
+                      "v4_363_residual_review_ingest_id": clean(row["v4_363_residual_review_ingest_id"]),
+                      "v4_357_observed_value_id": clean(row["v4_357_observed_value_id"]),
+
+                      "survey_or_source": clean(row["survey_or_source"]),
+                      "tracer_or_sample": clean(row["tracer_or_sample"]),
+                      "effective_redshift_z": float(row["effective_redshift_z"]),
+                      "observed_fsigma8": float(row["observed_fsigma8"]),
+                      "observed_fsigma8_uncertainty": float(row["observed_fsigma8_uncertainty"]),
+                      "baseline_fsigma8_prediction": float(row["baseline_fsigma8_prediction"]),
+                      "residual_baseline_minus_observed": float(row["residual_baseline_minus_observed"]),
+                      "normalized_residual_baseline_minus_observed": float(row["normalized_residual_baseline_minus_observed"]),
+                      "absolute_normalized_residual": float(row["absolute_normalized_residual"]),
+
+                      "residuals_approved_for_later_chi_square_readiness": bool(row["residuals_approved_for_later_chi_square_readiness"]),
+                      "ready_for_guarded_chi_square_readiness_not_chi_square": bool(row["ready_for_guarded_chi_square_readiness_not_chi_square"]),
+                      "guarded_diagonal_only": True,
+                      "full_covariance_available": False,
+
+                      "chi_square_term_formula": "normalized_residual_baseline_minus_observed^2",
+                      "chi_square_sum_formula": "sum(normalized_residual_baseline_minus_observed^2)",
+                      "degrees_of_freedom_candidate": "",
+                      "degrees_of_freedom_reason": "Not set until later guarded chi-square dry run; this packet prepares readiness only.",
+
+                      "chi_square_term_computed": False,
+                      "chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+
+                      "chi_square_readiness_status": "ready_for_later_guarded_chi_square_dry_run_not_chi_square",
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              chi_square_readiness = pd.DataFrame(readiness_rows)
+
+              formula_packet = pd.DataFrame([
+                  {
+                      "formula_id": "V4_364_FORMULA_001",
+                      "formula_name": "signed_normalized_residual",
+                      "formula_text": "r_i = (baseline_fsigma8_i - observed_fsigma8_i) / sigma_i",
+                      "computed_previous_gate": True,
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+                  {
+                      "formula_id": "V4_364_FORMULA_002",
+                      "formula_name": "guarded_diagonal_chi_square_term",
+                      "formula_text": "chi2_i = r_i^2",
+                      "computed_previous_gate": False,
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+                  {
+                      "formula_id": "V4_364_FORMULA_003",
+                      "formula_name": "guarded_diagonal_chi_square_sum",
+                      "formula_text": "chi2_guarded = sum_i chi2_i",
+                      "computed_previous_gate": False,
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+                  {
+                      "formula_id": "V4_364_FORMULA_004",
+                      "formula_name": "degrees_of_freedom_candidate",
+                      "formula_text": "dof candidate must be reviewed in later gate; no p-value is allowed here.",
+                      "computed_previous_gate": False,
+                      "computed_now": False,
+                      "needed_for_next_gate": True,
+                  },
+              ])
+
+              limitation_packet = pd.DataFrame([
+                  {
+                      "limitation_id": "V4_364_LIMIT_001",
+                      "limitation": "This is a guarded diagonal pathway only.",
+                      "status": "active_limit",
+                  },
+                  {
+                      "limitation_id": "V4_364_LIMIT_002",
+                      "limitation": "Full covariance is not available.",
+                      "status": "active_limit",
+                  },
+                  {
+                      "limitation_id": "V4_364_LIMIT_003",
+                      "limitation": "A guarded diagonal chi-square can be a diagnostic only, not a full likelihood.",
+                      "status": "active_limit",
+                  },
+                  {
+                      "limitation_id": "V4_364_LIMIT_004",
+                      "limitation": "No chi-square, likelihood, p-value, score, or support claim is computed in v4.364.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "limitation_id": "V4_364_LIMIT_005",
+                      "limitation": "Support claims remain blocked until later interpretation gates, and even then must preserve the diagonal-only limitation.",
+                      "status": "blocked_by_design",
+                  },
+              ])
+
+              next_gate_packet = pd.DataFrame([
+                  {
+                      "v4_364_next_gate_packet_id": "v4_364_next_gate_001",
+                      "next_gate": "v4_365_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support",
+                      "human_guarded_chi_square_dry_run_decision": "",
+                      "allowed_human_guarded_chi_square_dry_run_decisions": "approve_guarded_diagonal_chi_square_dry_run|needs_residual_repair|needs_full_covariance_first|keep_blocked",
+                      "human_guarded_chi_square_dry_run_note": "",
+                      "human_diagonal_only_warning_acknowledgement": "",
+                      "chi_square_dry_run_approved_now": False,
+                      "chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  }
+              ])
+
+              readiness_checklist = pd.DataFrame([
+                  {
+                      "check_id": "V4_364_CHECK_001",
+                      "check": "Residuals are approved for later guarded chi-square readiness.",
+                      "status": "passed",
+                  },
+                  {
+                      "check_id": "V4_364_CHECK_002",
+                      "check": "Each residual row has finite normalized residual values.",
+                      "status": "passed",
+                  },
+                  {
+                      "check_id": "V4_364_CHECK_003",
+                      "check": "Diagonal-only limitation is explicit.",
+                      "status": "guarded_only",
+                  },
+                  {
+                      "check_id": "V4_364_CHECK_004",
+                      "check": "Chi-square formula is prepared but not computed.",
+                      "status": "prepared_not_computed",
+                  },
+                  {
+                      "check_id": "V4_364_CHECK_005",
+                      "check": "Likelihood and p-values remain blocked.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "check_id": "V4_364_CHECK_006",
+                      "check": "Support claims remain blocked.",
+                      "status": "blocked_by_design",
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_364_GAP_001",
+                      "gap": "Guarded chi-square readiness packet created.",
+                      "status_after_v4_364": "readiness_packet_created_not_chi_square",
+                      "next_gate": "v4_365_guarded_diagonal_chi_square_dry_run",
+                  },
+                  {
+                      "gap_id": "V4_364_GAP_002",
+                      "gap": "Chi-square remains uncomputed.",
+                      "status_after_v4_364": "still_blocked",
+                      "next_gate": "v4_365_guarded_diagonal_chi_square_dry_run",
+                  },
+                  {
+                      "gap_id": "V4_364_GAP_003",
+                      "gap": "Likelihood and p-values remain uncomputed.",
+                      "status_after_v4_364": "still_blocked",
+                      "next_gate": "later_likelihood_or_p_value_gate_if_allowed",
+                  },
+                  {
+                      "gap_id": "V4_364_GAP_004",
+                      "gap": "Full covariance remains unavailable.",
+                      "status_after_v4_364": "guarded_diagonal_only",
+                      "next_gate": "full_covariance_repair_lane_if_needed",
+                  },
+                  {
+                      "gap_id": "V4_364_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_364": "still_blocked",
+                      "next_gate": "later_support_interpretation_gate_only_after_scoring",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_363_summary_found": summary363.get("version") == "v4.363",
+                  "input_v4_363_rules_all_passed": summary_rules_all_passed(summary363),
+                  "input_v4_363_failed_gates_none": summary363.get("failed_gates") == "none",
+                  "input_v4_363_residuals_approved_status": summary363.get("readiness_status") == "residuals_approved_for_guarded_chi_square_readiness_not_chi_square",
+                  "input_v4_363_residuals_computed_true": summary363.get("residuals_computed") is True,
+                  "input_v4_363_normalized_residuals_true": summary363.get("normalized_residuals_computed") is True,
+                  "input_v4_363_no_chi_square": summary363.get("chi_square_computed") is False,
+                  "input_v4_363_no_likelihood": summary363.get("likelihood_computed") is False,
+                  "input_v4_363_no_p_values": summary363.get("p_values_computed") is False,
+                  "input_v4_363_no_score_valid": summary363.get("score_valid") is False,
+                  "input_v4_363_no_support_allowed": summary363.get("support_allowed") is False,
+
+                  "rules363_all_passed": rules363["passed"].astype(bool).all(),
+                  "residual_review_rows_match_summary": len(residual_review_ledger) == int(summary363.get("residual_review_rows")),
+                  "approved_residual_rows_match_summary": len(approved_residuals) == int(summary363.get("residuals_approved_for_later_chi_square_readiness_rows")),
+                  "chi_square_input_rows_match_summary": len(chi_square_readiness_input) == int(summary363.get("chi_square_readiness_rows")),
+                  "computed_residuals_rows_match_summary": len(computed_residuals) == int(summary363.get("residuals_approved_for_later_chi_square_readiness_rows")),
+                  "boundary363_rows_equal_5": len(boundary363) == 5,
+                  "gap363_rows_equal_5": len(gap363) == 5,
+
+                  "chi_square_readiness_rows_match_input": len(chi_square_readiness) == len(chi_square_readiness_input),
+                  "all_residuals_approved": true_col(chi_square_readiness, "residuals_approved_for_later_chi_square_readiness"),
+                  "all_ready_for_chi_square_readiness": true_col(chi_square_readiness, "ready_for_guarded_chi_square_readiness_not_chi_square"),
+                  "all_guarded_diagonal_only": true_col(chi_square_readiness, "guarded_diagonal_only"),
+                  "full_covariance_false": false_col(chi_square_readiness, "full_covariance_available"),
+                  "normalized_residuals_finite": finite_series(chi_square_readiness["normalized_residual_baseline_minus_observed"]),
+                  "formula_packet_rows_equal_4": len(formula_packet) == 4,
+                  "limitation_packet_rows_equal_5": len(limitation_packet) == 5,
+                  "next_gate_packet_rows_equal_1": len(next_gate_packet) == 1,
+                  "readiness_checklist_rows_equal_6": len(readiness_checklist) == 6,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "chi_square_term_computed_false": false_col(chi_square_readiness, "chi_square_term_computed"),
+                  "chi_square_computed_false": false_col(chi_square_readiness, "chi_square_computed") and false_col(next_gate_packet, "chi_square_computed"),
+                  "likelihood_computed_false": false_col(chi_square_readiness, "likelihood_computed") and false_col(next_gate_packet, "likelihood_computed"),
+                  "p_values_computed_false": false_col(chi_square_readiness, "p_values_computed") and false_col(next_gate_packet, "p_values_computed"),
+                  "score_valid_false": false_col(chi_square_readiness, "score_valid") and false_col(next_gate_packet, "score_valid"),
+                  "support_allowed_false": false_col(chi_square_readiness, "support_allowed") and false_col(next_gate_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary364 = {
+                  "version": "v4.364",
+                  "route_name": "v4_364_guarded_chi_square_readiness_packet_no_chi_square_no_scoring_no_support_claims",
+                  "expected_result": "v4_364_guarded_chi_square_readiness_packet_passed_no_chi_square_no_scoring_no_claims",
+                  "input_version": "v4.363",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "readiness_status": "guarded_chi_square_readiness_packet_created_not_chi_square",
+                  "chi_square_readiness_rows": int(len(chi_square_readiness)),
+                  "residuals_computed": True,
+                  "normalized_residuals_computed": True,
+                  "chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "covariance_scope": "guarded_diagonal_diagnostic_only",
+                  "full_covariance_available": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_365_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support_claims",
+              }
+
+              chi_square_readiness.to_csv(outdir / "v4_364_guarded_chi_square_readiness_matrix_NOT_CHI_SQUARE_NOT_SCORING.csv", index=False)
+              formula_packet.to_csv(outdir / "v4_364_chi_square_formula_packet_NOT_COMPUTED.csv", index=False)
+              limitation_packet.to_csv(outdir / "v4_364_guarded_diagonal_limitations.csv", index=False)
+              next_gate_packet.to_csv(outdir / "v4_364_HUMAN_FILL_guarded_chi_square_dry_run_review_NO_SCORING.csv", index=False)
+              readiness_checklist.to_csv(outdir / "v4_364_chi_square_readiness_checklist.csv", index=False)
+              gap_update.to_csv(outdir / "v4_364_gap_status_after_chi_square_readiness.csv", index=False)
+              approved_residuals.to_csv(outdir / "v4_364_input_v4_363_approved_residuals_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_364_rule_checks.csv", index=False)
+
+              (outdir / "v4_364_summary.json").write_text(json.dumps(summary364, indent=2))
+
+              summary_md = f"""# TAIRID v4.364 Guarded Chi-Square Readiness Packet — No Chi-Square, No Scoring
+
+          Expected result: `{summary364["expected_result"]}`
+
+          {summary364["rules_passed"]} / {summary364["rules_total"]} rules passed
+
+          failed_gates = {summary364["failed_gates"]}
+
+          readiness_status = `{summary364["readiness_status"]}`
+
+          chi_square_readiness_rows = {summary364["chi_square_readiness_rows"]}
+
+          residuals_computed = true
+
+          normalized_residuals_computed = true
+
+          chi_square_computed = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          covariance_scope = guarded_diagonal_diagnostic_only
+
+          full_covariance_available = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step prepares guarded chi-square readiness only.
+
+          It does **not** compute chi-square.
+
+          It does **not** compute likelihood.
+
+          It does **not** compute p-values.
+
+          It does **not** create a valid score.
+
+          It does **not** make support claims.
+
+          Next route: `{summary364["selected_next_route"]}`
+          """
+              (outdir / "v4_364_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary364, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_364_guarded_chi_square_readiness_no_scoring.py
+
+      - name: Run v4.364 guarded chi-square readiness no scoring
+        run: |
+          python run_v4_364_guarded_chi_square_readiness_no_scoring.py
+
+      - name: Upload v4.364 guarded chi-square readiness artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-364-guarded-chi-square-readiness-no-chi-square-no-scoring-output
+          path: |
+            tairid_v4_364_guarded_chi_square_readiness_no_chi_square_no_scoring_output/
+            tairid_v4_364_guarded_chi_square_readiness_no_chi_square_no_scoring_output.zip
