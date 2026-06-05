@@ -1,0 +1,552 @@
+name: "!!! AAA CURRENT - TAIRID v4.387 observed row order validation no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-387-observed-row-order-validation-no-support:
+    name: "!!! AAA CURRENT - Run v4.387 observed row order validation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.386 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.386 output ZIP by pattern..."
+          INPUT_386_ZIP="$(ls tairid-v4-386-covariance-subblock-integrity-checks-no-scoring-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_386_ZIP" ]; then
+            echo "Could not find v4.386 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-386-covariance-subblock-integrity-checks-no-scoring-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.386 ZIP:"
+          echo "$INPUT_386_ZIP"
+          echo "INPUT_386_ZIP=$INPUT_386_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.387 observed row order validation script
+        run: |
+          cat > run_v4_387_observed_row_order_validation_no_support.py <<'PY'
+          #!/usr/bin/env python3
+          
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+          
+          CLAIM_BOUNDARY = "observed-row-order validation only; candidate 3x3 f_sigma8 subblock row and column labels may be checked against loaded BOSS DR12 redshift order z=0.38,0.51,0.61; no chi-square; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+          
+          EXPECTED_REDSHIFT_ORDER = ["z0.38", "z0.51", "z0.61"]
+          EXPECTED_OBSERVED_IDS = ["BOSS_DR12_z0.38", "BOSS_DR12_z0.51", "BOSS_DR12_z0.61"]
+          
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+          
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+          
+              return tmp
+          
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+          
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+          
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              if len(df) == 0:
+                  return True
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+          
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              if len(df) == 0:
+                  return True
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+          
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+          
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              if len(df) == 0:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+          
+          def ordered_unique_by_position(df, position_col, value_col):
+              out = []
+              seen = set()
+              for _, row in df.sort_values(position_col).iterrows():
+                  value = clean(row[value_col])
+                  if value not in seen:
+                      out.append(value)
+                      seen.add(value)
+              return out
+          
+          def main():
+              input_386 = Path(os.environ["INPUT_386_ZIP"])
+          
+              outdir = Path("tairid_v4_387_observed_row_order_validation_no_scoring_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+          
+              base386 = extract_zip(input_386, "tairid_v4_387_386_")
+          
+              summary386_path = find_one(base386, "v4_386_summary.json")
+              passed_subblocks_path = find_one(base386, "v4_386_PASSED_integrity_subblocks_FOR_ROW_ORDER_VALIDATION_NO_SCORING.csv")
+              integrity_ledger_path = find_one(base386, "v4_386_covariance_subblock_integrity_ledger_NO_SCORING_NO_SUPPORT.csv")
+              metric_checks_path = find_one(base386, "v4_386_covariance_subblock_integrity_metric_checks_NO_SCORING_NO_SUPPORT.csv")
+              failed_integrity_path = find_one(base386, "v4_386_failed_integrity_subblocks.csv")
+              row_order_staging_path = find_one(base386, "v4_386_row_order_validation_staging_packet_NO_SCORING_NO_SUPPORT.csv")
+              subblock_values_path = find_one(base386, "v4_386_input_v4_385_subblock_values_preserved.csv")
+              extraction_ledger_path = find_one(base386, "v4_386_input_v4_385_extraction_ledger_preserved.csv")
+              integrity_summary_path = find_one(base386, "v4_386_integrity_summary_NO_SCORING_NO_SUPPORT.csv")
+              limitations386_path = find_one(base386, "v4_386_limitations_after_integrity_checks.csv")
+              gap386_path = find_one(base386, "v4_386_gap_status_after_integrity_checks.csv")
+              route_status386_path = find_one(base386, "v4_386_route_status_summary.csv")
+              rules386_path = find_one(base386, "v4_386_rule_checks.csv")
+          
+              summary386 = json.loads(summary386_path.read_text())
+              passed_subblocks = pd.read_csv(passed_subblocks_path)
+              integrity_ledger = pd.read_csv(integrity_ledger_path)
+              metric_checks = pd.read_csv(metric_checks_path)
+              failed_integrity = pd.read_csv(failed_integrity_path)
+              row_order_staging = pd.read_csv(row_order_staging_path)
+              subblock_values = pd.read_csv(subblock_values_path)
+              extraction_ledger = pd.read_csv(extraction_ledger_path)
+              integrity_summary = pd.read_csv(integrity_summary_path)
+              limitations386 = pd.read_csv(limitations386_path)
+              gap386 = pd.read_csv(gap386_path)
+              route_status386 = pd.read_csv(route_status386_path)
+              rules386 = pd.read_csv(rules386_path)
+          
+              validation_rows = []
+              detail_rows = []
+          
+              for _, subblock in passed_subblocks.iterrows():
+                  extraction_id = clean(subblock["v4_385_extraction_id"])
+                  selected_member_name = clean(subblock["selected_member_name"])
+          
+                  member_values = subblock_values[
+                      subblock_values["v4_385_extraction_id"].astype(str) == extraction_id
+                  ].copy()
+          
+                  if len(member_values) == 0:
+                      member_values = subblock_values[
+                          subblock_values["selected_member_name"].astype(str) == selected_member_name
+                      ].copy()
+          
+                  member_values["subblock_row_position_zero_based"] = member_values["subblock_row_position_zero_based"].astype(int)
+                  member_values["subblock_col_position_zero_based"] = member_values["subblock_col_position_zero_based"].astype(int)
+          
+                  rows_by_pos = ordered_unique_by_position(member_values, "subblock_row_position_zero_based", "row_observed_redshift_candidate")
+                  cols_by_pos = ordered_unique_by_position(member_values, "subblock_col_position_zero_based", "col_observed_redshift_candidate")
+                  row_ids_by_pos = ordered_unique_by_position(member_values, "subblock_row_position_zero_based", "row_observed_id_candidate")
+                  col_ids_by_pos = ordered_unique_by_position(member_values, "subblock_col_position_zero_based", "col_observed_id_candidate")
+          
+                  row_order_matches = rows_by_pos == EXPECTED_REDSHIFT_ORDER
+                  col_order_matches = cols_by_pos == EXPECTED_REDSHIFT_ORDER
+                  row_ids_match = row_ids_by_pos == EXPECTED_OBSERVED_IDS
+                  col_ids_match = col_ids_by_pos == EXPECTED_OBSERVED_IDS
+          
+                  diagonal = member_values[
+                      member_values["subblock_row_position_zero_based"] == member_values["subblock_col_position_zero_based"]
+                  ].copy()
+                  diagonal_alignment = True
+                  for _, drow in diagonal.iterrows():
+                      if clean(drow["row_observed_redshift_candidate"]) != clean(drow["col_observed_redshift_candidate"]):
+                          diagonal_alignment = False
+                      if clean(drow["row_observed_id_candidate"]) != clean(drow["col_observed_id_candidate"]):
+                          diagonal_alignment = False
+          
+                  expected_grid = set((r, c) for r in range(3) for c in range(3))
+                  actual_grid = set(
+                      (int(r), int(c))
+                      for r, c in zip(member_values["subblock_row_position_zero_based"], member_values["subblock_col_position_zero_based"])
+                  )
+                  coordinate_grid_complete = actual_grid == expected_grid
+          
+                  symmetric_label_pairs = True
+                  for _, value_row in member_values.iterrows():
+                      r = int(value_row["subblock_row_position_zero_based"])
+                      c = int(value_row["subblock_col_position_zero_based"])
+                      opposite = member_values[
+                          (member_values["subblock_row_position_zero_based"] == c)
+                          & (member_values["subblock_col_position_zero_based"] == r)
+                      ]
+                      if len(opposite) != 1:
+                          symmetric_label_pairs = False
+                          continue
+                      opp = opposite.iloc[0]
+                      if clean(value_row["row_observed_redshift_candidate"]) != clean(opp["col_observed_redshift_candidate"]):
+                          symmetric_label_pairs = False
+                      if clean(value_row["col_observed_redshift_candidate"]) != clean(opp["row_observed_redshift_candidate"]):
+                          symmetric_label_pairs = False
+          
+                  validation_passed = (
+                      len(member_values) == 9
+                      and coordinate_grid_complete
+                      and row_order_matches
+                      and col_order_matches
+                      and row_ids_match
+                      and col_ids_match
+                      and diagonal_alignment
+                      and symmetric_label_pairs
+                  )
+          
+                  validation_id = f"v4_387_row_order_validation_{len(validation_rows)+1:03d}"
+          
+                  validation_rows.append({
+                      "v4_387_row_order_validation_id": validation_id,
+                      "v4_386_integrity_id": clean(subblock["v4_386_integrity_id"]),
+                      "v4_385_extraction_id": extraction_id,
+                      "selected_member_name": selected_member_name,
+                      "candidate_observable_family_from_filename": clean(subblock["candidate_observable_family_from_filename"]),
+                      "candidate_consensus_family_from_filename": clean(subblock["candidate_consensus_family_from_filename"]),
+                      "expected_redshift_order": "|".join(EXPECTED_REDSHIFT_ORDER),
+                      "candidate_row_redshift_order": "|".join(rows_by_pos),
+                      "candidate_col_redshift_order": "|".join(cols_by_pos),
+                      "expected_observed_row_ids": "|".join(EXPECTED_OBSERVED_IDS),
+                      "candidate_row_observed_id_order": "|".join(row_ids_by_pos),
+                      "candidate_col_observed_id_order": "|".join(col_ids_by_pos),
+                      "candidate_subblock_value_rows": int(len(member_values)),
+                      "coordinate_grid_complete_3x3": bool(coordinate_grid_complete),
+                      "row_redshift_order_matches_expected": bool(row_order_matches),
+                      "col_redshift_order_matches_expected": bool(col_order_matches),
+                      "row_observed_id_order_matches_expected": bool(row_ids_match),
+                      "col_observed_id_order_matches_expected": bool(col_ids_match),
+                      "diagonal_label_alignment_passed": bool(diagonal_alignment),
+                      "symmetric_label_pairing_passed": bool(symmetric_label_pairs),
+                      "observed_row_order_validation_passed": bool(validation_passed),
+                      "observed_row_order_matched": bool(validation_passed),
+                      "row_order_validation_status": "passed_metadata_row_order_validation_ready_for_human_subblock_choice" if validation_passed else "failed_metadata_row_order_validation",
+                      "covariance_subblock_extracted": True,
+                      "candidate_subblock_values_available_for_later_scoring_gate": bool(validation_passed),
+                      "full_covariance_matrix_loaded": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "chi_square_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+          
+                  for _, value_row in member_values.sort_values(["subblock_row_position_zero_based", "subblock_col_position_zero_based"]).iterrows():
+                      detail_rows.append({
+                          "v4_387_row_order_detail_id": f"v4_387_row_order_detail_{len(detail_rows)+1:04d}",
+                          "v4_387_row_order_validation_id": validation_id,
+                          "selected_member_name": selected_member_name,
+                          "subblock_row_position_zero_based": int(value_row["subblock_row_position_zero_based"]),
+                          "subblock_col_position_zero_based": int(value_row["subblock_col_position_zero_based"]),
+                          "subblock_row_position_one_based": int(value_row["subblock_row_position_one_based"]),
+                          "subblock_col_position_one_based": int(value_row["subblock_col_position_one_based"]),
+                          "row_observed_redshift_candidate": clean(value_row["row_observed_redshift_candidate"]),
+                          "col_observed_redshift_candidate": clean(value_row["col_observed_redshift_candidate"]),
+                          "row_observed_id_candidate": clean(value_row["row_observed_id_candidate"]),
+                          "col_observed_id_candidate": clean(value_row["col_observed_id_candidate"]),
+                          "candidate_covariance_subblock_value": float(value_row["candidate_covariance_subblock_value"]),
+                          "value_used_for_scoring": False,
+                          "likelihood_computed": False,
+                          "p_values_computed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      })
+          
+              validation_ledger = pd.DataFrame(validation_rows)
+              validation_details = pd.DataFrame(detail_rows)
+          
+              passed_row_order = validation_ledger[
+                  validation_ledger["observed_row_order_validation_passed"].astype(bool)
+              ].copy()
+              failed_row_order = validation_ledger[
+                  ~validation_ledger["observed_row_order_validation_passed"].astype(bool)
+              ].copy()
+          
+              human_choice_packet = passed_row_order.copy()
+              human_choice_packet["next_gate"] = "v4_388_human_guarded_covariance_subblock_approval_no_scoring_no_support"
+              human_choice_packet["human_guarded_subblock_choice_decision"] = ""
+              human_choice_packet["allowed_human_guarded_subblock_choice_decisions"] = "approve_one_guarded_covariance_subblock_for_full_covariance_chisq_dry_run|keep_as_comparison_only|reject_subblock|keep_blocked"
+              human_choice_packet["human_guarded_subblock_choice_note"] = ""
+              human_choice_packet["guarded_covariance_subblock_approved_now"] = False
+              human_choice_packet["full_covariance_chisq_allowed_next"] = False
+              human_choice_packet["score_valid"] = False
+              human_choice_packet["support_allowed"] = False
+          
+              row_order_summary = pd.DataFrame([
+                  {"summary_metric": "row_order_validation_rows", "value": int(len(validation_ledger)), "note": "Candidate integrity-passed subblocks checked for metadata row/column order."},
+                  {"summary_metric": "row_order_passed_subblocks", "value": int(len(passed_row_order)), "note": "Subblocks whose redshift and observed-id order matches z0.38|z0.51|z0.61."},
+                  {"summary_metric": "row_order_failed_subblocks", "value": int(len(failed_row_order)), "note": "Subblocks blocked by row-order validation."},
+                  {"summary_metric": "row_order_detail_rows", "value": int(len(validation_details)), "note": "Nine coordinate rows per candidate subblock."},
+                  {"summary_metric": "human_choice_packet_rows", "value": int(len(human_choice_packet)), "note": "Rows available for later human guarded subblock choice."},
+                  {"summary_metric": "chi_square_computed", "value": 0, "note": "No chi-square computed."},
+                  {"summary_metric": "score_valid", "value": 0, "note": "No scoring stage run."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+          
+              route_status_387 = pd.DataFrame([
+                  {"status_id": "V4_387_STATUS_001", "status": "observed_row_order_validation_completed", "detail": f"{len(passed_row_order)} candidate subblocks passed metadata row-order validation."},
+                  {"status_id": "V4_387_STATUS_002", "status": "human_subblock_choice_next", "detail": "A human must choose one guarded covariance subblock before full-covariance chi-square dry run."},
+                  {"status_id": "V4_387_STATUS_003", "status": "no_scoring_performed", "detail": "Row-order validation does not compute chi-square, likelihood, or p-values."},
+                  {"status_id": "V4_387_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+          
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_387_LIMIT_001", "limit": "Row-order validation checks metadata alignment, not scientific support.", "status": "active_limit"},
+                  {"limit_id": "V4_387_LIMIT_002", "limit": "Two final-consensus covariance parameterizations may pass; a later human gate must choose one guarded subblock.", "status": "active_limit"},
+                  {"limit_id": "V4_387_LIMIT_003", "limit": "No chi-square, likelihood, or p-values are computed in v4.387.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_387_LIMIT_004", "limit": "score_valid remains false until a later scoring gate.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_387_LIMIT_005", "limit": "No support claim is allowed.", "status": "blocked_by_design"},
+              ])
+          
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_387_GAP_001", "gap": "Observed row-order validation completed.", "status_after_v4_387": "passed_subblocks_ready_for_human_guarded_choice", "next_gate": "v4_388_human_guarded_covariance_subblock_approval_no_scoring_no_support"},
+                  {"gap_id": "V4_387_GAP_002", "gap": "One guarded covariance subblock still needs human approval.", "status_after_v4_387": "still_open", "next_gate": "v4_388_human_choice"},
+                  {"gap_id": "V4_387_GAP_003", "gap": "Full-covariance chi-square remains uncomputed.", "status_after_v4_387": "still_blocked", "next_gate": "v4_389_after_human_subblock_approval"},
+                  {"gap_id": "V4_387_GAP_004", "gap": "External audit remains pending after covariance-corrected diagnostic.", "status_after_v4_387": "still_later", "next_gate": "v4_390_external_ai_audit_packet"},
+                  {"gap_id": "V4_387_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_387": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_387"},
+              ])
+          
+              hard_checks = {
+                  "input_v4_386_summary_found": summary386.get("version") == "v4.386",
+                  "input_v4_386_rules_all_passed": summary_rules_all_passed(summary386),
+                  "input_v4_386_failed_gates_none": summary386.get("failed_gates") == "none",
+                  "input_v4_386_candidate_subblocks_checked_2": summary386.get("candidate_subblocks_checked") == 2,
+                  "input_v4_386_integrity_passed_2": summary386.get("integrity_passed_subblocks") == 2,
+                  "input_v4_386_integrity_failed_0": summary386.get("integrity_failed_subblocks") == 0,
+                  "input_v4_386_row_order_staging_rows_2": summary386.get("row_order_staging_packet_rows") == 2,
+                  "input_v4_386_shapes_3x3": summary386.get("all_shapes_3x3") is True,
+                  "input_v4_386_finite": summary386.get("all_finite_entries") is True,
+                  "input_v4_386_symmetric": summary386.get("all_symmetric_within_tolerance") is True,
+                  "input_v4_386_diagonal_positive": summary386.get("all_diagonal_positive") is True,
+                  "input_v4_386_psd_candidate": summary386.get("all_psd_candidate_within_tolerance") is True,
+                  "input_v4_386_no_full_covariance_loaded": summary386.get("full_covariance_values_loaded") is False,
+                  "input_v4_386_no_observed_order_matched": summary386.get("observed_row_order_matched") is False,
+                  "input_v4_386_no_chisq": summary386.get("chi_square_computed") is False,
+                  "input_v4_386_no_likelihood": summary386.get("likelihood_computed") is False,
+                  "input_v4_386_no_p_values": summary386.get("p_values_computed") is False,
+                  "input_v4_386_no_score_valid": summary386.get("score_valid") is False,
+                  "input_v4_386_no_support_allowed": summary386.get("support_allowed") is False,
+          
+                  "rules386_all_passed": passed_column_all(rules386),
+                  "passed_subblocks_rows_equal_2": len(passed_subblocks) == 2,
+                  "integrity_ledger_rows_equal_2": len(integrity_ledger) == 2,
+                  "failed_integrity_rows_equal_0": len(failed_integrity) == 0,
+                  "row_order_staging_rows_equal_2": len(row_order_staging) == 2,
+                  "subblock_values_rows_equal_18": len(subblock_values) == 18,
+                  "extraction_ledger_rows_equal_2": len(extraction_ledger) == 2,
+                  "integrity_summary_rows_equal_8": len(integrity_summary) == 8,
+                  "limitations386_rows_equal_5": len(limitations386) == 5,
+                  "gap386_rows_equal_5": len(gap386) == 5,
+                  "route_status386_rows_equal_4": len(route_status386) == 4,
+          
+                  "validation_ledger_rows_equal_2": len(validation_ledger) == 2,
+                  "passed_row_order_rows_equal_2": len(passed_row_order) == 2,
+                  "failed_row_order_rows_equal_0": len(failed_row_order) == 0,
+                  "validation_detail_rows_equal_18": len(validation_details) == 18,
+                  "human_choice_packet_rows_equal_2": len(human_choice_packet) == 2,
+                  "row_order_summary_rows_equal_8": len(row_order_summary) == 8,
+                  "route_status_387_rows_equal_4": len(route_status_387) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+          
+                  "all_coordinate_grids_complete": validation_ledger["coordinate_grid_complete_3x3"].astype(bool).all() if len(validation_ledger) else False,
+                  "all_row_redshift_orders_match": validation_ledger["row_redshift_order_matches_expected"].astype(bool).all() if len(validation_ledger) else False,
+                  "all_col_redshift_orders_match": validation_ledger["col_redshift_order_matches_expected"].astype(bool).all() if len(validation_ledger) else False,
+                  "all_row_observed_ids_match": validation_ledger["row_observed_id_order_matches_expected"].astype(bool).all() if len(validation_ledger) else False,
+                  "all_col_observed_ids_match": validation_ledger["col_observed_id_order_matches_expected"].astype(bool).all() if len(validation_ledger) else False,
+                  "all_diagonal_label_alignment": validation_ledger["diagonal_label_alignment_passed"].astype(bool).all() if len(validation_ledger) else False,
+                  "all_symmetric_label_pairing": validation_ledger["symmetric_label_pairing_passed"].astype(bool).all() if len(validation_ledger) else False,
+                  "all_observed_row_order_validation_passed": validation_ledger["observed_row_order_validation_passed"].astype(bool).all() if len(validation_ledger) else False,
+          
+                  "no_likelihood_computed": false_col(validation_ledger, "likelihood_computed") and false_col(validation_details, "likelihood_computed"),
+                  "no_p_values_computed": false_col(validation_ledger, "p_values_computed") and false_col(validation_details, "p_values_computed"),
+                  "no_chi_square_computed": false_col(validation_ledger, "chi_square_computed"),
+                  "no_score_valid": false_col(validation_ledger, "score_valid") and false_col(validation_details, "score_valid") and false_col(human_choice_packet, "score_valid"),
+                  "no_support_allowed": false_col(validation_ledger, "support_allowed") and false_col(validation_details, "support_allowed") and false_col(human_choice_packet, "support_allowed"),
+              }
+          
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+          
+              summary387 = {
+                  "version": "v4.387",
+                  "route_name": "v4_387_observed_row_order_validation_no_scoring_no_support_claims",
+                  "expected_result": "v4_387_observed_row_order_validation_passed_ready_for_human_subblock_choice_no_scoring_no_support_claims",
+                  "input_version": "v4.386",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "row_order_validation_rows": int(len(validation_ledger)),
+                  "row_order_passed_subblocks": int(len(passed_row_order)),
+                  "row_order_failed_subblocks": int(len(failed_row_order)),
+                  "row_order_detail_rows": int(len(validation_details)),
+                  "human_choice_packet_rows": int(len(human_choice_packet)),
+                  "expected_redshift_order": "|".join(EXPECTED_REDSHIFT_ORDER),
+                  "observed_row_order_matched": bool(len(passed_row_order) == 2 and len(failed_row_order) == 0),
+                  "covariance_subblock_extracted": True,
+                  "full_covariance_matrix_loaded": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_388_human_guarded_covariance_subblock_approval_no_scoring_no_support_claims",
+              }
+          
+              validation_ledger.to_csv(outdir / "v4_387_observed_row_order_validation_ledger_NO_SCORING_NO_SUPPORT.csv", index=False)
+              validation_details.to_csv(outdir / "v4_387_observed_row_order_validation_detail_rows_NO_SCORING_NO_SUPPORT.csv", index=False)
+              passed_row_order.to_csv(outdir / "v4_387_PASSED_row_order_subblocks_FOR_HUMAN_CHOICE_NO_SCORING.csv", index=False)
+              failed_row_order.to_csv(outdir / "v4_387_failed_row_order_subblocks.csv", index=False)
+              human_choice_packet.to_csv(outdir / "v4_387_HUMAN_FILL_guarded_covariance_subblock_choice_NO_SCORING_NO_SUPPORT.csv", index=False)
+              row_order_summary.to_csv(outdir / "v4_387_row_order_validation_summary_NO_SCORING_NO_SUPPORT.csv", index=False)
+              route_status_387.to_csv(outdir / "v4_387_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_387_limitations_after_row_order_validation.csv", index=False)
+              gap_update.to_csv(outdir / "v4_387_gap_status_after_row_order_validation.csv", index=False)
+              passed_subblocks.to_csv(outdir / "v4_387_input_v4_386_passed_integrity_subblocks_preserved.csv", index=False)
+              subblock_values.to_csv(outdir / "v4_387_input_v4_386_subblock_values_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_387_rule_checks.csv", index=False)
+          
+              (outdir / "v4_387_summary.json").write_text(json.dumps(summary387, indent=2))
+          
+              summary_md = f"""# TAIRID v4.387 Observed Row-Order Validation — No Scoring, No Support Claims
+          
+          Expected result: `{summary387["expected_result"]}`
+          
+          {summary387["rules_passed"]} / {summary387["rules_total"]} rules passed
+          
+          failed_gates = {summary387["failed_gates"]}
+          
+          row_order_validation_rows = {summary387["row_order_validation_rows"]}
+          
+          row_order_passed_subblocks = {summary387["row_order_passed_subblocks"]}
+          
+          row_order_failed_subblocks = {summary387["row_order_failed_subblocks"]}
+          
+          row_order_detail_rows = {summary387["row_order_detail_rows"]}
+          
+          human_choice_packet_rows = {summary387["human_choice_packet_rows"]}
+          
+          expected_redshift_order = `{summary387["expected_redshift_order"]}`
+          
+          observed_row_order_matched = {str(summary387["observed_row_order_matched"]).lower()}
+          
+          covariance_subblock_extracted = true
+          
+          full_covariance_matrix_loaded = false
+          
+          full_covariance_available = false
+          
+          full_covariance_values_loaded = false
+          
+          chi_square_computed = false
+          
+          likelihood_computed = false
+          
+          p_values_computed = false
+          
+          score_valid = false
+          
+          support_allowed = false
+          
+          Claim boundary: {CLAIM_BOUNDARY}.
+          
+          This step validates candidate observed row/column order metadata only.
+          
+          It does **not** compute chi-square.
+          
+          It does **not** compute likelihood or p-values.
+          
+          It does **not** make support claims.
+          
+          Next route: `{summary387["selected_next_route"]}`
+          """
+              (outdir / "v4_387_summary.md").write_text(summary_md)
+          
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+          
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+          
+              print(json.dumps(summary387, indent=2))
+              print(f"WROTE {zip_path}")
+          
+              if failed:
+                  raise SystemExit(1)
+          
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_387_observed_row_order_validation_no_support.py
+
+      - name: Run v4.387 observed row order validation no support
+        run: |
+          python run_v4_387_observed_row_order_validation_no_support.py
+
+      - name: Upload v4.387 observed row order validation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-387-observed-row-order-validation-no-scoring-no-support-output
+          path: |
+            tairid_v4_387_observed_row_order_validation_no_scoring_no_support_output/
+            tairid_v4_387_observed_row_order_validation_no_scoring_no_support_output.zip
