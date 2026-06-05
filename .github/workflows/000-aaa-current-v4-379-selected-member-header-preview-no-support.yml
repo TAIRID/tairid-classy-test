@@ -1,0 +1,604 @@
+name: "!!! AAA CURRENT - TAIRID v4.379 selected member header preview no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-379-selected-member-header-preview-no-support:
+    name: "!!! AAA CURRENT - Run v4.379 selected member header preview"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.378 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.378 output ZIP by pattern..."
+          INPUT_378_ZIP="$(ls tairid-v4-378-archive-member-review-ingest-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_378_ZIP" ]; then
+            echo "Could not find v4.378 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-378-archive-member-review-ingest-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.378 ZIP:"
+          echo "$INPUT_378_ZIP"
+          echo "INPUT_378_ZIP=$INPUT_378_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.379 selected member header preview script
+        run: |
+          cat > run_v4_379_selected_member_header_preview_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import tarfile
+          import shutil
+          import tempfile
+          import os
+          import re
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "selected archive member header/shape preview only; member bytes may be scanned only to derive non-value shape metadata and redacted line patterns; no usable covariance values retained; no exact covariance member approved; no covariance matrix loaded; no covariance dimensions confirmed; no observed-row order matched; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          NUMBER_RE = re.compile(r'[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?')
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def is_number_token(token):
+              token = token.strip().strip(",")
+              if not token:
+                  return False
+              try:
+                  float(token)
+                  return True
+              except Exception:
+                  return False
+
+          def redact_line(line, max_len=240):
+              redacted = NUMBER_RE.sub("<num>", line.strip())
+              redacted = re.sub(r"\s+", " ", redacted)
+              if len(redacted) > max_len:
+                  redacted = redacted[:max_len] + "...<truncated>"
+              return redacted
+
+          def find_downloaded_archives(base):
+              archives = []
+              for p in sorted(base.rglob("*")):
+                  if not p.is_file():
+                      continue
+                  s = str(p)
+                  if "downloaded_archives_preserved_not_for_value_ingest" in s:
+                      if p.suffix.lower() == ".zip" or p.name.lower().endswith(".tar.gz") or p.suffix.lower() in [".tgz", ".tar"]:
+                          archives.append(p)
+              return archives
+
+          def read_member_bytes_from_archives(archives, member_name):
+              for archive in archives:
+                  try:
+                      if zipfile.is_zipfile(archive):
+                          with zipfile.ZipFile(archive, "r") as z:
+                              if member_name in z.namelist():
+                                  return archive, z.read(member_name), "zip", ""
+                      elif tarfile.is_tarfile(archive):
+                          with tarfile.open(archive, "r:*") as t:
+                              names = t.getnames()
+                              if member_name in names:
+                                  f = t.extractfile(member_name)
+                                  if f is None:
+                                      return archive, b"", "tar", "member_extractfile_returned_none"
+                                  return archive, f.read(), "tar", ""
+                  except Exception as exc:
+                      continue
+              return None, b"", "", "selected_member_not_found_in_preserved_archives"
+
+          def summarize_member_bytes(data):
+              text = data.decode("utf-8", errors="replace")
+              lines = text.splitlines()
+
+              nonempty = [ln for ln in lines if ln.strip()]
+              comment = [ln for ln in nonempty if ln.strip().startswith("#")]
+              data_like = [ln for ln in nonempty if not ln.strip().startswith("#")]
+
+              token_counts = []
+              numeric_line_count = 0
+              mixed_line_count = 0
+
+              for ln in data_like:
+                  tokens = ln.replace(",", " ").split()
+                  if tokens:
+                      token_counts.append(len(tokens))
+                      if all(is_number_token(tok) for tok in tokens):
+                          numeric_line_count += 1
+                      else:
+                          mixed_line_count += 1
+
+              unique_counts = sorted(set(token_counts))
+              likely_rectangular = len(unique_counts) == 1 and len(token_counts) > 0
+              inferred_rows = len(token_counts)
+              inferred_columns = unique_counts[0] if likely_rectangular else ""
+
+              redacted_preview_lines = []
+              for ln in nonempty[:8]:
+                  redacted_preview_lines.append(redact_line(ln))
+
+              redacted_data_patterns = []
+              for ln in data_like[:5]:
+                  tokens = ln.replace(",", " ").split()
+                  pattern = []
+                  for tok in tokens[:20]:
+                      pattern.append("<num>" if is_number_token(tok) else "<text>")
+                  if len(tokens) > 20:
+                      pattern.append("...<truncated>")
+                  redacted_data_patterns.append(" ".join(pattern))
+
+              return {
+                  "total_line_count": len(lines),
+                  "nonempty_line_count": len(nonempty),
+                  "comment_or_header_line_count": len(comment),
+                  "data_like_line_count": len(data_like),
+                  "numeric_data_like_line_count": numeric_line_count,
+                  "mixed_data_like_line_count": mixed_line_count,
+                  "min_token_count": min(token_counts) if token_counts else "",
+                  "max_token_count": max(token_counts) if token_counts else "",
+                  "unique_token_counts": "|".join(str(x) for x in unique_counts),
+                  "likely_rectangular_numeric_table": bool(likely_rectangular and numeric_line_count == len(token_counts)),
+                  "inferred_shape_rows_candidate": inferred_rows if likely_rectangular else "",
+                  "inferred_shape_columns_candidate": inferred_columns,
+                  "redacted_first_nonempty_lines": " || ".join(redacted_preview_lines),
+                  "redacted_data_token_patterns": " || ".join(redacted_data_patterns),
+              }
+
+          def main():
+              input_378 = Path(os.environ["INPUT_378_ZIP"])
+
+              outdir = Path("tairid_v4_379_selected_archive_member_header_preview_no_values_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              preserved_archives_dir = outdir / "downloaded_archives_preserved_not_for_value_ingest"
+              preserved_archives_dir.mkdir(parents=True, exist_ok=True)
+
+              base378 = extract_zip(input_378, "tairid_v4_379_378_")
+
+              summary378_path = find_one(base378, "v4_378_summary.json")
+              review_ingest_path = find_one(base378, "v4_378_archive_member_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv")
+              selected_members_path = find_one(base378, "v4_378_SELECTED_archive_members_FOR_LATER_HEADER_ONLY_STAGING_NO_VALUES.csv")
+              rejected_path = find_one(base378, "v4_378_rejected_archive_members.csv")
+              blocked_path = find_one(base378, "v4_378_blocked_archive_members.csv")
+              header_staging_path = find_one(base378, "v4_378_member_header_staging_packet_NO_VALUES_NO_SUPPORT.csv")
+              member_review_summary_path = find_one(base378, "v4_378_member_review_summary_NO_VALUES.csv")
+              route_status_path = find_one(base378, "v4_378_route_status_summary.csv")
+              limitations378_path = find_one(base378, "v4_378_limitations_after_archive_member_review.csv")
+              gap378_path = find_one(base378, "v4_378_gap_status_after_archive_member_review.csv")
+              candidate_members_path = find_one(base378, "v4_378_input_v4_377_candidate_members_preserved.csv")
+              attempts_path = find_one(base378, "v4_378_input_v4_377_download_attempts_preserved.csv")
+              rules378_path = find_one(base378, "v4_378_rule_checks.csv")
+
+              summary378 = json.loads(summary378_path.read_text())
+              review_ingest = pd.read_csv(review_ingest_path)
+              selected_members = pd.read_csv(selected_members_path)
+              rejected = pd.read_csv(rejected_path)
+              blocked = pd.read_csv(blocked_path)
+              header_staging = pd.read_csv(header_staging_path)
+              member_review_summary = pd.read_csv(member_review_summary_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations378 = pd.read_csv(limitations378_path)
+              gap378 = pd.read_csv(gap378_path)
+              candidate_members = pd.read_csv(candidate_members_path)
+              attempts = pd.read_csv(attempts_path)
+              rules378 = pd.read_csv(rules378_path)
+
+              archives = find_downloaded_archives(base378)
+
+              copied_archives = []
+              for archive in archives:
+                  dest = preserved_archives_dir / archive.name
+                  if not dest.exists():
+                      shutil.copy2(archive, dest)
+                  copied_archives.append(dest)
+
+              preview_rows = []
+
+              for _, row in selected_members.iterrows():
+                  member_name = clean(row["member_name"])
+                  archive_path, data, archive_format_detected, read_error = read_member_bytes_from_archives(archives, member_name)
+
+                  if archive_path is not None and data:
+                      summary = summarize_member_bytes(data)
+                      found = True
+                      header_preview_status = "header_shape_preview_completed_no_values_retained"
+                  else:
+                      summary = {
+                          "total_line_count": "",
+                          "nonempty_line_count": "",
+                          "comment_or_header_line_count": "",
+                          "data_like_line_count": "",
+                          "numeric_data_like_line_count": "",
+                          "mixed_data_like_line_count": "",
+                          "min_token_count": "",
+                          "max_token_count": "",
+                          "unique_token_counts": "",
+                          "likely_rectangular_numeric_table": False,
+                          "inferred_shape_rows_candidate": "",
+                          "inferred_shape_columns_candidate": "",
+                          "redacted_first_nonempty_lines": "",
+                          "redacted_data_token_patterns": "",
+                      }
+                      found = False
+                      header_preview_status = "selected_member_not_found_or_empty"
+
+                  preview_rows.append({
+                      "v4_379_header_preview_id": f"v4_379_header_preview_{len(preview_rows)+1:03d}",
+                      "v4_378_member_review_id": clean(row["v4_378_member_review_id"]),
+                      "v4_377_member_id": clean(row["v4_377_member_id"]),
+                      "source_label": clean(row["source_label"]),
+                      "source_url": clean(row["source_url"]),
+                      "selected_member_name": member_name,
+                      "source_archive_found": bool(found),
+                      "source_archive_file_name": archive_path.name if archive_path is not None else "",
+                      "archive_format_detected": archive_format_detected,
+                      "member_size_bytes_from_listing": row["member_size_bytes"],
+                      "member_bytes_scanned_for_shape_only": len(data) if data else 0,
+
+                      "header_preview_status": header_preview_status,
+                      "read_error": read_error,
+                      "member_contents_scanned_for_shape_only": bool(found),
+                      "raw_covariance_values_retained": False,
+                      "usable_covariance_matrix_loaded": False,
+
+                      "total_line_count": summary["total_line_count"],
+                      "nonempty_line_count": summary["nonempty_line_count"],
+                      "comment_or_header_line_count": summary["comment_or_header_line_count"],
+                      "data_like_line_count": summary["data_like_line_count"],
+                      "numeric_data_like_line_count": summary["numeric_data_like_line_count"],
+                      "mixed_data_like_line_count": summary["mixed_data_like_line_count"],
+                      "min_token_count": summary["min_token_count"],
+                      "max_token_count": summary["max_token_count"],
+                      "unique_token_counts": summary["unique_token_counts"],
+                      "likely_rectangular_numeric_table": summary["likely_rectangular_numeric_table"],
+                      "inferred_shape_rows_candidate": summary["inferred_shape_rows_candidate"],
+                      "inferred_shape_columns_candidate": summary["inferred_shape_columns_candidate"],
+                      "redacted_first_nonempty_lines_NO_VALUES": summary["redacted_first_nonempty_lines"],
+                      "redacted_data_token_patterns_NO_VALUES": summary["redacted_data_token_patterns"],
+
+                      "exact_covariance_member_approved": False,
+                      "exact_covariance_file_staged": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              header_preview = pd.DataFrame(preview_rows)
+
+              shape_review_packet = header_preview.copy()
+              shape_review_packet["human_shape_preview_review_decision"] = ""
+              shape_review_packet["allowed_human_shape_preview_review_decisions"] = "approve_for_later_dimension_order_review|needs_member_repair|reject_member|keep_blocked"
+              shape_review_packet["human_shape_preview_review_note"] = ""
+              shape_review_packet["shape_preview_approved_now"] = False
+              shape_review_packet["covariance_dimension_confirmed"] = False
+              shape_review_packet["observed_row_order_matched"] = False
+              shape_review_packet["full_covariance_values_loaded"] = False
+              shape_review_packet["support_allowed"] = False
+
+              candidate_shape_rows = header_preview[
+                  header_preview["source_archive_found"].astype(bool)
+                  & header_preview["likely_rectangular_numeric_table"].astype(bool)
+              ].copy()
+
+              nonmatching_or_unclear_rows = header_preview[
+                  ~(
+                      header_preview["source_archive_found"].astype(bool)
+                      & header_preview["likely_rectangular_numeric_table"].astype(bool)
+                  )
+              ].copy()
+
+              preview_summary = pd.DataFrame([
+                  {"summary_metric": "selected_member_rows", "value": int(len(selected_members)), "note": "Selected rows from v4.378."},
+                  {"summary_metric": "header_preview_rows", "value": int(len(header_preview)), "note": "Rows previewed for non-value shape metadata."},
+                  {"summary_metric": "source_archive_found_rows", "value": int(header_preview["source_archive_found"].astype(bool).sum()), "note": "Selected members found inside preserved archives."},
+                  {"summary_metric": "candidate_rectangular_shape_rows", "value": int(len(candidate_shape_rows)), "note": "Rows that look like rectangular numeric tables by token count only."},
+                  {"summary_metric": "nonmatching_or_unclear_rows", "value": int(len(nonmatching_or_unclear_rows)), "note": "Rows needing repair or rejection before dimension/order review."},
+                  {"summary_metric": "raw_covariance_values_retained", "value": 0, "note": "Raw covariance values are not retained in v4.379."},
+                  {"summary_metric": "usable_covariance_matrix_loaded", "value": 0, "note": "No covariance matrix is loaded as usable data."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_379 = pd.DataFrame([
+                  {"status_id": "V4_379_STATUS_001", "status": "selected_member_header_shape_preview_completed", "detail": f"{len(header_preview)} selected members previewed for shape metadata only."},
+                  {"status_id": "V4_379_STATUS_002", "status": "raw_values_not_retained", "detail": "Numeric content was redacted into token patterns; no usable covariance values were retained."},
+                  {"status_id": "V4_379_STATUS_003", "status": "dimension_order_not_confirmed", "detail": "Shape candidates are not accepted as matching the observed rows yet."},
+                  {"status_id": "V4_379_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_379_LIMIT_001", "limit": "This step previews selected member structure only.", "status": "active_limit"},
+                  {"limit_id": "V4_379_LIMIT_002", "limit": "Raw covariance values are not retained or loaded.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_379_LIMIT_003", "limit": "No exact covariance member is approved in v4.379.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_379_LIMIT_004", "limit": "No covariance dimension or observed-row order match is confirmed.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_379_LIMIT_005", "limit": "No likelihood, p-values, score, or support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_379_GAP_001", "gap": "Selected member header/shape preview completed.", "status_after_v4_379": "shape_preview_available_no_values", "next_gate": "v4_380_shape_preview_review_ingest_no_values_no_support"},
+                  {"gap_id": "V4_379_GAP_002", "gap": "Exact covariance member remains unapproved.", "status_after_v4_379": "still_open", "next_gate": "human_shape_preview_review"},
+                  {"gap_id": "V4_379_GAP_003", "gap": "Covariance values remain unloaded.", "status_after_v4_379": "still_blocked", "next_gate": "later_after_dimension_order_review"},
+                  {"gap_id": "V4_379_GAP_004", "gap": "Covariance dimensions and observed-row order remain unconfirmed.", "status_after_v4_379": "still_blocked", "next_gate": "later_dimension_order_gate"},
+                  {"gap_id": "V4_379_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_379": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_379"},
+              ])
+
+              hard_checks = {
+                  "input_v4_378_summary_found": summary378.get("version") == "v4.378",
+                  "input_v4_378_rules_all_passed": summary_rules_all_passed(summary378),
+                  "input_v4_378_failed_gates_none": summary378.get("failed_gates") == "none",
+                  "input_v4_378_selected_members_4": summary378.get("selected_for_later_header_only_staging_rows") == 4,
+                  "input_v4_378_final_consensus_2": summary378.get("final_consensus_selected_rows") == 2,
+                  "input_v4_378_fs_consensus_2": summary378.get("fs_consensus_selected_rows") == 2,
+                  "input_v4_378_no_member_contents_read": summary378.get("member_contents_read") is False,
+                  "input_v4_378_no_header_preview_yet": summary378.get("member_header_previewed") is False,
+                  "input_v4_378_no_exact_member_approved": summary378.get("exact_covariance_member_approved") is False,
+                  "input_v4_378_no_exact_file_staged": summary378.get("exact_covariance_file_staged") is False,
+                  "input_v4_378_no_full_covariance": summary378.get("full_covariance_available") is False,
+                  "input_v4_378_no_values_loaded": summary378.get("full_covariance_values_loaded") is False,
+                  "input_v4_378_no_dimension_confirmed": summary378.get("covariance_dimension_confirmed") is False,
+                  "input_v4_378_no_row_order": summary378.get("observed_row_order_matched") is False,
+                  "input_v4_378_no_likelihood": summary378.get("likelihood_computed") is False,
+                  "input_v4_378_no_p_values": summary378.get("p_values_computed") is False,
+                  "input_v4_378_no_score_valid": summary378.get("score_valid") is False,
+                  "input_v4_378_no_support_allowed": summary378.get("support_allowed") is False,
+
+                  "rules378_all_passed": passed_column_all(rules378),
+                  "review_ingest_rows_match_candidate_members": len(review_ingest) == int(summary378.get("candidate_archive_member_rows")),
+                  "selected_members_rows_match_summary": len(selected_members) == int(summary378.get("selected_for_later_header_only_staging_rows")),
+                  "rejected_rows_match_summary": len(rejected) == int(summary378.get("rejected_member_rows")),
+                  "blocked_rows_match_summary": len(blocked) == int(summary378.get("blocked_member_rows")),
+                  "header_staging_rows_match_selected": len(header_staging) == len(selected_members),
+                  "member_review_summary_rows_equal_8": len(member_review_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations378_rows_equal_5": len(limitations378) == 5,
+                  "gap378_rows_equal_5": len(gap378) == 5,
+                  "candidate_members_rows_match_summary": len(candidate_members) == int(summary378.get("candidate_archive_member_rows")),
+                  "attempts_rows_equal_2": len(attempts) == 2,
+
+                  "preserved_archives_at_least_2": len(copied_archives) >= 2,
+                  "header_preview_rows_equal_selected": len(header_preview) == len(selected_members),
+                  "all_selected_members_found": header_preview["source_archive_found"].astype(bool).all(),
+                  "shape_review_packet_rows_equal_preview": len(shape_review_packet) == len(header_preview),
+                  "preview_summary_rows_equal_8": len(preview_summary) == 8,
+                  "route_status_379_rows_equal_4": len(route_status_379) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "raw_values_not_retained": false_col(header_preview, "raw_covariance_values_retained"),
+                  "usable_covariance_matrix_not_loaded": false_col(header_preview, "usable_covariance_matrix_loaded"),
+                  "exact_covariance_member_not_approved": false_col(header_preview, "exact_covariance_member_approved"),
+                  "exact_covariance_file_not_staged": false_col(header_preview, "exact_covariance_file_staged"),
+                  "no_full_covariance_available": false_col(header_preview, "full_covariance_available"),
+                  "no_covariance_values_loaded": false_col(header_preview, "full_covariance_values_loaded") and false_col(shape_review_packet, "full_covariance_values_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(header_preview, "covariance_dimension_confirmed") and false_col(shape_review_packet, "covariance_dimension_confirmed"),
+                  "no_observed_row_order_matched": false_col(header_preview, "observed_row_order_matched") and false_col(shape_review_packet, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(header_preview, "likelihood_computed"),
+                  "no_p_values_computed": false_col(header_preview, "p_values_computed"),
+                  "no_score_valid": false_col(header_preview, "score_valid"),
+                  "no_support_allowed": false_col(header_preview, "support_allowed") and false_col(shape_review_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary379 = {
+                  "version": "v4.379",
+                  "route_name": "v4_379_selected_archive_member_header_preview_no_values_no_support_claims",
+                  "expected_result": "v4_379_selected_archive_member_header_preview_passed_shape_metadata_no_values_no_support_claims",
+                  "input_version": "v4.378",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "selected_member_rows": int(len(selected_members)),
+                  "header_preview_rows": int(len(header_preview)),
+                  "candidate_rectangular_shape_rows": int(len(candidate_shape_rows)),
+                  "member_contents_scanned_for_shape_only": True,
+                  "member_header_previewed": True,
+                  "raw_covariance_values_retained": False,
+                  "usable_covariance_matrix_loaded": False,
+                  "exact_covariance_member_approved": False,
+                  "exact_covariance_file_staged": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_379_shape_preview_review_then_v4_380_shape_preview_review_ingest_no_values_no_support_claims",
+              }
+
+              header_preview.to_csv(outdir / "v4_379_selected_member_header_shape_preview_NO_VALUES_NO_SUPPORT.csv", index=False)
+              candidate_shape_rows.to_csv(outdir / "v4_379_candidate_rectangular_shape_rows_NO_VALUES.csv", index=False)
+              nonmatching_or_unclear_rows.to_csv(outdir / "v4_379_nonmatching_or_unclear_shape_rows_NO_VALUES.csv", index=False)
+              shape_review_packet.to_csv(outdir / "v4_379_HUMAN_FILL_shape_preview_review_NO_VALUES_NO_SUPPORT.csv", index=False)
+              preview_summary.to_csv(outdir / "v4_379_header_preview_summary_NO_VALUES.csv", index=False)
+              route_status_379.to_csv(outdir / "v4_379_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_379_limitations_after_header_preview.csv", index=False)
+              gap_update.to_csv(outdir / "v4_379_gap_status_after_header_preview.csv", index=False)
+              selected_members.to_csv(outdir / "v4_379_input_v4_378_selected_members_preserved.csv", index=False)
+              header_staging.to_csv(outdir / "v4_379_input_v4_378_header_staging_packet_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_379_rule_checks.csv", index=False)
+
+              (outdir / "v4_379_summary.json").write_text(json.dumps(summary379, indent=2))
+
+              summary_md = f"""# TAIRID v4.379 Selected Archive Member Header / Shape Preview — No Values, No Support Claims
+
+          Expected result: `{summary379["expected_result"]}`
+
+          {summary379["rules_passed"]} / {summary379["rules_total"]} rules passed
+
+          failed_gates = {summary379["failed_gates"]}
+
+          selected_member_rows = {summary379["selected_member_rows"]}
+
+          header_preview_rows = {summary379["header_preview_rows"]}
+
+          candidate_rectangular_shape_rows = {summary379["candidate_rectangular_shape_rows"]}
+
+          member_contents_scanned_for_shape_only = true
+
+          member_header_previewed = true
+
+          raw_covariance_values_retained = false
+
+          usable_covariance_matrix_loaded = false
+
+          exact_covariance_member_approved = false
+
+          exact_covariance_file_staged = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step previews selected archive-member structure only.
+
+          It does **not** retain raw covariance values.
+
+          It does **not** load a usable covariance matrix.
+
+          It does **not** approve an exact covariance member.
+
+          It does **not** confirm covariance dimensions or observed-row order.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary379["selected_next_route"]}`
+          """
+              (outdir / "v4_379_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary379, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_379_selected_member_header_preview_no_support.py
+
+      - name: Run v4.379 selected member header preview no support
+        run: |
+          python run_v4_379_selected_member_header_preview_no_support.py
+
+      - name: Upload v4.379 selected member header preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-379-selected-member-header-preview-no-values-no-support-output
+          path: |
+            tairid_v4_379_selected_archive_member_header_preview_no_values_no_support_output/
+            tairid_v4_379_selected_archive_member_header_preview_no_values_no_support_output.zip
