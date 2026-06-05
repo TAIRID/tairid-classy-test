@@ -1,0 +1,711 @@
+name: "!!! AAA CURRENT - TAIRID v4.385 controlled covariance subblock extraction dry run no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-385-controlled-covariance-subblock-extraction-dry-run-no-support:
+    name: "!!! AAA CURRENT - Run v4.385 controlled covariance subblock extraction dry run"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
+      - name: Find v4.384 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.384 output ZIP by pattern..."
+          INPUT_384_ZIP="$(ls tairid-v4-384-fsigma8-subblock-readiness-review-ingest-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_384_ZIP" ]; then
+            echo "Could not find v4.384 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-384-fsigma8-subblock-readiness-review-ingest-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.384 ZIP:"
+          echo "$INPUT_384_ZIP"
+          echo "INPUT_384_ZIP=$INPUT_384_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.385 extraction dry run script
+        run: |
+          cat > run_v4_385_controlled_covariance_subblock_extraction_dry_run_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import tarfile
+          import shutil
+          import tempfile
+          import os
+          import hashlib
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+          import requests
+
+          CLAIM_BOUNDARY = "controlled covariance subblock extraction dry run only; candidate 3x3 f_sigma8 subblock values may be extracted for later integrity checks; no chi-square; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          OFFICIAL_ALAM_ARCHIVE_URL = "https://data.sdss.org/sas/dr12/boss/papers/clustering/ALAM_ET_AL_2016_consensus_and_individual_Gaussian_constraints.tar.gz"
+          MAX_DOWNLOAD_BYTES = 350 * 1024 * 1024
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_file(url, dest):
+              headers = {"User-Agent": "TAIRID-v4.385-controlled-subblock-extraction-no-support"}
+              head_status = ""
+              content_length = ""
+
+              try:
+                  h = requests.head(url, allow_redirects=True, timeout=30, headers=headers)
+                  head_status = str(h.status_code)
+                  content_length = h.headers.get("content-length", "")
+              except Exception as exc:
+                  head_status = f"HEAD_error:{type(exc).__name__}"
+                  content_length = ""
+
+              if content_length:
+                  try:
+                      if int(content_length) > MAX_DOWNLOAD_BYTES:
+                          return {
+                              "fetched": False,
+                              "status": "skipped_content_length_exceeds_controlled_limit",
+                              "head_status": head_status,
+                              "content_length": content_length,
+                              "error": "",
+                              "bytes_downloaded": 0,
+                              "sha256": "",
+                          }
+                  except Exception:
+                      pass
+
+              try:
+                  r = requests.get(url, stream=True, timeout=120, headers=headers)
+                  status = str(r.status_code)
+                  r.raise_for_status()
+
+                  bytes_downloaded = 0
+                  with dest.open("wb") as f:
+                      for chunk in r.iter_content(chunk_size=1024 * 1024):
+                          if not chunk:
+                              continue
+                          bytes_downloaded += len(chunk)
+                          if bytes_downloaded > MAX_DOWNLOAD_BYTES:
+                              return {
+                                  "fetched": False,
+                                  "status": "aborted_download_exceeds_controlled_limit",
+                                  "head_status": head_status,
+                                  "content_length": content_length,
+                                  "error": "",
+                                  "bytes_downloaded": bytes_downloaded,
+                                  "sha256": "",
+                              }
+                          f.write(chunk)
+
+                  return {
+                      "fetched": True,
+                      "status": f"fetched_http_{status}",
+                      "head_status": head_status,
+                      "content_length": content_length,
+                      "error": "",
+                      "bytes_downloaded": bytes_downloaded,
+                      "sha256": sha256_file(dest),
+                  }
+              except Exception as exc:
+                  return {
+                      "fetched": False,
+                      "status": "fetch_failed",
+                      "head_status": head_status,
+                      "content_length": content_length,
+                      "error": f"{type(exc).__name__}: {exc}",
+                      "bytes_downloaded": 0,
+                      "sha256": "",
+                  }
+
+          def parse_numeric_matrix_from_member(archive_path: Path, member_name: str):
+              if not tarfile.is_tarfile(archive_path):
+                  raise ValueError("Expected tar-compatible official archive.")
+
+              with tarfile.open(archive_path, "r:*") as t:
+                  names = t.getnames()
+
+                  target_name = None
+                  if member_name in names:
+                      target_name = member_name
+                  else:
+                      suffix_matches = [n for n in names if n.endswith(member_name) or n.endswith("/" + member_name)]
+                      if len(suffix_matches) == 1:
+                          target_name = suffix_matches[0]
+
+                  if target_name is None:
+                      raise FileNotFoundError(f"Selected member not found in archive: {member_name}")
+
+                  extracted = t.extractfile(target_name)
+                  if extracted is None:
+                      raise ValueError(f"Could not extract member file: {target_name}")
+
+                  text = extracted.read().decode("utf-8", errors="replace")
+
+              numeric_rows = []
+              line_number_rows = []
+
+              for line_number, line in enumerate(text.splitlines(), start=1):
+                  stripped = line.strip()
+                  if not stripped or stripped.startswith("#"):
+                      continue
+
+                  tokens = stripped.replace(",", " ").split()
+                  try:
+                      numeric = [float(tok) for tok in tokens]
+                  except Exception:
+                      continue
+
+                  if numeric:
+                      numeric_rows.append(numeric)
+                      line_number_rows.append(line_number)
+
+              if not numeric_rows:
+                  raise ValueError(f"No numeric rows parsed for member: {member_name}")
+
+              widths = sorted(set(len(r) for r in numeric_rows))
+              if len(widths) != 1:
+                  raise ValueError(f"Numeric rows are not rectangular for member {member_name}; widths={widths}")
+
+              return target_name, numeric_rows, line_number_rows
+
+          def parse_indices(index_text):
+              parts = [p.strip() for p in clean(index_text).split("|") if p.strip()]
+              return [int(p) for p in parts]
+
+          def main():
+              input_384 = Path(os.environ["INPUT_384_ZIP"])
+
+              outdir = Path("tairid_v4_385_controlled_covariance_subblock_extraction_dry_run_no_scoring_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              source_dir = outdir / "official_source_archive_preserved"
+              source_dir.mkdir(parents=True, exist_ok=True)
+
+              base384 = extract_zip(input_384, "tairid_v4_385_384_")
+
+              summary384_path = find_one(base384, "v4_384_summary.json")
+              review_ingest_path = find_one(base384, "v4_384_subblock_readiness_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv")
+              approved_plans_path = find_one(base384, "v4_384_APPROVED_final_consensus_subblock_plans_FOR_CONTROLLED_EXTRACTION_NO_VALUES.csv")
+              blocked_plans_path = find_one(base384, "v4_384_blocked_fs_consensus_subblock_plans.csv")
+              controlled_packet_path = find_one(base384, "v4_384_controlled_covariance_subblock_extraction_packet_NO_VALUES_NO_SUPPORT.csv")
+              coordinate_packet_path = find_one(base384, "v4_384_controlled_extraction_coordinate_packet_NO_VALUES.csv")
+              extraction_order_path = find_one(base384, "v4_384_controlled_extraction_order_NO_VALUES.csv")
+              review_summary_path = find_one(base384, "v4_384_subblock_review_summary_NO_VALUES.csv")
+              route_status_path = find_one(base384, "v4_384_route_status_summary.csv")
+              limitations384_path = find_one(base384, "v4_384_limitations_after_subblock_review.csv")
+              gap384_path = find_one(base384, "v4_384_gap_status_after_subblock_review.csv")
+              readiness_matrix_path = find_one(base384, "v4_384_input_v4_383_subblock_readiness_preserved.csv")
+              coord_input_path = find_one(base384, "v4_384_input_v4_383_coordinate_plan_preserved.csv")
+              rules384_path = find_one(base384, "v4_384_rule_checks.csv")
+
+              summary384 = json.loads(summary384_path.read_text())
+              review_ingest = pd.read_csv(review_ingest_path)
+              approved_plans = pd.read_csv(approved_plans_path)
+              blocked_plans = pd.read_csv(blocked_plans_path)
+              controlled_packet = pd.read_csv(controlled_packet_path)
+              coordinate_packet = pd.read_csv(coordinate_packet_path)
+              extraction_order = pd.read_csv(extraction_order_path)
+              review_summary = pd.read_csv(review_summary_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations384 = pd.read_csv(limitations384_path)
+              gap384 = pd.read_csv(gap384_path)
+              readiness_matrix = pd.read_csv(readiness_matrix_path)
+              coord_input = pd.read_csv(coord_input_path)
+              rules384 = pd.read_csv(rules384_path)
+
+              archive_path = source_dir / "ALAM_ET_AL_2016_consensus_and_individual_Gaussian_constraints.tar.gz"
+              download_result = download_file(OFFICIAL_ALAM_ARCHIVE_URL, archive_path)
+
+              download_ledger = pd.DataFrame([{
+                  "v4_385_download_id": "v4_385_official_archive_download_001",
+                  "source_url": OFFICIAL_ALAM_ARCHIVE_URL,
+                  "download_attempted": True,
+                  "source_file_fetched": bool(download_result["fetched"]),
+                  "http_head_status": download_result["head_status"],
+                  "reported_content_length": download_result["content_length"],
+                  "download_status": download_result["status"],
+                  "download_error": download_result["error"],
+                  "bytes_downloaded": int(download_result["bytes_downloaded"]),
+                  "sha256_if_fetched": download_result["sha256"],
+                  "archive_used_for_controlled_extraction": bool(download_result["fetched"]),
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              }])
+
+              extraction_rows = []
+              subblock_value_rows = []
+              matrix_wide_rows = []
+
+              if not download_result["fetched"]:
+                  extraction_error = "official_archive_download_failed"
+              else:
+                  extraction_error = ""
+
+                  for _, plan in controlled_packet.sort_values("extraction_priority").iterrows():
+                      member_name = clean(plan["selected_member_name"])
+                      zero_indices = parse_indices(plan["selected_fsigma8_zero_based_indices"])
+                      one_indices = parse_indices(plan["selected_fsigma8_one_based_indices"])
+
+                      try:
+                          resolved_member_name, matrix, source_line_numbers = parse_numeric_matrix_from_member(archive_path, member_name)
+                          full_rows = len(matrix)
+                          full_cols = len(matrix[0]) if matrix else 0
+                          expected_9x9 = full_rows == 9 and full_cols == 9
+
+                          if not expected_9x9:
+                              raise ValueError(f"Expected 9x9 numeric matrix, got {full_rows}x{full_cols}")
+
+                          subblock = []
+                          for i in zero_indices:
+                              subblock_row = []
+                              for j in zero_indices:
+                                  subblock_row.append(float(matrix[i][j]))
+                              subblock.append(subblock_row)
+
+                          extraction_status = "controlled_subblock_extracted_no_scoring"
+                          member_found = True
+                          subblock_extracted = True
+                          member_error = ""
+
+                      except Exception as exc:
+                          resolved_member_name = ""
+                          full_rows = 0
+                          full_cols = 0
+                          expected_9x9 = False
+                          subblock = []
+                          extraction_status = "controlled_subblock_extraction_failed"
+                          member_found = False
+                          subblock_extracted = False
+                          member_error = f"{type(exc).__name__}: {exc}"
+
+                      extraction_id = f"v4_385_extraction_{len(extraction_rows)+1:03d}"
+
+                      extraction_rows.append({
+                          "v4_385_extraction_id": extraction_id,
+                          "v4_384_subblock_review_id": clean(plan["v4_384_subblock_review_id"]),
+                          "selected_member_name": member_name,
+                          "resolved_archive_member_name": resolved_member_name,
+                          "candidate_observable_family_from_filename": clean(plan["candidate_observable_family_from_filename"]),
+                          "candidate_consensus_family_from_filename": clean(plan["candidate_consensus_family_from_filename"]),
+                          "selected_mapping_hypothesis": clean(plan["selected_mapping_hypothesis"]),
+                          "selected_fsigma8_zero_based_indices": clean(plan["selected_fsigma8_zero_based_indices"]),
+                          "selected_fsigma8_one_based_indices": clean(plan["selected_fsigma8_one_based_indices"]),
+                          "candidate_subblock_size": int(float(plan["candidate_subblock_size"])),
+                          "member_found_in_official_archive": bool(member_found),
+                          "source_full_matrix_rows": int(full_rows),
+                          "source_full_matrix_columns": int(full_cols),
+                          "source_full_matrix_shape_is_9x9": bool(expected_9x9),
+                          "covariance_subblock_extracted": bool(subblock_extracted),
+                          "candidate_subblock_rows": int(len(subblock)) if subblock else 0,
+                          "candidate_subblock_columns": int(len(subblock[0])) if subblock else 0,
+                          "candidate_subblock_shape_is_3x3": bool(subblock_extracted and len(subblock) == 3 and len(subblock[0]) == 3),
+                          "extraction_status": extraction_status,
+                          "extraction_error": member_error,
+                          "controlled_value_extraction_dry_run": bool(subblock_extracted),
+                          "full_covariance_matrix_loaded": False,
+                          "full_covariance_available": False,
+                          "full_covariance_values_loaded": False,
+                          "covariance_dimension_confirmed": False,
+                          "observed_row_order_matched": False,
+                          "likelihood_computed": False,
+                          "p_values_computed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      })
+
+                      if subblock_extracted:
+                          for r in range(3):
+                              wide_row = {
+                                  "v4_385_extraction_id": extraction_id,
+                                  "selected_member_name": member_name,
+                                  "candidate_observable_family_from_filename": clean(plan["candidate_observable_family_from_filename"]),
+                                  "candidate_consensus_family_from_filename": clean(plan["candidate_consensus_family_from_filename"]),
+                                  "subblock_row_position_zero_based": r,
+                                  "subblock_row_position_one_based": r + 1,
+                                  "row_observed_redshift_candidate": ["z0.38", "z0.51", "z0.61"][r],
+                                  "cov_col_1": subblock[r][0],
+                                  "cov_col_2": subblock[r][1],
+                                  "cov_col_3": subblock[r][2],
+                                  "score_valid": False,
+                                  "support_allowed": False,
+                                  "claim_boundary": CLAIM_BOUNDARY,
+                              }
+                              matrix_wide_rows.append(wide_row)
+
+                          member_coords = coordinate_packet[
+                              coordinate_packet["selected_member_name"].astype(str) == member_name
+                          ].copy()
+
+                          for _, coord in member_coords.sort_values(
+                              ["subblock_row_position_zero_based", "subblock_col_position_zero_based"]
+                          ).iterrows():
+                              r = int(float(coord["subblock_row_position_zero_based"]))
+                              c = int(float(coord["subblock_col_position_zero_based"]))
+                              source_r = int(float(coord["source_matrix_row_zero_based"]))
+                              source_c = int(float(coord["source_matrix_col_zero_based"]))
+                              value = float(matrix[source_r][source_c])
+
+                              subblock_value_rows.append({
+                                  "v4_385_subblock_value_id": f"v4_385_subblock_value_{len(subblock_value_rows)+1:04d}",
+                                  "v4_385_extraction_id": extraction_id,
+                                  "selected_member_name": member_name,
+                                  "candidate_observable_family_from_filename": clean(plan["candidate_observable_family_from_filename"]),
+                                  "candidate_consensus_family_from_filename": clean(plan["candidate_consensus_family_from_filename"]),
+                                  "subblock_row_position_zero_based": r,
+                                  "subblock_col_position_zero_based": c,
+                                  "subblock_row_position_one_based": r + 1,
+                                  "subblock_col_position_one_based": c + 1,
+                                  "source_matrix_row_zero_based": source_r,
+                                  "source_matrix_col_zero_based": source_c,
+                                  "source_matrix_row_one_based": source_r + 1,
+                                  "source_matrix_col_one_based": source_c + 1,
+                                  "row_observed_redshift_candidate": clean(coord["row_observed_redshift"]),
+                                  "col_observed_redshift_candidate": clean(coord["col_observed_redshift"]),
+                                  "row_observed_id_candidate": clean(coord["row_observed_id_candidate"]),
+                                  "col_observed_id_candidate": clean(coord["col_observed_id_candidate"]),
+                                  "candidate_covariance_subblock_value": value,
+                                  "value_extracted_in_controlled_dry_run": True,
+                                  "value_used_for_scoring": False,
+                                  "likelihood_computed": False,
+                                  "p_values_computed": False,
+                                  "score_valid": False,
+                                  "support_allowed": False,
+                                  "claim_boundary": CLAIM_BOUNDARY,
+                              })
+
+              extraction_ledger = pd.DataFrame(extraction_rows)
+
+              subblock_values = pd.DataFrame(subblock_value_rows)
+              subblock_matrices_wide = pd.DataFrame(matrix_wide_rows)
+
+              if len(extraction_ledger):
+                  extracted_count = int(extraction_ledger["covariance_subblock_extracted"].astype(bool).sum())
+                  shape_3x3_count = int(extraction_ledger["candidate_subblock_shape_is_3x3"].astype(bool).sum())
+              else:
+                  extracted_count = 0
+                  shape_3x3_count = 0
+
+              value_rows_count = int(len(subblock_values))
+
+              integrity_staging_packet = extraction_ledger[
+                  extraction_ledger["covariance_subblock_extracted"].astype(bool)
+              ].copy()
+              integrity_staging_packet["next_gate"] = "v4_386_covariance_subblock_integrity_checks_no_scoring_no_support"
+              integrity_staging_packet["integrity_check_scope"] = "shape_finite_symmetric_diagonal_checks_only_no_scoring"
+              integrity_staging_packet["integrity_check_ready"] = True
+              integrity_staging_packet["score_valid"] = False
+              integrity_staging_packet["support_allowed"] = False
+
+              extraction_summary = pd.DataFrame([
+                  {"summary_metric": "controlled_extraction_plan_rows", "value": int(len(controlled_packet)), "note": "Rows approved by v4.384 for controlled extraction dry run."},
+                  {"summary_metric": "official_archive_downloaded", "value": int(download_result["fetched"]), "note": "Official archive fetched for controlled extraction."},
+                  {"summary_metric": "candidate_subblocks_extracted", "value": extracted_count, "note": "3x3 candidate f_sigma8 subblocks extracted for later integrity checks."},
+                  {"summary_metric": "candidate_subblock_value_rows", "value": value_rows_count, "note": "Nine coordinate values per extracted subblock."},
+                  {"summary_metric": "subblock_shape_3x3_rows", "value": shape_3x3_count, "note": "Extracted subblocks with 3x3 shape."},
+                  {"summary_metric": "likelihood_computed", "value": 0, "note": "No likelihood computed."},
+                  {"summary_metric": "score_valid", "value": 0, "note": "No scoring stage run."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_385 = pd.DataFrame([
+                  {"status_id": "V4_385_STATUS_001", "status": "controlled_subblock_extraction_dry_run_completed", "detail": f"{extracted_count} candidate final-consensus subblocks extracted for later integrity checks."},
+                  {"status_id": "V4_385_STATUS_002", "status": "no_scoring_performed", "detail": "The extracted subblocks are not used for chi-square, likelihood, p-values, or support claims."},
+                  {"status_id": "V4_385_STATUS_003", "status": "integrity_check_next", "detail": "Next gate checks 3x3 shape, finite values, symmetry, and diagonal behavior."},
+                  {"status_id": "V4_385_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_385_LIMIT_001", "limit": "Subblock extraction is not scoring.", "status": "active_limit"},
+                  {"limit_id": "V4_385_LIMIT_002", "limit": "Extracted candidate subblocks still require integrity checks.", "status": "active_limit"},
+                  {"limit_id": "V4_385_LIMIT_003", "limit": "Observed-row order is not validated by value in v4.385.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_385_LIMIT_004", "limit": "No chi-square, likelihood, or p-values are computed.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_385_LIMIT_005", "limit": "No support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_385_GAP_001", "gap": "Controlled candidate subblock extraction dry run completed.", "status_after_v4_385": "candidate_subblocks_extracted_for_integrity_checks_no_scoring", "next_gate": "v4_386_covariance_subblock_integrity_checks_no_scoring_no_support"},
+                  {"gap_id": "V4_385_GAP_002", "gap": "Subblock integrity remains unchecked.", "status_after_v4_385": "still_open", "next_gate": "v4_386_integrity_checks"},
+                  {"gap_id": "V4_385_GAP_003", "gap": "Observed-row order remains unvalidated.", "status_after_v4_385": "still_blocked", "next_gate": "v4_387_observed_row_order_validation"},
+                  {"gap_id": "V4_385_GAP_004", "gap": "Full-covariance scoring remains blocked.", "status_after_v4_385": "still_blocked", "next_gate": "later_after_integrity_and_row_order"},
+                  {"gap_id": "V4_385_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_385": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_385"},
+              ])
+
+              hard_checks = {
+                  "input_v4_384_summary_found": summary384.get("version") == "v4.384",
+                  "input_v4_384_rules_all_passed": summary_rules_all_passed(summary384),
+                  "input_v4_384_failed_gates_none": summary384.get("failed_gates") == "none",
+                  "input_v4_384_approved_final_consensus_rows_2": summary384.get("approved_final_consensus_subblock_plan_rows") == 2,
+                  "input_v4_384_blocked_fallback_rows_2": summary384.get("blocked_fallback_subblock_plan_rows") == 2,
+                  "input_v4_384_controlled_extraction_packet_rows_2": summary384.get("controlled_extraction_packet_rows") == 2,
+                  "input_v4_384_approved_coordinate_rows_18": summary384.get("approved_coordinate_rows") == 18,
+                  "input_v4_384_no_subblock_extracted": summary384.get("covariance_subblock_extracted") is False,
+                  "input_v4_384_no_values_loaded": summary384.get("full_covariance_values_loaded") is False,
+                  "input_v4_384_no_likelihood": summary384.get("likelihood_computed") is False,
+                  "input_v4_384_no_p_values": summary384.get("p_values_computed") is False,
+                  "input_v4_384_no_score_valid": summary384.get("score_valid") is False,
+                  "input_v4_384_no_support_allowed": summary384.get("support_allowed") is False,
+
+                  "rules384_all_passed": passed_column_all(rules384),
+                  "review_ingest_rows_equal_4": len(review_ingest) == 4,
+                  "approved_plans_rows_equal_2": len(approved_plans) == 2,
+                  "blocked_plans_rows_equal_2": len(blocked_plans) == 2,
+                  "controlled_packet_rows_equal_2": len(controlled_packet) == 2,
+                  "coordinate_packet_rows_equal_18": len(coordinate_packet) == 18,
+                  "extraction_order_rows_equal_2": len(extraction_order) == 2,
+                  "review_summary_rows_equal_8": len(review_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations384_rows_equal_5": len(limitations384) == 5,
+                  "gap384_rows_equal_5": len(gap384) == 5,
+                  "readiness_matrix_rows_equal_4": len(readiness_matrix) == 4,
+                  "coord_input_rows_equal_36": len(coord_input) == 36,
+
+                  "official_archive_downloaded": bool(download_result["fetched"]),
+                  "download_ledger_rows_equal_1": len(download_ledger) == 1,
+                  "extraction_ledger_rows_equal_2": len(extraction_ledger) == 2,
+                  "candidate_subblocks_extracted_equal_2": extracted_count == 2,
+                  "subblock_value_rows_equal_18": len(subblock_values) == 18,
+                  "subblock_matrices_wide_rows_equal_6": len(subblock_matrices_wide) == 6,
+                  "integrity_staging_packet_rows_equal_2": len(integrity_staging_packet) == 2,
+                  "extraction_summary_rows_equal_8": len(extraction_summary) == 8,
+                  "route_status_385_rows_equal_4": len(route_status_385) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "all_source_full_matrices_9x9": extraction_ledger["source_full_matrix_shape_is_9x9"].astype(bool).all() if len(extraction_ledger) else False,
+                  "all_candidate_subblocks_3x3": extraction_ledger["candidate_subblock_shape_is_3x3"].astype(bool).all() if len(extraction_ledger) else False,
+                  "no_full_covariance_matrix_loaded": false_col(extraction_ledger, "full_covariance_matrix_loaded"),
+                  "no_full_covariance_available": false_col(extraction_ledger, "full_covariance_available"),
+                  "no_full_covariance_values_loaded": false_col(extraction_ledger, "full_covariance_values_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(extraction_ledger, "covariance_dimension_confirmed"),
+                  "no_observed_row_order_matched": false_col(extraction_ledger, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(extraction_ledger, "likelihood_computed") and false_col(subblock_values, "likelihood_computed"),
+                  "no_p_values_computed": false_col(extraction_ledger, "p_values_computed") and false_col(subblock_values, "p_values_computed"),
+                  "no_score_valid": false_col(extraction_ledger, "score_valid") and false_col(subblock_values, "score_valid") and false_col(integrity_staging_packet, "score_valid"),
+                  "no_support_allowed": false_col(extraction_ledger, "support_allowed") and false_col(subblock_values, "support_allowed") and false_col(integrity_staging_packet, "support_allowed") and false_col(download_ledger, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary385 = {
+                  "version": "v4.385",
+                  "route_name": "v4_385_controlled_covariance_subblock_extraction_dry_run_no_scoring_no_support_claims",
+                  "expected_result": "v4_385_controlled_covariance_subblock_extraction_dry_run_passed_candidate_subblocks_extracted_no_scoring_no_support_claims",
+                  "input_version": "v4.384",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "controlled_extraction_packet_rows": int(len(controlled_packet)),
+                  "official_archive_downloaded": bool(download_result["fetched"]),
+                  "candidate_subblocks_extracted": int(extracted_count),
+                  "candidate_subblock_value_rows": int(len(subblock_values)),
+                  "candidate_subblock_matrix_rows": int(len(subblock_matrices_wide)),
+                  "integrity_staging_packet_rows": int(len(integrity_staging_packet)),
+                  "candidate_subblock_size": 3,
+                  "covariance_subblock_extracted": bool(extracted_count == 2),
+                  "candidate_subblock_values_extracted": bool(len(subblock_values) == 18),
+                  "full_covariance_matrix_loaded": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "chi_square_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_386_covariance_subblock_integrity_checks_no_scoring_no_support_claims",
+              }
+
+              download_ledger.to_csv(outdir / "v4_385_official_archive_download_ledger_NO_SCORING_NO_SUPPORT.csv", index=False)
+              extraction_ledger.to_csv(outdir / "v4_385_controlled_subblock_extraction_ledger_NO_SCORING_NO_SUPPORT.csv", index=False)
+              subblock_values.to_csv(outdir / "v4_385_candidate_fsigma8_subblock_values_FOR_INTEGRITY_CHECKS_NO_SCORING_NO_SUPPORT.csv", index=False)
+              subblock_matrices_wide.to_csv(outdir / "v4_385_candidate_fsigma8_subblock_matrices_wide_NO_SCORING_NO_SUPPORT.csv", index=False)
+              integrity_staging_packet.to_csv(outdir / "v4_385_integrity_check_staging_packet_NO_SCORING_NO_SUPPORT.csv", index=False)
+              extraction_summary.to_csv(outdir / "v4_385_extraction_summary_NO_SCORING_NO_SUPPORT.csv", index=False)
+              route_status_385.to_csv(outdir / "v4_385_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_385_limitations_after_extraction_dry_run.csv", index=False)
+              gap_update.to_csv(outdir / "v4_385_gap_status_after_extraction_dry_run.csv", index=False)
+              controlled_packet.to_csv(outdir / "v4_385_input_v4_384_controlled_extraction_packet_preserved.csv", index=False)
+              coordinate_packet.to_csv(outdir / "v4_385_input_v4_384_coordinate_packet_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_385_rule_checks.csv", index=False)
+
+              (outdir / "v4_385_summary.json").write_text(json.dumps(summary385, indent=2))
+
+              summary_md = f"""# TAIRID v4.385 Controlled Covariance Subblock Extraction Dry Run — No Scoring, No Support Claims
+
+          Expected result: `{summary385["expected_result"]}`
+
+          {summary385["rules_passed"]} / {summary385["rules_total"]} rules passed
+
+          failed_gates = {summary385["failed_gates"]}
+
+          controlled_extraction_packet_rows = {summary385["controlled_extraction_packet_rows"]}
+
+          official_archive_downloaded = {str(summary385["official_archive_downloaded"]).lower()}
+
+          candidate_subblocks_extracted = {summary385["candidate_subblocks_extracted"]}
+
+          candidate_subblock_value_rows = {summary385["candidate_subblock_value_rows"]}
+
+          candidate_subblock_matrix_rows = {summary385["candidate_subblock_matrix_rows"]}
+
+          integrity_staging_packet_rows = {summary385["integrity_staging_packet_rows"]}
+
+          covariance_subblock_extracted = {str(summary385["covariance_subblock_extracted"]).lower()}
+
+          candidate_subblock_values_extracted = {str(summary385["candidate_subblock_values_extracted"]).lower()}
+
+          full_covariance_matrix_loaded = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          chi_square_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step performs controlled candidate 3x3 f_sigma8 subblock extraction only.
+
+          It does **not** run integrity acceptance.
+
+          It does **not** validate observed-row order.
+
+          It does **not** compute chi-square, likelihood, or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary385["selected_next_route"]}`
+          """
+              (outdir / "v4_385_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary385, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_385_controlled_covariance_subblock_extraction_dry_run_no_support.py
+
+      - name: Run v4.385 controlled covariance subblock extraction dry run no support
+        run: |
+          python run_v4_385_controlled_covariance_subblock_extraction_dry_run_no_support.py
+
+      - name: Upload v4.385 controlled covariance subblock extraction artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-385-controlled-covariance-subblock-extraction-dry-run-no-scoring-no-support-output
+          path: |
+            tairid_v4_385_controlled_covariance_subblock_extraction_dry_run_no_scoring_no_support_output/
+            tairid_v4_385_controlled_covariance_subblock_extraction_dry_run_no_scoring_no_support_output.zip
