@@ -1,0 +1,641 @@
+name: "!!! AAA CURRENT - TAIRID v4.396B alternate full covariance chi-square dry run comparison no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-396B-alternate-full-covariance-chi-square-dry-run-comparison-no-support:
+    name: "!!! AAA CURRENT - Run v4.396B robustness chi-square comparison"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Find v4.395B and v4.389 input ZIPs
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.395B output ZIP by pattern..."
+          INPUT_395B_ZIP="$(ls tairid-v4-395B-controlled-alternate-covariance-extraction-integrity-row-order-no-scoring-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_395B_ZIP" ]; then
+            echo "Could not find v4.395B output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-395B-controlled-alternate-covariance-extraction-integrity-row-order-no-scoring-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Finding v4.389 output ZIP by pattern..."
+          INPUT_389_ZIP="$(ls tairid-v4-389-full-covariance-chi-square-dry-run-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_389_ZIP" ]; then
+            echo "Could not find v4.389 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-389-full-covariance-chi-square-dry-run-no-support-output.zip"
+            echo "If it is missing, upload the older v4.389 ZIP again."
+            exit 1
+          fi
+
+          echo "Using v4.395B ZIP:"
+          echo "$INPUT_395B_ZIP"
+
+          echo "Using v4.389 ZIP:"
+          echo "$INPUT_389_ZIP"
+
+          echo "INPUT_395B_ZIP=$INPUT_395B_ZIP" >> "$GITHUB_ENV"
+          echo "INPUT_389_ZIP=$INPUT_389_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.396B robustness chi-square comparison script
+        run: |
+          cat > run_v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_no_support.py <<'PY'
+          #!/usr/bin/env python3
+          
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+          import numpy as np
+          
+          CLAIM_BOUNDARY = "alternate full-covariance chi-square dry-run robustness comparison only; alternate 3x3 f_sigma8 covariance subblocks may be used for chi-square comparison; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+          
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+          
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+          
+              return tmp
+          
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+          
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+          
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+          
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+          
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+          
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+          
+          def matrix_from_values(df, value_col="candidate_covariance_subblock_value"):
+              m = np.zeros((3, 3), dtype=float)
+              for _, row in df.iterrows():
+                  r = int(float(row["subblock_row_position_zero_based"]))
+                  c = int(float(row["subblock_col_position_zero_based"]))
+                  m[r, c] = float(row[value_col])
+              return m
+          
+          def main():
+              input_395b = Path(os.environ["INPUT_395B_ZIP"])
+              input_389 = Path(os.environ["INPUT_389_ZIP"])
+          
+              outdir = Path("tairid_v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+          
+              base395 = extract_zip(input_395b, "tairid_v4_396B_395B_")
+              base389 = extract_zip(input_389, "tairid_v4_396B_389_")
+          
+              summary395_path = find_one(base395, "v4_395B_summary.json")
+              alt_values_path = find_one(base395, "v4_395B_alternate_fsigma8_subblock_values_FOR_COMPARISON_NO_SCORING_NO_SUPPORT.csv")
+              alt_wide_path = find_one(base395, "v4_395B_alternate_fsigma8_subblock_matrices_wide_NO_SCORING_NO_SUPPORT.csv")
+              ready_packet_path = find_one(base395, "v4_395B_robustness_comparison_ready_packet_NO_SCORING_NO_SUPPORT.csv")
+              integrity_path = find_one(base395, "v4_395B_alternate_subblock_integrity_checks_NO_SCORING_NO_SUPPORT.csv")
+              row_order_path = find_one(base395, "v4_395B_alternate_row_order_by_member_NO_SCORING_NO_SUPPORT.csv")
+              summary395_csv_path = find_one(base395, "v4_395B_extraction_integrity_row_order_summary_NO_SCORING_NO_SUPPORT.csv")
+              rules395_path = find_one(base395, "v4_395B_rule_checks.csv")
+          
+              summary389_path = find_one(base389, "v4_389_summary.json")
+              residual_path = find_one(base389, "v4_389_residual_vector_input_preserved_NO_SUPPORT.csv")
+              primary_terms_path = find_one(base389, "v4_389_full_covariance_chi_square_dry_run_terms_NO_SUPPORT.csv")
+              primary_summary_path = find_one(base389, "v4_389_full_covariance_chi_square_dry_run_summary_NO_SUPPORT.csv")
+              primary_subblock_path = find_one(base389, "v4_389_input_v4_388_approved_subblock_values_preserved.csv")
+              diagonal_terms_path = find_one(base389, "v4_389_input_v4_366_diagonal_terms_preserved.csv")
+              comparison389_path = find_one(base389, "v4_389_comparison_against_guarded_diagonal_NO_SUPPORT.csv")
+              rules389_path = find_one(base389, "v4_389_rule_checks.csv")
+          
+              summary395 = json.loads(summary395_path.read_text())
+              alt_values = pd.read_csv(alt_values_path)
+              alt_wide = pd.read_csv(alt_wide_path)
+              ready_packet = pd.read_csv(ready_packet_path)
+              integrity = pd.read_csv(integrity_path)
+              row_order = pd.read_csv(row_order_path)
+              summary395_csv = pd.read_csv(summary395_csv_path)
+              rules395 = pd.read_csv(rules395_path)
+          
+              summary389 = json.loads(summary389_path.read_text())
+              residual_vector = pd.read_csv(residual_path).sort_values("residual_vector_order")
+              primary_terms = pd.read_csv(primary_terms_path)
+              primary_summary = pd.read_csv(primary_summary_path)
+              primary_subblock_values = pd.read_csv(primary_subblock_path)
+              diagonal_terms = pd.read_csv(diagonal_terms_path)
+              comparison389 = pd.read_csv(comparison389_path)
+              rules389 = pd.read_csv(rules389_path)
+          
+              residual = residual_vector["residual_baseline_minus_observed"].astype(float).to_numpy()
+              residual_ids = residual_vector["v4_357_observed_value_id"].astype(str).tolist()
+              observed_ids = [
+                  f"BOSS_DR12_z{float(z):.2f}" for z in residual_vector["effective_redshift_z"].astype(float).tolist()
+              ]
+          
+              prior_diagonal = float(summary389["prior_guarded_diagonal_chi_square_sum"])
+              primary_chisq = float(summary389["full_covariance_chi_square_dry_run_sum"])
+          
+              alt_summary_rows = []
+              alt_term_rows = []
+              inverse_rows = []
+          
+              for _, ready in ready_packet.sort_values("v4_395B_extraction_id").iterrows():
+                  extraction_id = clean(ready["v4_395B_extraction_id"])
+                  member_name = clean(ready["candidate_member_name"])
+                  fam = clean(ready["candidate_observable_family"])
+                  consensus = clean(ready["candidate_consensus_family"])
+                  lane = clean(ready["robustness_lane"])
+          
+                  values_for_member = alt_values[alt_values["v4_395B_extraction_id"].astype(str) == extraction_id].copy()
+                  values_for_member = values_for_member.sort_values(
+                      ["subblock_row_position_zero_based", "subblock_col_position_zero_based"]
+                  )
+          
+                  matrix = matrix_from_values(values_for_member)
+                  inverse = np.linalg.inv(matrix)
+                  inv_residual = inverse @ residual
+                  terms = residual * inv_residual
+                  chisq = float(residual @ inverse @ residual)
+                  determinant = float(np.linalg.det(matrix))
+                  condition_number = float(np.linalg.cond(matrix))
+                  eig_min = float(np.linalg.eigvalsh(matrix).min())
+                  eig_max = float(np.linalg.eigvalsh(matrix).max())
+          
+                  alt_summary_rows.append({
+                      "v4_396B_alternate_chisq_id": f"v4_396B_alt_chisq_{len(alt_summary_rows)+1:03d}",
+                      "v4_395B_extraction_id": extraction_id,
+                      "candidate_member_name": member_name,
+                      "candidate_observable_family": fam,
+                      "candidate_consensus_family": consensus,
+                      "robustness_lane": lane,
+                      "degrees_of_freedom_candidate": 3,
+                      "alternate_full_covariance_chi_square_dry_run_sum": chisq,
+                      "primary_dM_Hz_full_covariance_chi_square_dry_run_sum": primary_chisq,
+                      "prior_guarded_diagonal_chi_square_sum": prior_diagonal,
+                      "alternate_minus_primary_chi_square_difference": chisq - primary_chisq,
+                      "alternate_to_primary_chi_square_ratio": chisq / primary_chisq if primary_chisq else "",
+                      "alternate_minus_diagonal_chi_square_difference": chisq - prior_diagonal,
+                      "alternate_to_diagonal_chi_square_ratio": chisq / prior_diagonal if prior_diagonal else "",
+                      "covariance_determinant": determinant,
+                      "covariance_condition_number": condition_number,
+                      "covariance_min_eigenvalue": eig_min,
+                      "covariance_max_eigenvalue": eig_max,
+                      "alternate_chi_square_computed": True,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+          
+                  for i in range(3):
+                      alt_term_rows.append({
+                          "v4_396B_alternate_chisq_term_id": f"v4_396B_alt_chisq_term_{len(alt_term_rows)+1:04d}",
+                          "v4_395B_extraction_id": extraction_id,
+                          "candidate_member_name": member_name,
+                          "candidate_observable_family": fam,
+                          "candidate_consensus_family": consensus,
+                          "observed_row_id": observed_ids[i],
+                          "effective_redshift_z": float(residual_vector.iloc[i]["effective_redshift_z"]),
+                          "observed_fsigma8": float(residual_vector.iloc[i]["observed_fsigma8"]),
+                          "baseline_fsigma8_prediction": float(residual_vector.iloc[i]["baseline_fsigma8_prediction"]),
+                          "residual_baseline_minus_observed": float(residual[i]),
+                          "inverse_covariance_times_residual_component": float(inv_residual[i]),
+                          "alternate_full_covariance_chi_square_component": float(terms[i]),
+                          "term_sum_interpretation": "components sum to alternate full covariance chi-square dry run",
+                          "likelihood_computed": False,
+                          "p_values_computed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      })
+          
+                  for i in range(3):
+                      for j in range(3):
+                          inverse_rows.append({
+                              "v4_396B_inverse_covariance_id": f"v4_396B_alt_inverse_{len(inverse_rows)+1:04d}",
+                              "v4_395B_extraction_id": extraction_id,
+                              "candidate_member_name": member_name,
+                              "candidate_observable_family": fam,
+                              "candidate_consensus_family": consensus,
+                              "row_position_zero_based": i,
+                              "col_position_zero_based": j,
+                              "row_observed_id": observed_ids[i],
+                              "col_observed_id": observed_ids[j],
+                              "inverse_covariance_value": float(inverse[i, j]),
+                              "likelihood_computed": False,
+                              "p_values_computed": False,
+                              "score_valid": False,
+                              "support_allowed": False,
+                              "claim_boundary": CLAIM_BOUNDARY,
+                          })
+          
+              alt_chisq_summary = pd.DataFrame(alt_summary_rows)
+              alt_chisq_terms = pd.DataFrame(alt_term_rows)
+              inverse_matrices = pd.DataFrame(inverse_rows)
+          
+              primary_comparison_row = pd.DataFrame([{
+                  "comparison_row_id": "v4_396B_comparison_primary_001",
+                  "comparison_type": "primary_guarded_dM_Hz_fsig",
+                  "candidate_member_name": "final_consensus_covtot_dM_Hz_fsig.txt",
+                  "candidate_observable_family": "dM_Hz_fsig",
+                  "candidate_consensus_family": "final_consensus",
+                  "robustness_lane": "primary_guarded_subblock_from_v4_389",
+                  "chi_square_dry_run_sum": primary_chisq,
+                  "difference_from_primary": 0.0,
+                  "ratio_to_primary": 1.0,
+                  "difference_from_prior_diagonal": primary_chisq - prior_diagonal,
+                  "ratio_to_prior_diagonal": primary_chisq / prior_diagonal if prior_diagonal else "",
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              }])
+          
+              alternate_comparison_rows = alt_chisq_summary.copy()
+              alternate_comparison_rows = pd.DataFrame([{
+                  "comparison_row_id": f"v4_396B_comparison_alt_{idx+1:03d}",
+                  "comparison_type": "alternate_or_fallback_covariance_subblock",
+                  "candidate_member_name": row["candidate_member_name"],
+                  "candidate_observable_family": row["candidate_observable_family"],
+                  "candidate_consensus_family": row["candidate_consensus_family"],
+                  "robustness_lane": row["robustness_lane"],
+                  "chi_square_dry_run_sum": row["alternate_full_covariance_chi_square_dry_run_sum"],
+                  "difference_from_primary": row["alternate_minus_primary_chi_square_difference"],
+                  "ratio_to_primary": row["alternate_to_primary_chi_square_ratio"],
+                  "difference_from_prior_diagonal": row["alternate_minus_diagonal_chi_square_difference"],
+                  "ratio_to_prior_diagonal": row["alternate_to_diagonal_chi_square_ratio"],
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              } for idx, row in alt_chisq_summary.iterrows()])
+          
+              primary_plus_alternate_comparison = pd.concat(
+                  [primary_comparison_row, alternate_comparison_rows],
+                  ignore_index=True
+              )
+          
+              chisq_values = primary_plus_alternate_comparison["chi_square_dry_run_sum"].astype(float)
+              robustness_min = float(chisq_values.min())
+              robustness_max = float(chisq_values.max())
+              robustness_width = float(robustness_max - robustness_min)
+          
+              robustness_band = pd.DataFrame([
+                  {
+                      "robustness_metric": "primary_full_covariance_chi_square_dry_run_sum",
+                      "value": primary_chisq,
+                      "note": "Primary human-approved dM_Hz_fsig subblock from v4.389.",
+                  },
+                  {
+                      "robustness_metric": "alternate_chi_square_min",
+                      "value": robustness_min,
+                      "note": "Minimum among primary plus alternate robustness dry runs.",
+                  },
+                  {
+                      "robustness_metric": "alternate_chi_square_max",
+                      "value": robustness_max,
+                      "note": "Maximum among primary plus alternate robustness dry runs.",
+                  },
+                  {
+                      "robustness_metric": "alternate_chi_square_range_width",
+                      "value": robustness_width,
+                      "note": "Max minus min across primary plus alternate robustness dry runs.",
+                  },
+                  {
+                      "robustness_metric": "prior_guarded_diagonal_chi_square_sum",
+                      "value": prior_diagonal,
+                      "note": "Earlier diagonal-only reference, not support.",
+                  },
+                  {
+                      "robustness_metric": "likelihood_computed",
+                      "value": 0,
+                      "note": "No likelihood computed.",
+                  },
+                  {
+                      "robustness_metric": "p_values_computed",
+                      "value": 0,
+                      "note": "No p-values computed.",
+                  },
+                  {
+                      "robustness_metric": "support_allowed",
+                      "value": 0,
+                      "note": "No support claim is allowed.",
+                  },
+              ])
+          
+              external_audit_packet = pd.DataFrame([
+                  {
+                      "audit_packet_id": "V4_396B_AUDIT_READY_001",
+                      "packet_role": "robustness_comparison_ready_for_external_audit",
+                      "primary_chi_square": primary_chisq,
+                      "alternate_comparison_rows": int(len(alt_chisq_summary)),
+                      "comparison_rows_total": int(len(primary_plus_alternate_comparison)),
+                      "robustness_min_chi_square": robustness_min,
+                      "robustness_max_chi_square": robustness_max,
+                      "robustness_range_width": robustness_width,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  }
+              ])
+          
+              comparison_summary = pd.DataFrame([
+                  {"summary_metric": "alternate_chi_square_rows", "value": int(len(alt_chisq_summary)), "note": "Alternate covariance candidates compared with same residual vector."},
+                  {"summary_metric": "alternate_chi_square_term_rows", "value": int(len(alt_chisq_terms)), "note": "Three term rows per alternate chi-square dry run."},
+                  {"summary_metric": "primary_plus_alternate_comparison_rows", "value": int(len(primary_plus_alternate_comparison)), "note": "Primary plus three alternate/fallback dry-run rows."},
+                  {"summary_metric": "primary_chi_square", "value": primary_chisq, "note": "v4.389 approved dM_Hz_fsig dry-run value."},
+                  {"summary_metric": "robustness_min_chi_square", "value": robustness_min, "note": "Minimum dry-run chi-square in comparison set."},
+                  {"summary_metric": "robustness_max_chi_square", "value": robustness_max, "note": "Maximum dry-run chi-square in comparison set."},
+                  {"summary_metric": "likelihood_computed", "value": 0, "note": "No likelihood computed."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+          
+              route_status_396 = pd.DataFrame([
+                  {"status_id": "V4_396B_STATUS_001", "status": "alternate_chi_square_dry_runs_computed", "detail": f"{len(alt_chisq_summary)} alternate covariance dry-run chi-square values computed."},
+                  {"status_id": "V4_396B_STATUS_002", "status": "robustness_band_created", "detail": f"Dry-run chi-square range across primary plus alternates is {robustness_min} to {robustness_max}."},
+                  {"status_id": "V4_396B_STATUS_003", "status": "no_likelihood_or_p_values", "detail": "This remains a dry-run diagnostic comparison only."},
+                  {"status_id": "V4_396B_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+          
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_396B_LIMIT_001", "limit": "Alternate chi-square comparison is not a likelihood or support claim.", "status": "active_limit"},
+                  {"limit_id": "V4_396B_LIMIT_002", "limit": "The comparison uses only three BOSS DR12 f_sigma8 residual rows.", "status": "active_limit"},
+                  {"limit_id": "V4_396B_LIMIT_003", "limit": "No p-values are computed in v4.396B.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_396B_LIMIT_004", "limit": "score_valid remains false.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_396B_LIMIT_005", "limit": "No support claim is allowed.", "status": "blocked_by_design"},
+              ])
+          
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_396B_GAP_001", "gap": "Alternate covariance dry-run comparison completed.", "status_after_v4_396B": "robustness_comparison_values_ready_for_audit_no_support", "next_gate": "v4_397B_robustness_external_audit_packet_no_support"},
+                  {"gap_id": "V4_396B_GAP_002", "gap": "Likelihood remains uncomputed.", "status_after_v4_396B": "still_blocked", "next_gate": "not_allowed_from_this_packet"},
+                  {"gap_id": "V4_396B_GAP_003", "gap": "p-values remain uncomputed.", "status_after_v4_396B": "still_blocked", "next_gate": "not_allowed_from_this_packet"},
+                  {"gap_id": "V4_396B_GAP_004", "gap": "Validated score remains unavailable.", "status_after_v4_396B": "still_blocked", "next_gate": "later_interpretation_gate_if_allowed"},
+                  {"gap_id": "V4_396B_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_396B": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_396B"},
+              ])
+          
+              # Expected exact values derived from the preserved archive data.
+              final_alt = alt_chisq_summary[
+                  (alt_chisq_summary["candidate_consensus_family"] == "final_consensus")
+                  & (alt_chisq_summary["candidate_observable_family"] == "dV_FAP_fsig")
+              ]
+              fs_rows = alt_chisq_summary[alt_chisq_summary["candidate_consensus_family"] == "FS_consensus"]
+          
+              hard_checks = {
+                  "input_v4_395B_summary_found": summary395.get("version") == "v4.395B",
+                  "input_v4_395B_rules_all_passed": summary_rules_all_passed(summary395),
+                  "input_v4_395B_failed_gates_none": summary395.get("failed_gates") == "none",
+                  "input_v4_395B_extracted_3": summary395.get("alternate_subblocks_extracted") == 3,
+                  "input_v4_395B_values_27": summary395.get("alternate_subblock_value_rows") == 27,
+                  "input_v4_395B_comparison_ready_3": summary395.get("comparison_ready_rows") == 3,
+                  "input_v4_395B_no_new_chisq": summary395.get("new_chi_square_computed") is False,
+                  "input_v4_395B_no_score": summary395.get("score_valid") is False,
+                  "input_v4_395B_no_support": summary395.get("support_allowed") is False,
+          
+                  "input_v4_389_summary_found": summary389.get("version") == "v4.389",
+                  "input_v4_389_rules_all_passed": summary_rules_all_passed(summary389),
+                  "input_v4_389_failed_gates_none": summary389.get("failed_gates") == "none",
+                  "input_v4_389_primary_chisq_matches": abs(float(summary389.get("full_covariance_chi_square_dry_run_sum")) - 1.384804886905097) < 1e-12,
+                  "input_v4_389_prior_diagonal_matches": abs(float(summary389.get("prior_guarded_diagonal_chi_square_sum")) - 1.362038876169214) < 1e-12,
+                  "input_v4_389_no_likelihood": summary389.get("likelihood_computed") is False,
+                  "input_v4_389_no_p_values": summary389.get("p_values_computed") is False,
+                  "input_v4_389_no_score": summary389.get("score_valid") is False,
+                  "input_v4_389_no_support": summary389.get("support_allowed") is False,
+          
+                  "rules395_all_passed": passed_column_all(rules395),
+                  "rules389_all_passed": passed_column_all(rules389),
+                  "ready_packet_rows_equal_3": len(ready_packet) == 3,
+                  "alt_values_rows_equal_27": len(alt_values) == 27,
+                  "alt_wide_rows_equal_9": len(alt_wide) == 9,
+                  "integrity_rows_equal_3": len(integrity) == 3,
+                  "row_order_rows_equal_3": len(row_order) == 3,
+                  "residual_vector_rows_equal_3": len(residual_vector) == 3,
+                  "primary_terms_rows_equal_3": len(primary_terms) == 3,
+                  "primary_subblock_values_rows_equal_9": len(primary_subblock_values) == 9,
+                  "diagonal_terms_rows_equal_3": len(diagonal_terms) == 3,
+                  "comparison389_rows_equal_4": len(comparison389) == 4,
+          
+                  "alternate_chi_square_rows_equal_3": len(alt_chisq_summary) == 3,
+                  "alternate_term_rows_equal_9": len(alt_chisq_terms) == 9,
+                  "inverse_matrix_rows_equal_27": len(inverse_matrices) == 27,
+                  "primary_plus_alternate_rows_equal_4": len(primary_plus_alternate_comparison) == 4,
+                  "final_consensus_alternate_rows_equal_1": len(final_alt) == 1,
+                  "fs_consensus_rows_equal_2": len(fs_rows) == 2,
+                  "comparison_summary_rows_equal_8": len(comparison_summary) == 8,
+                  "robustness_band_rows_equal_8": len(robustness_band) == 8,
+                  "external_audit_packet_rows_equal_1": len(external_audit_packet) == 1,
+                  "route_status_rows_equal_4": len(route_status_396) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+          
+                  "final_consensus_alternate_equals_primary": abs(float(final_alt.iloc[0]["alternate_full_covariance_chi_square_dry_run_sum"]) - primary_chisq) < 1e-12,
+                  "fs_consensus_chisq_values_equal_each_other": len(set(round(float(x), 15) for x in fs_rows["alternate_full_covariance_chi_square_dry_run_sum"])) == 1,
+                  "robustness_min_expected": abs(robustness_min - 1.2298323467773975) < 1e-12,
+                  "robustness_max_expected": abs(robustness_max - 1.384804886905097) < 1e-12,
+                  "robustness_width_expected": abs(robustness_width - 0.1549725401276995) < 1e-12,
+          
+                  "alternate_chi_square_computed": true_col(alt_chisq_summary, "alternate_chi_square_computed"),
+                  "no_likelihood_computed": false_col(alt_chisq_summary, "likelihood_computed") and false_col(alt_chisq_terms, "likelihood_computed") and false_col(primary_plus_alternate_comparison, "likelihood_computed"),
+                  "no_p_values_computed": false_col(alt_chisq_summary, "p_values_computed") and false_col(alt_chisq_terms, "p_values_computed") and false_col(primary_plus_alternate_comparison, "p_values_computed"),
+                  "no_score_valid": false_col(alt_chisq_summary, "score_valid") and false_col(alt_chisq_terms, "score_valid") and false_col(primary_plus_alternate_comparison, "score_valid") and false_col(external_audit_packet, "score_valid"),
+                  "no_support_allowed": false_col(alt_chisq_summary, "support_allowed") and false_col(alt_chisq_terms, "support_allowed") and false_col(primary_plus_alternate_comparison, "support_allowed") and false_col(external_audit_packet, "support_allowed"),
+              }
+          
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+          
+              summary396 = {
+                  "version": "v4.396B",
+                  "route_name": "v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_no_support_claims",
+                  "expected_result": "v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_passed_no_likelihood_no_p_values_no_support_claims",
+                  "input_versions": "v4.395B|v4.389",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "primary_dM_Hz_chi_square_dry_run_sum": primary_chisq,
+                  "prior_guarded_diagonal_chi_square_sum": prior_diagonal,
+                  "alternate_chi_square_rows": int(len(alt_chisq_summary)),
+                  "alternate_chi_square_term_rows": int(len(alt_chisq_terms)),
+                  "primary_plus_alternate_comparison_rows": int(len(primary_plus_alternate_comparison)),
+                  "robustness_min_chi_square": robustness_min,
+                  "robustness_max_chi_square": robustness_max,
+                  "robustness_chi_square_range_width": robustness_width,
+                  "final_consensus_dV_FAP_chi_square": float(final_alt.iloc[0]["alternate_full_covariance_chi_square_dry_run_sum"]),
+                  "fs_consensus_chi_square": float(fs_rows.iloc[0]["alternate_full_covariance_chi_square_dry_run_sum"]),
+                  "new_chi_square_computed": True,
+                  "alternate_chi_square_computed": True,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_397B_robustness_external_audit_packet_no_support_claims",
+              }
+          
+              alt_chisq_summary.to_csv(outdir / "v4_396B_alternate_full_covariance_chi_square_summary_NO_SUPPORT.csv", index=False)
+              alt_chisq_terms.to_csv(outdir / "v4_396B_alternate_full_covariance_chi_square_terms_NO_SUPPORT.csv", index=False)
+              inverse_matrices.to_csv(outdir / "v4_396B_alternate_inverse_covariance_matrices_NO_SUPPORT.csv", index=False)
+              primary_plus_alternate_comparison.to_csv(outdir / "v4_396B_primary_plus_alternate_chi_square_comparison_NO_SUPPORT.csv", index=False)
+              robustness_band.to_csv(outdir / "v4_396B_robustness_chi_square_band_summary_NO_SUPPORT.csv", index=False)
+              comparison_summary.to_csv(outdir / "v4_396B_robustness_comparison_summary_NO_SUPPORT.csv", index=False)
+              external_audit_packet.to_csv(outdir / "v4_396B_external_audit_staging_packet_NO_SUPPORT.csv", index=False)
+              route_status_396.to_csv(outdir / "v4_396B_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_396B_limitations_after_robustness_comparison.csv", index=False)
+              gap_update.to_csv(outdir / "v4_396B_gap_status_after_robustness_comparison.csv", index=False)
+              alt_values.to_csv(outdir / "v4_396B_input_v4_395B_alternate_subblock_values_preserved.csv", index=False)
+              residual_vector.to_csv(outdir / "v4_396B_input_v4_389_residual_vector_preserved.csv", index=False)
+              primary_terms.to_csv(outdir / "v4_396B_input_v4_389_primary_terms_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_396B_rule_checks.csv", index=False)
+          
+              (outdir / "v4_396B_summary.json").write_text(json.dumps(summary396, indent=2))
+          
+              summary_md = f"""# TAIRID v4.396B Alternate Full-Covariance Chi-Square Dry-Run Comparison — No Support Claims
+          
+          Expected result: `{summary396["expected_result"]}`
+          
+          {summary396["rules_passed"]} / {summary396["rules_total"]} rules passed
+          
+          failed_gates = {summary396["failed_gates"]}
+          
+          primary_dM_Hz_chi_square_dry_run_sum = {summary396["primary_dM_Hz_chi_square_dry_run_sum"]}
+          
+          prior_guarded_diagonal_chi_square_sum = {summary396["prior_guarded_diagonal_chi_square_sum"]}
+          
+          alternate_chi_square_rows = {summary396["alternate_chi_square_rows"]}
+          
+          alternate_chi_square_term_rows = {summary396["alternate_chi_square_term_rows"]}
+          
+          primary_plus_alternate_comparison_rows = {summary396["primary_plus_alternate_comparison_rows"]}
+          
+          robustness_min_chi_square = {summary396["robustness_min_chi_square"]}
+          
+          robustness_max_chi_square = {summary396["robustness_max_chi_square"]}
+          
+          robustness_chi_square_range_width = {summary396["robustness_chi_square_range_width"]}
+          
+          final_consensus_dV_FAP_chi_square = {summary396["final_consensus_dV_FAP_chi_square"]}
+          
+          fs_consensus_chi_square = {summary396["fs_consensus_chi_square"]}
+          
+          new_chi_square_computed = true
+          
+          alternate_chi_square_computed = true
+          
+          likelihood_computed = false
+          
+          p_values_computed = false
+          
+          score_valid = false
+          
+          support_allowed = false
+          
+          Claim boundary: {CLAIM_BOUNDARY}.
+          
+          This step computes alternate covariance chi-square dry-run comparisons only.
+          
+          It does **not** compute likelihood or p-values.
+          
+          It does **not** validate a score.
+          
+          It does **not** make support claims.
+          
+          Next route: `{summary396["selected_next_route"]}`
+          """
+              (outdir / "v4_396B_summary.md").write_text(summary_md)
+          
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+          
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+          
+              print(json.dumps(summary396, indent=2))
+              print(f"WROTE {zip_path}")
+          
+              if failed:
+                  raise SystemExit(1)
+          
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_no_support.py
+
+      - name: Run v4.396B alternate full covariance chi-square dry run comparison no support
+        run: |
+          python run_v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_no_support.py
+
+      - name: Upload v4.396B robustness chi-square comparison artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-396B-alternate-full-covariance-chi-square-dry-run-comparison-no-support-output
+          path: |
+            tairid_v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_no_support_output/
+            tairid_v4_396B_alternate_full_covariance_chi_square_dry_run_comparison_no_support_output.zip
