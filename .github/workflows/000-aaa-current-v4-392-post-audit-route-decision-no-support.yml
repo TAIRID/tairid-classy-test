@@ -1,0 +1,496 @@
+name: "!!! AAA CURRENT - TAIRID v4.392 post audit route decision no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-392-post-audit-route-decision-no-support:
+    name: "!!! AAA CURRENT - Run v4.392 post-audit route decision"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.391 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.391 output ZIP by pattern..."
+          INPUT_391_ZIP="$(ls tairid-v4-391-external-audit-response-ingest-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_391_ZIP" ]; then
+            echo "Could not find v4.391 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-391-external-audit-response-ingest-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.391 ZIP:"
+          echo "$INPUT_391_ZIP"
+          echo "INPUT_391_ZIP=$INPUT_391_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.392 post-audit route decision script
+        run: |
+          cat > run_v4_392_post_audit_route_decision_no_support.py <<'PY'
+          #!/usr/bin/env python3
+          
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+          
+          CLAIM_BOUNDARY = "post-audit route decision only; clean external audits may be used to choose the next bounded route; no new chi-square; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+          
+          PRIOR_DIAGONAL = 1.362038876169214
+          FULL_COV = 1.384804886905097
+          DIFF = 0.022766010735883135
+          RATIO = 1.0167146556050686
+          
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+          
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+          
+              return tmp
+          
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+          
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+          
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+          
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+          
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+          
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+          
+          def approx_equal(a, b, tol=1e-12):
+              return abs(float(a) - float(b)) <= tol
+          
+          def main():
+              input_391 = Path(os.environ["INPUT_391_ZIP"])
+          
+              outdir = Path("tairid_v4_392_post_audit_route_decision_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+          
+              base391 = extract_zip(input_391, "tairid_v4_392_391_")
+          
+              summary391_path = find_one(base391, "v4_391_summary.json")
+              audit_ledger_path = find_one(base391, "v4_391_external_audit_response_ingest_ledger_NO_SUPPORT.csv")
+              consensus_summary_path = find_one(base391, "v4_391_external_audit_consensus_summary_NO_SUPPORT.csv")
+              route_options_path = find_one(base391, "v4_391_post_audit_route_options_NO_SUPPORT.csv")
+              gap391_path = find_one(base391, "v4_391_gap_status_after_audit_response_ingest.csv")
+              limitations391_path = find_one(base391, "v4_391_limitations_after_audit_response_ingest.csv")
+              external_responses_path = find_one(base391, "v4_391_input_external_audit_responses_preserved.csv")
+              terms_path = find_one(base391, "v4_391_input_v4_389_chi_square_terms_preserved.csv")
+              diagonal_comparison_path = find_one(base391, "v4_391_input_v4_389_diagonal_comparison_preserved.csv")
+              findings390_path = find_one(base391, "v4_391_input_v4_390_findings_preserved.csv")
+              rules391_path = find_one(base391, "v4_391_rule_checks.csv")
+          
+              summary391 = json.loads(summary391_path.read_text())
+              audit_ledger = pd.read_csv(audit_ledger_path)
+              consensus_summary = pd.read_csv(consensus_summary_path)
+              route_options = pd.read_csv(route_options_path)
+              gap391 = pd.read_csv(gap391_path)
+              limitations391 = pd.read_csv(limitations391_path)
+              external_responses = pd.read_csv(external_responses_path)
+              terms = pd.read_csv(terms_path)
+              diagonal_comparison = pd.read_csv(diagonal_comparison_path)
+              findings390 = pd.read_csv(findings390_path)
+              rules391 = pd.read_csv(rules391_path)
+          
+              route_decision = pd.DataFrame([
+                  {
+                      "route_decision_id": "V4_392_ROUTE_DECISION_001",
+                      "route_name": "robustness_comparison_lane_no_support",
+                      "route_decision_status": "selected_next_primary_route",
+                      "reason": "Both external audits passed with no corrections, but both also preserved the strongest criticism: the diagnostic is still only three rows and one selected 3x3 covariance subblock. Robustness should precede any public-style writeup.",
+                      "next_gate": "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+                      "new_chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  },
+                  {
+                      "route_decision_id": "V4_392_ROUTE_DECISION_002",
+                      "route_name": "cautious_diagnostic_interpretation_no_support",
+                      "route_decision_status": "allowed_but_deferred_until_after_robustness",
+                      "reason": "A bounded writeup is now permitted as a milestone, but it should say guarded covariance-corrected diagnostic only and should not use support, validation, p-values, or likelihood language.",
+                      "next_gate": "later_cautious_diagnostic_writeup_packet_no_support_claims",
+                      "new_chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  },
+                  {
+                      "route_decision_id": "V4_392_ROUTE_DECISION_003",
+                      "route_name": "support_claim",
+                      "route_decision_status": "blocked",
+                      "reason": "External audit passing does not convert a guarded dry run into support for TAIRID.",
+                      "next_gate": "none",
+                      "new_chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  },
+                  {
+                      "route_decision_id": "V4_392_ROUTE_DECISION_004",
+                      "route_name": "likelihood_p_value_claim",
+                      "route_decision_status": "blocked",
+                      "reason": "v4.390 and both audits explicitly state no likelihood and no p-values were computed.",
+                      "next_gate": "none",
+                      "new_chi_square_computed": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  },
+              ])
+          
+              robustness_manifest = pd.DataFrame([
+                  {
+                      "robustness_item_id": "V4_392_ROBUST_001",
+                      "robustness_lane": "alternate_final_consensus_parameterization",
+                      "candidate": "final_consensus_covtot_dV_FAP_fsig.txt",
+                      "purpose": "Compare the covariance-corrected dry-run chi-square against the preserved dV/FAP/fsig final-consensus parameterization.",
+                      "source_status": "preserved_comparison_candidate_from_prior_lane",
+                      "next_gate": "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+                      "new_chi_square_computed_now": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "robustness_item_id": "V4_392_ROBUST_002",
+                      "robustness_lane": "full_shape_consensus_fallback",
+                      "candidate": "FS_consensus_covtot_dM_Hz_fsig.txt",
+                      "purpose": "Reopen the FS_consensus dM/Hz/fsig candidate as a fallback/comparison lane before any public-style interpretation.",
+                      "source_status": "preserved_blocked_fallback_candidate_from_prior_lane",
+                      "next_gate": "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+                      "new_chi_square_computed_now": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "robustness_item_id": "V4_392_ROBUST_003",
+                      "robustness_lane": "full_shape_consensus_fallback",
+                      "candidate": "FS_consensus_covtot_dV_FAP_fsig.txt",
+                      "purpose": "Reopen the FS_consensus dV/FAP/fsig candidate as a second fallback/comparison lane.",
+                      "source_status": "preserved_blocked_fallback_candidate_from_prior_lane",
+                      "next_gate": "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+                      "new_chi_square_computed_now": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "robustness_item_id": "V4_392_ROBUST_004",
+                      "robustness_lane": "row_count_and_scope_boundary",
+                      "candidate": "three_BOSS_DR12_rows_only",
+                      "purpose": "Preserve the limitation that this diagnostic uses only z0.38, z0.51, z0.61 and is not a multi-survey likelihood.",
+                      "source_status": "active_limit",
+                      "next_gate": "carried_forward_to_all_robustness_outputs",
+                      "new_chi_square_computed_now": False,
+                      "support_allowed": False,
+                  },
+              ])
+          
+              cautious_writeup_guardrails = pd.DataFrame([
+                  {
+                      "guardrail_id": "V4_392_WRITEUP_GUARD_001",
+                      "allowed_wording": "guarded covariance-corrected diagnostic",
+                      "blocked_wording": "proof|validation|confirmed support|TAIRID is supported",
+                      "reason": "The diagnostic has not produced likelihood, p-values, score_valid, or support_allowed.",
+                      "support_allowed": False,
+                  },
+                  {
+                      "guardrail_id": "V4_392_WRITEUP_GUARD_002",
+                      "allowed_wording": "the covariance-corrected dry-run chi-square is close to the prior diagonal diagnostic",
+                      "blocked_wording": "statistically significant|p-value|likelihood result",
+                      "reason": "No p-values or likelihood have been computed.",
+                      "support_allowed": False,
+                  },
+                  {
+                      "guardrail_id": "V4_392_WRITEUP_GUARD_003",
+                      "allowed_wording": "three-row BOSS DR12 diagnostic",
+                      "blocked_wording": "full survey validation|broad cosmological confirmation",
+                      "reason": "The current diagnostic uses only three BOSS DR12 f_sigma8 rows.",
+                      "support_allowed": False,
+                  },
+              ])
+          
+              post_audit_summary = pd.DataFrame([
+                  {"summary_metric": "external_audit_response_rows", "value": int(summary391["external_audit_response_rows"]), "note": "Two external AI audits ingested."},
+                  {"summary_metric": "audit_overall_pass_rows", "value": int(summary391["audit_overall_pass_rows"]), "note": "Both audits passed."},
+                  {"summary_metric": "overclaim_detected_rows", "value": int(summary391["overclaim_detected_rows"]), "note": "No overclaim detected."},
+                  {"summary_metric": "corrective_action_required_rows", "value": int(summary391["corrective_action_required_rows"]), "note": "No corrective action required."},
+                  {"summary_metric": "selected_primary_next_route", "value": "robustness_comparison_lane_no_support", "note": "Recommended before any public-style writeup."},
+                  {"summary_metric": "cautious_interpretation_status", "value": "allowed_but_deferred", "note": "Allowed only with no-support wording."},
+                  {"summary_metric": "new_chi_square_computed", "value": 0, "note": "No new chi-square computed in v4.392."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+          
+              route_status_392 = pd.DataFrame([
+                  {"status_id": "V4_392_STATUS_001", "status": "post_audit_route_decision_created", "detail": "Clean external audits were ingested in v4.391; v4.392 selects the robustness lane as the next primary route."},
+                  {"status_id": "V4_392_STATUS_002", "status": "cautious_writeup_deferred", "detail": "A cautious diagnostic writeup is allowed as a bounded milestone, but robustness comparison is recommended first."},
+                  {"status_id": "V4_392_STATUS_003", "status": "no_new_statistic_computed", "detail": "v4.392 computes no new chi-square, likelihood, p-values, or score."},
+                  {"status_id": "V4_392_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+          
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_392_LIMIT_001", "limit": "External audit success does not create support for TAIRID.", "status": "active_limit"},
+                  {"limit_id": "V4_392_LIMIT_002", "limit": "The covariance-corrected result remains a three-row guarded diagnostic.", "status": "active_limit"},
+                  {"limit_id": "V4_392_LIMIT_003", "limit": "Robustness against alternate covariance candidates remains open.", "status": "open_gap"},
+                  {"limit_id": "V4_392_LIMIT_004", "limit": "No likelihood, p-values, score, or support claim is allowed.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_392_LIMIT_005", "limit": "Cautious interpretation must remain no-support and no-validation language.", "status": "active_limit"},
+              ])
+          
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_392_GAP_001", "gap": "Post-audit route decision created.", "status_after_v4_392": "closed_cleanly", "next_gate": "v4_393B_robustness_comparison_lane_manifest_no_support"},
+                  {"gap_id": "V4_392_GAP_002", "gap": "Robustness against alternate covariance candidates.", "status_after_v4_392": "selected_next_open_lane", "next_gate": "v4_393B_robustness_comparison_lane_manifest_no_support"},
+                  {"gap_id": "V4_392_GAP_003", "gap": "Cautious diagnostic writeup.", "status_after_v4_392": "allowed_but_deferred", "next_gate": "later_after_robustness_or_user_choice"},
+                  {"gap_id": "V4_392_GAP_004", "gap": "Likelihood, p-values, score validity.", "status_after_v4_392": "still_blocked", "next_gate": "not_part_of_v4_392"},
+                  {"gap_id": "V4_392_GAP_005", "gap": "Support claims.", "status_after_v4_392": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_392"},
+              ])
+          
+              hard_checks = {
+                  "input_v4_391_summary_found": summary391.get("version") == "v4.391",
+                  "input_v4_391_rules_all_passed": summary_rules_all_passed(summary391),
+                  "input_v4_391_failed_gates_none": summary391.get("failed_gates") == "none",
+                  "input_audit_response_rows_2": summary391.get("external_audit_response_rows") == 2,
+                  "input_audit_pass_rows_2": summary391.get("audit_overall_pass_rows") == 2,
+                  "input_truth_boundary_rows_2": summary391.get("truth_boundary_preserved_rows") == 2,
+                  "input_overclaim_rows_0": summary391.get("overclaim_detected_rows") == 0,
+                  "input_corrective_action_rows_0": summary391.get("corrective_action_required_rows") == 0,
+                  "input_prior_diagonal_matches": approx_equal(summary391.get("prior_guarded_diagonal_chi_square_sum"), PRIOR_DIAGONAL),
+                  "input_full_cov_matches": approx_equal(summary391.get("full_covariance_chi_square_dry_run_sum"), FULL_COV),
+                  "input_diff_matches": approx_equal(summary391.get("full_minus_diagonal_chi_square_difference"), DIFF),
+                  "input_ratio_matches": approx_equal(summary391.get("full_to_diagonal_chi_square_ratio"), RATIO),
+                  "input_no_new_chi_square": summary391.get("new_chi_square_computed") is False,
+                  "input_no_likelihood": summary391.get("likelihood_computed") is False,
+                  "input_no_p_values": summary391.get("p_values_computed") is False,
+                  "input_score_valid_false": summary391.get("score_valid") is False,
+                  "input_support_allowed_false": summary391.get("support_allowed") is False,
+          
+                  "rules391_all_passed": passed_column_all(rules391),
+                  "audit_ledger_rows_equal_2": len(audit_ledger) == 2,
+                  "audit_ledger_all_pass": true_col(audit_ledger, "audit_overall_pass"),
+                  "audit_ledger_truth_boundary_preserved": true_col(audit_ledger, "truth_boundary_preserved"),
+                  "audit_ledger_no_improper_support_claim": false_col(audit_ledger, "improper_support_claim_found"),
+                  "audit_ledger_no_likelihood_pvalues": false_col(audit_ledger, "likelihood_or_p_values_computed"),
+                  "audit_ledger_no_score_support_validated": false_col(audit_ledger, "score_valid_or_support_allowed_validated"),
+                  "audit_ledger_no_corrective_action": false_col(audit_ledger, "corrective_action_required"),
+                  "consensus_summary_rows_equal_10": len(consensus_summary) == 10,
+                  "route_options_rows_equal_3": len(route_options) == 3,
+                  "gap391_rows_equal_5": len(gap391) == 5,
+                  "limitations391_rows_equal_5": len(limitations391) == 5,
+                  "external_responses_rows_equal_2": len(external_responses) == 2,
+                  "terms_rows_equal_3": len(terms) == 3,
+                  "diagonal_comparison_rows_equal_4": len(diagonal_comparison) == 4,
+                  "findings390_rows_equal_7": len(findings390) == 7,
+          
+                  "route_decision_rows_equal_4": len(route_decision) == 4,
+                  "selected_primary_route_one": int((route_decision["route_decision_status"] == "selected_next_primary_route").sum()) == 1,
+                  "selected_route_is_robustness": route_decision.loc[route_decision["route_decision_status"] == "selected_next_primary_route", "route_name"].iloc[0] == "robustness_comparison_lane_no_support",
+                  "blocked_routes_two": int((route_decision["route_decision_status"] == "blocked").sum()) == 2,
+                  "robustness_manifest_rows_equal_4": len(robustness_manifest) == 4,
+                  "cautious_writeup_guardrails_rows_equal_3": len(cautious_writeup_guardrails) == 3,
+                  "post_audit_summary_rows_equal_8": len(post_audit_summary) == 8,
+                  "route_status_392_rows_equal_4": len(route_status_392) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+          
+                  "no_new_chi_square_computed": false_col(route_decision, "new_chi_square_computed") and (post_audit_summary.loc[post_audit_summary["summary_metric"] == "new_chi_square_computed", "value"].astype(str).iloc[0] == "0"),
+                  "no_likelihood_computed": false_col(route_decision, "likelihood_computed"),
+                  "no_p_values_computed": false_col(route_decision, "p_values_computed"),
+                  "no_score_valid": false_col(route_decision, "score_valid"),
+                  "no_support_allowed": false_col(route_decision, "support_allowed") and false_col(robustness_manifest, "support_allowed") and false_col(cautious_writeup_guardrails, "support_allowed"),
+              }
+          
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+          
+              summary392 = {
+                  "version": "v4.392",
+                  "route_name": "v4_392_post_audit_route_decision_no_support_claims",
+                  "expected_result": "v4_392_post_audit_route_decision_passed_robustness_lane_selected_no_support_claims",
+                  "input_version": "v4.391",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "external_audit_response_rows": int(summary391["external_audit_response_rows"]),
+                  "audit_overall_pass_rows": int(summary391["audit_overall_pass_rows"]),
+                  "overclaim_detected_rows": int(summary391["overclaim_detected_rows"]),
+                  "corrective_action_required_rows": int(summary391["corrective_action_required_rows"]),
+                  "prior_guarded_diagonal_chi_square_sum": PRIOR_DIAGONAL,
+                  "full_covariance_chi_square_dry_run_sum": FULL_COV,
+                  "full_minus_diagonal_chi_square_difference": DIFF,
+                  "full_to_diagonal_chi_square_ratio": RATIO,
+                  "selected_primary_next_route": "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+                  "cautious_interpretation_status": "allowed_but_deferred_until_after_robustness",
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+              }
+          
+              route_decision.to_csv(outdir / "v4_392_post_audit_route_decision_NO_SUPPORT.csv", index=False)
+              robustness_manifest.to_csv(outdir / "v4_392_robustness_comparison_manifest_NO_SUPPORT.csv", index=False)
+              cautious_writeup_guardrails.to_csv(outdir / "v4_392_cautious_writeup_guardrails_NO_SUPPORT.csv", index=False)
+              post_audit_summary.to_csv(outdir / "v4_392_post_audit_decision_summary_NO_SUPPORT.csv", index=False)
+              route_status_392.to_csv(outdir / "v4_392_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_392_limitations_after_post_audit_route_decision.csv", index=False)
+              gap_update.to_csv(outdir / "v4_392_gap_status_after_post_audit_route_decision.csv", index=False)
+              audit_ledger.to_csv(outdir / "v4_392_input_v4_391_audit_ledger_preserved.csv", index=False)
+              route_options.to_csv(outdir / "v4_392_input_v4_391_route_options_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_392_rule_checks.csv", index=False)
+          
+              (outdir / "v4_392_summary.json").write_text(json.dumps(summary392, indent=2))
+          
+              summary_md = f"""# TAIRID v4.392 Post-Audit Route Decision — No Support Claims
+          
+          Expected result: `{summary392["expected_result"]}`
+          
+          {summary392["rules_passed"]} / {summary392["rules_total"]} rules passed
+          
+          failed_gates = {summary392["failed_gates"]}
+          
+          external_audit_response_rows = {summary392["external_audit_response_rows"]}
+          
+          audit_overall_pass_rows = {summary392["audit_overall_pass_rows"]}
+          
+          overclaim_detected_rows = {summary392["overclaim_detected_rows"]}
+          
+          corrective_action_required_rows = {summary392["corrective_action_required_rows"]}
+          
+          prior_guarded_diagonal_chi_square_sum = {summary392["prior_guarded_diagonal_chi_square_sum"]}
+          
+          full_covariance_chi_square_dry_run_sum = {summary392["full_covariance_chi_square_dry_run_sum"]}
+          
+          full_minus_diagonal_chi_square_difference = {summary392["full_minus_diagonal_chi_square_difference"]}
+          
+          full_to_diagonal_chi_square_ratio = {summary392["full_to_diagonal_chi_square_ratio"]}
+          
+          selected_primary_next_route = `{summary392["selected_primary_next_route"]}`
+          
+          cautious_interpretation_status = `{summary392["cautious_interpretation_status"]}`
+          
+          new_chi_square_computed = false
+          
+          likelihood_computed = false
+          
+          p_values_computed = false
+          
+          score_valid = false
+          
+          support_allowed = false
+          
+          Claim boundary: {CLAIM_BOUNDARY}.
+          
+          This step selects the post-audit route only.
+          
+          It does **not** compute a new chi-square.
+          
+          It does **not** compute likelihood or p-values.
+          
+          It does **not** validate a score.
+          
+          It does **not** make support claims.
+          
+          Next route: `{summary392["selected_next_route"]}`
+          """
+              (outdir / "v4_392_summary.md").write_text(summary_md)
+          
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+          
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+          
+              print(json.dumps(summary392, indent=2))
+              print(f"WROTE {zip_path}")
+          
+              if failed:
+                  raise SystemExit(1)
+          
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_392_post_audit_route_decision_no_support.py
+
+      - name: Run v4.392 post-audit route decision no support
+        run: |
+          python run_v4_392_post_audit_route_decision_no_support.py
+
+      - name: Upload v4.392 post-audit route decision artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-392-post-audit-route-decision-no-support-output
+          path: |
+            tairid_v4_392_post_audit_route_decision_no_support_output/
+            tairid_v4_392_post_audit_route_decision_no_support_output.zip
