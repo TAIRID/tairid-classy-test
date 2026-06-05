@@ -1,0 +1,586 @@
+name: "!!! AAA CURRENT - TAIRID v4.389 full covariance chi-square dry run no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-389-full-covariance-chi-square-dry-run-no-support:
+    name: "!!! AAA CURRENT - Run v4.389 full covariance chi-square dry run"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Find v4.388 guarded subblock ZIP and v4.366 residual/diagonal diagnostic ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.388 guarded covariance subblock approval ZIP..."
+          INPUT_388_ZIP="$(ls tairid-v4-388-human-guarded-covariance-subblock-approval-no-scoring-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_388_ZIP" ]; then
+            echo "Could not find v4.388 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-388-human-guarded-covariance-subblock-approval-no-scoring-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Finding v4.366 guarded chi-square diagnostic review ZIP for residual vector..."
+          INPUT_366_ZIP="$(ls tairid-v4-366-guarded-chi-square-diagnostic-review-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_366_ZIP" ]; then
+            echo "Could not find v4.366 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-366-guarded-chi-square-diagnostic-review-no-support-output.zip"
+            echo "This v4.389 gate needs v4.366 so the residual vector is sourced from the earlier approved residual/diagonal diagnostic chain."
+            exit 1
+          fi
+
+          echo "Using v4.388 ZIP:"
+          echo "$INPUT_388_ZIP"
+
+          echo "Using v4.366 ZIP:"
+          echo "$INPUT_366_ZIP"
+
+          echo "INPUT_388_ZIP=$INPUT_388_ZIP" >> "$GITHUB_ENV"
+          echo "INPUT_366_ZIP=$INPUT_366_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.389 full covariance chi-square dry run script
+        run: |
+          cat > run_v4_389_full_covariance_chi_square_dry_run_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import numpy as np
+          import pandas as pd
+
+          CLAIM_BOUNDARY = (
+              "full-covariance chi-square dry run only using the approved 3x3 f_sigma8 covariance subblock; "
+              "chi-square may be computed for diagnostic comparison; no likelihood; no p-values; "
+              "score_valid remains false; support_allowed remains false; no support claims"
+          )
+
+          OBSERVED_ORDER = ["z0.38", "z0.51", "z0.61"]
+          OBSERVED_IDS = ["BOSS_DR12_z0.38", "BOSS_DR12_z0.51", "BOSS_DR12_z0.61"]
+          SYMM_TOL = 1e-10
+          PSD_TOL = -1e-12
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def build_covariance_matrix(values_df):
+              C = np.zeros((3, 3), dtype=float)
+              rows = []
+              for _, row in values_df.iterrows():
+                  i = int(float(row["subblock_row_position_zero_based"]))
+                  j = int(float(row["subblock_col_position_zero_based"]))
+                  v = float(row["candidate_covariance_subblock_value"])
+                  if i < 0 or i > 2 or j < 0 or j > 2:
+                      raise ValueError(f"Subblock coordinate outside 3x3 range: {i},{j}")
+                  C[i, j] = v
+                  rows.append({
+                      "matrix_row_zero_based": i,
+                      "matrix_col_zero_based": j,
+                      "matrix_row_one_based": i + 1,
+                      "matrix_col_one_based": j + 1,
+                      "row_observed_redshift": clean(row["row_observed_redshift_candidate"]),
+                      "col_observed_redshift": clean(row["col_observed_redshift_candidate"]),
+                      "row_observed_id": clean(row["row_observed_id_candidate"]),
+                      "col_observed_id": clean(row["col_observed_id_candidate"]),
+                      "covariance_subblock_value": v,
+                      "value_used_for_chi_square_dry_run": True,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+              return C, pd.DataFrame(rows)
+
+          def matrix_to_long(matrix, label, member_name):
+              rows = []
+              for i in range(matrix.shape[0]):
+                  for j in range(matrix.shape[1]):
+                      rows.append({
+                          "matrix_label": label,
+                          "selected_member_name": member_name,
+                          "row_zero_based": i,
+                          "col_zero_based": j,
+                          "row_one_based": i + 1,
+                          "col_one_based": j + 1,
+                          "row_observed_redshift": OBSERVED_ORDER[i],
+                          "col_observed_redshift": OBSERVED_ORDER[j],
+                          "value": float(matrix[i, j]),
+                          "likelihood_computed": False,
+                          "p_values_computed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      })
+              return pd.DataFrame(rows)
+
+          def main():
+              input_388 = Path(os.environ["INPUT_388_ZIP"])
+              input_366 = Path(os.environ["INPUT_366_ZIP"])
+
+              outdir = Path("tairid_v4_389_full_covariance_chi_square_dry_run_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base388 = extract_zip(input_388, "tairid_v4_389_388_")
+              base366 = extract_zip(input_366, "tairid_v4_389_366_")
+
+              summary388_path = find_one(base388, "v4_388_summary.json")
+              approved_block_path = find_one(base388, "v4_388_APPROVED_guarded_covariance_subblock_FOR_FULL_COVARIANCE_CHISQ_DRY_RUN_NO_SUPPORT.csv")
+              approved_values_path = find_one(base388, "v4_388_APPROVED_subblock_values_FOR_DRY_RUN_INPUT_NO_SCORING_NO_SUPPORT.csv")
+              comparison_block_path = find_one(base388, "v4_388_comparison_covariance_subblock_NOT_SELECTED_NO_SCORING.csv")
+              comparison_values_path = find_one(base388, "v4_388_comparison_subblock_values_preserved_NO_SCORING.csv")
+              dry_run_packet_path = find_one(base388, "v4_388_full_covariance_chisq_dry_run_packet_NO_SUPPORT.csv")
+              audit_stage_path = find_one(base388, "v4_388_audit_staging_packet_NO_SCORING_NO_SUPPORT.csv")
+              rules388_path = find_one(base388, "v4_388_rule_checks.csv")
+
+              summary366_path = find_one(base366, "v4_366_summary.json")
+              diagonal_terms_path = find_one(base366, "v4_366_input_v4_365_computed_chi_square_terms_preserved.csv")
+              diagonal_summary_path = find_one(base366, "v4_366_input_v4_365_chi_square_summary_preserved.csv")
+              rules366_path = find_one(base366, "v4_366_rule_checks.csv")
+
+              summary388 = json.loads(summary388_path.read_text())
+              approved_block = pd.read_csv(approved_block_path)
+              approved_values = pd.read_csv(approved_values_path)
+              comparison_block = pd.read_csv(comparison_block_path)
+              comparison_values = pd.read_csv(comparison_values_path)
+              dry_run_packet = pd.read_csv(dry_run_packet_path)
+              audit_stage = pd.read_csv(audit_stage_path)
+              rules388 = pd.read_csv(rules388_path)
+
+              summary366 = json.loads(summary366_path.read_text())
+              diagonal_terms = pd.read_csv(diagonal_terms_path)
+              diagonal_summary = pd.read_csv(diagonal_summary_path)
+              rules366 = pd.read_csv(rules366_path)
+
+              diagonal_terms = diagonal_terms.sort_values("effective_redshift_z").reset_index(drop=True)
+              residual_vector = diagonal_terms["residual_baseline_minus_observed"].astype(float).to_numpy()
+              observed_minus_baseline_vector = diagonal_terms["observed_fsigma8"].astype(float).to_numpy() - diagonal_terms["baseline_fsigma8_prediction"].astype(float).to_numpy()
+
+              covariance_matrix, covariance_long = build_covariance_matrix(approved_values)
+              approved_member_name = clean(approved_block.loc[0, "selected_member_name"]) if len(approved_block) else ""
+
+              eigvals = np.linalg.eigvalsh(covariance_matrix)
+              determinant = float(np.linalg.det(covariance_matrix))
+              condition_number = float(np.linalg.cond(covariance_matrix))
+              inverse_matrix = np.linalg.inv(covariance_matrix)
+              inverse_long = matrix_to_long(inverse_matrix, "inverse_of_approved_3x3_fsigma8_subblock", approved_member_name)
+
+              cov_inv_residual = inverse_matrix @ residual_vector
+              chi_square = float(residual_vector.T @ inverse_matrix @ residual_vector)
+              dry_run_term_rows = []
+
+              for i in range(3):
+                  dry_run_term_rows.append({
+                      "v4_389_chi_square_term_id": f"v4_389_full_covariance_term_{i+1:03d}",
+                      "observed_row_id": OBSERVED_IDS[i],
+                      "effective_redshift_z": float(diagonal_terms.loc[i, "effective_redshift_z"]),
+                      "observed_fsigma8": float(diagonal_terms.loc[i, "observed_fsigma8"]),
+                      "baseline_fsigma8_prediction": float(diagonal_terms.loc[i, "baseline_fsigma8_prediction"]),
+                      "residual_baseline_minus_observed": float(residual_vector[i]),
+                      "covariance_inverse_times_residual_component": float(cov_inv_residual[i]),
+                      "full_covariance_chi_square_component": float(residual_vector[i] * cov_inv_residual[i]),
+                      "term_sum_interpretation": "components sum to full covariance chi-square dry run",
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              dry_run_terms = pd.DataFrame(dry_run_term_rows)
+
+              diagonal_guarded_sum = float(summary366["guarded_diagonal_chi_square_sum"])
+              diagonal_uncertainty_sum = float(diagonal_terms["chi_square_term_guarded_diagonal"].astype(float).sum())
+
+              residual_vector_df = diagonal_terms[[
+                  "v4_357_observed_value_id",
+                  "survey_or_source",
+                  "tracer_or_sample",
+                  "effective_redshift_z",
+                  "observed_fsigma8",
+                  "observed_fsigma8_uncertainty",
+                  "baseline_fsigma8_prediction",
+                  "residual_baseline_minus_observed",
+                  "normalized_residual_baseline_minus_observed",
+                  "chi_square_term_guarded_diagonal",
+              ]].copy()
+              residual_vector_df["residual_vector_order"] = range(1, len(residual_vector_df) + 1)
+              residual_vector_df["used_in_full_covariance_chi_square_dry_run"] = True
+              residual_vector_df["likelihood_computed"] = False
+              residual_vector_df["p_values_computed"] = False
+              residual_vector_df["score_valid"] = False
+              residual_vector_df["support_allowed"] = False
+              residual_vector_df["claim_boundary"] = CLAIM_BOUNDARY
+
+              comparison_summary = pd.DataFrame([
+                  {
+                      "comparison_id": "V4_389_COMPARE_001",
+                      "metric": "prior_guarded_diagonal_chi_square_sum",
+                      "value": diagonal_guarded_sum,
+                      "source": "v4.366 guarded diagonal diagnostic",
+                      "interpretation_boundary": "diagonal_only_reference_not_support",
+                      "support_allowed": False,
+                  },
+                  {
+                      "comparison_id": "V4_389_COMPARE_002",
+                      "metric": "full_covariance_chi_square_dry_run_sum",
+                      "value": chi_square,
+                      "source": "v4.389 approved dM_Hz_fsig 3x3 covariance subblock dry run",
+                      "interpretation_boundary": "covariance_corrected_dry_run_not_likelihood_not_support",
+                      "support_allowed": False,
+                  },
+                  {
+                      "comparison_id": "V4_389_COMPARE_003",
+                      "metric": "difference_full_minus_diagonal",
+                      "value": chi_square - diagonal_guarded_sum,
+                      "source": "v4.389 minus v4.366",
+                      "interpretation_boundary": "diagnostic_difference_only",
+                      "support_allowed": False,
+                  },
+                  {
+                      "comparison_id": "V4_389_COMPARE_004",
+                      "metric": "ratio_full_to_diagonal",
+                      "value": chi_square / diagonal_guarded_sum if diagonal_guarded_sum != 0 else "",
+                      "source": "v4.389 divided by v4.366",
+                      "interpretation_boundary": "diagnostic_ratio_only",
+                      "support_allowed": False,
+                  },
+              ])
+
+              diagnostic_summary = pd.DataFrame([
+                  {"diagnostic_metric": "approved_observable_family", "value": clean(approved_block.loc[0, "approved_observable_family"]) if "approved_observable_family" in approved_block.columns else "dM_Hz_fsig", "computed": True, "status": "guarded_dry_run", "note": "Approved guarded subblock family."},
+                  {"diagnostic_metric": "chi_square_full_covariance_dry_run", "value": chi_square, "computed": True, "status": "computed_no_likelihood_no_p_values_no_support", "note": "Residual transpose inverse covariance residual."},
+                  {"diagnostic_metric": "degrees_of_freedom_candidate", "value": 3, "computed": True, "status": "candidate_only_no_p_value", "note": "No p-value is computed."},
+                  {"diagnostic_metric": "covariance_determinant", "value": determinant, "computed": True, "status": "integrity_context_only", "note": "Determinant of approved 3x3 covariance subblock."},
+                  {"diagnostic_metric": "covariance_condition_number", "value": condition_number, "computed": True, "status": "integrity_context_only", "note": "Condition number of approved 3x3 covariance subblock."},
+                  {"diagnostic_metric": "minimum_covariance_eigenvalue", "value": float(eigvals.min()), "computed": True, "status": "integrity_context_only", "note": "Smallest eigenvalue of approved 3x3 covariance subblock."},
+                  {"diagnostic_metric": "likelihood_computed", "value": 0, "computed": False, "status": "blocked_by_design", "note": "No likelihood is computed in v4.389."},
+                  {"diagnostic_metric": "p_values_computed", "value": 0, "computed": False, "status": "blocked_by_design", "note": "No p-values are computed in v4.389."},
+                  {"diagnostic_metric": "score_valid", "value": 0, "computed": False, "status": "truth_boundary", "note": "score_valid remains false."},
+                  {"diagnostic_metric": "support_allowed", "value": 0, "computed": False, "status": "truth_boundary", "note": "No support claim is allowed."},
+              ])
+
+              audit_packet = pd.DataFrame([
+                  {
+                      "audit_item_id": "V4_389_AUDIT_001",
+                      "item": "Full-covariance chi-square dry run computed from approved 3x3 f_sigma8 covariance subblock.",
+                      "status": "computed_for_audit_no_support",
+                      "value": chi_square,
+                      "support_allowed": False,
+                  },
+                  {
+                      "audit_item_id": "V4_389_AUDIT_002",
+                      "item": "Likelihood and p-values remain uncomputed.",
+                      "status": "blocked_by_design",
+                      "value": "",
+                      "support_allowed": False,
+                  },
+                  {
+                      "audit_item_id": "V4_389_AUDIT_003",
+                      "item": "score_valid remains false and support claims remain blocked.",
+                      "status": "truth_boundary_active",
+                      "value": "",
+                      "support_allowed": False,
+                  },
+                  {
+                      "audit_item_id": "V4_389_AUDIT_004",
+                      "item": "Comparison to prior diagonal diagnostic is included for audit context only.",
+                      "status": "comparison_context_only",
+                      "value": diagonal_guarded_sum,
+                      "support_allowed": False,
+                  },
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_389_LIMIT_001", "limit": "This is a dry-run chi-square diagnostic, not a likelihood analysis.", "status": "active_limit"},
+                  {"limit_id": "V4_389_LIMIT_002", "limit": "No p-value is computed from this chi-square.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_389_LIMIT_003", "limit": "The computation uses the approved 3x3 f_sigma8 subblock, not the full 9x9 covariance object.", "status": "active_limit"},
+                  {"limit_id": "V4_389_LIMIT_004", "limit": "score_valid remains false pending external audit and later interpretation gates.", "status": "truth_boundary"},
+                  {"limit_id": "V4_389_LIMIT_005", "limit": "No support claim is allowed from v4.389.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_389_GAP_001", "gap": "Full-covariance chi-square dry run completed.", "status_after_v4_389": "computed_for_external_audit_no_support", "next_gate": "v4_390_external_ai_audit_packet_covariance_corrected_diagnostic_no_support"},
+                  {"gap_id": "V4_389_GAP_002", "gap": "External audit remains pending.", "status_after_v4_389": "still_open", "next_gate": "v4_390_external_ai_audit_packet"},
+                  {"gap_id": "V4_389_GAP_003", "gap": "Likelihood and p-values remain uncomputed.", "status_after_v4_389": "still_blocked", "next_gate": "later_only_if_truth_boundary_allows"},
+                  {"gap_id": "V4_389_GAP_004", "gap": "Validated score remains unavailable.", "status_after_v4_389": "score_valid_false", "next_gate": "external_audit_then_interpretation_gate"},
+                  {"gap_id": "V4_389_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_389": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_389"},
+              ])
+
+              hard_checks = {
+                  "input_v4_388_summary_found": summary388.get("version") == "v4.388",
+                  "input_v4_388_rules_all_passed": summary_rules_all_passed(summary388),
+                  "input_v4_388_failed_gates_none": summary388.get("failed_gates") == "none",
+                  "input_v4_388_approved_one_subblock": summary388.get("approved_guarded_subblock_rows") == 1,
+                  "input_v4_388_dry_run_packet_one": summary388.get("dry_run_packet_rows") == 1,
+                  "input_v4_388_full_covariance_chisq_allowed_next": summary388.get("full_covariance_chisq_allowed_next") is True,
+                  "input_v4_388_no_chi_square_yet": summary388.get("chi_square_computed") is False,
+                  "input_v4_388_no_likelihood": summary388.get("likelihood_computed") is False,
+                  "input_v4_388_no_p_values": summary388.get("p_values_computed") is False,
+                  "input_v4_388_no_score_valid": summary388.get("score_valid") is False,
+                  "input_v4_388_no_support_allowed": summary388.get("support_allowed") is False,
+
+                  "input_v4_366_summary_found": summary366.get("version") == "v4.366",
+                  "input_v4_366_rules_all_passed": summary_rules_all_passed(summary366),
+                  "input_v4_366_failed_gates_none": summary366.get("failed_gates") == "none",
+                  "input_v4_366_diagonal_chi_square_reviewed": summary366.get("diagnostic_review_approved_for_external_audit") is True,
+                  "input_v4_366_chi_square_term_rows_3": summary366.get("chi_square_term_rows") == 3,
+                  "input_v4_366_no_likelihood": summary366.get("likelihood_computed") is False,
+                  "input_v4_366_no_p_values": summary366.get("p_values_computed") is False,
+                  "input_v4_366_no_score_valid": summary366.get("score_valid") is False,
+                  "input_v4_366_no_support_allowed": summary366.get("support_allowed") is False,
+
+                  "rules388_all_passed": passed_column_all(rules388),
+                  "rules366_all_passed": passed_column_all(rules366),
+                  "approved_block_rows_equal_1": len(approved_block) == 1,
+                  "approved_values_rows_equal_9": len(approved_values) == 9,
+                  "comparison_block_rows_equal_1": len(comparison_block) == 1,
+                  "comparison_values_rows_equal_9": len(comparison_values) == 9,
+                  "dry_run_packet_rows_equal_1": len(dry_run_packet) == 1,
+                  "audit_stage_rows_equal_3": len(audit_stage) == 3,
+                  "diagonal_terms_rows_equal_3": len(diagonal_terms) == 3,
+                  "diagonal_summary_has_rows": len(diagonal_summary) >= 5,
+
+                  "covariance_matrix_shape_3x3": covariance_matrix.shape == (3, 3),
+                  "covariance_matrix_all_finite": bool(np.isfinite(covariance_matrix).all()),
+                  "covariance_matrix_symmetric": bool(np.allclose(covariance_matrix, covariance_matrix.T, atol=SYMM_TOL, rtol=0)),
+                  "covariance_eigenvalues_psd_tolerance": bool(eigvals.min() >= PSD_TOL),
+                  "covariance_determinant_positive": determinant > 0,
+                  "covariance_condition_number_finite": bool(np.isfinite(condition_number)),
+                  "inverse_matrix_all_finite": bool(np.isfinite(inverse_matrix).all()),
+                  "residual_vector_length_3": len(residual_vector) == 3,
+                  "residual_vector_all_finite": bool(np.isfinite(residual_vector).all()),
+                  "observed_minus_baseline_is_negative_residual": bool(np.allclose(observed_minus_baseline_vector, -residual_vector, atol=1e-8)),
+
+                  "chi_square_computed_finite": bool(np.isfinite(chi_square)),
+                  "chi_square_computed_positive": chi_square >= 0,
+                  "dry_run_terms_rows_equal_3": len(dry_run_terms) == 3,
+                  "dry_run_terms_sum_matches_chi_square": abs(float(dry_run_terms["full_covariance_chi_square_component"].sum()) - chi_square) < 1e-10,
+                  "diagnostic_summary_rows_equal_10": len(diagnostic_summary) == 10,
+                  "comparison_summary_rows_equal_4": len(comparison_summary) == 4,
+                  "audit_packet_rows_equal_4": len(audit_packet) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+                  "integrity_context_eigenvalues_three": len(eigvals) == 3,
+
+                  "no_likelihood_computed": false_col(dry_run_terms, "likelihood_computed") and false_col(covariance_long, "likelihood_computed"),
+                  "no_p_values_computed": false_col(dry_run_terms, "p_values_computed") and false_col(covariance_long, "p_values_computed"),
+                  "no_score_valid": false_col(dry_run_terms, "score_valid") and false_col(covariance_long, "score_valid") and false_col(inverse_long, "score_valid"),
+                  "no_support_allowed": false_col(dry_run_terms, "support_allowed") and false_col(covariance_long, "support_allowed") and false_col(inverse_long, "support_allowed") and false_col(audit_packet, "support_allowed") and false_col(comparison_summary, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary389 = {
+                  "version": "v4.389",
+                  "route_name": "v4_389_full_covariance_chi_square_dry_run_no_support_claims",
+                  "expected_result": "v4_389_full_covariance_chi_square_dry_run_passed_no_likelihood_no_p_values_no_support_claims",
+                  "input_versions": "v4.388|v4.366",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "approved_observable_family": clean(approved_block.loc[0, "approved_observable_family"]) if "approved_observable_family" in approved_block.columns else "dM_Hz_fsig",
+                  "approved_subblock_value_rows": int(len(approved_values)),
+                  "residual_vector_rows": int(len(residual_vector_df)),
+                  "degrees_of_freedom_candidate": 3,
+                  "prior_guarded_diagonal_chi_square_sum": diagonal_guarded_sum,
+                  "full_covariance_chi_square_dry_run_sum": chi_square,
+                  "full_minus_diagonal_chi_square_difference": chi_square - diagonal_guarded_sum,
+                  "full_to_diagonal_chi_square_ratio": chi_square / diagonal_guarded_sum if diagonal_guarded_sum != 0 else None,
+                  "covariance_determinant": determinant,
+                  "covariance_condition_number": condition_number,
+                  "minimum_covariance_eigenvalue": float(eigvals.min()),
+                  "covariance_subblock_values_loaded": True,
+                  "full_9x9_covariance_values_loaded": False,
+                  "full_covariance_chi_square_computed": True,
+                  "chi_square_computed": True,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_390_external_ai_audit_packet_covariance_corrected_diagnostic_no_support_claims",
+              }
+
+              residual_vector_df.to_csv(outdir / "v4_389_residual_vector_input_preserved_NO_SUPPORT.csv", index=False)
+              covariance_long.to_csv(outdir / "v4_389_approved_covariance_subblock_values_USED_FOR_DRY_RUN_NO_SUPPORT.csv", index=False)
+              inverse_long.to_csv(outdir / "v4_389_inverse_covariance_subblock_matrix_NO_SUPPORT.csv", index=False)
+              dry_run_terms.to_csv(outdir / "v4_389_full_covariance_chi_square_dry_run_terms_NO_SUPPORT.csv", index=False)
+              diagnostic_summary.to_csv(outdir / "v4_389_full_covariance_chi_square_dry_run_summary_NO_SUPPORT.csv", index=False)
+              comparison_summary.to_csv(outdir / "v4_389_comparison_against_guarded_diagonal_NO_SUPPORT.csv", index=False)
+              audit_packet.to_csv(outdir / "v4_389_audit_staging_packet_NO_SUPPORT.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_389_limitations_after_full_covariance_dry_run.csv", index=False)
+              gap_update.to_csv(outdir / "v4_389_gap_status_after_full_covariance_dry_run.csv", index=False)
+              approved_block.to_csv(outdir / "v4_389_input_v4_388_approved_guarded_subblock_preserved.csv", index=False)
+              approved_values.to_csv(outdir / "v4_389_input_v4_388_approved_subblock_values_preserved.csv", index=False)
+              diagonal_terms.to_csv(outdir / "v4_389_input_v4_366_diagonal_terms_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_389_rule_checks.csv", index=False)
+
+              (outdir / "v4_389_summary.json").write_text(json.dumps(summary389, indent=2))
+
+              summary_md = f"""# TAIRID v4.389 Full-Covariance Chi-Square Dry Run — No Support Claims
+
+          Expected result: `{summary389["expected_result"]}`
+
+          {summary389["rules_passed"]} / {summary389["rules_total"]} rules passed
+
+          failed_gates = {summary389["failed_gates"]}
+
+          approved_observable_family = `{summary389["approved_observable_family"]}`
+
+          approved_subblock_value_rows = {summary389["approved_subblock_value_rows"]}
+
+          residual_vector_rows = {summary389["residual_vector_rows"]}
+
+          degrees_of_freedom_candidate = {summary389["degrees_of_freedom_candidate"]}
+
+          prior_guarded_diagonal_chi_square_sum = {summary389["prior_guarded_diagonal_chi_square_sum"]}
+
+          full_covariance_chi_square_dry_run_sum = {summary389["full_covariance_chi_square_dry_run_sum"]}
+
+          full_minus_diagonal_chi_square_difference = {summary389["full_minus_diagonal_chi_square_difference"]}
+
+          full_to_diagonal_chi_square_ratio = {summary389["full_to_diagonal_chi_square_ratio"]}
+
+          covariance_subblock_values_loaded = true
+
+          full_9x9_covariance_values_loaded = false
+
+          full_covariance_chi_square_computed = true
+
+          chi_square_computed = true
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step computes a full-covariance chi-square dry run using the approved 3x3 f_sigma8 covariance subblock.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** validate a score.
+
+          It does **not** make support claims.
+
+          Next route: `{summary389["selected_next_route"]}`
+          """
+              (outdir / "v4_389_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary389, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+
+          PY
+
+          python -m py_compile run_v4_389_full_covariance_chi_square_dry_run_no_support.py
+
+      - name: Run v4.389 full covariance chi-square dry run no support
+        run: |
+          python run_v4_389_full_covariance_chi_square_dry_run_no_support.py
+
+      - name: Upload v4.389 full covariance chi-square dry run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-389-full-covariance-chi-square-dry-run-no-support-output
+          path: |
+            tairid_v4_389_full_covariance_chi_square_dry_run_no_support_output/
+            tairid_v4_389_full_covariance_chi_square_dry_run_no_support_output.zip
