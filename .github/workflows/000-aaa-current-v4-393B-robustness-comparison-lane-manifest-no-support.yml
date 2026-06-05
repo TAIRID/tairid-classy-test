@@ -1,0 +1,527 @@
+name: "!!! AAA CURRENT - TAIRID v4.393B robustness comparison lane manifest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-393b-robustness-comparison-lane-manifest-no-support:
+    name: "!!! AAA CURRENT - Run v4.393B robustness comparison lane manifest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.392 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.392 output ZIP by pattern..."
+          INPUT_392_ZIP="$(ls tairid-v4-392-post-audit-route-decision-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_392_ZIP" ]; then
+            echo "Could not find v4.392 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-392-post-audit-route-decision-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.392 ZIP:"
+          echo "$INPUT_392_ZIP"
+          echo "INPUT_392_ZIP=$INPUT_392_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.393B robustness manifest script
+        run: |
+          cat > run_v4_393b_robustness_comparison_lane_manifest_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "robustness comparison lane manifest only; alternate covariance candidates may be listed for later review; no covariance values loaded; no new chi-square; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          BASELINE_DIAG_CHISQ = 1.362038876169214
+          BASELINE_FULL_CHISQ = 1.384804886905097
+          BASELINE_DIFF = 0.022766010735883135
+          BASELINE_RATIO = 1.0167146556050686
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def candidate_family(candidate_name):
+              name = str(candidate_name)
+              if "dV_FAP" in name:
+                  observable_family = "dV_FAP_fsig"
+              elif "dM_Hz" in name:
+                  observable_family = "dM_Hz_fsig"
+              else:
+                  observable_family = "scope_boundary"
+
+              if name.startswith("final_consensus"):
+                  consensus_family = "final_consensus"
+              elif name.startswith("FS_consensus"):
+                  consensus_family = "FS_consensus"
+              else:
+                  consensus_family = "not_a_covariance_candidate"
+
+              return observable_family, consensus_family
+
+          def main():
+              input_392 = Path(os.environ["INPUT_392_ZIP"])
+
+              outdir = Path("tairid_v4_393B_robustness_comparison_lane_manifest_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base392 = extract_zip(input_392, "tairid_v4_393B_392_")
+
+              summary392_path = find_one(base392, "v4_392_summary.json")
+              route_decision_path = find_one(base392, "v4_392_post_audit_route_decision_NO_SUPPORT.csv")
+              robustness_manifest_path = find_one(base392, "v4_392_robustness_comparison_manifest_NO_SUPPORT.csv")
+              cautious_guardrails_path = find_one(base392, "v4_392_cautious_writeup_guardrails_NO_SUPPORT.csv")
+              decision_summary_path = find_one(base392, "v4_392_post_audit_decision_summary_NO_SUPPORT.csv")
+              route_status_path = find_one(base392, "v4_392_route_status_summary.csv")
+              limitations392_path = find_one(base392, "v4_392_limitations_after_post_audit_route_decision.csv")
+              gap392_path = find_one(base392, "v4_392_gap_status_after_post_audit_route_decision.csv")
+              audit_ledger_path = find_one(base392, "v4_392_input_v4_391_audit_ledger_preserved.csv")
+              route_options_path = find_one(base392, "v4_392_input_v4_391_route_options_preserved.csv")
+              rules392_path = find_one(base392, "v4_392_rule_checks.csv")
+
+              summary392 = json.loads(summary392_path.read_text())
+              route_decision = pd.read_csv(route_decision_path)
+              robustness_manifest_input = pd.read_csv(robustness_manifest_path)
+              cautious_guardrails = pd.read_csv(cautious_guardrails_path)
+              decision_summary = pd.read_csv(decision_summary_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations392 = pd.read_csv(limitations392_path)
+              gap392 = pd.read_csv(gap392_path)
+              audit_ledger = pd.read_csv(audit_ledger_path)
+              route_options = pd.read_csv(route_options_path)
+              rules392 = pd.read_csv(rules392_path)
+
+              candidate_input = robustness_manifest_input[
+                  robustness_manifest_input["robustness_lane"].astype(str) != "row_count_and_scope_boundary"
+              ].copy()
+
+              candidate_rows = []
+              for _, row in candidate_input.iterrows():
+                  observable_family, consensus_family = candidate_family(row["candidate"])
+                  if consensus_family == "final_consensus":
+                      suggested_priority = 1
+                      suggested_role = "alternate_final_consensus_parameterization"
+                  elif consensus_family == "FS_consensus":
+                      suggested_priority = 2 if observable_family == "dM_Hz_fsig" else 3
+                      suggested_role = "full_shape_consensus_fallback_comparison"
+                  else:
+                      suggested_priority = 99
+                      suggested_role = "unclassified_candidate"
+
+                  candidate_rows.append({
+                      "v4_393B_candidate_id": f"v4_393B_robust_candidate_{len(candidate_rows)+1:03d}",
+                      "source_robustness_item_id": clean(row["robustness_item_id"]),
+                      "robustness_lane": clean(row["robustness_lane"]),
+                      "candidate_member_name": clean(row["candidate"]),
+                      "candidate_observable_family": observable_family,
+                      "candidate_consensus_family": consensus_family,
+                      "suggested_priority": suggested_priority,
+                      "suggested_role": suggested_role,
+                      "purpose": clean(row["purpose"]),
+                      "source_status": clean(row["source_status"]),
+                      "next_review_gate": "v4_394B_robustness_candidate_review_ingest_no_values_no_support_claims",
+                      "candidate_status_after_v4_393B": "listed_for_human_robustness_review_no_values",
+                      "needs_human_review_before_reopen": True,
+                      "new_chi_square_computed": False,
+                      "covariance_values_loaded": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              candidate_manifest = pd.DataFrame(candidate_rows)
+
+              human_review_packet = candidate_manifest.copy()
+              human_review_packet["human_robustness_candidate_decision"] = ""
+              human_review_packet["allowed_human_robustness_candidate_decisions"] = "approve_for_controlled_reopen_and_extraction|keep_as_fallback_only|reject_candidate_for_now|needs_source_repair"
+              human_review_packet["human_robustness_candidate_note"] = ""
+              human_review_packet["candidate_approved_for_next_gate_now"] = False
+              human_review_packet["new_chi_square_computed"] = False
+              human_review_packet["covariance_values_loaded"] = False
+              human_review_packet["support_allowed"] = False
+
+              robustness_sequence = pd.DataFrame([
+                  {
+                      "sequence_id": "V4_393B_SEQUENCE_001",
+                      "planned_gate": "v4_394B_robustness_candidate_review_ingest_no_values_no_support_claims",
+                      "goal": "Ingest human decisions for alternate covariance candidates.",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "sequence_id": "V4_393B_SEQUENCE_002",
+                      "planned_gate": "v4_395B_controlled_alternate_covariance_extraction_and_integrity_no_scoring_no_support_claims",
+                      "goal": "Reopen approved alternate candidates and perform extraction/integrity checks under the same boundary.",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "sequence_id": "V4_393B_SEQUENCE_003",
+                      "planned_gate": "v4_396B_alternate_full_covariance_chi_square_comparison_no_support_claims",
+                      "goal": "Compute dry-run chi-square comparison across approved alternate covariance candidates, still without likelihood or support.",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "sequence_id": "V4_393B_SEQUENCE_004",
+                      "planned_gate": "v4_397B_robustness_external_audit_packet_no_support_claims",
+                      "goal": "Package robustness comparison for external audit before public-style interpretation.",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "sequence_id": "V4_393B_SEQUENCE_005",
+                      "planned_gate": "v4_398A_cautious_diagnostic_writeup_packet_no_support_claims",
+                      "goal": "Only after robustness, prepare cautious diagnostic writeup with no support claim.",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+              ])
+
+              baseline_reference = pd.DataFrame([
+                  {
+                      "reference_id": "V4_393B_BASELINE_001",
+                      "reference_metric": "prior_guarded_diagonal_chi_square_sum",
+                      "value": BASELINE_DIAG_CHISQ,
+                      "source_stage": "v4.366",
+                      "role": "prior diagonal-only comparison baseline",
+                      "support_allowed": False,
+                  },
+                  {
+                      "reference_id": "V4_393B_BASELINE_002",
+                      "reference_metric": "full_covariance_chi_square_dry_run_sum",
+                      "value": BASELINE_FULL_CHISQ,
+                      "source_stage": "v4.389/v4.390",
+                      "role": "human-approved dM_Hz_fsig final-consensus guarded covariance-corrected dry-run baseline",
+                      "support_allowed": False,
+                  },
+                  {
+                      "reference_id": "V4_393B_BASELINE_003",
+                      "reference_metric": "full_minus_diagonal_chi_square_difference",
+                      "value": BASELINE_DIFF,
+                      "source_stage": "v4.389/v4.390",
+                      "role": "diagnostic difference only, not support",
+                      "support_allowed": False,
+                  },
+                  {
+                      "reference_id": "V4_393B_BASELINE_004",
+                      "reference_metric": "full_to_diagonal_chi_square_ratio",
+                      "value": BASELINE_RATIO,
+                      "source_stage": "v4.389/v4.390",
+                      "role": "diagnostic ratio only, not support",
+                      "support_allowed": False,
+                  },
+              ])
+
+              robustness_scope_boundary = pd.DataFrame([
+                  {
+                      "boundary_id": "V4_393B_BOUNDARY_001",
+                      "boundary": "Robustness manifest does not compute new chi-square.",
+                      "status": "blocked_by_design",
+                      "support_allowed": False,
+                  },
+                  {
+                      "boundary_id": "V4_393B_BOUNDARY_002",
+                      "boundary": "Alternate covariance candidates must pass human review before reopening.",
+                      "status": "active_limit",
+                      "support_allowed": False,
+                  },
+                  {
+                      "boundary_id": "V4_393B_BOUNDARY_003",
+                      "boundary": "No covariance values are loaded in v4.393B.",
+                      "status": "blocked_by_design",
+                      "support_allowed": False,
+                  },
+                  {
+                      "boundary_id": "V4_393B_BOUNDARY_004",
+                      "boundary": "No likelihood, p-values, score validity, or support claim is allowed.",
+                      "status": "blocked_by_design",
+                      "support_allowed": False,
+                  },
+              ])
+
+              manifest_summary = pd.DataFrame([
+                  {"summary_metric": "robustness_candidate_rows", "value": int(len(candidate_manifest)), "note": "Alternate covariance candidates listed for human review only."},
+                  {"summary_metric": "final_consensus_alternate_rows", "value": int((candidate_manifest["candidate_consensus_family"] == "final_consensus").sum()), "note": "Alternate final-consensus parameterization candidate rows."},
+                  {"summary_metric": "fs_consensus_fallback_rows", "value": int((candidate_manifest["candidate_consensus_family"] == "FS_consensus").sum()), "note": "Full-shape fallback/comparison candidate rows."},
+                  {"summary_metric": "human_review_packet_rows", "value": int(len(human_review_packet)), "note": "Rows requiring human decision before reopening."},
+                  {"summary_metric": "new_chi_square_computed", "value": 0, "note": "No new chi-square computed in v4.393B."},
+                  {"summary_metric": "likelihood_computed", "value": 0, "note": "No likelihood computed."},
+                  {"summary_metric": "p_values_computed", "value": 0, "note": "No p-values computed."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_393b = pd.DataFrame([
+                  {"status_id": "V4_393B_STATUS_001", "status": "robustness_manifest_created", "detail": f"{len(candidate_manifest)} alternate covariance candidates listed for human review."},
+                  {"status_id": "V4_393B_STATUS_002", "status": "cautious_writeup_still_deferred", "detail": "Writeup remains deferred until robustness lane completes or is intentionally parked."},
+                  {"status_id": "V4_393B_STATUS_003", "status": "no_new_calculation", "detail": "No new chi-square, likelihood, or p-values computed."},
+                  {"status_id": "V4_393B_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_393B_LIMIT_001", "limit": "This stage lists robustness candidates only.", "status": "active_limit"},
+                  {"limit_id": "V4_393B_LIMIT_002", "limit": "No alternate covariance values are loaded.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_393B_LIMIT_003", "limit": "No alternate chi-square is computed yet.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_393B_LIMIT_004", "limit": "The result remains a three-row BOSS DR12 diagnostic, not a multi-survey likelihood.", "status": "active_limit"},
+                  {"limit_id": "V4_393B_LIMIT_005", "limit": "No support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_393B_GAP_001", "gap": "Robustness comparison manifest created.", "status_after_v4_393B": "alternate_candidates_ready_for_human_review_no_values", "next_gate": "v4_394B_robustness_candidate_review_ingest_no_values_no_support"},
+                  {"gap_id": "V4_393B_GAP_002", "gap": "Alternate covariance extraction remains unperformed.", "status_after_v4_393B": "still_blocked", "next_gate": "later_after_human_candidate_review"},
+                  {"gap_id": "V4_393B_GAP_003", "gap": "Alternate chi-square comparison remains uncomputed.", "status_after_v4_393B": "still_blocked", "next_gate": "later_v4_396B"},
+                  {"gap_id": "V4_393B_GAP_004", "gap": "Cautious writeup remains deferred.", "status_after_v4_393B": "deferred_until_after_robustness", "next_gate": "later_v4_398A"},
+                  {"gap_id": "V4_393B_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_393B": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_393B"},
+              ])
+
+              hard_checks = {
+                  "input_v4_392_summary_found": summary392.get("version") == "v4.392",
+                  "input_v4_392_rules_all_passed": summary_rules_all_passed(summary392),
+                  "input_v4_392_failed_gates_none": summary392.get("failed_gates") == "none",
+                  "input_v4_392_audit_rows_2": summary392.get("external_audit_response_rows") == 2,
+                  "input_v4_392_audit_pass_rows_2": summary392.get("audit_overall_pass_rows") == 2,
+                  "input_v4_392_no_overclaims": summary392.get("overclaim_detected_rows") == 0,
+                  "input_v4_392_no_corrections": summary392.get("corrective_action_required_rows") == 0,
+                  "input_v4_392_selected_robustness": summary392.get("selected_primary_next_route") == "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+                  "input_v4_392_no_new_chi_square": summary392.get("new_chi_square_computed") is False,
+                  "input_v4_392_no_likelihood": summary392.get("likelihood_computed") is False,
+                  "input_v4_392_no_p_values": summary392.get("p_values_computed") is False,
+                  "input_v4_392_no_score_valid": summary392.get("score_valid") is False,
+                  "input_v4_392_no_support_allowed": summary392.get("support_allowed") is False,
+
+                  "rules392_all_passed": passed_column_all(rules392),
+                  "route_decision_rows_equal_4": len(route_decision) == 4,
+                  "robustness_manifest_input_rows_equal_4": len(robustness_manifest_input) == 4,
+                  "candidate_input_rows_equal_3": len(candidate_input) == 3,
+                  "cautious_guardrails_rows_equal_3": len(cautious_guardrails) == 3,
+                  "decision_summary_rows_equal_8": len(decision_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations392_rows_equal_5": len(limitations392) == 5,
+                  "gap392_rows_equal_5": len(gap392) == 5,
+                  "audit_ledger_rows_equal_2": len(audit_ledger) == 2,
+                  "route_options_rows_equal_3": len(route_options) == 3,
+
+                  "candidate_manifest_rows_equal_3": len(candidate_manifest) == 3,
+                  "final_consensus_alternate_rows_equal_1": int((candidate_manifest["candidate_consensus_family"] == "final_consensus").sum()) == 1,
+                  "fs_consensus_rows_equal_2": int((candidate_manifest["candidate_consensus_family"] == "FS_consensus").sum()) == 2,
+                  "human_review_packet_rows_equal_candidates": len(human_review_packet) == len(candidate_manifest),
+                  "robustness_sequence_rows_equal_5": len(robustness_sequence) == 5,
+                  "baseline_reference_rows_equal_4": len(baseline_reference) == 4,
+                  "scope_boundary_rows_equal_4": len(robustness_scope_boundary) == 4,
+                  "manifest_summary_rows_equal_8": len(manifest_summary) == 8,
+                  "route_status_393b_rows_equal_4": len(route_status_393b) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "no_new_chi_square_computed": false_col(candidate_manifest, "new_chi_square_computed") and false_col(human_review_packet, "new_chi_square_computed") and false_col(robustness_sequence, "new_chi_square_computed"),
+                  "no_covariance_values_loaded": false_col(candidate_manifest, "covariance_values_loaded") and false_col(human_review_packet, "covariance_values_loaded"),
+                  "no_likelihood_computed": false_col(candidate_manifest, "likelihood_computed"),
+                  "no_p_values_computed": false_col(candidate_manifest, "p_values_computed"),
+                  "no_score_valid": false_col(candidate_manifest, "score_valid"),
+                  "no_support_allowed": false_col(candidate_manifest, "support_allowed") and false_col(human_review_packet, "support_allowed") and false_col(robustness_sequence, "support_allowed") and false_col(baseline_reference, "support_allowed") and false_col(robustness_scope_boundary, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary393b = {
+                  "version": "v4.393B",
+                  "route_name": "v4_393B_robustness_comparison_lane_manifest_no_support_claims",
+                  "expected_result": "v4_393B_robustness_comparison_lane_manifest_passed_no_values_no_support_claims",
+                  "input_version": "v4.392",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "robustness_candidate_rows": int(len(candidate_manifest)),
+                  "final_consensus_alternate_rows": int((candidate_manifest["candidate_consensus_family"] == "final_consensus").sum()),
+                  "fs_consensus_fallback_rows": int((candidate_manifest["candidate_consensus_family"] == "FS_consensus").sum()),
+                  "human_review_packet_rows": int(len(human_review_packet)),
+                  "prior_guarded_diagonal_chi_square_sum": BASELINE_DIAG_CHISQ,
+                  "full_covariance_chi_square_dry_run_sum": BASELINE_FULL_CHISQ,
+                  "full_minus_diagonal_chi_square_difference": BASELINE_DIFF,
+                  "full_to_diagonal_chi_square_ratio": BASELINE_RATIO,
+                  "new_chi_square_computed": False,
+                  "covariance_values_loaded": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_393B_robustness_candidate_review_then_v4_394B_robustness_candidate_review_ingest_no_values_no_support_claims",
+              }
+
+              candidate_manifest.to_csv(outdir / "v4_393B_robustness_candidate_manifest_NO_VALUES_NO_SUPPORT.csv", index=False)
+              human_review_packet.to_csv(outdir / "v4_393B_HUMAN_FILL_robustness_candidate_review_NO_VALUES_NO_SUPPORT.csv", index=False)
+              robustness_sequence.to_csv(outdir / "v4_393B_robustness_sequence_plan_NO_SUPPORT.csv", index=False)
+              baseline_reference.to_csv(outdir / "v4_393B_baseline_covariance_corrected_reference_NO_SUPPORT.csv", index=False)
+              robustness_scope_boundary.to_csv(outdir / "v4_393B_robustness_scope_boundary_NO_SUPPORT.csv", index=False)
+              manifest_summary.to_csv(outdir / "v4_393B_manifest_summary_NO_SUPPORT.csv", index=False)
+              route_status_393b.to_csv(outdir / "v4_393B_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_393B_limitations_after_robustness_manifest.csv", index=False)
+              gap_update.to_csv(outdir / "v4_393B_gap_status_after_robustness_manifest.csv", index=False)
+              robustness_manifest_input.to_csv(outdir / "v4_393B_input_v4_392_robustness_manifest_preserved.csv", index=False)
+              route_decision.to_csv(outdir / "v4_393B_input_v4_392_route_decision_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_393B_rule_checks.csv", index=False)
+
+              (outdir / "v4_393B_summary.json").write_text(json.dumps(summary393b, indent=2))
+
+              summary_md = f"""# TAIRID v4.393B Robustness Comparison Lane Manifest — No Values, No Support Claims
+
+          Expected result: `{summary393b["expected_result"]}`
+
+          {summary393b["rules_passed"]} / {summary393b["rules_total"]} rules passed
+
+          failed_gates = {summary393b["failed_gates"]}
+
+          robustness_candidate_rows = {summary393b["robustness_candidate_rows"]}
+
+          final_consensus_alternate_rows = {summary393b["final_consensus_alternate_rows"]}
+
+          fs_consensus_fallback_rows = {summary393b["fs_consensus_fallback_rows"]}
+
+          human_review_packet_rows = {summary393b["human_review_packet_rows"]}
+
+          prior_guarded_diagonal_chi_square_sum = {summary393b["prior_guarded_diagonal_chi_square_sum"]}
+
+          full_covariance_chi_square_dry_run_sum = {summary393b["full_covariance_chi_square_dry_run_sum"]}
+
+          full_minus_diagonal_chi_square_difference = {summary393b["full_minus_diagonal_chi_square_difference"]}
+
+          full_to_diagonal_chi_square_ratio = {summary393b["full_to_diagonal_chi_square_ratio"]}
+
+          new_chi_square_computed = false
+
+          covariance_values_loaded = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step creates a robustness comparison lane manifest only.
+
+          It does **not** load alternate covariance values.
+
+          It does **not** compute a new chi-square.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary393b["selected_next_route"]}`
+          """
+              (outdir / "v4_393B_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary393b, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_393b_robustness_comparison_lane_manifest_no_support.py
+
+      - name: Run v4.393B robustness comparison lane manifest no support
+        run: |
+          python run_v4_393b_robustness_comparison_lane_manifest_no_support.py
+
+      - name: Upload v4.393B robustness comparison lane manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-393B-robustness-comparison-lane-manifest-no-values-no-support-output
+          path: |
+            tairid_v4_393B_robustness_comparison_lane_manifest_no_support_output/
+            tairid_v4_393B_robustness_comparison_lane_manifest_no_support_output.zip
