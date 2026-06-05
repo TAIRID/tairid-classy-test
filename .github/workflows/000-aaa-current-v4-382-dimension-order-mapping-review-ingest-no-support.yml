@@ -1,0 +1,613 @@
+name: "!!! AAA CURRENT - TAIRID v4.382 dimension order mapping review ingest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-382-dimension-order-mapping-review-ingest-no-support:
+    name: "!!! AAA CURRENT - Run v4.382 dimension order mapping review ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.381 output ZIP and human-filled mapping review ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.381 output ZIP..."
+          INPUT_381_ZIP="$(ls tairid-v4-381-dimension-order-mapping-readiness-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_381_ZIP" ]; then
+            echo "Could not find v4.381 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-381-dimension-order-mapping-readiness-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled v4.381 mapping review ZIP..."
+          HUMAN_FILLED_MAPPING_REVIEW_ZIP="$(ls tairid-v4-381-human-filled-dimension-order-mapping-review-for-v4-382-no-values-no-support*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$HUMAN_FILLED_MAPPING_REVIEW_ZIP" ]; then
+            echo "Could not find human-filled mapping review ZIP."
+            echo "Expected:"
+            echo "tairid-v4-381-human-filled-dimension-order-mapping-review-for-v4-382-no-values-no-support.zip"
+            exit 1
+          fi
+
+          echo "Using v4.381 ZIP:"
+          echo "$INPUT_381_ZIP"
+
+          echo "Using human-filled review ZIP:"
+          echo "$HUMAN_FILLED_MAPPING_REVIEW_ZIP"
+
+          echo "INPUT_381_ZIP=$INPUT_381_ZIP" >> "$GITHUB_ENV"
+          echo "HUMAN_FILLED_MAPPING_REVIEW_ZIP=$HUMAN_FILLED_MAPPING_REVIEW_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.382 mapping review ingest script
+        run: |
+          cat > run_v4_382_dimension_order_mapping_review_ingest_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "dimension/order mapping review ingest only; interleaved mapping hypotheses may be approved for later fsigma8 subblock-readiness; no raw covariance values retained; no usable covariance matrix loaded; no covariance subblock extracted; no full covariance available; no covariance values loaded; no observed-row order matched by value; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          ALLOWED_MAPPING_DECISIONS = {
+              "approve_mapping_hypothesis_for_later_subblock_readiness",
+              "needs_source_documentation",
+              "reject_mapping_hypothesis",
+              "keep_blocked",
+          }
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def main():
+              input_381 = Path(os.environ["INPUT_381_ZIP"])
+              human_zip = Path(os.environ["HUMAN_FILLED_MAPPING_REVIEW_ZIP"])
+
+              outdir = Path("tairid_v4_382_dimension_order_mapping_review_ingest_no_values_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base381 = extract_zip(input_381, "tairid_v4_382_381_")
+              basehuman = extract_zip(human_zip, "tairid_v4_382_human_")
+
+              summary381_path = find_one(base381, "v4_381_summary.json")
+              readiness_matrix_path = find_one(base381, "v4_381_dimension_order_readiness_matrix_NO_VALUES_NO_SUPPORT.csv")
+              mapping_hypotheses_path = find_one(base381, "v4_381_candidate_dimension_order_mapping_hypotheses_NO_VALUES.csv")
+              blank_review_path = find_one(base381, "v4_381_HUMAN_FILL_dimension_order_mapping_review_NO_VALUES_NO_SUPPORT.csv")
+              family_summary_path = find_one(base381, "v4_381_candidate_covariance_family_summary_NO_VALUES.csv")
+              readiness_summary_path = find_one(base381, "v4_381_dimension_order_readiness_summary_NO_VALUES.csv")
+              route_status_path = find_one(base381, "v4_381_route_status_summary.csv")
+              limitations381_path = find_one(base381, "v4_381_limitations_after_dimension_order_readiness.csv")
+              gap381_path = find_one(base381, "v4_381_gap_status_after_dimension_order_readiness.csv")
+              dim_input_path = find_one(base381, "v4_381_input_v4_380_dimension_order_packet_preserved.csv")
+              header_preview_path = find_one(base381, "v4_381_input_v4_380_header_preview_preserved.csv")
+              rules381_path = find_one(base381, "v4_381_rule_checks.csv")
+
+              human_review_path = find_one_suffix(basehuman, "HUMAN_FILLED_dimension_order_mapping_review_NO_VALUES_NO_SUPPORT.csv")
+
+              summary381 = json.loads(summary381_path.read_text())
+              readiness_matrix = pd.read_csv(readiness_matrix_path)
+              mapping_hypotheses = pd.read_csv(mapping_hypotheses_path)
+              blank_review = pd.read_csv(blank_review_path)
+              family_summary = pd.read_csv(family_summary_path)
+              readiness_summary = pd.read_csv(readiness_summary_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations381 = pd.read_csv(limitations381_path)
+              gap381 = pd.read_csv(gap381_path)
+              dim_input = pd.read_csv(dim_input_path)
+              header_preview = pd.read_csv(header_preview_path)
+              rules381 = pd.read_csv(rules381_path)
+              human_review = pd.read_csv(human_review_path)
+
+              for col in [
+                  "human_dimension_order_mapping_decision",
+                  "human_dimension_order_mapping_note",
+                  "mapping_hypothesis_approved_now",
+                  "dimension_order_mapping_confirmed_now",
+              ]:
+                  if col not in human_review.columns:
+                      human_review[col] = ""
+
+              ingest_rows = []
+
+              for _, row in human_review.iterrows():
+                  decision = clean(row["human_dimension_order_mapping_decision"])
+                  approved = decision == "approve_mapping_hypothesis_for_later_subblock_readiness"
+
+                  if approved:
+                      row_status = "approved_for_later_fsigma8_subblock_readiness_no_values"
+                  elif decision == "needs_source_documentation":
+                      row_status = "blocked_needs_source_documentation"
+                  elif decision == "reject_mapping_hypothesis":
+                      row_status = "rejected_mapping_hypothesis_for_current_lane"
+                  elif decision == "keep_blocked":
+                      row_status = "kept_blocked_as_documentation_fallback_no_values"
+                  else:
+                      row_status = "invalid_or_missing_dimension_order_mapping_decision"
+
+                  ingest_rows.append({
+                      "v4_382_mapping_review_id": f"v4_382_mapping_review_{len(ingest_rows)+1:03d}",
+                      "v4_381_mapping_hypothesis_id": clean(row["v4_381_mapping_hypothesis_id"]),
+                      "selected_member_name": clean(row["selected_member_name"]),
+                      "candidate_observable_family_from_filename": clean(row["candidate_observable_family_from_filename"]),
+                      "candidate_consensus_family_from_filename": clean(row["candidate_consensus_family_from_filename"]),
+                      "hypothesis_id": clean(row["hypothesis_id"]),
+                      "hypothesis_label": clean(row["hypothesis_label"]),
+                      "candidate_vector_order": clean(row["candidate_vector_order"]),
+                      "candidate_fsig_zero_based_indices": clean(row["candidate_fsig_zero_based_indices"]),
+                      "candidate_fsig_one_based_indices": clean(row["candidate_fsig_one_based_indices"]),
+                      "mapping_basis": clean(row["mapping_basis"]),
+                      "candidate_priority": int(float(row["candidate_priority"])),
+                      "human_dimension_order_mapping_decision": decision,
+                      "human_dimension_order_mapping_note": clean(row["human_dimension_order_mapping_note"]),
+                      "row_review_status": row_status,
+                      "mapping_hypothesis_approved_for_later_subblock_readiness": bool(approved),
+                      "mapping_hypothesis_selected_now": bool(approved),
+                      "dimension_order_mapping_confirmed_now": False,
+                      "fsigma8_subblock_identified_now": False,
+                      "raw_covariance_values_retained": False,
+                      "usable_covariance_matrix_loaded": False,
+                      "covariance_subblock_extracted": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              review_ingest = pd.DataFrame(ingest_rows)
+
+              approved_mappings = review_ingest[
+                  review_ingest["mapping_hypothesis_approved_for_later_subblock_readiness"].astype(bool)
+              ].copy()
+              rejected_mappings = review_ingest[
+                  review_ingest["row_review_status"] == "rejected_mapping_hypothesis_for_current_lane"
+              ].copy()
+              blocked_mappings = review_ingest[
+                  review_ingest["row_review_status"] == "kept_blocked_as_documentation_fallback_no_values"
+              ].copy()
+              documentation_needed = review_ingest[
+                  review_ingest["row_review_status"] == "blocked_needs_source_documentation"
+              ].copy()
+              invalid_rows = review_ingest[
+                  review_ingest["row_review_status"] == "invalid_or_missing_dimension_order_mapping_decision"
+              ].copy()
+
+              subblock_readiness = approved_mappings.copy()
+              subblock_readiness["next_gate"] = "v4_383_fsigma8_subblock_readiness_no_values_no_support_claims"
+              subblock_readiness["subblock_readiness_scope"] = "prepare_candidate_fsigma8_indices_for_later_extraction_without_loading_covariance_values"
+              subblock_readiness["selected_mapping_family"] = "interleaved_by_redshift"
+              subblock_readiness["selected_fsigma8_zero_based_indices"] = subblock_readiness["candidate_fsig_zero_based_indices"]
+              subblock_readiness["selected_fsigma8_one_based_indices"] = subblock_readiness["candidate_fsig_one_based_indices"]
+              subblock_readiness["candidate_subblock_size"] = 3
+              subblock_readiness["subblock_candidate_identified_for_later_review"] = True
+              subblock_readiness["covariance_subblock_extracted_now"] = False
+              subblock_readiness["covariance_values_loaded"] = False
+              subblock_readiness["support_allowed"] = False
+
+              selected_family_summary = pd.DataFrame([
+                  {
+                      "selected_family_id": "V4_382_SELECTED_001",
+                      "selected_mapping": "interleaved_by_redshift",
+                      "selected_fsigma8_one_based_indices": "3|6|9",
+                      "selected_fsigma8_zero_based_indices": "2|5|8",
+                      "approved_member_rows": int(len(approved_mappings)),
+                      "status": "selected_for_later_subblock_readiness_no_values",
+                      "support_allowed": False,
+                  },
+                  {
+                      "selected_family_id": "V4_382_SELECTED_002",
+                      "selected_mapping": "grouped_by_observable",
+                      "selected_fsigma8_one_based_indices": "7|8|9",
+                      "selected_fsigma8_zero_based_indices": "6|7|8",
+                      "approved_member_rows": 0,
+                      "status": "rejected_for_current_lane",
+                      "support_allowed": False,
+                  },
+                  {
+                      "selected_family_id": "V4_382_SELECTED_003",
+                      "selected_mapping": "requires_source_documentation",
+                      "selected_fsigma8_one_based_indices": "",
+                      "selected_fsigma8_zero_based_indices": "",
+                      "approved_member_rows": 0,
+                      "status": "kept_blocked_as_fallback",
+                      "support_allowed": False,
+                  },
+              ])
+
+              review_summary = pd.DataFrame([
+                  {"summary_metric": "mapping_review_rows", "value": int(len(review_ingest)), "note": "Human mapping-review rows ingested."},
+                  {"summary_metric": "approved_mapping_rows", "value": int(len(approved_mappings)), "note": "Interleaved mapping rows approved for later subblock readiness only."},
+                  {"summary_metric": "rejected_mapping_rows", "value": int(len(rejected_mappings)), "note": "Grouped mapping rows rejected for current lane."},
+                  {"summary_metric": "blocked_mapping_rows", "value": int(len(blocked_mappings)), "note": "Documentation-required fallback rows kept blocked."},
+                  {"summary_metric": "documentation_needed_rows", "value": int(len(documentation_needed)), "note": "Rows explicitly requiring new documentation before proceeding."},
+                  {"summary_metric": "subblock_readiness_rows", "value": int(len(subblock_readiness)), "note": "Rows prepared for later fsigma8 subblock-readiness gate."},
+                  {"summary_metric": "covariance_values_loaded", "value": 0, "note": "No covariance values loaded."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_382 = pd.DataFrame([
+                  {
+                      "status_id": "V4_382_STATUS_001",
+                      "status": "dimension_order_mapping_review_ingested",
+                      "detail": f"{len(approved_mappings)} interleaved mapping hypotheses selected for later subblock readiness.",
+                  },
+                  {
+                      "status_id": "V4_382_STATUS_002",
+                      "status": "fsigma8_candidate_indices_selected_not_extracted",
+                      "detail": "Candidate fsigma8 positions are 3,6,9 one-based and 2,5,8 zero-based.",
+                  },
+                  {
+                      "status_id": "V4_382_STATUS_003",
+                      "status": "no_covariance_values_loaded",
+                      "detail": "No covariance matrix or subblock is loaded in this gate.",
+                  },
+                  {
+                      "status_id": "V4_382_STATUS_004",
+                      "status": "support_still_blocked",
+                      "detail": "support_allowed=false remains active.",
+                  },
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {
+                      "limit_id": "V4_382_LIMIT_001",
+                      "limit": "The interleaved mapping is selected for later subblock readiness only, not used for scoring.",
+                      "status": "active_limit",
+                  },
+                  {
+                      "limit_id": "V4_382_LIMIT_002",
+                      "limit": "No covariance subblock is extracted in v4.382.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "limit_id": "V4_382_LIMIT_003",
+                      "limit": "No covariance values are loaded in v4.382.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "limit_id": "V4_382_LIMIT_004",
+                      "limit": "Observed-row matching by value is not performed in v4.382.",
+                      "status": "blocked_by_design",
+                  },
+                  {
+                      "limit_id": "V4_382_LIMIT_005",
+                      "limit": "No likelihood, p-values, score, or support claim is allowed.",
+                      "status": "blocked_by_design",
+                  },
+              ])
+
+              gap_update = pd.DataFrame([
+                  {
+                      "gap_id": "V4_382_GAP_001",
+                      "gap": "Dimension/order mapping review ingested.",
+                      "status_after_v4_382": "interleaved_mapping_selected_for_later_subblock_readiness_no_values",
+                      "next_gate": "v4_383_fsigma8_subblock_readiness_no_values_no_support",
+                  },
+                  {
+                      "gap_id": "V4_382_GAP_002",
+                      "gap": "Exact covariance member remains unapproved for scoring.",
+                      "status_after_v4_382": "still_open",
+                      "next_gate": "later_after_subblock_readiness_and_value_ingest_review",
+                  },
+                  {
+                      "gap_id": "V4_382_GAP_003",
+                      "gap": "Covariance values remain unloaded.",
+                      "status_after_v4_382": "still_blocked",
+                      "next_gate": "later_value_ingest_gate_only_after_subblock_readiness",
+                  },
+                  {
+                      "gap_id": "V4_382_GAP_004",
+                      "gap": "Observed-row order remains untested by values.",
+                      "status_after_v4_382": "still_blocked",
+                      "next_gate": "later_subblock_and_row_order_gate",
+                  },
+                  {
+                      "gap_id": "V4_382_GAP_005",
+                      "gap": "Support claims remain blocked.",
+                      "status_after_v4_382": "still_blocked",
+                      "next_gate": "no_support_claims_allowed_from_v4_382",
+                  },
+              ])
+
+              hard_checks = {
+                  "input_v4_381_summary_found": summary381.get("version") == "v4.381",
+                  "input_v4_381_rules_all_passed": summary_rules_all_passed(summary381),
+                  "input_v4_381_failed_gates_none": summary381.get("failed_gates") == "none",
+                  "input_v4_381_readiness_rows_4": summary381.get("dimension_order_readiness_rows") == 4,
+                  "input_v4_381_mapping_hypothesis_rows_12": summary381.get("mapping_hypothesis_rows") == 12,
+                  "input_v4_381_human_review_rows_12": summary381.get("human_review_packet_rows") == 12,
+                  "input_v4_381_dimension_matches_expected_4": summary381.get("dimension_matches_expected_9x9_rows") == 4,
+                  "input_v4_381_no_mapping_confirmed": summary381.get("mapping_confirmed_now") is False,
+                  "input_v4_381_no_fsig_subblock": summary381.get("fsigma8_subblock_identified_now") is False,
+                  "input_v4_381_raw_values_not_retained": summary381.get("raw_covariance_values_retained") is False,
+                  "input_v4_381_matrix_not_loaded": summary381.get("usable_covariance_matrix_loaded") is False,
+                  "input_v4_381_no_subblock_extracted": summary381.get("covariance_subblock_extracted") is False,
+                  "input_v4_381_no_full_covariance": summary381.get("full_covariance_available") is False,
+                  "input_v4_381_no_values_loaded": summary381.get("full_covariance_values_loaded") is False,
+                  "input_v4_381_no_dimension_confirmed": summary381.get("covariance_dimension_confirmed") is False,
+                  "input_v4_381_no_row_order": summary381.get("observed_row_order_matched") is False,
+                  "input_v4_381_no_likelihood": summary381.get("likelihood_computed") is False,
+                  "input_v4_381_no_p_values": summary381.get("p_values_computed") is False,
+                  "input_v4_381_no_score_valid": summary381.get("score_valid") is False,
+                  "input_v4_381_no_support_allowed": summary381.get("support_allowed") is False,
+
+                  "rules381_all_passed": passed_column_all(rules381),
+                  "readiness_matrix_rows_equal_4": len(readiness_matrix) == 4,
+                  "mapping_hypotheses_rows_equal_12": len(mapping_hypotheses) == 12,
+                  "blank_review_rows_equal_12": len(blank_review) == 12,
+                  "human_review_rows_equal_12": len(human_review) == 12,
+                  "family_summary_rows_equal_4": len(family_summary) == 4,
+                  "readiness_summary_rows_equal_8": len(readiness_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations381_rows_equal_5": len(limitations381) == 5,
+                  "gap381_rows_equal_5": len(gap381) == 5,
+                  "dim_input_rows_equal_4": len(dim_input) == 4,
+                  "header_preview_rows_equal_4": len(header_preview) == 4,
+
+                  "human_decisions_filled": human_review["human_dimension_order_mapping_decision"].apply(clean).ne("").all(),
+                  "human_decisions_allowed": human_review["human_dimension_order_mapping_decision"].apply(clean).isin(ALLOWED_MAPPING_DECISIONS).all(),
+                  "review_ingest_rows_equal_human_review": len(review_ingest) == len(human_review),
+                  "approved_mappings_equal_4": len(approved_mappings) == 4,
+                  "approved_mappings_all_interleaved": (approved_mappings["hypothesis_id"] == "interleaved_by_redshift").all(),
+                  "approved_fsig_indices_one_based_369": (approved_mappings["candidate_fsig_one_based_indices"] == "3|6|9").all(),
+                  "approved_fsig_indices_zero_based_258": (approved_mappings["candidate_fsig_zero_based_indices"] == "2|5|8").all(),
+                  "rejected_mappings_equal_4": len(rejected_mappings) == 4,
+                  "rejected_mappings_all_grouped": (rejected_mappings["hypothesis_id"] == "grouped_by_observable").all(),
+                  "blocked_mappings_equal_4": len(blocked_mappings) == 4,
+                  "documentation_needed_equal_0": len(documentation_needed) == 0,
+                  "invalid_rows_equal_0": len(invalid_rows) == 0,
+                  "subblock_readiness_rows_equal_approved": len(subblock_readiness) == len(approved_mappings),
+                  "selected_family_summary_rows_equal_3": len(selected_family_summary) == 3,
+                  "review_summary_rows_equal_8": len(review_summary) == 8,
+                  "route_status_382_rows_equal_4": len(route_status_382) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "no_dimension_order_mapping_confirmed": false_col(review_ingest, "dimension_order_mapping_confirmed_now"),
+                  "no_fsigma8_subblock_identified_now": false_col(review_ingest, "fsigma8_subblock_identified_now"),
+                  "raw_values_not_retained": false_col(review_ingest, "raw_covariance_values_retained"),
+                  "usable_matrix_not_loaded": false_col(review_ingest, "usable_covariance_matrix_loaded"),
+                  "no_subblock_extracted": false_col(review_ingest, "covariance_subblock_extracted") and false_col(subblock_readiness, "covariance_subblock_extracted_now"),
+                  "no_full_covariance_available": false_col(review_ingest, "full_covariance_available"),
+                  "no_covariance_values_loaded": false_col(review_ingest, "full_covariance_values_loaded") and false_col(subblock_readiness, "covariance_values_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(review_ingest, "covariance_dimension_confirmed"),
+                  "no_observed_row_order_matched": false_col(review_ingest, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(review_ingest, "likelihood_computed"),
+                  "no_p_values_computed": false_col(review_ingest, "p_values_computed"),
+                  "no_score_valid": false_col(review_ingest, "score_valid"),
+                  "no_support_allowed": false_col(review_ingest, "support_allowed") and false_col(subblock_readiness, "support_allowed") and false_col(selected_family_summary, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary382 = {
+                  "version": "v4.382",
+                  "route_name": "v4_382_dimension_order_mapping_review_ingest_no_values_no_support_claims",
+                  "expected_result": "v4_382_dimension_order_mapping_review_ingest_passed_interleaved_selected_no_values_no_support_claims",
+                  "input_version": "v4.381",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "mapping_review_rows": int(len(review_ingest)),
+                  "approved_mapping_rows": int(len(approved_mappings)),
+                  "rejected_mapping_rows": int(len(rejected_mappings)),
+                  "blocked_mapping_rows": int(len(blocked_mappings)),
+                  "selected_mapping_hypothesis": "interleaved_by_redshift",
+                  "selected_fsigma8_zero_based_indices": "2|5|8",
+                  "selected_fsigma8_one_based_indices": "3|6|9",
+                  "subblock_readiness_rows": int(len(subblock_readiness)),
+                  "dimension_order_mapping_confirmed_now": False,
+                  "fsigma8_subblock_identified_now": False,
+                  "raw_covariance_values_retained": False,
+                  "usable_covariance_matrix_loaded": False,
+                  "covariance_subblock_extracted": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_383_fsigma8_subblock_readiness_no_values_no_support_claims",
+              }
+
+              review_ingest.to_csv(outdir / "v4_382_dimension_order_mapping_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv", index=False)
+              approved_mappings.to_csv(outdir / "v4_382_APPROVED_interleaved_mapping_hypotheses_FOR_LATER_SUBBLOCK_READINESS_NO_VALUES.csv", index=False)
+              rejected_mappings.to_csv(outdir / "v4_382_rejected_grouped_mapping_hypotheses.csv", index=False)
+              blocked_mappings.to_csv(outdir / "v4_382_blocked_documentation_fallback_hypotheses.csv", index=False)
+              subblock_readiness.to_csv(outdir / "v4_382_fsigma8_subblock_readiness_packet_NO_VALUES_NO_SUPPORT.csv", index=False)
+              selected_family_summary.to_csv(outdir / "v4_382_selected_mapping_family_summary_NO_VALUES.csv", index=False)
+              review_summary.to_csv(outdir / "v4_382_mapping_review_summary_NO_VALUES.csv", index=False)
+              route_status_382.to_csv(outdir / "v4_382_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_382_limitations_after_mapping_review.csv", index=False)
+              gap_update.to_csv(outdir / "v4_382_gap_status_after_mapping_review.csv", index=False)
+              human_review.to_csv(outdir / "v4_382_input_human_filled_mapping_review_preserved.csv", index=False)
+              mapping_hypotheses.to_csv(outdir / "v4_382_input_v4_381_mapping_hypotheses_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_382_rule_checks.csv", index=False)
+
+              (outdir / "v4_382_summary.json").write_text(json.dumps(summary382, indent=2))
+
+              summary_md = f"""# TAIRID v4.382 Dimension/Order Mapping Review Ingest — No Values, No Support Claims
+
+          Expected result: `{summary382["expected_result"]}`
+
+          {summary382["rules_passed"]} / {summary382["rules_total"]} rules passed
+
+          failed_gates = {summary382["failed_gates"]}
+
+          mapping_review_rows = {summary382["mapping_review_rows"]}
+
+          approved_mapping_rows = {summary382["approved_mapping_rows"]}
+
+          rejected_mapping_rows = {summary382["rejected_mapping_rows"]}
+
+          blocked_mapping_rows = {summary382["blocked_mapping_rows"]}
+
+          selected_mapping_hypothesis = `{summary382["selected_mapping_hypothesis"]}`
+
+          selected_fsigma8_zero_based_indices = `{summary382["selected_fsigma8_zero_based_indices"]}`
+
+          selected_fsigma8_one_based_indices = `{summary382["selected_fsigma8_one_based_indices"]}`
+
+          subblock_readiness_rows = {summary382["subblock_readiness_rows"]}
+
+          dimension_order_mapping_confirmed_now = false
+
+          fsigma8_subblock_identified_now = false
+
+          raw_covariance_values_retained = false
+
+          usable_covariance_matrix_loaded = false
+
+          covariance_subblock_extracted = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step ingests the mapping review and selects the interleaved hypothesis for later subblock readiness only.
+
+          It does **not** extract a covariance subblock.
+
+          It does **not** load covariance values.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary382["selected_next_route"]}`
+          """
+              (outdir / "v4_382_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary382, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_382_dimension_order_mapping_review_ingest_no_support.py
+
+      - name: Run v4.382 dimension order mapping review ingest no support
+        run: |
+          python run_v4_382_dimension_order_mapping_review_ingest_no_support.py
+
+      - name: Upload v4.382 dimension order mapping review ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-382-dimension-order-mapping-review-ingest-no-values-no-support-output
+          path: |
+            tairid_v4_382_dimension_order_mapping_review_ingest_no_values_no_support_output/
+            tairid_v4_382_dimension_order_mapping_review_ingest_no_values_no_support_output.zip
