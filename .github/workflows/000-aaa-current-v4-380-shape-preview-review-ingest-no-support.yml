@@ -1,0 +1,511 @@
+name: "!!! AAA CURRENT - TAIRID v4.380 shape preview review ingest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-380-shape-preview-review-ingest-no-support:
+    name: "!!! AAA CURRENT - Run v4.380 shape preview review ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.379 output ZIP and human-filled shape review ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.379 output ZIP..."
+          INPUT_379_ZIP="$(ls tairid-v4-379-selected-member-header-preview-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_379_ZIP" ]; then
+            echo "Could not find v4.379 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-379-selected-member-header-preview-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled v4.379 shape review ZIP..."
+          HUMAN_FILLED_SHAPE_REVIEW_ZIP="$(ls tairid-v4-379-human-filled-shape-preview-review-for-v4-380-no-values-no-support*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$HUMAN_FILLED_SHAPE_REVIEW_ZIP" ]; then
+            echo "Could not find human-filled shape review ZIP."
+            echo "Expected:"
+            echo "tairid-v4-379-human-filled-shape-preview-review-for-v4-380-no-values-no-support.zip"
+            exit 1
+          fi
+
+          echo "Using v4.379 ZIP:"
+          echo "$INPUT_379_ZIP"
+
+          echo "Using human-filled review ZIP:"
+          echo "$HUMAN_FILLED_SHAPE_REVIEW_ZIP"
+
+          echo "INPUT_379_ZIP=$INPUT_379_ZIP" >> "$GITHUB_ENV"
+          echo "HUMAN_FILLED_SHAPE_REVIEW_ZIP=$HUMAN_FILLED_SHAPE_REVIEW_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.380 shape preview review ingest script
+        run: |
+          cat > run_v4_380_shape_preview_review_ingest_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "shape preview review ingest only; 9x9 rectangular covariance-like members may be approved for later dimension/order review; no raw covariance values retained; no usable covariance matrix loaded; no exact covariance member approved; no covariance dimensions confirmed against observed rows; no observed-row order matched; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          ALLOWED_SHAPE_REVIEW_DECISIONS = {
+              "approve_for_later_dimension_order_review",
+              "needs_member_repair",
+              "reject_member",
+              "keep_blocked",
+          }
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def main():
+              input_379 = Path(os.environ["INPUT_379_ZIP"])
+              human_zip = Path(os.environ["HUMAN_FILLED_SHAPE_REVIEW_ZIP"])
+
+              outdir = Path("tairid_v4_380_shape_preview_review_ingest_no_values_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base379 = extract_zip(input_379, "tairid_v4_380_379_")
+              basehuman = extract_zip(human_zip, "tairid_v4_380_human_")
+
+              summary379_path = find_one(base379, "v4_379_summary.json")
+              header_preview_path = find_one(base379, "v4_379_selected_member_header_shape_preview_NO_VALUES_NO_SUPPORT.csv")
+              candidate_shape_path = find_one(base379, "v4_379_candidate_rectangular_shape_rows_NO_VALUES.csv")
+              nonmatching_path = find_one(base379, "v4_379_nonmatching_or_unclear_shape_rows_NO_VALUES.csv")
+              blank_review_path = find_one(base379, "v4_379_HUMAN_FILL_shape_preview_review_NO_VALUES_NO_SUPPORT.csv")
+              preview_summary_path = find_one(base379, "v4_379_header_preview_summary_NO_VALUES.csv")
+              route_status_path = find_one(base379, "v4_379_route_status_summary.csv")
+              limitations379_path = find_one(base379, "v4_379_limitations_after_header_preview.csv")
+              gap379_path = find_one(base379, "v4_379_gap_status_after_header_preview.csv")
+              selected_members_path = find_one(base379, "v4_379_input_v4_378_selected_members_preserved.csv")
+              header_staging_path = find_one(base379, "v4_379_input_v4_378_header_staging_packet_preserved.csv")
+              rules379_path = find_one(base379, "v4_379_rule_checks.csv")
+
+              human_review_path = find_one_suffix(basehuman, "HUMAN_FILLED_shape_preview_review_NO_VALUES_NO_SUPPORT.csv")
+
+              summary379 = json.loads(summary379_path.read_text())
+              header_preview = pd.read_csv(header_preview_path)
+              candidate_shape = pd.read_csv(candidate_shape_path)
+              nonmatching = pd.read_csv(nonmatching_path)
+              blank_review = pd.read_csv(blank_review_path)
+              preview_summary = pd.read_csv(preview_summary_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations379 = pd.read_csv(limitations379_path)
+              gap379 = pd.read_csv(gap379_path)
+              selected_members = pd.read_csv(selected_members_path)
+              header_staging = pd.read_csv(header_staging_path)
+              rules379 = pd.read_csv(rules379_path)
+              human_review = pd.read_csv(human_review_path)
+
+              for col in [
+                  "human_shape_preview_review_decision",
+                  "human_shape_preview_review_note",
+                  "shape_preview_approved_now",
+              ]:
+                  if col not in human_review.columns:
+                      human_review[col] = ""
+
+              ingest_rows = []
+
+              for _, row in human_review.iterrows():
+                  decision = clean(row["human_shape_preview_review_decision"])
+
+                  if decision == "approve_for_later_dimension_order_review":
+                      row_status = "approved_for_later_dimension_order_review_no_values"
+                      approved_now = True
+                  elif decision == "needs_member_repair":
+                      row_status = "blocked_needs_member_repair"
+                      approved_now = False
+                  elif decision == "reject_member":
+                      row_status = "rejected_after_shape_preview"
+                      approved_now = False
+                  elif decision == "keep_blocked":
+                      row_status = "kept_blocked_after_shape_preview"
+                      approved_now = False
+                  else:
+                      row_status = "invalid_or_missing_shape_preview_review_decision"
+                      approved_now = False
+
+                  ingest_rows.append({
+                      "v4_380_shape_review_id": f"v4_380_shape_review_{len(ingest_rows)+1:03d}",
+                      "v4_379_header_preview_id": clean(row["v4_379_header_preview_id"]),
+                      "v4_378_member_review_id": clean(row["v4_378_member_review_id"]),
+                      "v4_377_member_id": clean(row["v4_377_member_id"]),
+                      "source_label": clean(row["source_label"]),
+                      "source_url": clean(row["source_url"]),
+                      "selected_member_name": clean(row["selected_member_name"]),
+                      "source_archive_found": clean(row["source_archive_found"]).lower() in ["true", "1", "yes"],
+                      "archive_format_detected": clean(row["archive_format_detected"]),
+                      "header_preview_status": clean(row["header_preview_status"]),
+                      "likely_rectangular_numeric_table": clean(row["likely_rectangular_numeric_table"]).lower() in ["true", "1", "yes"],
+                      "inferred_shape_rows_candidate": clean(row["inferred_shape_rows_candidate"]),
+                      "inferred_shape_columns_candidate": clean(row["inferred_shape_columns_candidate"]),
+                      "unique_token_counts": clean(row["unique_token_counts"]),
+                      "human_shape_preview_review_decision": decision,
+                      "human_shape_preview_review_note": clean(row["human_shape_preview_review_note"]),
+                      "row_review_status": row_status,
+                      "shape_preview_approved_for_later_dimension_order_review": bool(approved_now),
+
+                      "raw_covariance_values_retained": False,
+                      "usable_covariance_matrix_loaded": False,
+                      "exact_covariance_member_approved": False,
+                      "exact_covariance_file_staged": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              review_ingest = pd.DataFrame(ingest_rows)
+
+              approved_shapes = review_ingest[
+                  review_ingest["shape_preview_approved_for_later_dimension_order_review"].astype(bool)
+              ].copy()
+              repair_shapes = review_ingest[review_ingest["row_review_status"] == "blocked_needs_member_repair"].copy()
+              rejected_shapes = review_ingest[review_ingest["row_review_status"] == "rejected_after_shape_preview"].copy()
+              blocked_shapes = review_ingest[review_ingest["row_review_status"] == "kept_blocked_after_shape_preview"].copy()
+              invalid_rows = review_ingest[review_ingest["row_review_status"] == "invalid_or_missing_shape_preview_review_decision"].copy()
+
+              dimension_order_packet = approved_shapes.copy()
+              dimension_order_packet["next_gate"] = "v4_381_candidate_covariance_dimension_order_mapping_readiness_no_values_no_support_claims"
+              dimension_order_packet["dimension_order_review_scope"] = "map_9x9_candidate_structure_to_3_redshift_rows_and_parameter_vector_no_values"
+              dimension_order_packet["candidate_matrix_dimension_from_preview"] = (
+                  dimension_order_packet["inferred_shape_rows_candidate"].astype(str)
+                  + "x"
+                  + dimension_order_packet["inferred_shape_columns_candidate"].astype(str)
+              )
+              dimension_order_packet["candidate_observable_family_from_filename"] = dimension_order_packet["selected_member_name"].apply(
+                  lambda s: "dM_Hz_fsig" if "dM_Hz" in str(s) else ("dV_FAP_fsig" if "dV_FAP" in str(s) else "unknown")
+              )
+              dimension_order_packet["candidate_consensus_family_from_filename"] = dimension_order_packet["selected_member_name"].apply(
+                  lambda s: "final_consensus" if "final_consensus" in str(s) else ("FS_consensus" if "FS_consensus" in str(s) else "unknown")
+              )
+              dimension_order_packet["dimension_order_mapping_confirmed_now"] = False
+              dimension_order_packet["fsigma8_subblock_identified_now"] = False
+              dimension_order_packet["covariance_values_loaded"] = False
+              dimension_order_packet["support_allowed"] = False
+
+              shape_review_summary = pd.DataFrame([
+                  {"summary_metric": "shape_review_rows", "value": int(len(review_ingest)), "note": "Human shape-review rows ingested."},
+                  {"summary_metric": "approved_for_later_dimension_order_review_rows", "value": int(len(approved_shapes)), "note": "Approved only for later dimension/order mapping, not value loading."},
+                  {"summary_metric": "repair_shape_rows", "value": int(len(repair_shapes)), "note": "Rows needing member repair."},
+                  {"summary_metric": "rejected_shape_rows", "value": int(len(rejected_shapes)), "note": "Rows rejected after shape preview."},
+                  {"summary_metric": "blocked_shape_rows", "value": int(len(blocked_shapes)), "note": "Rows kept blocked after preview."},
+                  {"summary_metric": "candidate_9x9_rectangular_rows", "value": int(len(approved_shapes)), "note": "Approved rows have 9x9 rectangular metadata."},
+                  {"summary_metric": "covariance_values_loaded", "value": 0, "note": "No covariance values loaded."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_380 = pd.DataFrame([
+                  {"status_id": "V4_380_STATUS_001", "status": "shape_preview_review_ingested", "detail": f"{len(approved_shapes)} rows approved for later dimension/order review."},
+                  {"status_id": "V4_380_STATUS_002", "status": "nine_by_nine_shape_detected", "detail": "Rows are candidate 9x9 covariance-like tables, but no observed-row mapping is confirmed yet."},
+                  {"status_id": "V4_380_STATUS_003", "status": "no_values_loaded", "detail": "Shape review approval does not load covariance values."},
+                  {"status_id": "V4_380_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_380_LIMIT_001", "limit": "Shape approval is not exact covariance approval.", "status": "active_limit"},
+                  {"limit_id": "V4_380_LIMIT_002", "limit": "A 9x9 rectangular table still needs dimension/order mapping against the observed rows.", "status": "active_limit"},
+                  {"limit_id": "V4_380_LIMIT_003", "limit": "No covariance values are loaded in v4.380.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_380_LIMIT_004", "limit": "No covariance dimension or observed-row order match is confirmed.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_380_LIMIT_005", "limit": "No likelihood, p-values, score, or support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_380_GAP_001", "gap": "Shape preview review ingested.", "status_after_v4_380": "approved_for_later_dimension_order_review_no_values", "next_gate": "v4_381_candidate_covariance_dimension_order_mapping_readiness_no_values_no_support"},
+                  {"gap_id": "V4_380_GAP_002", "gap": "Exact covariance member remains unapproved.", "status_after_v4_380": "still_open", "next_gate": "later_after_dimension_order_review"},
+                  {"gap_id": "V4_380_GAP_003", "gap": "Covariance values remain unloaded.", "status_after_v4_380": "still_blocked", "next_gate": "later_after_dimension_order_and_subblock_mapping"},
+                  {"gap_id": "V4_380_GAP_004", "gap": "Covariance dimensions and observed-row order remain unconfirmed.", "status_after_v4_380": "still_blocked", "next_gate": "v4_381_dimension_order_mapping_readiness"},
+                  {"gap_id": "V4_380_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_380": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_380"},
+              ])
+
+              hard_checks = {
+                  "input_v4_379_summary_found": summary379.get("version") == "v4.379",
+                  "input_v4_379_rules_all_passed": summary_rules_all_passed(summary379),
+                  "input_v4_379_failed_gates_none": summary379.get("failed_gates") == "none",
+                  "input_v4_379_selected_members_4": summary379.get("selected_member_rows") == 4,
+                  "input_v4_379_header_preview_rows_4": summary379.get("header_preview_rows") == 4,
+                  "input_v4_379_candidate_rectangular_shape_rows_4": summary379.get("candidate_rectangular_shape_rows") == 4,
+                  "input_v4_379_member_scanned_shape_only": summary379.get("member_contents_scanned_for_shape_only") is True,
+                  "input_v4_379_header_previewed_true": summary379.get("member_header_previewed") is True,
+                  "input_v4_379_raw_values_not_retained": summary379.get("raw_covariance_values_retained") is False,
+                  "input_v4_379_matrix_not_loaded": summary379.get("usable_covariance_matrix_loaded") is False,
+                  "input_v4_379_exact_member_not_approved": summary379.get("exact_covariance_member_approved") is False,
+                  "input_v4_379_exact_file_not_staged": summary379.get("exact_covariance_file_staged") is False,
+                  "input_v4_379_no_full_covariance": summary379.get("full_covariance_available") is False,
+                  "input_v4_379_no_values_loaded": summary379.get("full_covariance_values_loaded") is False,
+                  "input_v4_379_no_dimension_confirmed": summary379.get("covariance_dimension_confirmed") is False,
+                  "input_v4_379_no_row_order": summary379.get("observed_row_order_matched") is False,
+                  "input_v4_379_no_likelihood": summary379.get("likelihood_computed") is False,
+                  "input_v4_379_no_p_values": summary379.get("p_values_computed") is False,
+                  "input_v4_379_no_score_valid": summary379.get("score_valid") is False,
+                  "input_v4_379_no_support_allowed": summary379.get("support_allowed") is False,
+
+                  "rules379_all_passed": passed_column_all(rules379),
+                  "header_preview_rows_match_summary": len(header_preview) == int(summary379.get("header_preview_rows")),
+                  "candidate_shape_rows_match_summary": len(candidate_shape) == int(summary379.get("candidate_rectangular_shape_rows")),
+                  "nonmatching_rows_equal_0": len(nonmatching) == 0,
+                  "blank_review_rows_match_preview": len(blank_review) == len(header_preview),
+                  "human_review_rows_match_preview": len(human_review) == len(header_preview),
+                  "preview_summary_rows_equal_8": len(preview_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations379_rows_equal_5": len(limitations379) == 5,
+                  "gap379_rows_equal_5": len(gap379) == 5,
+                  "selected_members_rows_equal_4": len(selected_members) == 4,
+                  "header_staging_rows_equal_4": len(header_staging) == 4,
+
+                  "human_decisions_filled": human_review["human_shape_preview_review_decision"].apply(clean).ne("").all(),
+                  "human_decisions_allowed": human_review["human_shape_preview_review_decision"].apply(clean).isin(ALLOWED_SHAPE_REVIEW_DECISIONS).all(),
+                  "review_ingest_rows_equal_human_review": len(review_ingest) == len(human_review),
+                  "approved_shapes_equal_4": len(approved_shapes) == 4,
+                  "repair_shapes_equal_0": len(repair_shapes) == 0,
+                  "rejected_shapes_equal_0": len(rejected_shapes) == 0,
+                  "blocked_shapes_equal_0": len(blocked_shapes) == 0,
+                  "invalid_rows_equal_0": len(invalid_rows) == 0,
+                  "dimension_order_packet_rows_equal_approved": len(dimension_order_packet) == len(approved_shapes),
+                  "shape_review_summary_rows_equal_8": len(shape_review_summary) == 8,
+                  "route_status_380_rows_equal_4": len(route_status_380) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "raw_values_not_retained": false_col(review_ingest, "raw_covariance_values_retained"),
+                  "usable_matrix_not_loaded": false_col(review_ingest, "usable_covariance_matrix_loaded"),
+                  "exact_covariance_member_not_approved": false_col(review_ingest, "exact_covariance_member_approved"),
+                  "exact_covariance_file_not_staged": false_col(review_ingest, "exact_covariance_file_staged"),
+                  "no_full_covariance_available": false_col(review_ingest, "full_covariance_available"),
+                  "no_covariance_values_loaded": false_col(review_ingest, "full_covariance_values_loaded") and false_col(dimension_order_packet, "covariance_values_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(review_ingest, "covariance_dimension_confirmed") and false_col(dimension_order_packet, "dimension_order_mapping_confirmed_now"),
+                  "no_observed_row_order_matched": false_col(review_ingest, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(review_ingest, "likelihood_computed"),
+                  "no_p_values_computed": false_col(review_ingest, "p_values_computed"),
+                  "no_score_valid": false_col(review_ingest, "score_valid"),
+                  "no_support_allowed": false_col(review_ingest, "support_allowed") and false_col(dimension_order_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary380 = {
+                  "version": "v4.380",
+                  "route_name": "v4_380_shape_preview_review_ingest_no_values_no_support_claims",
+                  "expected_result": "v4_380_shape_preview_review_ingest_passed_approved_for_dimension_order_review_no_values_no_support_claims",
+                  "input_version": "v4.379",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "shape_review_rows": int(len(review_ingest)),
+                  "approved_for_later_dimension_order_review_rows": int(len(approved_shapes)),
+                  "dimension_order_packet_rows": int(len(dimension_order_packet)),
+                  "candidate_9x9_rectangular_rows": int(len(approved_shapes)),
+                  "raw_covariance_values_retained": False,
+                  "usable_covariance_matrix_loaded": False,
+                  "exact_covariance_member_approved": False,
+                  "exact_covariance_file_staged": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_381_candidate_covariance_dimension_order_mapping_readiness_no_values_no_support_claims",
+              }
+
+              review_ingest.to_csv(outdir / "v4_380_shape_preview_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv", index=False)
+              approved_shapes.to_csv(outdir / "v4_380_APPROVED_shape_previews_FOR_DIMENSION_ORDER_REVIEW_NO_VALUES.csv", index=False)
+              dimension_order_packet.to_csv(outdir / "v4_380_dimension_order_review_packet_NO_VALUES_NO_SUPPORT.csv", index=False)
+              repair_shapes.to_csv(outdir / "v4_380_repair_shape_rows.csv", index=False)
+              rejected_shapes.to_csv(outdir / "v4_380_rejected_shape_rows.csv", index=False)
+              blocked_shapes.to_csv(outdir / "v4_380_blocked_shape_rows.csv", index=False)
+              shape_review_summary.to_csv(outdir / "v4_380_shape_review_summary_NO_VALUES.csv", index=False)
+              route_status_380.to_csv(outdir / "v4_380_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_380_limitations_after_shape_review.csv", index=False)
+              gap_update.to_csv(outdir / "v4_380_gap_status_after_shape_review.csv", index=False)
+              human_review.to_csv(outdir / "v4_380_input_human_filled_shape_review_preserved.csv", index=False)
+              header_preview.to_csv(outdir / "v4_380_input_v4_379_header_preview_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_380_rule_checks.csv", index=False)
+
+              (outdir / "v4_380_summary.json").write_text(json.dumps(summary380, indent=2))
+
+              summary_md = f"""# TAIRID v4.380 Shape Preview Review Ingest — No Values, No Support Claims
+
+          Expected result: `{summary380["expected_result"]}`
+
+          {summary380["rules_passed"]} / {summary380["rules_total"]} rules passed
+
+          failed_gates = {summary380["failed_gates"]}
+
+          shape_review_rows = {summary380["shape_review_rows"]}
+
+          approved_for_later_dimension_order_review_rows = {summary380["approved_for_later_dimension_order_review_rows"]}
+
+          dimension_order_packet_rows = {summary380["dimension_order_packet_rows"]}
+
+          candidate_9x9_rectangular_rows = {summary380["candidate_9x9_rectangular_rows"]}
+
+          raw_covariance_values_retained = false
+
+          usable_covariance_matrix_loaded = false
+
+          exact_covariance_member_approved = false
+
+          exact_covariance_file_staged = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step ingests shape-preview review only.
+
+          It does **not** load covariance values.
+
+          It does **not** approve an exact covariance member.
+
+          It does **not** confirm covariance dimension or observed-row order.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary380["selected_next_route"]}`
+          """
+              (outdir / "v4_380_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary380, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_380_shape_preview_review_ingest_no_support.py
+
+      - name: Run v4.380 shape preview review ingest no support
+        run: |
+          python run_v4_380_shape_preview_review_ingest_no_support.py
+
+      - name: Upload v4.380 shape preview review ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-380-shape-preview-review-ingest-no-values-no-support-output
+          path: |
+            tairid_v4_380_shape_preview_review_ingest_no_values_no_support_output/
+            tairid_v4_380_shape_preview_review_ingest_no_values_no_support_output.zip
