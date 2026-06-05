@@ -1,0 +1,503 @@
+name: "!!! AAA CURRENT - TAIRID v4.378 archive member review ingest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-378-archive-member-review-ingest-no-support:
+    name: "!!! AAA CURRENT - Run v4.378 archive member review ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.377 output ZIP and human-filled archive member review ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.377 output ZIP..."
+          INPUT_377_ZIP="$(ls tairid-v4-377-controlled-source-download-archive-listing-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_377_ZIP" ]; then
+            echo "Could not find v4.377 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-377-controlled-source-download-archive-listing-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled v4.377 archive member review ZIP..."
+          HUMAN_FILLED_MEMBER_REVIEW_ZIP="$(ls tairid-v4-377-human-filled-archive-member-review-for-v4-378-no-values-no-support*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$HUMAN_FILLED_MEMBER_REVIEW_ZIP" ]; then
+            echo "Could not find human-filled archive member review ZIP."
+            echo "Expected:"
+            echo "tairid-v4-377-human-filled-archive-member-review-for-v4-378-no-values-no-support.zip"
+            exit 1
+          fi
+
+          echo "Using v4.377 ZIP:"
+          echo "$INPUT_377_ZIP"
+
+          echo "Using human-filled review ZIP:"
+          echo "$HUMAN_FILLED_MEMBER_REVIEW_ZIP"
+
+          echo "INPUT_377_ZIP=$INPUT_377_ZIP" >> "$GITHUB_ENV"
+          echo "HUMAN_FILLED_MEMBER_REVIEW_ZIP=$HUMAN_FILLED_MEMBER_REVIEW_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.378 archive member review ingest script
+        run: |
+          cat > run_v4_378_archive_member_review_ingest_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "archive member review ingest only; selected archive members may be approved for later header-only staging; no member contents read now; no covariance values loaded; no exact covariance member approved; no covariance dimensions confirmed; no observed-row order matched; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          ALLOWED_MEMBER_DECISIONS = {
+              "stage_member_header_only",
+              "needs_more_archive_search",
+              "reject_member",
+              "keep_blocked",
+          }
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def main():
+              input_377 = Path(os.environ["INPUT_377_ZIP"])
+              human_zip = Path(os.environ["HUMAN_FILLED_MEMBER_REVIEW_ZIP"])
+
+              outdir = Path("tairid_v4_378_archive_member_review_ingest_no_values_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              preserved_archives_dir = outdir / "downloaded_archives_preserved_not_for_value_ingest"
+              preserved_archives_dir.mkdir(parents=True, exist_ok=True)
+
+              base377 = extract_zip(input_377, "tairid_v4_378_377_")
+              basehuman = extract_zip(human_zip, "tairid_v4_378_human_")
+
+              summary377_path = find_one(base377, "v4_377_summary.json")
+              attempts_path = find_one(base377, "v4_377_controlled_download_attempt_ledger_NO_VALUES_NO_SUPPORT.csv")
+              archive_members_path = find_one(base377, "v4_377_archive_member_listing_NO_MEMBER_CONTENTS_NO_VALUES.csv")
+              candidate_members_path = find_one(base377, "v4_377_candidate_covariance_likelihood_growth_members_NO_VALUES.csv")
+              blank_review_path = find_one(base377, "v4_377_HUMAN_FILL_archive_member_review_NO_VALUES_NO_SUPPORT.csv")
+              attempt_summary_path = find_one(base377, "v4_377_controlled_attempt_summary_NO_VALUES.csv")
+              limitations377_path = find_one(base377, "v4_377_limitations_after_controlled_attempt.csv")
+              gap377_path = find_one(base377, "v4_377_gap_status_after_controlled_attempt.csv")
+              attempt_packet_path = find_one(base377, "v4_377_input_v4_376_controlled_attempt_packet_preserved.csv")
+              rules377_path = find_one(base377, "v4_377_rule_checks.csv")
+
+              human_review_path = find_one_suffix(basehuman, "HUMAN_FILLED_archive_member_review_NO_VALUES_NO_SUPPORT.csv")
+
+              summary377 = json.loads(summary377_path.read_text())
+              attempts = pd.read_csv(attempts_path)
+              archive_members = pd.read_csv(archive_members_path)
+              candidate_members = pd.read_csv(candidate_members_path)
+              blank_review = pd.read_csv(blank_review_path)
+              attempt_summary = pd.read_csv(attempt_summary_path)
+              limitations377 = pd.read_csv(limitations377_path)
+              gap377 = pd.read_csv(gap377_path)
+              attempt_packet = pd.read_csv(attempt_packet_path)
+              rules377 = pd.read_csv(rules377_path)
+              human_review = pd.read_csv(human_review_path)
+
+              downloaded_archives = []
+              for p in sorted(base377.rglob("*")):
+                  if p.is_file() and "downloaded_archives_not_for_value_ingest" in str(p):
+                      dest = preserved_archives_dir / p.name
+                      shutil.copy2(p, dest)
+                      downloaded_archives.append(dest)
+
+              for col in [
+                  "human_archive_member_review_decision",
+                  "human_archive_member_review_note",
+                  "member_selected_for_later_header_only_staging",
+              ]:
+                  if col not in human_review.columns:
+                      human_review[col] = ""
+
+              ingest_rows = []
+
+              for _, row in human_review.iterrows():
+                  decision = clean(row["human_archive_member_review_decision"])
+                  selected = decision == "stage_member_header_only"
+
+                  if decision == "stage_member_header_only":
+                      row_status = "selected_for_later_header_only_staging_no_values"
+                  elif decision == "needs_more_archive_search":
+                      row_status = "blocked_needs_more_archive_search"
+                  elif decision == "reject_member":
+                      row_status = "rejected_archive_member_for_current_covariance_lane"
+                  elif decision == "keep_blocked":
+                      row_status = "kept_blocked_as_fallback_no_values"
+                  else:
+                      row_status = "invalid_or_missing_archive_member_review_decision"
+
+                  ingest_rows.append({
+                      "v4_378_member_review_id": f"v4_378_member_review_{len(ingest_rows)+1:03d}",
+                      "v4_377_member_id": clean(row["v4_377_member_id"]),
+                      "source_id": clean(row["source_id"]),
+                      "source_label": clean(row["source_label"]),
+                      "source_url": clean(row["source_url"]),
+                      "archive_format": clean(row["archive_format"]),
+                      "member_name": clean(row["member_name"]),
+                      "member_size_bytes": row["member_size_bytes"],
+                      "member_compressed_size_bytes": clean(row["member_compressed_size_bytes"]),
+                      "member_is_dir": clean(row["member_is_dir"]),
+                      "keyword_hits": clean(row["keyword_hits"]),
+                      "candidate_covariance_like_member": clean(row["candidate_covariance_like_member"]).lower() in ["true", "1", "yes"],
+                      "candidate_likelihood_like_member": clean(row["candidate_likelihood_like_member"]).lower() in ["true", "1", "yes"],
+                      "candidate_growth_like_member": clean(row["candidate_growth_like_member"]).lower() in ["true", "1", "yes"],
+                      "human_archive_member_review_decision": decision,
+                      "human_archive_member_review_note": clean(row["human_archive_member_review_note"]),
+                      "row_review_status": row_status,
+                      "selected_for_later_header_only_staging": bool(selected),
+                      "member_contents_read": False,
+                      "member_header_previewed": False,
+                      "exact_covariance_member_approved": False,
+                      "exact_covariance_file_staged": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              review_ingest = pd.DataFrame(ingest_rows)
+
+              selected_members = review_ingest[review_ingest["selected_for_later_header_only_staging"].astype(bool)].copy()
+              rejected_members = review_ingest[review_ingest["row_review_status"] == "rejected_archive_member_for_current_covariance_lane"].copy()
+              blocked_members = review_ingest[review_ingest["row_review_status"] == "kept_blocked_as_fallback_no_values"].copy()
+              invalid_rows = review_ingest[review_ingest["row_review_status"] == "invalid_or_missing_archive_member_review_decision"].copy()
+
+              final_consensus_selected = selected_members[
+                  selected_members["member_name"].astype(str).str.contains("final_consensus", case=False, na=False)
+              ].copy()
+
+              fs_consensus_selected = selected_members[
+                  selected_members["member_name"].astype(str).str.contains("FS_consensus", case=False, na=False)
+              ].copy()
+
+              header_staging_packet = selected_members.copy()
+              header_staging_packet["next_gate"] = "v4_379_selected_archive_member_header_preview_no_values_no_support_claims"
+              header_staging_packet["header_staging_scope"] = "extract_or_preview_selected_member_header_only_no_covariance_values"
+              header_staging_packet["header_staging_order"] = range(1, len(header_staging_packet) + 1)
+              header_staging_packet["member_contents_read_now"] = False
+              header_staging_packet["covariance_values_loaded"] = False
+              header_staging_packet["support_allowed"] = False
+
+              member_review_summary = pd.DataFrame([
+                  {"summary_metric": "candidate_archive_member_rows", "value": int(len(candidate_members)), "note": "Candidate rows from v4.377 member listing."},
+                  {"summary_metric": "selected_for_later_header_only_staging_rows", "value": int(len(selected_members)), "note": "Selected only for later header preview, not value loading."},
+                  {"summary_metric": "final_consensus_selected_rows", "value": int(len(final_consensus_selected)), "note": "Final consensus covariance-like members selected."},
+                  {"summary_metric": "fs_consensus_selected_rows", "value": int(len(fs_consensus_selected)), "note": "Full-shape consensus covariance-like members selected as fallback/comparison."},
+                  {"summary_metric": "rejected_member_rows", "value": int(len(rejected_members)), "note": "Rejected for current repair lane."},
+                  {"summary_metric": "blocked_member_rows", "value": int(len(blocked_members)), "note": "Kept blocked as fallback, not selected now."},
+                  {"summary_metric": "covariance_values_loaded", "value": 0, "note": "No covariance values loaded."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status = pd.DataFrame([
+                  {"status_id": "V4_378_STATUS_001", "status": "archive_member_review_ingested", "detail": f"{len(selected_members)} members selected for later header-only staging."},
+                  {"status_id": "V4_378_STATUS_002", "status": "final_consensus_members_prioritized", "detail": "Final consensus covariance-like members are included before individual method or image artifacts."},
+                  {"status_id": "V4_378_STATUS_003", "status": "no_member_contents_read", "detail": "This gate only ingests review decisions and preserves archives for later header preview."},
+                  {"status_id": "V4_378_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_378_LIMIT_001", "limit": "Selection here means later header-only/member-preview staging, not covariance approval.", "status": "active_limit"},
+                  {"limit_id": "V4_378_LIMIT_002", "limit": "No archive member contents are read in v4.378.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_378_LIMIT_003", "limit": "No covariance values are loaded in v4.378.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_378_LIMIT_004", "limit": "No covariance dimension or observed-row order match is confirmed.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_378_LIMIT_005", "limit": "No likelihood, p-values, score, or support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_378_GAP_001", "gap": "Archive member review ingested.", "status_after_v4_378": "selected_members_ready_for_later_header_preview_no_values", "next_gate": "v4_379_selected_archive_member_header_preview_no_values_no_support"},
+                  {"gap_id": "V4_378_GAP_002", "gap": "Exact covariance member remains unapproved.", "status_after_v4_378": "still_open", "next_gate": "later_after_header_preview_and_shape_order_review"},
+                  {"gap_id": "V4_378_GAP_003", "gap": "Covariance values remain unloaded.", "status_after_v4_378": "still_blocked", "next_gate": "later_after_header_preview_identifies_exact_matrix"},
+                  {"gap_id": "V4_378_GAP_004", "gap": "Covariance dimensions and observed-row order remain unconfirmed.", "status_after_v4_378": "still_blocked", "next_gate": "later_shape_and_order_gate"},
+                  {"gap_id": "V4_378_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_378": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_378"},
+              ])
+
+              hard_checks = {
+                  "input_v4_377_summary_found": summary377.get("version") == "v4.377",
+                  "input_v4_377_rules_all_passed": summary_rules_all_passed(summary377),
+                  "input_v4_377_failed_gates_none": summary377.get("failed_gates") == "none",
+                  "input_v4_377_controlled_attempt_rows_2": summary377.get("controlled_attempt_rows") == 2,
+                  "input_v4_377_download_attempted_true": summary377.get("download_attempted") is True,
+                  "input_v4_377_source_files_fetched_2": summary377.get("source_files_fetched") == 2,
+                  "input_v4_377_archive_listings_inspected_2": summary377.get("archive_or_header_listing_inspected_rows") == 2,
+                  "input_v4_377_archive_members_78": summary377.get("archive_member_rows_listed") == 78,
+                  "input_v4_377_candidate_members_34": summary377.get("candidate_archive_member_rows") == 34,
+                  "input_v4_377_no_exact_file_staged": summary377.get("exact_covariance_file_staged") is False,
+                  "input_v4_377_no_full_covariance": summary377.get("full_covariance_available") is False,
+                  "input_v4_377_no_values_loaded": summary377.get("full_covariance_values_loaded") is False,
+                  "input_v4_377_no_dimension_confirmed": summary377.get("covariance_dimension_confirmed") is False,
+                  "input_v4_377_no_row_order": summary377.get("observed_row_order_matched") is False,
+                  "input_v4_377_no_likelihood": summary377.get("likelihood_computed") is False,
+                  "input_v4_377_no_p_values": summary377.get("p_values_computed") is False,
+                  "input_v4_377_no_score_valid": summary377.get("score_valid") is False,
+                  "input_v4_377_no_support_allowed": summary377.get("support_allowed") is False,
+
+                  "rules377_all_passed": passed_column_all(rules377),
+                  "attempts_rows_equal_2": len(attempts) == 2,
+                  "archive_members_rows_match_summary": len(archive_members) == int(summary377.get("archive_member_rows_listed")),
+                  "candidate_members_rows_match_summary": len(candidate_members) == int(summary377.get("candidate_archive_member_rows")),
+                  "blank_review_rows_match_candidate_members": len(blank_review) == len(candidate_members),
+                  "human_review_rows_match_candidate_members": len(human_review) == len(candidate_members),
+                  "attempt_summary_rows_equal_7": len(attempt_summary) == 7,
+                  "limitations377_rows_equal_5": len(limitations377) == 5,
+                  "gap377_rows_equal_5": len(gap377) == 5,
+                  "attempt_packet_rows_equal_2": len(attempt_packet) == 2,
+
+                  "human_decisions_filled": human_review["human_archive_member_review_decision"].apply(clean).ne("").all(),
+                  "human_decisions_allowed": human_review["human_archive_member_review_decision"].apply(clean).isin(ALLOWED_MEMBER_DECISIONS).all(),
+                  "review_ingest_rows_equal_human_review": len(review_ingest) == len(human_review),
+                  "selected_members_equal_4": len(selected_members) == 4,
+                  "final_consensus_selected_at_least_2": len(final_consensus_selected) >= 2,
+                  "fs_consensus_selected_at_least_2": len(fs_consensus_selected) >= 2,
+                  "rejected_members_at_least_1": len(rejected_members) >= 1,
+                  "blocked_members_at_least_1": len(blocked_members) >= 1,
+                  "invalid_rows_equal_0": len(invalid_rows) == 0,
+                  "header_staging_packet_rows_equal_selected": len(header_staging_packet) == len(selected_members),
+                  "member_review_summary_rows_equal_8": len(member_review_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+                  "downloaded_archives_preserved_at_least_2": len(downloaded_archives) >= 2,
+
+                  "no_member_contents_read_review_ingest": false_col(review_ingest, "member_contents_read"),
+                  "no_member_contents_read_header_packet": false_col(header_staging_packet, "member_contents_read_now"),
+                  "no_exact_covariance_member_approved": false_col(review_ingest, "exact_covariance_member_approved"),
+                  "no_exact_covariance_file_staged": false_col(review_ingest, "exact_covariance_file_staged"),
+                  "no_full_covariance_available": false_col(review_ingest, "full_covariance_available"),
+                  "no_covariance_values_loaded": false_col(review_ingest, "full_covariance_values_loaded") and false_col(header_staging_packet, "covariance_values_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(review_ingest, "covariance_dimension_confirmed"),
+                  "no_observed_row_order_matched": false_col(review_ingest, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(review_ingest, "likelihood_computed"),
+                  "no_p_values_computed": false_col(review_ingest, "p_values_computed"),
+                  "no_score_valid": false_col(review_ingest, "score_valid"),
+                  "no_support_allowed": false_col(review_ingest, "support_allowed") and false_col(header_staging_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary378 = {
+                  "version": "v4.378",
+                  "route_name": "v4_378_archive_member_review_ingest_no_values_no_support_claims",
+                  "expected_result": "v4_378_archive_member_review_ingest_passed_selected_members_for_header_only_no_values_no_support_claims",
+                  "input_version": "v4.377",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "candidate_archive_member_rows": int(len(candidate_members)),
+                  "selected_for_later_header_only_staging_rows": int(len(selected_members)),
+                  "final_consensus_selected_rows": int(len(final_consensus_selected)),
+                  "fs_consensus_selected_rows": int(len(fs_consensus_selected)),
+                  "rejected_member_rows": int(len(rejected_members)),
+                  "blocked_member_rows": int(len(blocked_members)),
+                  "member_contents_read": False,
+                  "member_header_previewed": False,
+                  "exact_covariance_member_approved": False,
+                  "exact_covariance_file_staged": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_379_selected_archive_member_header_preview_no_values_no_support_claims",
+              }
+
+              review_ingest.to_csv(outdir / "v4_378_archive_member_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv", index=False)
+              selected_members.to_csv(outdir / "v4_378_SELECTED_archive_members_FOR_LATER_HEADER_ONLY_STAGING_NO_VALUES.csv", index=False)
+              rejected_members.to_csv(outdir / "v4_378_rejected_archive_members.csv", index=False)
+              blocked_members.to_csv(outdir / "v4_378_blocked_archive_members.csv", index=False)
+              header_staging_packet.to_csv(outdir / "v4_378_member_header_staging_packet_NO_VALUES_NO_SUPPORT.csv", index=False)
+              member_review_summary.to_csv(outdir / "v4_378_member_review_summary_NO_VALUES.csv", index=False)
+              route_status.to_csv(outdir / "v4_378_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_378_limitations_after_archive_member_review.csv", index=False)
+              gap_update.to_csv(outdir / "v4_378_gap_status_after_archive_member_review.csv", index=False)
+              human_review.to_csv(outdir / "v4_378_input_human_filled_archive_member_review_preserved.csv", index=False)
+              candidate_members.to_csv(outdir / "v4_378_input_v4_377_candidate_members_preserved.csv", index=False)
+              attempts.to_csv(outdir / "v4_378_input_v4_377_download_attempts_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_378_rule_checks.csv", index=False)
+
+              (outdir / "v4_378_summary.json").write_text(json.dumps(summary378, indent=2))
+
+              summary_md = f"""# TAIRID v4.378 Archive Member Review Ingest — No Values, No Support Claims
+
+          Expected result: `{summary378["expected_result"]}`
+
+          {summary378["rules_passed"]} / {summary378["rules_total"]} rules passed
+
+          failed_gates = {summary378["failed_gates"]}
+
+          candidate_archive_member_rows = {summary378["candidate_archive_member_rows"]}
+
+          selected_for_later_header_only_staging_rows = {summary378["selected_for_later_header_only_staging_rows"]}
+
+          final_consensus_selected_rows = {summary378["final_consensus_selected_rows"]}
+
+          fs_consensus_selected_rows = {summary378["fs_consensus_selected_rows"]}
+
+          member_contents_read = false
+
+          member_header_previewed = false
+
+          exact_covariance_member_approved = false
+
+          exact_covariance_file_staged = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step ingests archive-member review decisions only.
+
+          It does **not** read archive member contents.
+
+          It does **not** load covariance values.
+
+          It does **not** approve an exact covariance member.
+
+          It does **not** confirm covariance dimensions or observed-row order.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary378["selected_next_route"]}`
+          """
+              (outdir / "v4_378_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary378, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_378_archive_member_review_ingest_no_support.py
+
+      - name: Run v4.378 archive member review ingest no support
+        run: |
+          python run_v4_378_archive_member_review_ingest_no_support.py
+
+      - name: Upload v4.378 archive member review ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-378-archive-member-review-ingest-no-values-no-support-output
+          path: |
+            tairid_v4_378_archive_member_review_ingest_no_values_no_support_output/
+            tairid_v4_378_archive_member_review_ingest_no_values_no_support_output.zip
