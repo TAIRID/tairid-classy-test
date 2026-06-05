@@ -1,0 +1,554 @@
+name: "!!! AAA CURRENT - TAIRID v4.381 dimension order mapping readiness no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-381-dimension-order-mapping-readiness-no-support:
+    name: "!!! AAA CURRENT - Run v4.381 dimension order mapping readiness"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.380 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.380 output ZIP by pattern..."
+          INPUT_380_ZIP="$(ls tairid-v4-380-shape-preview-review-ingest-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_380_ZIP" ]; then
+            echo "Could not find v4.380 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-380-shape-preview-review-ingest-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.380 ZIP:"
+          echo "$INPUT_380_ZIP"
+          echo "INPUT_380_ZIP=$INPUT_380_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.381 dimension order readiness script
+        run: |
+          cat > run_v4_381_dimension_order_mapping_readiness_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "candidate covariance dimension/order mapping readiness only; 9x9 shape may be mapped into candidate 3 redshift x 3 observable hypotheses; no mapping is confirmed; no raw covariance values retained; no usable covariance matrix loaded; no covariance subblock extracted; no observed-row order matched; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          OBSERVED_REDSHIFT_ROWS = ["z0.38", "z0.51", "z0.61"]
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def true_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def observable_labels_from_family(family):
+              if family == "dM_Hz_fsig":
+                  return ["dM", "Hz", "fsig"]
+              if family == "dV_FAP_fsig":
+                  return ["dV", "FAP", "fsig"]
+              return ["obs1", "obs2", "fsig"]
+
+          def build_mapping_hypotheses(row):
+              member_name = clean(row["selected_member_name"])
+              observable_family = clean(row["candidate_observable_family_from_filename"])
+              consensus_family = clean(row["candidate_consensus_family_from_filename"])
+              labels = observable_labels_from_family(observable_family)
+
+              hypotheses = []
+
+              hypotheses.append({
+                  "hypothesis_id": "interleaved_by_redshift",
+                  "hypothesis_label": "Interleaved by redshift: [obsA_z1, obsB_z1, fsig_z1, obsA_z2, obsB_z2, fsig_z2, obsA_z3, obsB_z3, fsig_z3]",
+                  "candidate_vector_order": f"{labels[0]}_z0.38|{labels[1]}_z0.38|fsig_z0.38|{labels[0]}_z0.51|{labels[1]}_z0.51|fsig_z0.51|{labels[0]}_z0.61|{labels[1]}_z0.61|fsig_z0.61",
+                  "candidate_fsig_zero_based_indices": "2|5|8",
+                  "candidate_fsig_one_based_indices": "3|6|9",
+                  "mapping_basis": "filename_observable_order_plus_three_redshift_bins",
+                  "candidate_priority": 1,
+              })
+
+              hypotheses.append({
+                  "hypothesis_id": "grouped_by_observable",
+                  "hypothesis_label": "Grouped by observable: [obsA_z1, obsA_z2, obsA_z3, obsB_z1, obsB_z2, obsB_z3, fsig_z1, fsig_z2, fsig_z3]",
+                  "candidate_vector_order": f"{labels[0]}_z0.38|{labels[0]}_z0.51|{labels[0]}_z0.61|{labels[1]}_z0.38|{labels[1]}_z0.51|{labels[1]}_z0.61|fsig_z0.38|fsig_z0.51|fsig_z0.61",
+                  "candidate_fsig_zero_based_indices": "6|7|8",
+                  "candidate_fsig_one_based_indices": "7|8|9",
+                  "mapping_basis": "filename_observable_order_plus_grouped_parameter_blocks",
+                  "candidate_priority": 2,
+              })
+
+              hypotheses.append({
+                  "hypothesis_id": "requires_source_documentation",
+                  "hypothesis_label": "Mapping not inferable from filename alone; source documentation or file comments required before subblock extraction.",
+                  "candidate_vector_order": "",
+                  "candidate_fsig_zero_based_indices": "",
+                  "candidate_fsig_one_based_indices": "",
+                  "mapping_basis": "truth_boundary_fallback",
+                  "candidate_priority": 3,
+              })
+
+              output = []
+              for h in hypotheses:
+                  output.append({
+                      "selected_member_name": member_name,
+                      "candidate_observable_family_from_filename": observable_family,
+                      "candidate_consensus_family_from_filename": consensus_family,
+                      **h
+                  })
+              return output
+
+          def main():
+              input_380 = Path(os.environ["INPUT_380_ZIP"])
+
+              outdir = Path("tairid_v4_381_candidate_covariance_dimension_order_mapping_readiness_no_values_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base380 = extract_zip(input_380, "tairid_v4_381_380_")
+
+              summary380_path = find_one(base380, "v4_380_summary.json")
+              review_ingest_path = find_one(base380, "v4_380_shape_preview_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv")
+              approved_shapes_path = find_one(base380, "v4_380_APPROVED_shape_previews_FOR_DIMENSION_ORDER_REVIEW_NO_VALUES.csv")
+              dimension_order_packet_path = find_one(base380, "v4_380_dimension_order_review_packet_NO_VALUES_NO_SUPPORT.csv")
+              repair_shapes_path = find_one(base380, "v4_380_repair_shape_rows.csv")
+              rejected_shapes_path = find_one(base380, "v4_380_rejected_shape_rows.csv")
+              blocked_shapes_path = find_one(base380, "v4_380_blocked_shape_rows.csv")
+              shape_summary_path = find_one(base380, "v4_380_shape_review_summary_NO_VALUES.csv")
+              route_status_path = find_one(base380, "v4_380_route_status_summary.csv")
+              limitations380_path = find_one(base380, "v4_380_limitations_after_shape_review.csv")
+              gap380_path = find_one(base380, "v4_380_gap_status_after_shape_review.csv")
+              header_preview_path = find_one(base380, "v4_380_input_v4_379_header_preview_preserved.csv")
+              rules380_path = find_one(base380, "v4_380_rule_checks.csv")
+
+              summary380 = json.loads(summary380_path.read_text())
+              review_ingest = pd.read_csv(review_ingest_path)
+              approved_shapes = pd.read_csv(approved_shapes_path)
+              dimension_order_packet_input = pd.read_csv(dimension_order_packet_path)
+              repair_shapes = pd.read_csv(repair_shapes_path)
+              rejected_shapes = pd.read_csv(rejected_shapes_path)
+              blocked_shapes = pd.read_csv(blocked_shapes_path)
+              shape_summary = pd.read_csv(shape_summary_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations380 = pd.read_csv(limitations380_path)
+              gap380 = pd.read_csv(gap380_path)
+              header_preview = pd.read_csv(header_preview_path)
+              rules380 = pd.read_csv(rules380_path)
+
+              readiness_rows = []
+
+              for _, row in dimension_order_packet_input.iterrows():
+                  rows_candidate = int(float(row["inferred_shape_rows_candidate"]))
+                  cols_candidate = int(float(row["inferred_shape_columns_candidate"]))
+                  expected_dimension = len(OBSERVED_REDSHIFT_ROWS) * 3
+                  dimension_matches_expected = rows_candidate == expected_dimension and cols_candidate == expected_dimension
+
+                  readiness_rows.append({
+                      "v4_381_dimension_order_readiness_id": f"v4_381_dim_order_ready_{len(readiness_rows)+1:03d}",
+                      "v4_380_shape_review_id": clean(row["v4_380_shape_review_id"]),
+                      "selected_member_name": clean(row["selected_member_name"]),
+                      "source_label": clean(row["source_label"]),
+                      "source_url": clean(row["source_url"]),
+                      "candidate_observable_family_from_filename": clean(row["candidate_observable_family_from_filename"]),
+                      "candidate_consensus_family_from_filename": clean(row["candidate_consensus_family_from_filename"]),
+                      "candidate_matrix_dimension_from_preview": clean(row["candidate_matrix_dimension_from_preview"]),
+                      "expected_dimension_from_loaded_rows_and_three_observables": expected_dimension,
+                      "expected_structure_hypothesis": "3_loaded_redshift_rows_x_3_observables_each",
+                      "loaded_redshift_rows": "|".join(OBSERVED_REDSHIFT_ROWS),
+                      "dimension_matches_expected_9x9": bool(dimension_matches_expected),
+                      "dimension_order_readiness_status": "ready_for_human_mapping_hypothesis_review_no_values" if dimension_matches_expected else "blocked_dimension_not_9x9",
+                      "dimension_order_mapping_confirmed_now": False,
+                      "fsigma8_subblock_identified_now": False,
+                      "raw_covariance_values_retained": False,
+                      "usable_covariance_matrix_loaded": False,
+                      "covariance_subblock_extracted": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              readiness_matrix = pd.DataFrame(readiness_rows)
+
+              hypothesis_rows = []
+              for _, row in dimension_order_packet_input.iterrows():
+                  base_hypotheses = build_mapping_hypotheses(row)
+                  for h in base_hypotheses:
+                      hypothesis_rows.append({
+                          "v4_381_mapping_hypothesis_id": f"v4_381_mapping_hypothesis_{len(hypothesis_rows)+1:03d}",
+                          "selected_member_name": h["selected_member_name"],
+                          "candidate_observable_family_from_filename": h["candidate_observable_family_from_filename"],
+                          "candidate_consensus_family_from_filename": h["candidate_consensus_family_from_filename"],
+                          "hypothesis_id": h["hypothesis_id"],
+                          "hypothesis_label": h["hypothesis_label"],
+                          "candidate_vector_order": h["candidate_vector_order"],
+                          "candidate_fsig_zero_based_indices": h["candidate_fsig_zero_based_indices"],
+                          "candidate_fsig_one_based_indices": h["candidate_fsig_one_based_indices"],
+                          "mapping_basis": h["mapping_basis"],
+                          "candidate_priority": h["candidate_priority"],
+                          "mapping_confirmed_now": False,
+                          "fsigma8_subblock_identified_now": False,
+                          "covariance_values_loaded": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      })
+
+              mapping_hypotheses = pd.DataFrame(hypothesis_rows)
+
+              human_review_packet = mapping_hypotheses.copy()
+              human_review_packet["human_dimension_order_mapping_decision"] = ""
+              human_review_packet["allowed_human_dimension_order_mapping_decisions"] = "approve_mapping_hypothesis_for_later_subblock_readiness|needs_source_documentation|reject_mapping_hypothesis|keep_blocked"
+              human_review_packet["human_dimension_order_mapping_note"] = ""
+              human_review_packet["mapping_hypothesis_approved_now"] = False
+              human_review_packet["dimension_order_mapping_confirmed_now"] = False
+              human_review_packet["fsigma8_subblock_identified_now"] = False
+              human_review_packet["covariance_values_loaded"] = False
+              human_review_packet["support_allowed"] = False
+
+              family_summary = pd.DataFrame([
+                  {
+                      "family_id": "V4_381_FAMILY_001",
+                      "family": "final_consensus_dM_Hz_fsig",
+                      "selected_rows": int(readiness_matrix["selected_member_name"].astype(str).str.contains("final_consensus", case=False, na=False).sum() and readiness_matrix["selected_member_name"].astype(str).str.contains("dM_Hz", case=False, na=False).sum()),
+                      "role": "candidate closest to final consensus dM/Hz/fsig covariance family",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "family_id": "V4_381_FAMILY_002",
+                      "family": "final_consensus_dV_FAP_fsig",
+                      "selected_rows": int(((readiness_matrix["selected_member_name"].astype(str).str.contains("final_consensus", case=False, na=False)) & (readiness_matrix["selected_member_name"].astype(str).str.contains("dV_FAP", case=False, na=False))).sum()),
+                      "role": "candidate closest to final consensus dV/FAP/fsig covariance family",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "family_id": "V4_381_FAMILY_003",
+                      "family": "FS_consensus_dM_Hz_fsig",
+                      "selected_rows": int(((readiness_matrix["selected_member_name"].astype(str).str.contains("FS_consensus", case=False, na=False)) & (readiness_matrix["selected_member_name"].astype(str).str.contains("dM_Hz", case=False, na=False))).sum()),
+                      "role": "full-shape consensus dM/Hz/fsig fallback/comparison family",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "family_id": "V4_381_FAMILY_004",
+                      "family": "FS_consensus_dV_FAP_fsig",
+                      "selected_rows": int(((readiness_matrix["selected_member_name"].astype(str).str.contains("FS_consensus", case=False, na=False)) & (readiness_matrix["selected_member_name"].astype(str).str.contains("dV_FAP", case=False, na=False))).sum()),
+                      "role": "full-shape consensus dV/FAP/fsig fallback/comparison family",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+              ])
+
+              readiness_summary = pd.DataFrame([
+                  {"summary_metric": "dimension_order_readiness_rows", "value": int(len(readiness_matrix)), "note": "Candidate 9x9 files moved into dimension/order readiness."},
+                  {"summary_metric": "mapping_hypothesis_rows", "value": int(len(mapping_hypotheses)), "note": "Three mapping hypotheses per candidate member."},
+                  {"summary_metric": "dimension_matches_expected_9x9_rows", "value": int(readiness_matrix["dimension_matches_expected_9x9"].astype(bool).sum()), "note": "Rows whose preview shape matches 3 redshifts x 3 observables."},
+                  {"summary_metric": "interleaved_hypothesis_rows", "value": int((mapping_hypotheses["hypothesis_id"] == "interleaved_by_redshift").sum()), "note": "Candidate fsig positions 3,6,9 one-based."},
+                  {"summary_metric": "grouped_hypothesis_rows", "value": int((mapping_hypotheses["hypothesis_id"] == "grouped_by_observable").sum()), "note": "Candidate fsig positions 7,8,9 one-based."},
+                  {"summary_metric": "requires_documentation_hypothesis_rows", "value": int((mapping_hypotheses["hypothesis_id"] == "requires_source_documentation").sum()), "note": "Truth-boundary fallback hypothesis."},
+                  {"summary_metric": "covariance_values_loaded", "value": 0, "note": "No covariance values loaded."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_381 = pd.DataFrame([
+                  {"status_id": "V4_381_STATUS_001", "status": "dimension_order_readiness_created", "detail": f"{len(readiness_matrix)} candidate 9x9 rows prepared for human mapping review."},
+                  {"status_id": "V4_381_STATUS_002", "status": "mapping_hypotheses_created", "detail": "Interleaved, grouped, and documentation-required hypotheses created for each member."},
+                  {"status_id": "V4_381_STATUS_003", "status": "no_mapping_confirmed", "detail": "No dimension/order mapping or fsigma8 subblock is confirmed in v4.381."},
+                  {"status_id": "V4_381_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_381_LIMIT_001", "limit": "9x9 shape does not by itself prove correct row/order mapping.", "status": "active_limit"},
+                  {"limit_id": "V4_381_LIMIT_002", "limit": "Mapping hypotheses are candidates only and require later human review.", "status": "active_limit"},
+                  {"limit_id": "V4_381_LIMIT_003", "limit": "No covariance values or subblocks are loaded in v4.381.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_381_LIMIT_004", "limit": "No covariance dimension or observed-row order match is confirmed.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_381_LIMIT_005", "limit": "No likelihood, p-values, score, or support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_381_GAP_001", "gap": "Candidate dimension/order mapping readiness created.", "status_after_v4_381": "mapping_hypotheses_ready_for_human_review_no_values", "next_gate": "v4_382_dimension_order_mapping_review_ingest_no_values_no_support"},
+                  {"gap_id": "V4_381_GAP_002", "gap": "Exact covariance member remains unapproved.", "status_after_v4_381": "still_open", "next_gate": "human_mapping_review"},
+                  {"gap_id": "V4_381_GAP_003", "gap": "Covariance values remain unloaded.", "status_after_v4_381": "still_blocked", "next_gate": "later_after_mapping_and_subblock_readiness"},
+                  {"gap_id": "V4_381_GAP_004", "gap": "Covariance dimension/order match remains unconfirmed.", "status_after_v4_381": "still_blocked", "next_gate": "v4_382_dimension_order_mapping_review"},
+                  {"gap_id": "V4_381_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_381": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_381"},
+              ])
+
+              hard_checks = {
+                  "input_v4_380_summary_found": summary380.get("version") == "v4.380",
+                  "input_v4_380_rules_all_passed": summary_rules_all_passed(summary380),
+                  "input_v4_380_failed_gates_none": summary380.get("failed_gates") == "none",
+                  "input_v4_380_shape_review_rows_4": summary380.get("shape_review_rows") == 4,
+                  "input_v4_380_approved_for_dimension_order_rows_4": summary380.get("approved_for_later_dimension_order_review_rows") == 4,
+                  "input_v4_380_dimension_order_packet_rows_4": summary380.get("dimension_order_packet_rows") == 4,
+                  "input_v4_380_candidate_9x9_rows_4": summary380.get("candidate_9x9_rectangular_rows") == 4,
+                  "input_v4_380_raw_values_not_retained": summary380.get("raw_covariance_values_retained") is False,
+                  "input_v4_380_matrix_not_loaded": summary380.get("usable_covariance_matrix_loaded") is False,
+                  "input_v4_380_exact_member_not_approved": summary380.get("exact_covariance_member_approved") is False,
+                  "input_v4_380_exact_file_not_staged": summary380.get("exact_covariance_file_staged") is False,
+                  "input_v4_380_no_full_covariance": summary380.get("full_covariance_available") is False,
+                  "input_v4_380_no_values_loaded": summary380.get("full_covariance_values_loaded") is False,
+                  "input_v4_380_no_dimension_confirmed": summary380.get("covariance_dimension_confirmed") is False,
+                  "input_v4_380_no_row_order": summary380.get("observed_row_order_matched") is False,
+                  "input_v4_380_no_likelihood": summary380.get("likelihood_computed") is False,
+                  "input_v4_380_no_p_values": summary380.get("p_values_computed") is False,
+                  "input_v4_380_no_score_valid": summary380.get("score_valid") is False,
+                  "input_v4_380_no_support_allowed": summary380.get("support_allowed") is False,
+
+                  "rules380_all_passed": passed_column_all(rules380),
+                  "review_ingest_rows_equal_4": len(review_ingest) == 4,
+                  "approved_shapes_rows_equal_4": len(approved_shapes) == 4,
+                  "dimension_order_packet_input_rows_equal_4": len(dimension_order_packet_input) == 4,
+                  "repair_shapes_rows_equal_0": len(repair_shapes) == 0,
+                  "rejected_shapes_rows_equal_0": len(rejected_shapes) == 0,
+                  "blocked_shapes_rows_equal_0": len(blocked_shapes) == 0,
+                  "shape_summary_rows_equal_8": len(shape_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations380_rows_equal_5": len(limitations380) == 5,
+                  "gap380_rows_equal_5": len(gap380) == 5,
+                  "header_preview_rows_equal_4": len(header_preview) == 4,
+
+                  "readiness_matrix_rows_equal_4": len(readiness_matrix) == 4,
+                  "all_dimension_matches_expected_9x9": readiness_matrix["dimension_matches_expected_9x9"].astype(bool).all(),
+                  "mapping_hypotheses_rows_equal_12": len(mapping_hypotheses) == 12,
+                  "human_review_packet_rows_equal_hypotheses": len(human_review_packet) == len(mapping_hypotheses),
+                  "interleaved_hypotheses_equal_4": int((mapping_hypotheses["hypothesis_id"] == "interleaved_by_redshift").sum()) == 4,
+                  "grouped_hypotheses_equal_4": int((mapping_hypotheses["hypothesis_id"] == "grouped_by_observable").sum()) == 4,
+                  "documentation_hypotheses_equal_4": int((mapping_hypotheses["hypothesis_id"] == "requires_source_documentation").sum()) == 4,
+                  "family_summary_rows_equal_4": len(family_summary) == 4,
+                  "readiness_summary_rows_equal_8": len(readiness_summary) == 8,
+                  "route_status_381_rows_equal_4": len(route_status_381) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "no_mapping_confirmed": false_col(readiness_matrix, "dimension_order_mapping_confirmed_now") and false_col(mapping_hypotheses, "mapping_confirmed_now"),
+                  "no_fsigma8_subblock_identified": false_col(readiness_matrix, "fsigma8_subblock_identified_now") and false_col(mapping_hypotheses, "fsigma8_subblock_identified_now"),
+                  "raw_values_not_retained": false_col(readiness_matrix, "raw_covariance_values_retained"),
+                  "usable_matrix_not_loaded": false_col(readiness_matrix, "usable_covariance_matrix_loaded"),
+                  "no_covariance_subblock_extracted": false_col(readiness_matrix, "covariance_subblock_extracted"),
+                  "no_full_covariance_available": false_col(readiness_matrix, "full_covariance_available"),
+                  "no_covariance_values_loaded": false_col(readiness_matrix, "full_covariance_values_loaded") and false_col(mapping_hypotheses, "covariance_values_loaded") and false_col(human_review_packet, "covariance_values_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(readiness_matrix, "covariance_dimension_confirmed"),
+                  "no_observed_row_order_matched": false_col(readiness_matrix, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(readiness_matrix, "likelihood_computed"),
+                  "no_p_values_computed": false_col(readiness_matrix, "p_values_computed"),
+                  "no_score_valid": false_col(readiness_matrix, "score_valid"),
+                  "no_support_allowed": false_col(readiness_matrix, "support_allowed") and false_col(mapping_hypotheses, "support_allowed") and false_col(human_review_packet, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary381 = {
+                  "version": "v4.381",
+                  "route_name": "v4_381_candidate_covariance_dimension_order_mapping_readiness_no_values_no_support_claims",
+                  "expected_result": "v4_381_candidate_covariance_dimension_order_mapping_readiness_passed_no_values_no_support_claims",
+                  "input_version": "v4.380",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "dimension_order_readiness_rows": int(len(readiness_matrix)),
+                  "mapping_hypothesis_rows": int(len(mapping_hypotheses)),
+                  "human_review_packet_rows": int(len(human_review_packet)),
+                  "dimension_matches_expected_9x9_rows": int(readiness_matrix["dimension_matches_expected_9x9"].astype(bool).sum()),
+                  "mapping_confirmed_now": False,
+                  "fsigma8_subblock_identified_now": False,
+                  "raw_covariance_values_retained": False,
+                  "usable_covariance_matrix_loaded": False,
+                  "covariance_subblock_extracted": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_381_dimension_order_mapping_review_then_v4_382_dimension_order_mapping_review_ingest_no_values_no_support_claims",
+              }
+
+              readiness_matrix.to_csv(outdir / "v4_381_dimension_order_readiness_matrix_NO_VALUES_NO_SUPPORT.csv", index=False)
+              mapping_hypotheses.to_csv(outdir / "v4_381_candidate_dimension_order_mapping_hypotheses_NO_VALUES.csv", index=False)
+              human_review_packet.to_csv(outdir / "v4_381_HUMAN_FILL_dimension_order_mapping_review_NO_VALUES_NO_SUPPORT.csv", index=False)
+              family_summary.to_csv(outdir / "v4_381_candidate_covariance_family_summary_NO_VALUES.csv", index=False)
+              readiness_summary.to_csv(outdir / "v4_381_dimension_order_readiness_summary_NO_VALUES.csv", index=False)
+              route_status_381.to_csv(outdir / "v4_381_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_381_limitations_after_dimension_order_readiness.csv", index=False)
+              gap_update.to_csv(outdir / "v4_381_gap_status_after_dimension_order_readiness.csv", index=False)
+              dimension_order_packet_input.to_csv(outdir / "v4_381_input_v4_380_dimension_order_packet_preserved.csv", index=False)
+              header_preview.to_csv(outdir / "v4_381_input_v4_380_header_preview_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_381_rule_checks.csv", index=False)
+
+              (outdir / "v4_381_summary.json").write_text(json.dumps(summary381, indent=2))
+
+              summary_md = f"""# TAIRID v4.381 Candidate Covariance Dimension/Order Mapping Readiness — No Values, No Support Claims
+
+          Expected result: `{summary381["expected_result"]}`
+
+          {summary381["rules_passed"]} / {summary381["rules_total"]} rules passed
+
+          failed_gates = {summary381["failed_gates"]}
+
+          dimension_order_readiness_rows = {summary381["dimension_order_readiness_rows"]}
+
+          mapping_hypothesis_rows = {summary381["mapping_hypothesis_rows"]}
+
+          human_review_packet_rows = {summary381["human_review_packet_rows"]}
+
+          dimension_matches_expected_9x9_rows = {summary381["dimension_matches_expected_9x9_rows"]}
+
+          mapping_confirmed_now = false
+
+          fsigma8_subblock_identified_now = false
+
+          raw_covariance_values_retained = false
+
+          usable_covariance_matrix_loaded = false
+
+          covariance_subblock_extracted = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step builds mapping-readiness hypotheses only.
+
+          It does **not** confirm the correct covariance order.
+
+          It does **not** identify a usable fsigma8 subblock.
+
+          It does **not** load covariance values.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary381["selected_next_route"]}`
+          """
+              (outdir / "v4_381_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary381, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_381_dimension_order_mapping_readiness_no_support.py
+
+      - name: Run v4.381 dimension order mapping readiness no support
+        run: |
+          python run_v4_381_dimension_order_mapping_readiness_no_support.py
+
+      - name: Upload v4.381 dimension order mapping readiness artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-381-dimension-order-mapping-readiness-no-values-no-support-output
+          path: |
+            tairid_v4_381_candidate_covariance_dimension_order_mapping_readiness_no_values_no_support_output/
+            tairid_v4_381_candidate_covariance_dimension_order_mapping_readiness_no_values_no_support_output.zip
