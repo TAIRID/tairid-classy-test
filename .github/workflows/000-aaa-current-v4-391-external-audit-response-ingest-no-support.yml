@@ -1,0 +1,437 @@
+name: "!!! AAA CURRENT - TAIRID v4.391 external audit response ingest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-391-external-audit-response-ingest-no-support:
+    name: "!!! AAA CURRENT - Run v4.391 external audit response ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.390 audit packet ZIP and external audit response ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.390 external audit packet ZIP..."
+          INPUT_390_ZIP="$(ls tairid-v4-390-external-ai-audit-packet-covariance-corrected-diagnostic-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_390_ZIP" ]; then
+            echo "Could not find v4.390 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-390-external-ai-audit-packet-covariance-corrected-diagnostic-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled external audit response ZIP..."
+          AUDIT_RESPONSE_ZIP="$(ls tairid-v4-390-human-filled-external-ai-audit-responses-for-v4-391-no-support*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$AUDIT_RESPONSE_ZIP" ]; then
+            echo "Could not find external audit response ZIP."
+            echo "Expected:"
+            echo "tairid-v4-390-human-filled-external-ai-audit-responses-for-v4-391-no-support.zip"
+            exit 1
+          fi
+
+          echo "Using v4.390 ZIP:"
+          echo "$INPUT_390_ZIP"
+          echo "Using external audit response ZIP:"
+          echo "$AUDIT_RESPONSE_ZIP"
+
+          echo "INPUT_390_ZIP=$INPUT_390_ZIP" >> "$GITHUB_ENV"
+          echo "AUDIT_RESPONSE_ZIP=$AUDIT_RESPONSE_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.391 external audit response ingest script
+        run: |
+          cat > run_v4_391_external_audit_response_ingest_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "external audit response ingest only; external audit responses may be recorded and compared against v4.390 packet values; no new chi-square; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          EXPECTED_PRIOR_DIAGONAL = 1.362038876169214
+          EXPECTED_FULL_COV = 1.384804886905097
+          EXPECTED_DIFF = 0.022766010735883135
+          EXPECTED_RATIO = 1.0167146556050686
+          TOL = 1e-12
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def bool_col_all(df, col, expected=True):
+              if col not in df.columns:
+                  return False
+              truthy = df[col].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
+              return bool(truthy.all() if expected else (~truthy).all())
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def approx_equal(value, expected, tol=TOL):
+              try:
+                  return abs(float(value) - float(expected)) <= tol
+              except Exception:
+                  return False
+
+          def main():
+              input_390 = Path(os.environ["INPUT_390_ZIP"])
+              audit_zip = Path(os.environ["AUDIT_RESPONSE_ZIP"])
+
+              outdir = Path("tairid_v4_391_external_audit_response_ingest_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base390 = extract_zip(input_390, "tairid_v4_391_390_")
+              baseaudit = extract_zip(audit_zip, "tairid_v4_391_audit_")
+
+              summary390_path = find_one(base390, "v4_390_summary.json")
+              findings390_path = find_one(base390, "v4_390_guarded_covariance_corrected_findings_NO_SUPPORT.csv")
+              ruled_open390_path = find_one(base390, "v4_390_ruled_out_and_open_gaps.csv")
+              stage_ledger390_path = find_one(base390, "v4_390_stage_ledger_through_covariance_corrected_diagnostic.csv")
+              questions390_path = find_one(base390, "v4_390_external_ai_audit_questions.csv")
+              comparison389_path = find_one(base390, "v4_389_comparison_against_guarded_diagonal_NO_SUPPORT.csv")
+              terms389_path = find_one(base390, "v4_389_full_covariance_chi_square_dry_run_terms_NO_SUPPORT.csv")
+              dry_summary389_path = find_one(base390, "v4_389_full_covariance_chi_square_dry_run_summary_NO_SUPPORT.csv")
+              rules390_path = find_one(base390, "v4_390_rule_checks.csv")
+
+              audit_response_path = find_one_suffix(baseaudit, "HUMAN_FILLED_external_ai_audit_responses_FOR_v4_391_NO_SUPPORT.csv")
+
+              summary390 = json.loads(summary390_path.read_text())
+              findings390 = pd.read_csv(findings390_path)
+              ruled_open390 = pd.read_csv(ruled_open390_path)
+              stage_ledger390 = pd.read_csv(stage_ledger390_path)
+              questions390 = pd.read_csv(questions390_path)
+              comparison389 = pd.read_csv(comparison389_path)
+              terms389 = pd.read_csv(terms389_path)
+              dry_summary389 = pd.read_csv(dry_summary389_path)
+              rules390 = pd.read_csv(rules390_path)
+              audit_responses = pd.read_csv(audit_response_path)
+
+              term_col = "chi_square_term" if "chi_square_term" in terms389.columns else "full_covariance_chi_square_component"
+              term_sum = float(terms389[term_col].sum()) if term_col in terms389.columns else float("nan")
+
+              audit_review_rows = []
+              for _, row in audit_responses.iterrows():
+                  audit_review_rows.append({
+                      "v4_391_audit_response_review_id": f"v4_391_audit_response_{len(audit_review_rows)+1:03d}",
+                      "external_audit_id": clean(row["external_audit_id"]),
+                      "auditor_label": clean(row["auditor_label"]),
+                      "audit_overall_pass": clean(row["audit_overall_pass"]).lower() in ["true", "1", "yes"],
+                      "truth_boundary_preserved": clean(row["truth_boundary_preserved"]).lower() in ["true", "1", "yes"],
+                      "improper_support_claim_found": clean(row["improper_support_claim_found"]).lower() in ["true", "1", "yes"],
+                      "likelihood_or_p_values_computed": clean(row["likelihood_or_p_values_computed"]).lower() in ["true", "1", "yes"],
+                      "score_valid_or_support_allowed_validated": clean(row["score_valid_or_support_allowed_validated"]).lower() in ["true", "1", "yes"],
+                      "diagonal_vs_covariance_corrected_distinguished": clean(row["diagonal_vs_covariance_corrected_distinguished"]).lower() in ["true", "1", "yes"],
+                      "full_covariance_chi_square_value_supported": clean(row["full_covariance_chi_square_value_supported"]).lower() in ["true", "1", "yes"],
+                      "overclaim_detected": clean(row["overclaim_detected"]).lower() in ["true", "1", "yes"],
+                      "corrective_action_required": clean(row["corrective_action_required"]).lower() in ["true", "1", "yes"],
+                      "reported_prior_matches_packet": approx_equal(row["reported_prior_guarded_diagonal_chi_square_sum"], summary390["prior_guarded_diagonal_chi_square_sum"]),
+                      "reported_full_cov_matches_packet": approx_equal(row["reported_full_covariance_chi_square_dry_run_sum"], summary390["full_covariance_chi_square_dry_run_sum"]),
+                      "reported_difference_matches_packet": approx_equal(row["reported_full_minus_diagonal_chi_square_difference"], summary390["full_minus_diagonal_chi_square_difference"]),
+                      "reported_ratio_matches_packet": approx_equal(row["reported_full_to_diagonal_chi_square_ratio"], summary390["full_to_diagonal_chi_square_ratio"]),
+                      "reported_dof_matches_packet": int(float(row["reported_degrees_of_freedom_candidate"])) == int(summary390["degrees_of_freedom_candidate"]),
+                      "strongest_honest_conclusion": clean(row["strongest_honest_conclusion"]),
+                      "strongest_honest_criticism": clean(row["strongest_honest_criticism"]),
+                      "recommended_next_gate": clean(row["recommended_next_gate"]),
+                      "audit_response_accepted_for_ledger": True,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+              audit_review = pd.DataFrame(audit_review_rows)
+
+              consensus_summary = pd.DataFrame([
+                  {"consensus_metric": "external_audit_response_rows", "value": int(len(audit_responses)), "note": "Two external AI audit responses ingested."},
+                  {"consensus_metric": "audit_overall_pass_rows", "value": int(audit_review["audit_overall_pass"].astype(bool).sum()), "note": "Audits reporting overall pass."},
+                  {"consensus_metric": "truth_boundary_preserved_rows", "value": int(audit_review["truth_boundary_preserved"].astype(bool).sum()), "note": "Audits reporting truth boundary preserved."},
+                  {"consensus_metric": "overclaim_detected_rows", "value": int(audit_review["overclaim_detected"].astype(bool).sum()), "note": "Should remain zero."},
+                  {"consensus_metric": "corrective_action_required_rows", "value": int(audit_review["corrective_action_required"].astype(bool).sum()), "note": "Should remain zero."},
+                  {"consensus_metric": "packet_value_match_rows", "value": int((audit_review["reported_full_cov_matches_packet"].astype(bool) & audit_review["reported_prior_matches_packet"].astype(bool)).sum()), "note": "Audits whose key values match the packet."},
+                  {"consensus_metric": "likelihood_computed", "value": 0, "note": "No likelihood computed."},
+                  {"consensus_metric": "p_values_computed", "value": 0, "note": "No p-values computed."},
+                  {"consensus_metric": "score_valid", "value": 0, "note": "score_valid remains false."},
+                  {"consensus_metric": "support_allowed", "value": 0, "note": "support_allowed remains false."},
+              ])
+
+              post_audit_options = pd.DataFrame([
+                  {
+                      "route_option_id": "V4_391_ROUTE_001",
+                      "route_name": "cautious_diagnostic_interpretation_no_support",
+                      "route_status": "available_after_clean_audit_ingest",
+                      "description": "Prepare a bounded interpretation stating only that the covariance-corrected dry-run chi-square is close to the prior diagonal diagnostic, without p-values, likelihood, score validation, or support claims.",
+                      "support_allowed": False,
+                  },
+                  {
+                      "route_option_id": "V4_391_ROUTE_002",
+                      "route_name": "robustness_comparison_lane_no_support",
+                      "route_status": "recommended_before_any_public_scientific_writeup",
+                      "description": "Run the same dry-run calculation on preserved alternate covariance candidates such as dV_FAP_fsig and FS_consensus to test covariance-family sensitivity.",
+                      "support_allowed": False,
+                  },
+                  {
+                      "route_option_id": "V4_391_ROUTE_003",
+                      "route_name": "external_audit_archive_only_no_interpretation",
+                      "route_status": "available_if_stopping_here",
+                      "description": "Archive the audit response and make no interpretive move yet.",
+                      "support_allowed": False,
+                  },
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_391_LIMIT_001", "limit": "External audits passing does not convert the dry run into a support claim.", "status": "active_limit"},
+                  {"limit_id": "V4_391_LIMIT_002", "limit": "No new chi-square is computed in v4.391.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_391_LIMIT_003", "limit": "No likelihood or p-values are computed in v4.391.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_391_LIMIT_004", "limit": "score_valid remains false and support_allowed remains false.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_391_LIMIT_005", "limit": "Broader robustness and interpretation remain future gates.", "status": "open_gap"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_391_GAP_001", "gap": "External audit responses ingested.", "status_after_v4_391": "closed_cleanly", "next_gate": "v4_392_post_audit_route_decision_no_support"},
+                  {"gap_id": "V4_391_GAP_002", "gap": "Cautious interpretation not yet written.", "status_after_v4_391": "still_open", "next_gate": "cautious_diagnostic_interpretation_or_route_decision"},
+                  {"gap_id": "V4_391_GAP_003", "gap": "Robustness against alternate covariance candidates not yet run.", "status_after_v4_391": "still_open", "next_gate": "robustness_comparison_lane"},
+                  {"gap_id": "V4_391_GAP_004", "gap": "Likelihood and p-values remain uncomputed.", "status_after_v4_391": "still_blocked", "next_gate": "future_truth_boundary_change_required"},
+                  {"gap_id": "V4_391_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_391": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_391"},
+              ])
+
+              hard_checks = {
+                  "input_v4_390_summary_found": summary390.get("version") == "v4.390",
+                  "input_v4_390_rules_all_passed": int(summary390.get("rules_passed")) == int(summary390.get("rules_total")),
+                  "input_v4_390_failed_gates_none": summary390.get("failed_gates") == "none",
+                  "input_prior_diagonal_matches_expected": approx_equal(summary390.get("prior_guarded_diagonal_chi_square_sum"), EXPECTED_PRIOR_DIAGONAL),
+                  "input_full_cov_matches_expected": approx_equal(summary390.get("full_covariance_chi_square_dry_run_sum"), EXPECTED_FULL_COV),
+                  "input_difference_matches_expected": approx_equal(summary390.get("full_minus_diagonal_chi_square_difference"), EXPECTED_DIFF),
+                  "input_ratio_matches_expected": approx_equal(summary390.get("full_to_diagonal_chi_square_ratio"), EXPECTED_RATIO),
+                  "input_dof_3": int(summary390.get("degrees_of_freedom_candidate")) == 3,
+                  "input_likelihood_false": summary390.get("likelihood_computed") is False,
+                  "input_p_values_false": summary390.get("p_values_computed") is False,
+                  "input_score_valid_false": summary390.get("score_valid") is False,
+                  "input_support_allowed_false": summary390.get("support_allowed") is False,
+                  "rules390_all_passed": passed_column_all(rules390),
+                  "findings390_rows_at_least_7": len(findings390) >= 7,
+                  "ruled_open390_rows_at_least_5": len(ruled_open390) >= 5,
+                  "stage_ledger390_has_rows": len(stage_ledger390) >= 1,
+                  "questions390_has_10_rows": len(questions390) >= 10,
+                  "comparison389_has_rows": len(comparison389) >= 1,
+                  "terms389_rows_3": len(terms389) == 3,
+                  "term_sum_matches_full_cov": approx_equal(term_sum, summary390.get("full_covariance_chi_square_dry_run_sum"), 1e-9),
+                  "dry_summary389_has_rows": len(dry_summary389) >= 1,
+
+                  "audit_response_rows_equal_2": len(audit_responses) == 2,
+                  "audit_review_rows_equal_responses": len(audit_review) == len(audit_responses),
+                  "audit_overall_pass_all": bool_col_all(audit_review, "audit_overall_pass", True),
+                  "truth_boundary_preserved_all": bool_col_all(audit_review, "truth_boundary_preserved", True),
+                  "no_improper_support_claim_found_all": bool_col_all(audit_review, "improper_support_claim_found", False),
+                  "no_likelihood_or_p_values_reported_all": bool_col_all(audit_review, "likelihood_or_p_values_computed", False),
+                  "no_score_or_support_validated_all": bool_col_all(audit_review, "score_valid_or_support_allowed_validated", False),
+                  "diagonal_vs_cov_distinguished_all": bool_col_all(audit_review, "diagonal_vs_covariance_corrected_distinguished", True),
+                  "value_supported_all": bool_col_all(audit_review, "full_covariance_chi_square_value_supported", True),
+                  "no_overclaim_detected_all": bool_col_all(audit_review, "overclaim_detected", False),
+                  "no_corrective_action_required_all": bool_col_all(audit_review, "corrective_action_required", False),
+                  "reported_prior_matches_packet_all": bool_col_all(audit_review, "reported_prior_matches_packet", True),
+                  "reported_full_cov_matches_packet_all": bool_col_all(audit_review, "reported_full_cov_matches_packet", True),
+                  "reported_difference_matches_packet_all": bool_col_all(audit_review, "reported_difference_matches_packet", True),
+                  "reported_ratio_matches_packet_all": bool_col_all(audit_review, "reported_ratio_matches_packet", True),
+                  "reported_dof_matches_packet_all": bool_col_all(audit_review, "reported_dof_matches_packet", True),
+                  "audit_responses_accepted_for_ledger_all": bool_col_all(audit_review, "audit_response_accepted_for_ledger", True),
+                  "consensus_summary_rows_equal_10": len(consensus_summary) == 10,
+                  "post_audit_options_rows_equal_3": len(post_audit_options) == 3,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "no_new_likelihood": summary390.get("likelihood_computed") is False,
+                  "no_new_p_values": summary390.get("p_values_computed") is False,
+                  "no_score_valid": false_col(audit_review, "score_valid"),
+                  "no_support_allowed": false_col(audit_review, "support_allowed") and false_col(post_audit_options, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([{"gate": k, "passed": bool(v)} for k, v in hard_checks.items()])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary391 = {
+                  "version": "v4.391",
+                  "route_name": "v4_391_external_ai_audit_response_ingest_no_support_claims",
+                  "expected_result": "v4_391_external_ai_audit_response_ingest_passed_no_corrections_no_support_claims",
+                  "input_version": "v4.390",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "external_audit_response_rows": int(len(audit_responses)),
+                  "audit_overall_pass_rows": int(audit_review["audit_overall_pass"].astype(bool).sum()),
+                  "truth_boundary_preserved_rows": int(audit_review["truth_boundary_preserved"].astype(bool).sum()),
+                  "overclaim_detected_rows": int(audit_review["overclaim_detected"].astype(bool).sum()),
+                  "corrective_action_required_rows": int(audit_review["corrective_action_required"].astype(bool).sum()),
+                  "prior_guarded_diagonal_chi_square_sum": float(summary390["prior_guarded_diagonal_chi_square_sum"]),
+                  "full_covariance_chi_square_dry_run_sum": float(summary390["full_covariance_chi_square_dry_run_sum"]),
+                  "full_minus_diagonal_chi_square_difference": float(summary390["full_minus_diagonal_chi_square_difference"]),
+                  "full_to_diagonal_chi_square_ratio": float(summary390["full_to_diagonal_chi_square_ratio"]),
+                  "degrees_of_freedom_candidate": int(summary390["degrees_of_freedom_candidate"]),
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_392_post_audit_route_decision_no_support_claims",
+              }
+
+              audit_review.to_csv(outdir / "v4_391_external_audit_response_ingest_ledger_NO_SUPPORT.csv", index=False)
+              consensus_summary.to_csv(outdir / "v4_391_external_audit_consensus_summary_NO_SUPPORT.csv", index=False)
+              post_audit_options.to_csv(outdir / "v4_391_post_audit_route_options_NO_SUPPORT.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_391_limitations_after_audit_response_ingest.csv", index=False)
+              gap_update.to_csv(outdir / "v4_391_gap_status_after_audit_response_ingest.csv", index=False)
+              audit_responses.to_csv(outdir / "v4_391_input_external_audit_responses_preserved.csv", index=False)
+              findings390.to_csv(outdir / "v4_391_input_v4_390_findings_preserved.csv", index=False)
+              comparison389.to_csv(outdir / "v4_391_input_v4_389_diagonal_comparison_preserved.csv", index=False)
+              terms389.to_csv(outdir / "v4_391_input_v4_389_chi_square_terms_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_391_rule_checks.csv", index=False)
+              (outdir / "v4_391_summary.json").write_text(json.dumps(summary391, indent=2))
+
+              summary_md = f"""# TAIRID v4.391 External AI Audit Response Ingest — No Support Claims
+
+          Expected result: `{summary391['expected_result']}`
+
+          {summary391['rules_passed']} / {summary391['rules_total']} rules passed
+
+          failed_gates = {summary391['failed_gates']}
+
+          external_audit_response_rows = {summary391['external_audit_response_rows']}
+
+          audit_overall_pass_rows = {summary391['audit_overall_pass_rows']}
+
+          truth_boundary_preserved_rows = {summary391['truth_boundary_preserved_rows']}
+
+          overclaim_detected_rows = {summary391['overclaim_detected_rows']}
+
+          corrective_action_required_rows = {summary391['corrective_action_required_rows']}
+
+          prior_guarded_diagonal_chi_square_sum = {summary391['prior_guarded_diagonal_chi_square_sum']}
+
+          full_covariance_chi_square_dry_run_sum = {summary391['full_covariance_chi_square_dry_run_sum']}
+
+          full_minus_diagonal_chi_square_difference = {summary391['full_minus_diagonal_chi_square_difference']}
+
+          full_to_diagonal_chi_square_ratio = {summary391['full_to_diagonal_chi_square_ratio']}
+
+          new_chi_square_computed = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step ingests the external audit responses only.
+
+          It does **not** compute a new chi-square.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** validate score_valid.
+
+          It does **not** allow support claims.
+
+          Next route: `{summary391['selected_next_route']}`
+          """
+              (outdir / "v4_391_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary391, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_391_external_audit_response_ingest_no_support.py
+
+      - name: Run v4.391 external audit response ingest no support
+        run: |
+          python run_v4_391_external_audit_response_ingest_no_support.py
+
+      - name: Upload v4.391 external audit response ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-391-external-audit-response-ingest-no-support-output
+          path: |
+            tairid_v4_391_external_audit_response_ingest_no_support_output/
+            tairid_v4_391_external_audit_response_ingest_no_support_output.zip
