@@ -1,0 +1,533 @@
+name: "!!! AAA CURRENT - TAIRID v4.383 fsigma8 subblock readiness no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-383-fsigma8-subblock-readiness-no-support:
+    name: "!!! AAA CURRENT - Run v4.383 fsigma8 subblock readiness"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.382 input ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.382 output ZIP by pattern..."
+          INPUT_382_ZIP="$(ls tairid-v4-382-dimension-order-mapping-review-ingest-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_382_ZIP" ]; then
+            echo "Could not find v4.382 output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-382-dimension-order-mapping-review-ingest-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Using v4.382 ZIP:"
+          echo "$INPUT_382_ZIP"
+          echo "INPUT_382_ZIP=$INPUT_382_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.383 fsigma8 subblock readiness script
+        run: |
+          cat > run_v4_383_fsigma8_subblock_readiness_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "fsigma8 subblock-readiness only; candidate interleaved indices may be converted into subblock coordinate plans; no raw covariance values retained; no usable covariance matrix loaded; no covariance subblock extracted; no full covariance available; no covariance values loaded; no observed-row order matched by value; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          OBSERVED_REDSHIFT_ROWS = ["z0.38", "z0.51", "z0.61"]
+          OBSERVED_ROW_IDS = ["BOSS_DR12_z0.38", "BOSS_DR12_z0.51", "BOSS_DR12_z0.61"]
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def parse_indices(index_text):
+              parts = [p.strip() for p in clean(index_text).split("|") if p.strip() != ""]
+              return [int(p) for p in parts]
+
+          def matrix_coords(indices):
+              rows = []
+              for i_pos, i in enumerate(indices):
+                  for j_pos, j in enumerate(indices):
+                      rows.append({
+                          "subblock_row_position_zero_based": i_pos,
+                          "subblock_col_position_zero_based": j_pos,
+                          "subblock_row_position_one_based": i_pos + 1,
+                          "subblock_col_position_one_based": j_pos + 1,
+                          "source_matrix_row_zero_based": i,
+                          "source_matrix_col_zero_based": j,
+                          "source_matrix_row_one_based": i + 1,
+                          "source_matrix_col_one_based": j + 1,
+                          "row_observed_redshift": OBSERVED_REDSHIFT_ROWS[i_pos],
+                          "col_observed_redshift": OBSERVED_REDSHIFT_ROWS[j_pos],
+                          "row_observed_id_candidate": OBSERVED_ROW_IDS[i_pos],
+                          "col_observed_id_candidate": OBSERVED_ROW_IDS[j_pos],
+                      })
+              return rows
+
+          def main():
+              input_382 = Path(os.environ["INPUT_382_ZIP"])
+
+              outdir = Path("tairid_v4_383_fsigma8_subblock_readiness_no_values_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base382 = extract_zip(input_382, "tairid_v4_383_382_")
+
+              summary382_path = find_one(base382, "v4_382_summary.json")
+              review_ingest_path = find_one(base382, "v4_382_dimension_order_mapping_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv")
+              approved_mappings_path = find_one(base382, "v4_382_APPROVED_interleaved_mapping_hypotheses_FOR_LATER_SUBBLOCK_READINESS_NO_VALUES.csv")
+              rejected_mappings_path = find_one(base382, "v4_382_rejected_grouped_mapping_hypotheses.csv")
+              blocked_mappings_path = find_one(base382, "v4_382_blocked_documentation_fallback_hypotheses.csv")
+              subblock_readiness_input_path = find_one(base382, "v4_382_fsigma8_subblock_readiness_packet_NO_VALUES_NO_SUPPORT.csv")
+              selected_family_summary_path = find_one(base382, "v4_382_selected_mapping_family_summary_NO_VALUES.csv")
+              mapping_review_summary_path = find_one(base382, "v4_382_mapping_review_summary_NO_VALUES.csv")
+              route_status_path = find_one(base382, "v4_382_route_status_summary.csv")
+              limitations382_path = find_one(base382, "v4_382_limitations_after_mapping_review.csv")
+              gap382_path = find_one(base382, "v4_382_gap_status_after_mapping_review.csv")
+              mapping_hypotheses_path = find_one(base382, "v4_382_input_v4_381_mapping_hypotheses_preserved.csv")
+              rules382_path = find_one(base382, "v4_382_rule_checks.csv")
+
+              summary382 = json.loads(summary382_path.read_text())
+              review_ingest = pd.read_csv(review_ingest_path)
+              approved_mappings = pd.read_csv(approved_mappings_path)
+              rejected_mappings = pd.read_csv(rejected_mappings_path)
+              blocked_mappings = pd.read_csv(blocked_mappings_path)
+              subblock_readiness_input = pd.read_csv(subblock_readiness_input_path)
+              selected_family_summary = pd.read_csv(selected_family_summary_path)
+              mapping_review_summary = pd.read_csv(mapping_review_summary_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations382 = pd.read_csv(limitations382_path)
+              gap382 = pd.read_csv(gap382_path)
+              mapping_hypotheses = pd.read_csv(mapping_hypotheses_path)
+              rules382 = pd.read_csv(rules382_path)
+
+              readiness_rows = []
+              coordinate_rows = []
+
+              for _, row in subblock_readiness_input.iterrows():
+                  zero_indices = parse_indices(row["selected_fsigma8_zero_based_indices"])
+                  one_indices = parse_indices(row["selected_fsigma8_one_based_indices"])
+                  index_count = len(zero_indices)
+                  unique_index_count = len(set(zero_indices))
+                  sorted_indices = sorted(zero_indices)
+                  index_valid = zero_indices == [2, 5, 8] and one_indices == [3, 6, 9]
+                  subblock_size = index_count
+                  coordinate_count = subblock_size * subblock_size if index_valid else 0
+
+                  readiness_id = f"v4_383_subblock_ready_{len(readiness_rows)+1:03d}"
+
+                  readiness_rows.append({
+                      "v4_383_subblock_readiness_id": readiness_id,
+                      "v4_382_mapping_review_id": clean(row["v4_382_mapping_review_id"]),
+                      "selected_member_name": clean(row["selected_member_name"]),
+                      "source_label": clean(row.get("source_label", "")),
+                      "source_url": clean(row.get("source_url", "")),
+                      "candidate_observable_family_from_filename": clean(row["candidate_observable_family_from_filename"]),
+                      "candidate_consensus_family_from_filename": clean(row["candidate_consensus_family_from_filename"]),
+                      "selected_mapping_hypothesis": clean(row["selected_mapping_family"]),
+                      "selected_fsigma8_zero_based_indices": clean(row["selected_fsigma8_zero_based_indices"]),
+                      "selected_fsigma8_one_based_indices": clean(row["selected_fsigma8_one_based_indices"]),
+                      "selected_indices_count": index_count,
+                      "unique_selected_indices_count": unique_index_count,
+                      "sorted_selected_zero_based_indices": "|".join(str(x) for x in sorted_indices),
+                      "candidate_subblock_size": subblock_size,
+                      "candidate_subblock_coordinate_count": coordinate_count,
+                      "candidate_observed_redshift_order": "|".join(OBSERVED_REDSHIFT_ROWS),
+                      "candidate_observed_row_ids": "|".join(OBSERVED_ROW_IDS),
+                      "subblock_readiness_status": "ready_for_human_subblock_index_review_no_values" if index_valid else "blocked_invalid_candidate_indices",
+                      "index_plan_valid_for_3x3_fsigma8_subblock": bool(index_valid),
+                      "subblock_candidate_identified_for_later_review": bool(index_valid),
+                      "dimension_order_mapping_confirmed_now": False,
+                      "fsigma8_subblock_identified_now": False,
+                      "covariance_subblock_extracted": False,
+                      "raw_covariance_values_retained": False,
+                      "usable_covariance_matrix_loaded": False,
+                      "exact_covariance_member_approved": False,
+                      "full_covariance_available": False,
+                      "full_covariance_values_loaded": False,
+                      "covariance_dimension_confirmed": False,
+                      "observed_row_order_matched": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+                  if index_valid:
+                      for coord in matrix_coords(zero_indices):
+                          coordinate_rows.append({
+                              "v4_383_subblock_coordinate_id": f"v4_383_subblock_coord_{len(coordinate_rows)+1:04d}",
+                              "v4_383_subblock_readiness_id": readiness_id,
+                              "selected_member_name": clean(row["selected_member_name"]),
+                              "candidate_consensus_family_from_filename": clean(row["candidate_consensus_family_from_filename"]),
+                              "candidate_observable_family_from_filename": clean(row["candidate_observable_family_from_filename"]),
+                              **coord,
+                              "coordinate_status": "candidate_coordinate_for_later_extraction_no_values",
+                              "coordinate_value_loaded": False,
+                              "support_allowed": False,
+                              "claim_boundary": CLAIM_BOUNDARY,
+                          })
+
+              subblock_readiness = pd.DataFrame(readiness_rows)
+              coordinate_plan = pd.DataFrame(coordinate_rows)
+
+              human_review_packet = subblock_readiness.copy()
+              human_review_packet["human_subblock_readiness_decision"] = ""
+              human_review_packet["allowed_human_subblock_readiness_decisions"] = "approve_subblock_index_plan_for_later_controlled_value_extraction|needs_mapping_repair|reject_candidate_member|keep_blocked"
+              human_review_packet["human_subblock_readiness_note"] = ""
+              human_review_packet["subblock_index_plan_approved_now"] = False
+              human_review_packet["covariance_subblock_extracted"] = False
+              human_review_packet["full_covariance_values_loaded"] = False
+              human_review_packet["support_allowed"] = False
+
+              family_candidate_priority = pd.DataFrame([
+                  {
+                      "priority_id": "V4_383_PRIORITY_001",
+                      "family": "final_consensus_dM_Hz_fsig",
+                      "member_match_count": int(((subblock_readiness["candidate_consensus_family_from_filename"].astype(str) == "final_consensus") & (subblock_readiness["candidate_observable_family_from_filename"].astype(str) == "dM_Hz_fsig")).sum()),
+                      "suggested_role": "primary candidate if matching original observed fσ8 row definitions",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "priority_id": "V4_383_PRIORITY_002",
+                      "family": "final_consensus_dV_FAP_fsig",
+                      "member_match_count": int(((subblock_readiness["candidate_consensus_family_from_filename"].astype(str) == "final_consensus") & (subblock_readiness["candidate_observable_family_from_filename"].astype(str) == "dV_FAP_fsig")).sum()),
+                      "suggested_role": "parallel final-consensus parameterization candidate",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "priority_id": "V4_383_PRIORITY_003",
+                      "family": "FS_consensus_dM_Hz_fsig",
+                      "member_match_count": int(((subblock_readiness["candidate_consensus_family_from_filename"].astype(str) == "FS_consensus") & (subblock_readiness["candidate_observable_family_from_filename"].astype(str) == "dM_Hz_fsig")).sum()),
+                      "suggested_role": "full-shape fallback or comparison candidate",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "priority_id": "V4_383_PRIORITY_004",
+                      "family": "FS_consensus_dV_FAP_fsig",
+                      "member_match_count": int(((subblock_readiness["candidate_consensus_family_from_filename"].astype(str) == "FS_consensus") & (subblock_readiness["candidate_observable_family_from_filename"].astype(str) == "dV_FAP_fsig")).sum()),
+                      "suggested_role": "full-shape fallback or comparison candidate",
+                      "values_loaded": False,
+                      "support_allowed": False,
+                  },
+              ])
+
+              readiness_summary = pd.DataFrame([
+                  {"summary_metric": "subblock_readiness_rows", "value": int(len(subblock_readiness)), "note": "Approved interleaved mapping rows converted into subblock-readiness rows."},
+                  {"summary_metric": "valid_3x3_index_plan_rows", "value": int(subblock_readiness["index_plan_valid_for_3x3_fsigma8_subblock"].astype(bool).sum()), "note": "Rows with candidate fσ8 indices 2|5|8 zero-based."},
+                  {"summary_metric": "subblock_coordinate_rows", "value": int(len(coordinate_plan)), "note": "Nine coordinate candidates per member, no values loaded."},
+                  {"summary_metric": "human_review_packet_rows", "value": int(len(human_review_packet)), "note": "Rows for human subblock-readiness review."},
+                  {"summary_metric": "dimension_order_mapping_confirmed_now", "value": 0, "note": "Still not confirmed as a scoring-ready covariance mapping."},
+                  {"summary_metric": "covariance_subblock_extracted", "value": 0, "note": "No subblock extracted."},
+                  {"summary_metric": "full_covariance_values_loaded", "value": 0, "note": "No covariance values loaded."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_383 = pd.DataFrame([
+                  {"status_id": "V4_383_STATUS_001", "status": "fsigma8_subblock_readiness_created", "detail": f"{len(subblock_readiness)} member rows prepared with candidate indices 2|5|8 zero-based."},
+                  {"status_id": "V4_383_STATUS_002", "status": "coordinate_plan_created", "detail": f"{len(coordinate_plan)} candidate subblock coordinate rows created without values."},
+                  {"status_id": "V4_383_STATUS_003", "status": "no_subblock_extracted", "detail": "Subblock coordinate plan is not value extraction."},
+                  {"status_id": "V4_383_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_383_LIMIT_001", "limit": "Subblock readiness is not covariance extraction.", "status": "active_limit"},
+                  {"limit_id": "V4_383_LIMIT_002", "limit": "Candidate indices 2|5|8 are selected for later review only.", "status": "active_limit"},
+                  {"limit_id": "V4_383_LIMIT_003", "limit": "No covariance values are loaded in v4.383.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_383_LIMIT_004", "limit": "Observed-row order is not matched by value in v4.383.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_383_LIMIT_005", "limit": "No likelihood, p-values, score, or support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_383_GAP_001", "gap": "fσ8 subblock-readiness created.", "status_after_v4_383": "subblock_index_plan_ready_for_human_review_no_values", "next_gate": "v4_384_fsigma8_subblock_readiness_review_ingest_no_values_no_support"},
+                  {"gap_id": "V4_383_GAP_002", "gap": "Subblock extraction remains unperformed.", "status_after_v4_383": "still_blocked", "next_gate": "later_after_human_subblock_readiness_review"},
+                  {"gap_id": "V4_383_GAP_003", "gap": "Covariance values remain unloaded.", "status_after_v4_383": "still_blocked", "next_gate": "later_controlled_value_extraction_gate"},
+                  {"gap_id": "V4_383_GAP_004", "gap": "Observed-row order remains untested by values.", "status_after_v4_383": "still_blocked", "next_gate": "later_row_order_validation_gate"},
+                  {"gap_id": "V4_383_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_383": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_383"},
+              ])
+
+              hard_checks = {
+                  "input_v4_382_summary_found": summary382.get("version") == "v4.382",
+                  "input_v4_382_rules_all_passed": summary_rules_all_passed(summary382),
+                  "input_v4_382_failed_gates_none": summary382.get("failed_gates") == "none",
+                  "input_v4_382_mapping_review_rows_12": summary382.get("mapping_review_rows") == 12,
+                  "input_v4_382_approved_mapping_rows_4": summary382.get("approved_mapping_rows") == 4,
+                  "input_v4_382_selected_interleaved": summary382.get("selected_mapping_hypothesis") == "interleaved_by_redshift",
+                  "input_v4_382_zero_indices_258": summary382.get("selected_fsigma8_zero_based_indices") == "2|5|8",
+                  "input_v4_382_one_indices_369": summary382.get("selected_fsigma8_one_based_indices") == "3|6|9",
+                  "input_v4_382_subblock_readiness_rows_4": summary382.get("subblock_readiness_rows") == 4,
+                  "input_v4_382_no_dimension_confirmed": summary382.get("dimension_order_mapping_confirmed_now") is False,
+                  "input_v4_382_no_fsig_subblock_identified": summary382.get("fsigma8_subblock_identified_now") is False,
+                  "input_v4_382_no_subblock_extracted": summary382.get("covariance_subblock_extracted") is False,
+                  "input_v4_382_no_full_covariance": summary382.get("full_covariance_available") is False,
+                  "input_v4_382_no_values_loaded": summary382.get("full_covariance_values_loaded") is False,
+                  "input_v4_382_no_likelihood": summary382.get("likelihood_computed") is False,
+                  "input_v4_382_no_p_values": summary382.get("p_values_computed") is False,
+                  "input_v4_382_no_score_valid": summary382.get("score_valid") is False,
+                  "input_v4_382_no_support_allowed": summary382.get("support_allowed") is False,
+
+                  "rules382_all_passed": passed_column_all(rules382),
+                  "review_ingest_rows_equal_12": len(review_ingest) == 12,
+                  "approved_mappings_rows_equal_4": len(approved_mappings) == 4,
+                  "rejected_mappings_rows_equal_4": len(rejected_mappings) == 4,
+                  "blocked_mappings_rows_equal_4": len(blocked_mappings) == 4,
+                  "subblock_readiness_input_rows_equal_4": len(subblock_readiness_input) == 4,
+                  "selected_family_summary_rows_equal_3": len(selected_family_summary) == 3,
+                  "mapping_review_summary_rows_equal_8": len(mapping_review_summary) == 8,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations382_rows_equal_5": len(limitations382) == 5,
+                  "gap382_rows_equal_5": len(gap382) == 5,
+                  "mapping_hypotheses_rows_equal_12": len(mapping_hypotheses) == 12,
+
+                  "subblock_readiness_rows_equal_4": len(subblock_readiness) == 4,
+                  "all_index_plans_valid": subblock_readiness["index_plan_valid_for_3x3_fsigma8_subblock"].astype(bool).all(),
+                  "coordinate_plan_rows_equal_36": len(coordinate_plan) == 36,
+                  "human_review_packet_rows_equal_readiness": len(human_review_packet) == len(subblock_readiness),
+                  "family_candidate_priority_rows_equal_4": len(family_candidate_priority) == 4,
+                  "readiness_summary_rows_equal_8": len(readiness_summary) == 8,
+                  "route_status_383_rows_equal_4": len(route_status_383) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "no_dimension_order_mapping_confirmed": false_col(subblock_readiness, "dimension_order_mapping_confirmed_now"),
+                  "no_fsigma8_subblock_identified_now": false_col(subblock_readiness, "fsigma8_subblock_identified_now"),
+                  "no_subblock_extracted": false_col(subblock_readiness, "covariance_subblock_extracted") and false_col(human_review_packet, "covariance_subblock_extracted"),
+                  "raw_values_not_retained": false_col(subblock_readiness, "raw_covariance_values_retained"),
+                  "usable_matrix_not_loaded": false_col(subblock_readiness, "usable_covariance_matrix_loaded"),
+                  "exact_covariance_member_not_approved": false_col(subblock_readiness, "exact_covariance_member_approved"),
+                  "no_full_covariance_available": false_col(subblock_readiness, "full_covariance_available"),
+                  "no_covariance_values_loaded": false_col(subblock_readiness, "full_covariance_values_loaded") and false_col(human_review_packet, "full_covariance_values_loaded") and false_col(coordinate_plan, "coordinate_value_loaded"),
+                  "no_covariance_dimension_confirmed": false_col(subblock_readiness, "covariance_dimension_confirmed"),
+                  "no_observed_row_order_matched": false_col(subblock_readiness, "observed_row_order_matched"),
+                  "no_likelihood_computed": false_col(subblock_readiness, "likelihood_computed"),
+                  "no_p_values_computed": false_col(subblock_readiness, "p_values_computed"),
+                  "no_score_valid": false_col(subblock_readiness, "score_valid"),
+                  "no_support_allowed": false_col(subblock_readiness, "support_allowed") and false_col(human_review_packet, "support_allowed") and false_col(coordinate_plan, "support_allowed") and false_col(family_candidate_priority, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary383 = {
+                  "version": "v4.383",
+                  "route_name": "v4_383_fsigma8_subblock_readiness_no_values_no_support_claims",
+                  "expected_result": "v4_383_fsigma8_subblock_readiness_passed_coordinate_plan_no_values_no_support_claims",
+                  "input_version": "v4.382",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "subblock_readiness_rows": int(len(subblock_readiness)),
+                  "valid_3x3_index_plan_rows": int(subblock_readiness["index_plan_valid_for_3x3_fsigma8_subblock"].astype(bool).sum()),
+                  "subblock_coordinate_rows": int(len(coordinate_plan)),
+                  "human_review_packet_rows": int(len(human_review_packet)),
+                  "selected_fsigma8_zero_based_indices": "2|5|8",
+                  "selected_fsigma8_one_based_indices": "3|6|9",
+                  "candidate_subblock_size": 3,
+                  "dimension_order_mapping_confirmed_now": False,
+                  "fsigma8_subblock_identified_now": False,
+                  "covariance_subblock_extracted": False,
+                  "raw_covariance_values_retained": False,
+                  "usable_covariance_matrix_loaded": False,
+                  "exact_covariance_member_approved": False,
+                  "full_covariance_available": False,
+                  "full_covariance_values_loaded": False,
+                  "covariance_dimension_confirmed": False,
+                  "observed_row_order_matched": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "human_fill_v4_383_subblock_readiness_review_then_v4_384_fsigma8_subblock_readiness_review_ingest_no_values_no_support_claims",
+              }
+
+              subblock_readiness.to_csv(outdir / "v4_383_fsigma8_subblock_readiness_matrix_NO_VALUES_NO_SUPPORT.csv", index=False)
+              coordinate_plan.to_csv(outdir / "v4_383_fsigma8_subblock_coordinate_plan_NO_VALUES.csv", index=False)
+              human_review_packet.to_csv(outdir / "v4_383_HUMAN_FILL_fsigma8_subblock_readiness_review_NO_VALUES_NO_SUPPORT.csv", index=False)
+              family_candidate_priority.to_csv(outdir / "v4_383_family_candidate_priority_NO_VALUES.csv", index=False)
+              readiness_summary.to_csv(outdir / "v4_383_subblock_readiness_summary_NO_VALUES.csv", index=False)
+              route_status_383.to_csv(outdir / "v4_383_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_383_limitations_after_subblock_readiness.csv", index=False)
+              gap_update.to_csv(outdir / "v4_383_gap_status_after_subblock_readiness.csv", index=False)
+              subblock_readiness_input.to_csv(outdir / "v4_383_input_v4_382_subblock_readiness_preserved.csv", index=False)
+              approved_mappings.to_csv(outdir / "v4_383_input_v4_382_approved_mappings_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_383_rule_checks.csv", index=False)
+
+              (outdir / "v4_383_summary.json").write_text(json.dumps(summary383, indent=2))
+
+              summary_md = f"""# TAIRID v4.383 fσ8 Subblock Readiness — No Values, No Support Claims
+
+          Expected result: `{summary383["expected_result"]}`
+
+          {summary383["rules_passed"]} / {summary383["rules_total"]} rules passed
+
+          failed_gates = {summary383["failed_gates"]}
+
+          subblock_readiness_rows = {summary383["subblock_readiness_rows"]}
+
+          valid_3x3_index_plan_rows = {summary383["valid_3x3_index_plan_rows"]}
+
+          subblock_coordinate_rows = {summary383["subblock_coordinate_rows"]}
+
+          human_review_packet_rows = {summary383["human_review_packet_rows"]}
+
+          selected_fsigma8_zero_based_indices = `{summary383["selected_fsigma8_zero_based_indices"]}`
+
+          selected_fsigma8_one_based_indices = `{summary383["selected_fsigma8_one_based_indices"]}`
+
+          candidate_subblock_size = {summary383["candidate_subblock_size"]}
+
+          dimension_order_mapping_confirmed_now = false
+
+          fsigma8_subblock_identified_now = false
+
+          covariance_subblock_extracted = false
+
+          raw_covariance_values_retained = false
+
+          usable_covariance_matrix_loaded = false
+
+          exact_covariance_member_approved = false
+
+          full_covariance_available = false
+
+          full_covariance_values_loaded = false
+
+          covariance_dimension_confirmed = false
+
+          observed_row_order_matched = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step builds the fσ8 subblock coordinate plan only.
+
+          It does **not** extract covariance values.
+
+          It does **not** load a usable covariance matrix.
+
+          It does **not** confirm observed-row order by value.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary383["selected_next_route"]}`
+          """
+              (outdir / "v4_383_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary383, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_383_fsigma8_subblock_readiness_no_support.py
+
+      - name: Run v4.383 fsigma8 subblock readiness no support
+        run: |
+          python run_v4_383_fsigma8_subblock_readiness_no_support.py
+
+      - name: Upload v4.383 fsigma8 subblock readiness artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-383-fsigma8-subblock-readiness-no-values-no-support-output
+          path: |
+            tairid_v4_383_fsigma8_subblock_readiness_no_values_no_support_output/
+            tairid_v4_383_fsigma8_subblock_readiness_no_values_no_support_output.zip
