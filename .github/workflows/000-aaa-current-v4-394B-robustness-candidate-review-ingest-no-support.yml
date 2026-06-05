@@ -1,0 +1,562 @@
+name: "!!! AAA CURRENT - TAIRID v4.394B robustness candidate review ingest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-394B-robustness-candidate-review-ingest-no-support:
+    name: "!!! AAA CURRENT - Run v4.394B robustness candidate review ingest"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Find v4.393B output ZIP and human-filled robustness review ZIP
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Repository root files:"
+          ls -la
+
+          echo "Finding v4.393B output ZIP..."
+          INPUT_393B_ZIP="$(ls tairid-v4-393B-robustness-comparison-lane-manifest-no-values-no-support-output*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$INPUT_393B_ZIP" ]; then
+            echo "Could not find v4.393B output ZIP."
+            echo "Expected:"
+            echo "tairid-v4-393B-robustness-comparison-lane-manifest-no-values-no-support-output.zip"
+            exit 1
+          fi
+
+          echo "Finding human-filled v4.393B robustness candidate review ZIP..."
+          HUMAN_FILLED_ROBUSTNESS_REVIEW_ZIP="$(ls tairid-v4-393B-human-filled-robustness-candidate-review-for-v4-394B-no-values-no-support*.zip 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$HUMAN_FILLED_ROBUSTNESS_REVIEW_ZIP" ]; then
+            echo "Could not find human-filled robustness candidate review ZIP."
+            echo "Expected:"
+            echo "tairid-v4-393B-human-filled-robustness-candidate-review-for-v4-394B-no-values-no-support.zip"
+            exit 1
+          fi
+
+          echo "Using v4.393B ZIP:"
+          echo "$INPUT_393B_ZIP"
+
+          echo "Using human-filled robustness review ZIP:"
+          echo "$HUMAN_FILLED_ROBUSTNESS_REVIEW_ZIP"
+
+          echo "INPUT_393B_ZIP=$INPUT_393B_ZIP" >> "$GITHUB_ENV"
+          echo "HUMAN_FILLED_ROBUSTNESS_REVIEW_ZIP=$HUMAN_FILLED_ROBUSTNESS_REVIEW_ZIP" >> "$GITHUB_ENV"
+
+      - name: Write self-contained v4.394B robustness candidate review ingest script
+        run: |
+          cat > run_v4_394B_robustness_candidate_review_ingest_no_support.py <<'PY'
+          #!/usr/bin/env python3
+
+          import json
+          import zipfile
+          import shutil
+          import tempfile
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import pandas as pd
+
+          CLAIM_BOUNDARY = "robustness candidate review ingest only; alternate covariance candidates may be approved for later controlled extraction; no covariance values loaded; no new chi-square; no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+
+          ALLOWED_ROBUSTNESS_DECISIONS = {
+              "approve_for_controlled_reopen_and_extraction",
+              "keep_as_fallback_only",
+              "reject_candidate_for_now",
+              "needs_source_repair",
+          }
+
+          OFFICIAL_ALAM_ARCHIVE_URL = "https://data.sdss.org/sas/dr12/boss/papers/clustering/ALAM_ET_AL_2016_consensus_and_individual_Gaussian_constraints.tar.gz"
+
+          OBSERVED_REDSHIFT_ROWS = ["z0.38", "z0.51", "z0.61"]
+          OBSERVED_ROW_IDS = ["BOSS_DR12_z0.38", "BOSS_DR12_z0.51", "BOSS_DR12_z0.61"]
+          FSIG_ZERO_BASED = [2, 5, 8]
+          FSIG_ONE_BASED = [3, 6, 9]
+
+          def extract_zip(path: Path, prefix: str) -> Path:
+              tmp = Path(tempfile.mkdtemp(prefix=prefix))
+              with zipfile.ZipFile(path, "r") as z:
+                  z.extractall(tmp)
+
+              for nested_zip in list(tmp.rglob("*.zip")):
+                  try:
+                      nested_out = tmp / (nested_zip.stem + "_unzipped")
+                      nested_out.mkdir(exist_ok=True)
+                      with zipfile.ZipFile(nested_zip, "r") as z2:
+                          z2.extractall(nested_out)
+                  except zipfile.BadZipFile:
+                      pass
+
+              return tmp
+
+          def find_one(base: Path, filename: str) -> Path:
+              matches = list(base.rglob(filename))
+              if not matches:
+                  raise FileNotFoundError(f"Could not find {filename}")
+              return matches[0]
+
+          def find_one_suffix(base: Path, suffix: str) -> Path:
+              matches = [p for p in base.rglob("*") if p.is_file() and p.name.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Could not find file ending with {suffix}")
+              return matches[0]
+
+          def clean(value):
+              if pd.isna(value):
+                  return ""
+              return str(value).strip()
+
+          def false_col(df, col):
+              if col not in df.columns:
+                  return False
+              return df[col].fillna(False).astype(str).str.strip().str.lower().isin(["false", "0", "", "nan", "none"]).all()
+
+          def summary_rules_all_passed(summary):
+              try:
+                  return int(summary.get("rules_passed")) == int(summary.get("rules_total"))
+              except Exception:
+                  return False
+
+          def passed_column_all(df):
+              if "passed" not in df.columns:
+                  return False
+              return df["passed"].fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes"]).all()
+
+          def build_coordinate_rows(candidate_id, member_name, observable_family, consensus_family):
+              rows = []
+              for i_pos, source_i in enumerate(FSIG_ZERO_BASED):
+                  for j_pos, source_j in enumerate(FSIG_ZERO_BASED):
+                      rows.append({
+                          "v4_394B_candidate_id": candidate_id,
+                          "candidate_member_name": member_name,
+                          "candidate_observable_family": observable_family,
+                          "candidate_consensus_family": consensus_family,
+                          "subblock_row_position_zero_based": i_pos,
+                          "subblock_col_position_zero_based": j_pos,
+                          "subblock_row_position_one_based": i_pos + 1,
+                          "subblock_col_position_one_based": j_pos + 1,
+                          "source_matrix_row_zero_based": source_i,
+                          "source_matrix_col_zero_based": source_j,
+                          "source_matrix_row_one_based": source_i + 1,
+                          "source_matrix_col_one_based": source_j + 1,
+                          "row_observed_redshift_candidate": OBSERVED_REDSHIFT_ROWS[i_pos],
+                          "col_observed_redshift_candidate": OBSERVED_REDSHIFT_ROWS[j_pos],
+                          "row_observed_id_candidate": OBSERVED_ROW_IDS[i_pos],
+                          "col_observed_id_candidate": OBSERVED_ROW_IDS[j_pos],
+                          "coordinate_approved_for_later_value_extraction": True,
+                          "coordinate_value_loaded_now": False,
+                          "new_chi_square_computed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      })
+              return rows
+
+          def main():
+              input_393B = Path(os.environ["INPUT_393B_ZIP"])
+              human_zip = Path(os.environ["HUMAN_FILLED_ROBUSTNESS_REVIEW_ZIP"])
+
+              outdir = Path("tairid_v4_394B_robustness_candidate_review_ingest_no_values_no_support_output")
+              if outdir.exists():
+                  shutil.rmtree(outdir)
+              outdir.mkdir(parents=True)
+
+              base393B = extract_zip(input_393B, "tairid_v4_394B_393B_")
+              basehuman = extract_zip(human_zip, "tairid_v4_394B_human_")
+
+              summary393B_path = find_one(base393B, "v4_393B_summary.json")
+              candidate_manifest_path = find_one(base393B, "v4_393B_robustness_candidate_manifest_NO_VALUES_NO_SUPPORT.csv")
+              blank_review_path = find_one(base393B, "v4_393B_HUMAN_FILL_robustness_candidate_review_NO_VALUES_NO_SUPPORT.csv")
+              baseline_ref_path = find_one(base393B, "v4_393B_baseline_covariance_corrected_reference_NO_SUPPORT.csv")
+              manifest_summary_path = find_one(base393B, "v4_393B_manifest_summary_NO_SUPPORT.csv")
+              scope_boundary_path = find_one(base393B, "v4_393B_robustness_scope_boundary_NO_SUPPORT.csv")
+              sequence_plan_path = find_one(base393B, "v4_393B_robustness_sequence_plan_NO_SUPPORT.csv")
+              route_status_path = find_one(base393B, "v4_393B_route_status_summary.csv")
+              limitations393B_path = find_one(base393B, "v4_393B_limitations_after_robustness_manifest.csv")
+              gap393B_path = find_one(base393B, "v4_393B_gap_status_after_robustness_manifest.csv")
+              route_decision_input_path = find_one(base393B, "v4_393B_input_v4_392_route_decision_preserved.csv")
+              rules393B_path = find_one(base393B, "v4_393B_rule_checks.csv")
+
+              human_review_path = find_one_suffix(basehuman, "HUMAN_FILLED_robustness_candidate_review_NO_VALUES_NO_SUPPORT.csv")
+
+              summary393B = json.loads(summary393B_path.read_text())
+              candidate_manifest = pd.read_csv(candidate_manifest_path)
+              blank_review = pd.read_csv(blank_review_path)
+              baseline_ref = pd.read_csv(baseline_ref_path)
+              manifest_summary = pd.read_csv(manifest_summary_path)
+              scope_boundary = pd.read_csv(scope_boundary_path)
+              sequence_plan = pd.read_csv(sequence_plan_path)
+              route_status = pd.read_csv(route_status_path)
+              limitations393B = pd.read_csv(limitations393B_path)
+              gap393B = pd.read_csv(gap393B_path)
+              route_decision_input = pd.read_csv(route_decision_input_path)
+              rules393B = pd.read_csv(rules393B_path)
+              human_review = pd.read_csv(human_review_path)
+
+              for col in [
+                  "human_robustness_candidate_decision",
+                  "human_robustness_candidate_note",
+                  "candidate_approved_for_next_gate_now",
+              ]:
+                  if col not in human_review.columns:
+                      human_review[col] = ""
+
+              ingest_rows = []
+              coordinate_rows = []
+
+              for _, row in human_review.sort_values("suggested_priority").iterrows():
+                  decision = clean(row["human_robustness_candidate_decision"])
+                  approved = decision == "approve_for_controlled_reopen_and_extraction"
+
+                  if approved:
+                      row_status = "approved_for_later_controlled_alternate_extraction_no_values"
+                  elif decision == "keep_as_fallback_only":
+                      row_status = "kept_as_fallback_only_no_values"
+                  elif decision == "reject_candidate_for_now":
+                      row_status = "rejected_for_current_robustness_lane"
+                  elif decision == "needs_source_repair":
+                      row_status = "blocked_needs_source_repair"
+                  else:
+                      row_status = "invalid_or_missing_robustness_candidate_decision"
+
+                  candidate_id = clean(row["v4_393B_candidate_id"])
+                  member_name = clean(row["candidate_member_name"])
+                  observable_family = clean(row["candidate_observable_family"])
+                  consensus_family = clean(row["candidate_consensus_family"])
+
+                  ingest_rows.append({
+                      "v4_394B_review_id": f"v4_394B_review_{len(ingest_rows)+1:03d}",
+                      "v4_393B_candidate_id": candidate_id,
+                      "source_robustness_item_id": clean(row["source_robustness_item_id"]),
+                      "robustness_lane": clean(row["robustness_lane"]),
+                      "candidate_member_name": member_name,
+                      "candidate_observable_family": observable_family,
+                      "candidate_consensus_family": consensus_family,
+                      "suggested_priority": int(float(row["suggested_priority"])),
+                      "suggested_role": clean(row["suggested_role"]),
+                      "purpose": clean(row["purpose"]),
+                      "human_robustness_candidate_decision": decision,
+                      "human_robustness_candidate_note": clean(row["human_robustness_candidate_note"]),
+                      "row_review_status": row_status,
+                      "candidate_approved_for_controlled_reopen_and_extraction": bool(approved),
+                      "source_archive_url": OFFICIAL_ALAM_ARCHIVE_URL,
+                      "selected_fsigma8_zero_based_indices": "2|5|8",
+                      "selected_fsigma8_one_based_indices": "3|6|9",
+                      "candidate_subblock_size": 3,
+                      "candidate_coordinate_rows_expected": 9,
+                      "new_chi_square_computed": False,
+                      "covariance_values_loaded": False,
+                      "covariance_subblock_extracted_now": False,
+                      "full_covariance_values_loaded": False,
+                      "likelihood_computed": False,
+                      "p_values_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+
+                  if approved:
+                      coordinate_rows.extend(build_coordinate_rows(candidate_id, member_name, observable_family, consensus_family))
+
+              review_ingest = pd.DataFrame(ingest_rows)
+              approved_candidates = review_ingest[review_ingest["candidate_approved_for_controlled_reopen_and_extraction"].astype(bool)].copy()
+              fallback_only = review_ingest[review_ingest["row_review_status"] == "kept_as_fallback_only_no_values"].copy()
+              rejected_candidates = review_ingest[review_ingest["row_review_status"] == "rejected_for_current_robustness_lane"].copy()
+              repair_candidates = review_ingest[review_ingest["row_review_status"] == "blocked_needs_source_repair"].copy()
+              invalid_rows = review_ingest[review_ingest["row_review_status"] == "invalid_or_missing_robustness_candidate_decision"].copy()
+
+              final_consensus_alternate = approved_candidates[
+                  approved_candidates["candidate_consensus_family"].astype(str).eq("final_consensus")
+                  & approved_candidates["candidate_observable_family"].astype(str).eq("dV_FAP_fsig")
+              ].copy()
+
+              fs_consensus_fallback = approved_candidates[
+                  approved_candidates["candidate_consensus_family"].astype(str).eq("FS_consensus")
+              ].copy()
+
+              controlled_extraction_packet = approved_candidates.copy()
+              controlled_extraction_packet["next_gate"] = "v4_395B_controlled_alternate_covariance_extraction_integrity_row_order_no_support"
+              controlled_extraction_packet["controlled_robustness_scope"] = "alternate_covariance_subblock_extraction_integrity_and_row_order_no_scoring"
+              controlled_extraction_packet["extraction_priority"] = range(1, len(controlled_extraction_packet) + 1)
+              controlled_extraction_packet["value_extraction_allowed_in_next_gate"] = True
+              controlled_extraction_packet["coordinate_rows_expected"] = 9
+              controlled_extraction_packet["coordinate_rows_available"] = 9
+              controlled_extraction_packet["new_chi_square_computed"] = False
+              controlled_extraction_packet["covariance_values_loaded"] = False
+              controlled_extraction_packet["score_valid"] = False
+              controlled_extraction_packet["support_allowed"] = False
+
+              coordinate_packet = pd.DataFrame(coordinate_rows)
+
+              comparison_plan = pd.DataFrame([
+                  {
+                      "comparison_plan_id": "V4_394B_COMPARE_001",
+                      "candidate_member_name": "final_consensus_covtot_dV_FAP_fsig.txt",
+                      "candidate_role": "alternate_final_consensus_parameterization",
+                      "compare_against": "v4.389 approved dM_Hz_fsig dry run",
+                      "planned_next_gate": "v4_395B",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "comparison_plan_id": "V4_394B_COMPARE_002",
+                      "candidate_member_name": "FS_consensus_covtot_dM_Hz_fsig.txt",
+                      "candidate_role": "full_shape_consensus_fallback_same_observable_family",
+                      "compare_against": "v4.389 approved dM_Hz_fsig dry run",
+                      "planned_next_gate": "v4_395B",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+                  {
+                      "comparison_plan_id": "V4_394B_COMPARE_003",
+                      "candidate_member_name": "FS_consensus_covtot_dV_FAP_fsig.txt",
+                      "candidate_role": "full_shape_consensus_fallback_alternate_parameterization",
+                      "compare_against": "v4.389 approved dM_Hz_fsig dry run",
+                      "planned_next_gate": "v4_395B",
+                      "new_chi_square_computed": False,
+                      "support_allowed": False,
+                  },
+              ])
+
+              review_summary = pd.DataFrame([
+                  {"summary_metric": "robustness_review_rows", "value": int(len(review_ingest)), "note": "Human robustness review rows ingested."},
+                  {"summary_metric": "approved_robustness_candidate_rows", "value": int(len(approved_candidates)), "note": "Rows approved for controlled alternate extraction only."},
+                  {"summary_metric": "final_consensus_alternate_approved_rows", "value": int(len(final_consensus_alternate)), "note": "Final-consensus alternate dV/FAP/fsig row approved."},
+                  {"summary_metric": "fs_consensus_fallback_approved_rows", "value": int(len(fs_consensus_fallback)), "note": "FS-consensus fallback rows approved for robustness comparison."},
+                  {"summary_metric": "controlled_extraction_packet_rows", "value": int(len(controlled_extraction_packet)), "note": "Rows that may enter v4.395B controlled extraction checks."},
+                  {"summary_metric": "coordinate_packet_rows", "value": int(len(coordinate_packet)), "note": "Nine coordinate rows per approved candidate, no values loaded."},
+                  {"summary_metric": "new_chi_square_computed", "value": 0, "note": "No new chi-square computed in v4.394B."},
+                  {"summary_metric": "support_allowed", "value": 0, "note": "No support claim is allowed."},
+              ])
+
+              route_status_394B = pd.DataFrame([
+                  {"status_id": "V4_394B_STATUS_001", "status": "robustness_candidate_review_ingested", "detail": f"{len(approved_candidates)} alternate covariance candidates approved for later controlled extraction."},
+                  {"status_id": "V4_394B_STATUS_002", "status": "comparison_candidates_selected", "detail": "Approved candidates include final-consensus dV/FAP/fsig and two FS-consensus fallback rows."},
+                  {"status_id": "V4_394B_STATUS_003", "status": "no_values_or_chi_square", "detail": "This gate only approves candidates for v4.395B."},
+                  {"status_id": "V4_394B_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ])
+
+              limitation_update = pd.DataFrame([
+                  {"limit_id": "V4_394B_LIMIT_001", "limit": "Candidate approval is for robustness extraction only, not interpretation.", "status": "active_limit"},
+                  {"limit_id": "V4_394B_LIMIT_002", "limit": "No alternate covariance values are loaded in v4.394B.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_394B_LIMIT_003", "limit": "No new chi-square is computed in v4.394B.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_394B_LIMIT_004", "limit": "No likelihood, p-values, or score validation is allowed.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_394B_LIMIT_005", "limit": "No support claim is allowed.", "status": "blocked_by_design"},
+              ])
+
+              gap_update = pd.DataFrame([
+                  {"gap_id": "V4_394B_GAP_001", "gap": "Robustness candidate review ingested.", "status_after_v4_394B": "three_candidates_approved_for_controlled_extraction_no_values", "next_gate": "v4_395B_controlled_alternate_covariance_extraction_integrity_row_order_no_support"},
+                  {"gap_id": "V4_394B_GAP_002", "gap": "Alternate covariance extraction remains unperformed.", "status_after_v4_394B": "still_open", "next_gate": "v4_395B"},
+                  {"gap_id": "V4_394B_GAP_003", "gap": "Alternate chi-square comparison remains uncomputed.", "status_after_v4_394B": "still_blocked", "next_gate": "v4_396B_after_extraction_integrity_row_order"},
+                  {"gap_id": "V4_394B_GAP_004", "gap": "Cautious interpretation remains deferred.", "status_after_v4_394B": "deferred_until_after_robustness", "next_gate": "later_v4_398A"},
+                  {"gap_id": "V4_394B_GAP_005", "gap": "Support claims remain blocked.", "status_after_v4_394B": "still_blocked", "next_gate": "no_support_claims_allowed_from_v4_394B"},
+              ])
+
+              hard_checks = {
+                  "input_v4_393B_summary_found": summary393B.get("version") == "v4.393B",
+                  "input_v4_393B_rules_all_passed": summary_rules_all_passed(summary393B),
+                  "input_v4_393B_failed_gates_none": summary393B.get("failed_gates") == "none",
+                  "input_v4_393B_candidate_rows_3": summary393B.get("robustness_candidate_rows") == 3,
+                  "input_v4_393B_final_consensus_alternate_rows_1": summary393B.get("final_consensus_alternate_rows") == 1,
+                  "input_v4_393B_fs_consensus_rows_2": summary393B.get("fs_consensus_fallback_rows") == 2,
+                  "input_v4_393B_no_new_chi_square": summary393B.get("new_chi_square_computed") is False,
+                  "input_v4_393B_no_covariance_values_loaded": summary393B.get("covariance_values_loaded") is False,
+                  "input_v4_393B_no_likelihood": summary393B.get("likelihood_computed") is False,
+                  "input_v4_393B_no_p_values": summary393B.get("p_values_computed") is False,
+                  "input_v4_393B_no_score_valid": summary393B.get("score_valid") is False,
+                  "input_v4_393B_no_support_allowed": summary393B.get("support_allowed") is False,
+
+                  "rules393B_all_passed": passed_column_all(rules393B),
+                  "candidate_manifest_rows_equal_3": len(candidate_manifest) == 3,
+                  "blank_review_rows_equal_3": len(blank_review) == 3,
+                  "baseline_ref_rows_at_least_1": len(baseline_ref) >= 1,
+                  "manifest_summary_rows_at_least_1": len(manifest_summary) >= 1,
+                  "scope_boundary_rows_at_least_1": len(scope_boundary) >= 1,
+                  "sequence_plan_rows_at_least_1": len(sequence_plan) >= 1,
+                  "route_status_rows_equal_4": len(route_status) == 4,
+                  "limitations393B_rows_equal_5": len(limitations393B) == 5,
+                  "gap393B_rows_equal_5": len(gap393B) == 5,
+                  "route_decision_input_rows_at_least_1": len(route_decision_input) >= 1,
+
+                  "human_review_rows_equal_3": len(human_review) == 3,
+                  "human_decisions_filled": human_review["human_robustness_candidate_decision"].apply(clean).ne("").all(),
+                  "human_decisions_allowed": human_review["human_robustness_candidate_decision"].apply(clean).isin(ALLOWED_ROBUSTNESS_DECISIONS).all(),
+                  "review_ingest_rows_equal_human_review": len(review_ingest) == len(human_review),
+                  "approved_candidates_equal_3": len(approved_candidates) == 3,
+                  "fallback_only_equal_0": len(fallback_only) == 0,
+                  "rejected_candidates_equal_0": len(rejected_candidates) == 0,
+                  "repair_candidates_equal_0": len(repair_candidates) == 0,
+                  "invalid_rows_equal_0": len(invalid_rows) == 0,
+                  "final_consensus_alternate_approved_equal_1": len(final_consensus_alternate) == 1,
+                  "fs_consensus_fallback_approved_equal_2": len(fs_consensus_fallback) == 2,
+                  "controlled_extraction_packet_rows_equal_3": len(controlled_extraction_packet) == 3,
+                  "coordinate_packet_rows_equal_27": len(coordinate_packet) == 27,
+                  "comparison_plan_rows_equal_3": len(comparison_plan) == 3,
+                  "review_summary_rows_equal_8": len(review_summary) == 8,
+                  "route_status_394B_rows_equal_4": len(route_status_394B) == 4,
+                  "limitation_update_rows_equal_5": len(limitation_update) == 5,
+                  "gap_update_rows_equal_5": len(gap_update) == 5,
+
+                  "no_new_chi_square_computed": false_col(review_ingest, "new_chi_square_computed") and false_col(coordinate_packet, "new_chi_square_computed") and false_col(comparison_plan, "new_chi_square_computed"),
+                  "no_covariance_values_loaded": false_col(review_ingest, "covariance_values_loaded") and false_col(coordinate_packet, "coordinate_value_loaded_now"),
+                  "no_subblock_extracted_now": false_col(review_ingest, "covariance_subblock_extracted_now"),
+                  "no_full_covariance_values_loaded": false_col(review_ingest, "full_covariance_values_loaded"),
+                  "no_likelihood_computed": false_col(review_ingest, "likelihood_computed"),
+                  "no_p_values_computed": false_col(review_ingest, "p_values_computed"),
+                  "no_score_valid": false_col(review_ingest, "score_valid") and false_col(coordinate_packet, "score_valid") and false_col(controlled_extraction_packet, "score_valid"),
+                  "no_support_allowed": false_col(review_ingest, "support_allowed") and false_col(coordinate_packet, "support_allowed") and false_col(controlled_extraction_packet, "support_allowed") and false_col(comparison_plan, "support_allowed"),
+              }
+
+              rule_checks = pd.DataFrame([
+                  {"gate": k, "passed": bool(v)} for k, v in hard_checks.items()
+              ])
+              failed = rule_checks.loc[~rule_checks["passed"], "gate"].tolist()
+
+              summary394B = {
+                  "version": "v4.394B",
+                  "route_name": "v4_394B_robustness_candidate_review_ingest_no_values_no_support_claims",
+                  "expected_result": "v4_394B_robustness_candidate_review_ingest_passed_all_candidates_approved_no_values_no_support_claims",
+                  "input_version": "v4.393B",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": int(rule_checks["passed"].sum()),
+                  "rules_total": int(len(rule_checks)),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "robustness_review_rows": int(len(review_ingest)),
+                  "approved_robustness_candidate_rows": int(len(approved_candidates)),
+                  "final_consensus_alternate_approved_rows": int(len(final_consensus_alternate)),
+                  "fs_consensus_fallback_approved_rows": int(len(fs_consensus_fallback)),
+                  "controlled_extraction_packet_rows": int(len(controlled_extraction_packet)),
+                  "coordinate_packet_rows": int(len(coordinate_packet)),
+                  "new_chi_square_computed": False,
+                  "covariance_values_loaded": False,
+                  "covariance_subblock_extracted_now": False,
+                  "full_covariance_values_loaded": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_395B_controlled_alternate_covariance_extraction_integrity_row_order_no_support_claims",
+              }
+
+              review_ingest.to_csv(outdir / "v4_394B_robustness_candidate_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv", index=False)
+              approved_candidates.to_csv(outdir / "v4_394B_APPROVED_robustness_candidates_FOR_CONTROLLED_EXTRACTION_NO_VALUES.csv", index=False)
+              final_consensus_alternate.to_csv(outdir / "v4_394B_APPROVED_final_consensus_alternate_NO_VALUES.csv", index=False)
+              fs_consensus_fallback.to_csv(outdir / "v4_394B_APPROVED_fs_consensus_fallbacks_NO_VALUES.csv", index=False)
+              controlled_extraction_packet.to_csv(outdir / "v4_394B_controlled_alternate_covariance_extraction_packet_NO_VALUES_NO_SUPPORT.csv", index=False)
+              coordinate_packet.to_csv(outdir / "v4_394B_controlled_alternate_coordinate_packet_NO_VALUES.csv", index=False)
+              comparison_plan.to_csv(outdir / "v4_394B_robustness_comparison_plan_NO_VALUES_NO_SUPPORT.csv", index=False)
+              review_summary.to_csv(outdir / "v4_394B_robustness_candidate_review_summary_NO_VALUES.csv", index=False)
+              route_status_394B.to_csv(outdir / "v4_394B_route_status_summary.csv", index=False)
+              limitation_update.to_csv(outdir / "v4_394B_limitations_after_robustness_candidate_review.csv", index=False)
+              gap_update.to_csv(outdir / "v4_394B_gap_status_after_robustness_candidate_review.csv", index=False)
+              human_review.to_csv(outdir / "v4_394B_input_human_filled_robustness_candidate_review_preserved.csv", index=False)
+              candidate_manifest.to_csv(outdir / "v4_394B_input_v4_393B_candidate_manifest_preserved.csv", index=False)
+              rule_checks.to_csv(outdir / "v4_394B_rule_checks.csv", index=False)
+
+              (outdir / "v4_394B_summary.json").write_text(json.dumps(summary394B, indent=2))
+
+              summary_md = f"""# TAIRID v4.394B Robustness Candidate Review Ingest — No Values, No Support Claims
+
+          Expected result: `{summary394B["expected_result"]}`
+
+          {summary394B["rules_passed"]} / {summary394B["rules_total"]} rules passed
+
+          failed_gates = {summary394B["failed_gates"]}
+
+          robustness_review_rows = {summary394B["robustness_review_rows"]}
+
+          approved_robustness_candidate_rows = {summary394B["approved_robustness_candidate_rows"]}
+
+          final_consensus_alternate_approved_rows = {summary394B["final_consensus_alternate_approved_rows"]}
+
+          fs_consensus_fallback_approved_rows = {summary394B["fs_consensus_fallback_approved_rows"]}
+
+          controlled_extraction_packet_rows = {summary394B["controlled_extraction_packet_rows"]}
+
+          coordinate_packet_rows = {summary394B["coordinate_packet_rows"]}
+
+          new_chi_square_computed = false
+
+          covariance_values_loaded = false
+
+          covariance_subblock_extracted_now = false
+
+          full_covariance_values_loaded = false
+
+          likelihood_computed = false
+
+          p_values_computed = false
+
+          score_valid = false
+
+          support_allowed = false
+
+          Claim boundary: {CLAIM_BOUNDARY}.
+
+          This step ingests the robustness candidate human review.
+
+          It approves alternate covariance candidates for the next controlled extraction lane only.
+
+          It does **not** load covariance values.
+
+          It does **not** compute a new chi-square.
+
+          It does **not** compute likelihood or p-values.
+
+          It does **not** make support claims.
+
+          Next route: `{summary394B["selected_next_route"]}`
+          """
+              (outdir / "v4_394B_summary.md").write_text(summary_md)
+
+              zip_path = outdir.with_suffix(".zip")
+              if zip_path.exists():
+                  zip_path.unlink()
+
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(outdir.rglob("*")):
+                      if p.is_file():
+                          z.write(p, p.relative_to(outdir.parent))
+
+              print(json.dumps(summary394B, indent=2))
+              print(f"WROTE {zip_path}")
+
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python -m py_compile run_v4_394B_robustness_candidate_review_ingest_no_support.py
+
+      - name: Run v4.394B robustness candidate review ingest no support
+        run: |
+          python run_v4_394B_robustness_candidate_review_ingest_no_support.py
+
+      - name: Upload v4.394B robustness candidate review ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-394B-robustness-candidate-review-ingest-no-values-no-support-output
+          path: |
+            tairid_v4_394B_robustness_candidate_review_ingest_no_values_no_support_output/
+            tairid_v4_394B_robustness_candidate_review_ingest_no_values_no_support_output.zip
