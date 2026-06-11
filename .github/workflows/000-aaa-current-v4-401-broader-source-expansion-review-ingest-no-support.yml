@@ -1,0 +1,380 @@
+name: "!!! AAA CURRENT - TAIRID v4.401 broader source expansion review ingest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-401:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run v4.401 broader source expansion review ingest
+        shell: bash
+        run: |
+          cat > run_tairid_v4_401_broader_source_expansion_review_ingest.py <<'PY'
+          #!/usr/bin/env python3
+          import csv
+          import glob
+          import json
+          import os
+          import sys
+          import zipfile
+          from datetime import datetime, timezone
+          
+          VERSION = "v4.401"
+          ROUTE_NAME = "v4_401_broader_source_expansion_review_ingest_no_values_no_support_claims"
+          EXPECTED_RESULT = "v4_401_broader_source_expansion_review_ingest_passed_eboss_lrg_elg_qso_selected_no_values_no_support_claims"
+          OUTPUT_DIR = "tairid_v4_401_broader_source_expansion_review_ingest_no_support_output"
+          OUTPUT_ZIP = "tairid-v4-401-broader-source-expansion-review-ingest-no-values-no-support-output.zip"
+          
+          INPUT_400B_GLOB = "**/tairid-v4-400B-broader-source-expansion-manifest-no-values-no-support-output*.zip"
+          HUMAN_REVIEW_GLOB = "**/tairid-v4-400B-human-filled-source-expansion-review-for-v4-401-no-values-no-support*.zip"
+          
+          ALLOWED_DECISIONS = {
+              "approve_for_source_inventory",
+              "defer_until_later",
+              "reject_for_current_lane",
+              "keep_blocked",
+          }
+          
+          CLAIM_BOUNDARY = (
+              "source expansion review ingest only; eBOSS LRG/ELG/QSO may be selected for official source inventory; "
+              "no new observed values loaded; no covariance values loaded; no new chi-square computed; "
+              "no likelihood; no p-values; score_valid remains false; support_allowed remains false; no support claims"
+          )
+          
+          def fail(msg):
+              print("FAILED:", msg)
+              sys.exit(1)
+          
+          def first_match(pattern, exclude_output=True):
+              matches = sorted(glob.glob(pattern, recursive=True))
+              if exclude_output:
+                  matches = [m for m in matches if OUTPUT_DIR not in m and OUTPUT_ZIP not in m]
+              return matches[0] if matches else None
+          
+          def read_zip_json(zip_path, suffix):
+              with zipfile.ZipFile(zip_path, "r") as z:
+                  names = [n for n in z.namelist() if n.endswith(suffix)]
+                  if not names:
+                      fail(f"Could not find {suffix} in {zip_path}")
+                  return json.loads(z.read(names[0]).decode("utf-8"))
+          
+          def read_zip_csv(zip_path, suffix):
+              with zipfile.ZipFile(zip_path, "r") as z:
+                  names = [n for n in z.namelist() if n.endswith(suffix)]
+                  if not names:
+                      fail(f"Could not find {suffix} in {zip_path}")
+                  text = z.read(names[0]).decode("utf-8-sig")
+              return list(csv.DictReader(text.splitlines()))
+          
+          def to_bool(value):
+              if isinstance(value, bool):
+                  return value
+              s = str(value).strip().lower()
+              return s in {"true", "1", "yes", "y"}
+          
+          def to_float(value):
+              try:
+                  return float(value)
+              except Exception:
+                  return None
+          
+          def write_csv(path, rows, fieldnames=None):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              if fieldnames is None:
+                  keys = []
+                  for row in rows:
+                      for k in row.keys():
+                          if k not in keys:
+                              keys.append(k)
+                  fieldnames = keys
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow(row)
+          
+          def add_rule(rules, gate, passed):
+              rules.append({"gate": gate, "passed": bool(passed)})
+          
+          def main():
+              input_400b_zip = first_match(INPUT_400B_GLOB)
+              human_zip = first_match(HUMAN_REVIEW_GLOB)
+              if not input_400b_zip:
+                  fail(f"Missing input ZIP matching {INPUT_400B_GLOB}")
+              if not human_zip:
+                  fail(f"Missing human review ZIP matching {HUMAN_REVIEW_GLOB}")
+          
+              summary_400b = read_zip_json(input_400b_zip, "v4_400B_summary.json")
+              rules_400b = read_zip_csv(input_400b_zip, "v4_400B_rule_checks.csv")
+              candidates = read_zip_csv(input_400b_zip, "v4_400B_broader_source_expansion_candidates_NO_VALUES_NO_SUPPORT.csv")
+              human_template = read_zip_csv(input_400b_zip, "v4_400B_HUMAN_FILL_source_expansion_review_NO_VALUES_NO_SUPPORT.csv")
+              human_rows = read_zip_csv(human_zip, "v4_400B_HUMAN_FILLED_source_expansion_review_FOR_v4_401_NO_VALUES_NO_SUPPORT.csv")
+          
+              candidate_by_id = {r["v4_400B_candidate_id"]: r for r in candidates}
+              review_by_id = {r["v4_400B_candidate_id"]: r for r in human_rows}
+          
+              for row in human_rows:
+                  base = candidate_by_id.get(row.get("v4_400B_candidate_id"))
+                  if base is None:
+                      continue
+                  for k, v in base.items():
+                      if k not in row or row[k] == "":
+                          row[k] = v
+          
+              approved = [
+                  r for r in human_rows
+                  if r.get("human_source_expansion_decision") == "approve_for_source_inventory"
+                  and to_bool(r.get("source_inventory_approved_now"))
+              ]
+              deferred = [r for r in human_rows if r.get("human_source_expansion_decision") == "defer_until_later"]
+              rejected_or_blocked = [
+                  r for r in human_rows
+                  if r.get("human_source_expansion_decision") in {"reject_for_current_lane", "keep_blocked"}
+              ]
+          
+              approved_eboss = [r for r in approved if r.get("source_lane_type") == "broader_sdss_eboss_tracer"]
+              approved_ids = {r.get("v4_400B_candidate_id") for r in approved}
+              expected_eboss_ids = {"V4_400B_SOURCE_002", "V4_400B_SOURCE_003", "V4_400B_SOURCE_004"}
+              non_eboss_approved = [r for r in approved if r.get("source_lane_type") != "broader_sdss_eboss_tracer"]
+              low_redshift_deferred = [r for r in deferred if r.get("source_lane_type") == "low_redshift_anchor_family"]
+              independent_deferred = [r for r in deferred if r.get("source_lane_type") == "independent_survey_family"]
+          
+              rules = []
+              add_rule(rules, "input_400b_zip_found", bool(input_400b_zip))
+              add_rule(rules, "human_review_zip_found", bool(human_zip))
+              add_rule(rules, "input_400b_summary_version_correct", summary_400b.get("version") == "v4.400B")
+              add_rule(rules, "input_400b_expected_result_correct", summary_400b.get("expected_result") == "v4_400B_broader_source_expansion_manifest_passed_no_values_no_support_claims")
+              add_rule(rules, "input_400b_rules_all_passed", all(to_bool(r.get("passed")) for r in rules_400b))
+              add_rule(rules, "input_400b_failed_gates_none", summary_400b.get("failed_gates") == "none")
+              add_rule(rules, "input_400b_candidate_rows_equal_9", len(candidates) == 9)
+              add_rule(rules, "input_400b_review_template_rows_equal_8", len(human_template) == 8)
+              add_rule(rules, "human_review_rows_equal_8", len(human_rows) == 8)
+              add_rule(rules, "human_review_ids_match_template_ids", {r.get("v4_400B_candidate_id") for r in human_rows} == {r.get("v4_400B_candidate_id") for r in human_template})
+              add_rule(rules, "human_decision_column_present", all("human_source_expansion_decision" in r for r in human_rows))
+              add_rule(rules, "human_decisions_allowed", all(r.get("human_source_expansion_decision") in ALLOWED_DECISIONS for r in human_rows))
+              add_rule(rules, "human_notes_present", all(str(r.get("human_source_expansion_note", "")).strip() for r in human_rows))
+              add_rule(rules, "approval_flag_column_present", all("source_inventory_approved_now" in r for r in human_rows))
+              add_rule(rules, "approved_source_inventory_rows_equal_3", len(approved) == 3)
+              add_rule(rules, "approved_candidates_are_exact_eboss_three", approved_ids == expected_eboss_ids)
+              add_rule(rules, "approved_eboss_rows_equal_3", len(approved_eboss) == 3)
+              add_rule(rules, "non_eboss_approved_rows_equal_0", len(non_eboss_approved) == 0)
+              add_rule(rules, "deferred_rows_equal_5", len(deferred) == 5)
+              add_rule(rules, "rejected_or_blocked_rows_equal_0", len(rejected_or_blocked) == 0)
+              add_rule(rules, "low_redshift_deferred_rows_equal_2", len(low_redshift_deferred) == 2)
+              add_rule(rules, "independent_deferred_rows_equal_3", len(independent_deferred) == 3)
+              add_rule(rules, "new_observed_values_still_not_loaded", summary_400b.get("new_observed_values_loaded") is False)
+              add_rule(rules, "covariance_values_still_not_loaded", summary_400b.get("covariance_values_loaded") is False)
+              add_rule(rules, "new_chi_square_still_not_computed", summary_400b.get("new_chi_square_computed") is False)
+              add_rule(rules, "likelihood_still_not_computed", summary_400b.get("likelihood_computed") is False)
+              add_rule(rules, "p_values_still_not_computed", summary_400b.get("p_values_computed") is False)
+              add_rule(rules, "score_valid_still_false", summary_400b.get("score_valid") is False)
+              add_rule(rules, "support_allowed_still_false", summary_400b.get("support_allowed") is False)
+              add_rule(rules, "prior_diagonal_value_preserved", abs(float(summary_400b.get("prior_guarded_diagonal_chi_square_sum")) - 1.362038876169214) < 1e-12)
+              add_rule(rules, "primary_covariance_value_preserved", abs(float(summary_400b.get("primary_dM_Hz_chi_square_dry_run_sum")) - 1.384804886905097) < 1e-12)
+              add_rule(rules, "robustness_min_preserved", abs(float(summary_400b.get("robustness_min_chi_square")) - 1.2298323467773977) < 1e-12)
+              add_rule(rules, "robustness_max_preserved", abs(float(summary_400b.get("robustness_max_chi_square")) - 1.384804886905097) < 1e-12)
+              add_rule(rules, "robustness_width_preserved", abs(float(summary_400b.get("robustness_chi_square_range_width")) - 0.15497254012769934) < 1e-12)
+          
+              os.makedirs(OUTPUT_DIR, exist_ok=True)
+          
+              ingest_rows = []
+              for row in human_rows:
+                  decision = row.get("human_source_expansion_decision")
+                  approved_now = row in approved
+                  ingest_rows.append({
+                      "v4_401_ingest_id": "V4_401_INGEST_" + row.get("v4_400B_candidate_id", "").split("_")[-1],
+                      "v4_400B_candidate_id": row.get("v4_400B_candidate_id"),
+                      "candidate_family": row.get("candidate_family"),
+                      "source_lane_type": row.get("source_lane_type"),
+                      "survey_or_release_family": row.get("survey_or_release_family"),
+                      "tracer_or_sample_family": row.get("tracer_or_sample_family"),
+                      "priority": row.get("priority"),
+                      "human_source_expansion_decision": decision,
+                      "source_inventory_approved_now": str(to_bool(row.get("source_inventory_approved_now"))).lower(),
+                      "human_source_expansion_note": row.get("human_source_expansion_note"),
+                      "next_action": "official_source_inventory_manifest" if row in approved else "deferred_until_after_first_eboss_pass",
+                      "new_observed_values_loaded": "false",
+                      "covariance_values_loaded": "false",
+                      "new_chi_square_computed": "false",
+                      "score_valid": "false",
+                      "support_allowed": "false",
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+          
+              approved_rows = []
+              for i, row in enumerate(sorted(approved, key=lambda r: int(float(r.get("priority", 999)))), start=1):
+                  approved_rows.append({
+                      "v4_401_approved_id": f"V4_401_APPROVED_{i:03d}",
+                      "v4_400B_candidate_id": row.get("v4_400B_candidate_id"),
+                      "candidate_family": row.get("candidate_family"),
+                      "survey_or_release_family": row.get("survey_or_release_family"),
+                      "tracer_or_sample_family": row.get("tracer_or_sample_family"),
+                      "source_lane_type": row.get("source_lane_type"),
+                      "priority": row.get("priority"),
+                      "approved_next_gate": "v4_402_eboss_official_source_inventory_manifest_no_values_no_support_claims",
+                      "inventory_target": "official_public_source_and_covariance_availability_only",
+                      "observed_values_to_load_now": "false",
+                      "covariance_values_to_load_now": "false",
+                      "support_allowed": "false",
+                  })
+          
+              deferred_rows = []
+              for i, row in enumerate(sorted(deferred, key=lambda r: int(float(r.get("priority", 999)))), start=1):
+                  deferred_rows.append({
+                      "v4_401_deferred_id": f"V4_401_DEFERRED_{i:03d}",
+                      "v4_400B_candidate_id": row.get("v4_400B_candidate_id"),
+                      "candidate_family": row.get("candidate_family"),
+                      "source_lane_type": row.get("source_lane_type"),
+                      "reason": "deferred_to_keep_first_expansion_path_numeric_and_not_branching",
+                      "later_route": "after_eBOSS_source_inventory_and_first_numeric_comparison",
+                      "support_allowed": "false",
+                  })
+          
+              seed_rows = []
+              for i, row in enumerate(sorted(approved, key=lambda r: int(float(r.get("priority", 999)))), start=1):
+                  seed_rows.append({
+                      "v4_401_seed_id": f"V4_401_EBOSS_SEED_{i:03d}",
+                      "selected_family": row.get("candidate_family"),
+                      "survey_or_release_family": row.get("survey_or_release_family"),
+                      "tracer_or_sample_family": row.get("tracer_or_sample_family"),
+                      "first_inventory_questions": "official_observed_value_source|definition_match_to_fsigma8|covariance_or_uncertainty_availability",
+                      "must_confirm_before_values": "redshift|observed_fsigma8|uncertainty_definition|covariance_status|source_provenance",
+                      "blocked_now": "observed_value_loading|covariance_loading|chi_square|likelihood|p_values|support_claim",
+                  })
+          
+              requirement_rows = []
+              reqs = [
+                  ("official_source", "Locate official/public source file or paper table for observed f_sigma8 value."),
+                  ("definition_match", "Confirm observable definition matches f_sigma8 or explicitly stage conversion/park decision."),
+                  ("uncertainty_or_covariance", "Confirm uncertainty and covariance status before any scoring."),
+              ]
+              rid = 1
+              for row in seed_rows:
+                  for req_id, req_text in reqs:
+                      requirement_rows.append({
+                          "v4_401_requirement_id": f"V4_401_REQ_{rid:03d}",
+                          "selected_family": row["selected_family"],
+                          "requirement_type": req_id,
+                          "requirement": req_text,
+                          "values_loaded_now": "false",
+                          "support_allowed": "false",
+                      })
+                      rid += 1
+          
+              status_rows = [
+                  {"status_id": "V4_401_STATUS_001", "status": "source_expansion_review_ingested", "detail": "Human review selected eBOSS LRG, ELG, and QSO as first official source inventory lanes."},
+                  {"status_id": "V4_401_STATUS_002", "status": "branching_reduced", "detail": "WiggleZ, 6dFGS, SDSS MGS, VIPERS, and GAMA are deferred until after the first eBOSS pass."},
+                  {"status_id": "V4_401_STATUS_003", "status": "no_values_loaded", "detail": "No observed values or covariance values are loaded in v4.401."},
+                  {"status_id": "V4_401_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ]
+          
+              gap_rows = [
+                  {"gap_id": "V4_401_GAP_001", "gap": "Official eBOSS source inventory still needs to be performed.", "status_after_v4_401": "selected_next", "next_gate": "v4_402_eboss_official_source_inventory_manifest"},
+                  {"gap_id": "V4_401_GAP_002", "gap": "Observed values are not loaded yet.", "status_after_v4_401": "still_blocked", "next_gate": "later_after_source_inventory_confirmation"},
+                  {"gap_id": "V4_401_GAP_003", "gap": "Covariance availability is not yet reviewed for the eBOSS expansion lanes.", "status_after_v4_401": "still_open", "next_gate": "v4_402_source_inventory_then_covariance_availability_gate"},
+                  {"gap_id": "V4_401_GAP_004", "gap": "No broader scientific support claim is permitted.", "status_after_v4_401": "still_blocked", "next_gate": "no_support_claims_allowed"},
+              ]
+          
+              limitations_rows = [
+                  {"limit_id": "V4_401_LIMIT_001", "limit": "This is a human review ingest only, not a numeric source test.", "status": "active_limit"},
+                  {"limit_id": "V4_401_LIMIT_002", "limit": "Only the eBOSS LRG/ELG/QSO lanes are selected for the first expansion path.", "status": "active_limit"},
+                  {"limit_id": "V4_401_LIMIT_003", "limit": "No observed values or covariance values are loaded in v4.401.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_401_LIMIT_004", "limit": "No chi-square, likelihood, p-values, score validation, or support claim is allowed.", "status": "blocked_by_design"},
+              ]
+          
+              add_rule(rules, "ingest_output_rows_equal_8", len(ingest_rows) == 8)
+              add_rule(rules, "approved_output_rows_equal_3", len(approved_rows) == 3)
+              add_rule(rules, "deferred_output_rows_equal_5", len(deferred_rows) == 5)
+              add_rule(rules, "seed_packet_rows_equal_3", len(seed_rows) == 3)
+              add_rule(rules, "requirements_rows_equal_9", len(requirement_rows) == 9)
+              add_rule(rules, "status_rows_equal_4", len(status_rows) == 4)
+              add_rule(rules, "gap_rows_equal_4", len(gap_rows) == 4)
+              add_rule(rules, "limitations_rows_equal_4", len(limitations_rows) == 4)
+              add_rule(rules, "selected_next_route_is_v4_402", True)
+              add_rule(rules, "no_output_support_allowed", all(str(r.get("support_allowed", "false")).lower() == "false" for r in ingest_rows + approved_rows + deferred_rows + requirement_rows))
+          
+              failed = [r["gate"] for r in rules if not r["passed"]]
+              summary = {
+                  "version": VERSION,
+                  "route_name": ROUTE_NAME,
+                  "expected_result": EXPECTED_RESULT,
+                  "input_version": "v4.400B",
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": len(rules) - len(failed),
+                  "rules_total": len(rules),
+                  "failed_gates": "none" if not failed else "|".join(failed),
+                  "human_review_rows": len(human_rows),
+                  "approved_source_inventory_rows": len(approved_rows),
+                  "deferred_source_rows": len(deferred_rows),
+                  "approved_eboss_rows": len(approved_eboss),
+                  "low_redshift_deferred_rows": len(low_redshift_deferred),
+                  "independent_survey_deferred_rows": len(independent_deferred),
+                  "source_inventory_seed_packet_rows": len(seed_rows),
+                  "source_inventory_requirement_rows": len(requirement_rows),
+                  "prior_guarded_diagonal_chi_square_sum": summary_400b.get("prior_guarded_diagonal_chi_square_sum"),
+                  "primary_dM_Hz_chi_square_dry_run_sum": summary_400b.get("primary_dM_Hz_chi_square_dry_run_sum"),
+                  "robustness_min_chi_square": summary_400b.get("robustness_min_chi_square"),
+                  "robustness_max_chi_square": summary_400b.get("robustness_max_chi_square"),
+                  "robustness_chi_square_range_width": summary_400b.get("robustness_chi_square_range_width"),
+                  "selected_first_expansion_lane": "eBOSS_LRG_ELG_QSO",
+                  "new_observed_values_loaded": False,
+                  "covariance_values_loaded": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_402_eboss_official_source_inventory_manifest_no_values_no_support_claims",
+              }
+          
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_source_expansion_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv"), ingest_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_APPROVED_eboss_source_inventory_candidates_NO_VALUES_NO_SUPPORT.csv"), approved_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_DEFERRED_source_expansion_candidates_NO_VALUES_NO_SUPPORT.csv"), deferred_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_eboss_source_inventory_seed_packet_NO_VALUES_NO_SUPPORT.csv"), seed_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_next_gate_source_inventory_requirements_NO_VALUES_NO_SUPPORT.csv"), requirement_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_route_status_summary.csv"), status_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_gap_status_after_review_ingest.csv"), gap_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_limitations_after_review_ingest.csv"), limitations_rows)
+              write_csv(os.path.join(OUTPUT_DIR, "v4_401_rule_checks.csv"), rules, ["gate", "passed"])
+              with open(os.path.join(OUTPUT_DIR, "v4_401_summary.json"), "w", encoding="utf-8") as f:
+                  json.dump(summary, f, indent=2)
+              with open(os.path.join(OUTPUT_DIR, "v4_401_summary.md"), "w", encoding="utf-8") as f:
+                  f.write(f"# {VERSION} Summary\n\n")
+                  f.write(f"Expected result: `{EXPECTED_RESULT}`\n\n")
+                  f.write(f"Rules passed: {summary['rules_passed']} / {summary['rules_total']}\n\n")
+                  f.write(f"Failed gates: {summary['failed_gates']}\n\n")
+                  f.write("Selected first expansion lane: eBOSS LRG / ELG / QSO.\n\n")
+                  f.write("No observed values, covariance values, chi-square, likelihood, p-values, validated score, or support claim are produced.\n")
+          
+              with zipfile.ZipFile(OUTPUT_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for root, _, files in os.walk(OUTPUT_DIR):
+                      for name in files:
+                          fp = os.path.join(root, name)
+                          z.write(fp, arcname=fp)
+              print(json.dumps(summary, indent=2))
+              print(f"WROTE {OUTPUT_ZIP}")
+              if failed:
+                  fail("Rule check failed: " + "|".join(failed))
+          
+          if __name__ == "__main__":
+              main()
+          PY
+          python run_tairid_v4_401_broader_source_expansion_review_ingest.py
+
+      - name: Upload v4.401 broader source expansion review ingest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-401-broader-source-expansion-review-ingest-no-values-no-support-output
+          path: |
+            tairid-v4-401-broader-source-expansion-review-ingest-no-values-no-support-output.zip
+            tairid_v4_401_broader_source_expansion_review_ingest_no_support_output/**
