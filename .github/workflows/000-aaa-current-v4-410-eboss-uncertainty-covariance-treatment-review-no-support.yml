@@ -1,0 +1,291 @@
+name: "!!! AAA CURRENT - TAIRID v4.410 eBOSS uncertainty covariance treatment review no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-410:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run v4.410 eBOSS uncertainty covariance treatment review
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > run_tairid_v4_410.py <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import os
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          VERSION = "v4.410"
+          OUTDIR = Path("tairid_v4_410_eboss_uncertainty_covariance_treatment_review_no_support_output")
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+
+          def boolish(value):
+              return str(value).strip().lower() in {"true", "1", "yes"}
+
+          def read_csv_text(text):
+              return list(csv.DictReader(io.StringIO(text)))
+
+          def write_csv(path, rows, fieldnames=None):
+              path = OUTDIR / path
+              if fieldnames is None:
+                  fieldnames = list(rows[0].keys()) if rows else ["empty"]
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow(r)
+
+          def open_effective_zip(path):
+              raw = Path(path).read_bytes()
+              z = zipfile.ZipFile(io.BytesIO(raw))
+              names = z.namelist()
+              if len(names) == 1 and names[0].lower().endswith(".zip"):
+                  nested = z.read(names[0])
+                  z.close()
+                  return zipfile.ZipFile(io.BytesIO(nested))
+              return z
+
+          def find_member(z, suffix):
+              matches = [n for n in z.namelist() if n.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Missing member ending with {suffix}")
+              return matches[0]
+
+          def finite_float(value, label):
+              try:
+                  x = float(value)
+              except Exception as e:
+                  raise ValueError(f"{label} is not numeric: {value!r}") from e
+              if not math.isfinite(x):
+                  raise ValueError(f"{label} is not finite: {value!r}")
+              return x
+
+          input_candidates = sorted(Path(".").glob("tairid-v4-409-eboss-guarded-residual-staging-no-chi-square-no-support-output*.zip"))
+          if not input_candidates:
+              raise FileNotFoundError("Could not find tairid-v4-409-eboss-guarded-residual-staging-no-chi-square-no-support-output*.zip in repo root")
+          input_zip = input_candidates[0]
+
+          with open_effective_zip(input_zip) as z:
+              summary_name = find_member(z, "v4_409_summary.json")
+              residual_name = find_member(z, "v4_409_eboss_guarded_residual_staging_NO_CHI_SQUARE_NO_SUPPORT.csv")
+              input_packet_name = find_member(z, "v4_409_input_packet_FOR_V4_410_UNCERTAINTY_COVARIANCE_REVIEW_NO_SUPPORT.csv")
+              summary_409 = json.loads(z.read(summary_name).decode("utf-8"))
+              residual_rows = read_csv_text(z.read(residual_name).decode("utf-8"))
+              input_rows = read_csv_text(z.read(input_packet_name).decode("utf-8"))
+
+          expected_tracers = {"LRG", "ELG", "QSO"}
+          for row in input_rows:
+              finite_float(row["effective_redshift_z"], "z")
+              finite_float(row["observed_central_value"], "observed")
+              sigma = finite_float(row["observed_one_sigma_uncertainty"], "sigma")
+              if sigma <= 0:
+                  raise ValueError("Observed one-sigma uncertainty must be positive")
+              finite_float(row["baseline_prediction_fsigma8"], "prediction")
+              finite_float(row["signed_residual_observed_minus_baseline"], "residual")
+              finite_float(row["residual_in_one_sigma_units"], "sigma units")
+
+          treatment_rows = [
+              {
+                  "v4_410_treatment_id": "V4_410_TREATMENT_001",
+                  "treatment_layer": "observed_value_uncertainty",
+                  "finding": "Official one-sigma f_sigma_8 uncertainties are present for LRG, ELG, and QSO.",
+                  "status": "available_for_guarded_diagonal_dry_run_next_gate",
+                  "row_count_supported": len(input_rows),
+                  "may_compute_chi_square_in_this_gate": False,
+                  "may_compute_guarded_diagonal_chi_square_next_gate": True,
+                  "covariance_values_loaded": False,
+                  "support_allowed": False,
+              },
+              {
+                  "v4_410_treatment_id": "V4_410_TREATMENT_002",
+                  "treatment_layer": "covariance_matrix",
+                  "finding": "No eBOSS covariance matrix values are loaded in the current packet.",
+                  "status": "not_available_in_current_gate",
+                  "row_count_supported": 0,
+                  "may_compute_chi_square_in_this_gate": False,
+                  "may_compute_guarded_diagonal_chi_square_next_gate": False,
+                  "covariance_values_loaded": False,
+                  "support_allowed": False,
+              },
+              {
+                  "v4_410_treatment_id": "V4_410_TREATMENT_003",
+                  "treatment_layer": "likelihood_p_value_score",
+                  "finding": "Likelihood, p-values, score validation, and support claims remain blocked.",
+                  "status": "blocked",
+                  "row_count_supported": 0,
+                  "may_compute_chi_square_in_this_gate": False,
+                  "may_compute_guarded_diagonal_chi_square_next_gate": False,
+                  "covariance_values_loaded": False,
+                  "support_allowed": False,
+              },
+              {
+                  "v4_410_treatment_id": "V4_410_TREATMENT_004",
+                  "treatment_layer": "next_numeric_route",
+                  "finding": "Proceed to a guarded diagonal eBOSS dry-run using official one-sigma uncertainties while keeping covariance recovery separate.",
+                  "status": "selected_next_route",
+                  "row_count_supported": len(input_rows),
+                  "may_compute_chi_square_in_this_gate": False,
+                  "may_compute_guarded_diagonal_chi_square_next_gate": True,
+                  "covariance_values_loaded": False,
+                  "support_allowed": False,
+              },
+          ]
+
+          v411_rows = []
+          for idx, row in enumerate(input_rows, 1):
+              tracer = row["tracer_or_sample_family"]
+              v411_rows.append({
+                  "v4_411_input_id": f"V4_411_EBOSS_DIAGONAL_INPUT_{idx:03d}",
+                  "tracer_or_sample_family": tracer,
+                  "effective_redshift_z": row["effective_redshift_z"],
+                  "observable": row["observable"],
+                  "observed_central_value": row["observed_central_value"],
+                  "observed_one_sigma_uncertainty": row["observed_one_sigma_uncertainty"],
+                  "baseline_prediction_fsigma8": row["baseline_prediction_fsigma8"],
+                  "signed_residual_observed_minus_baseline": row["signed_residual_observed_minus_baseline"],
+                  "residual_in_one_sigma_units": row["residual_in_one_sigma_units"],
+                  "may_compute_guarded_diagonal_chi_square_in_v4_411": True,
+                  "diagonal_term_computed_now": False,
+                  "chi_square_sum_computed_now": False,
+                  "covariance_values_loaded": False,
+                  "support_allowed": False,
+              })
+
+          limitations = [
+              {"limitation_id": "V4_410_LIMIT_001", "limitation": "This gate reviews uncertainty treatment only; it does not compute chi-square.", "status": "active_limit"},
+              {"limitation_id": "V4_410_LIMIT_002", "limitation": "The next guarded diagonal dry-run would use only listed one-sigma uncertainties and would ignore cross-tracer covariance.", "status": "active_limit"},
+              {"limitation_id": "V4_410_LIMIT_003", "limitation": "No eBOSS covariance matrix values are loaded yet.", "status": "active_limit"},
+              {"limitation_id": "V4_410_LIMIT_004", "limitation": "No likelihood, p-values, validated score, or support claim is allowed.", "status": "active_limit"},
+          ]
+          gaps = [
+              {"gap_id": "V4_410_OPEN_GAP_001", "gap": "Run guarded diagonal eBOSS chi-square dry-run as a provisional comparison.", "status": "open_next_gate"},
+              {"gap_id": "V4_410_OPEN_GAP_002", "gap": "Recover or parse eBOSS covariance/likelihood material before any covariance-corrected eBOSS interpretation.", "status": "open_later_gate"},
+              {"gap_id": "V4_410_OPEN_GAP_003", "gap": "Compare eBOSS result against BOSS DR12 only after guarded numeric metric is computed.", "status": "open_later_gate"},
+          ]
+          route_options = [
+              {"route": "v4_411_eboss_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support", "recommendation": "primary_next", "description": "Compute provisional diagonal chi-square using official one-sigma uncertainties only."},
+              {"route": "v4_411B_eboss_covariance_recovery_before_metric", "recommendation": "alternate_if_diagonal_rejected", "description": "Use only if guarded diagonal dry-run is rejected as too weak to be useful."},
+              {"route": "halt_and_review_prediction_method", "recommendation": "fallback_only", "description": "Use only if baseline predictions or observed values are challenged."},
+          ]
+
+          summary = {
+              "version": VERSION,
+              "route_name": "v4_410_eboss_uncertainty_covariance_treatment_review_no_support",
+              "expected_result": "v4_410_eboss_uncertainty_covariance_treatment_review_passed_diagonal_dry_run_selected_no_chi_square_no_support_claims",
+              "input_version": "v4.409",
+              "created_utc": datetime.now(timezone.utc).isoformat(),
+              "failed_gates": "none",
+              "observed_value_rows": len(input_rows),
+              "guarded_residual_rows": len(residual_rows),
+              "uncertainty_review_rows": len(treatment_rows),
+              "official_one_sigma_available_rows": sum(1 for r in input_rows if float(r["observed_one_sigma_uncertainty"]) > 0),
+              "covariance_values_loaded": False,
+              "covariance_corrected_metric_allowed_now": False,
+              "guarded_diagonal_dry_run_selected_next": True,
+              "v4_411_input_rows": len(v411_rows),
+              "new_observed_values_loaded": False,
+              "prediction_loaded": True,
+              "residuals_computed": False,
+              "new_chi_square_computed": False,
+              "likelihood_computed": False,
+              "p_values_computed": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": "v4_411_eboss_guarded_diagonal_chi_square_dry_run_no_likelihood_no_support",
+              "claim_boundary": "eBOSS uncertainty/covariance treatment review only; official one-sigma uncertainties may be used in the next gate for a guarded diagonal dry-run; no chi-square, likelihood, p-values, validated score, covariance-corrected eBOSS metric, or TAIRID support claim is computed or allowed here",
+          }
+
+          checks = []
+          def check(name, condition):
+              checks.append({"gate": name, "passed": bool(condition)})
+          check("input_409_zip_found", True)
+          check("v4_409_summary_found", isinstance(summary_409, dict))
+          check("input_409_version_correct", summary_409.get("version") == "v4.409")
+          check("input_409_failed_gates_none", summary_409.get("failed_gates") == "none")
+          check("input_409_residuals_computed_true", summary_409.get("residuals_computed") is True)
+          check("input_409_new_chi_square_computed_false", summary_409.get("new_chi_square_computed") is False)
+          check("input_409_support_allowed_false", summary_409.get("support_allowed") is False)
+          check("input_rows_eq_3", len(input_rows) == 3)
+          check("residual_rows_eq_3", len(residual_rows) == 3)
+          check("required_tracers_present", {r["tracer_or_sample_family"] for r in input_rows} == expected_tracers)
+          check("all_observed_uncertainties_positive", all(float(r["observed_one_sigma_uncertainty"]) > 0 for r in input_rows))
+          check("all_residual_sigma_units_finite", all(math.isfinite(float(r["residual_in_one_sigma_units"])) for r in input_rows))
+          check("uncertainty_review_rows_eq_4", len(treatment_rows) == 4)
+          check("official_one_sigma_available_rows_eq_3", summary["official_one_sigma_available_rows"] == 3)
+          check("v4_411_input_rows_eq_3", len(v411_rows) == 3)
+          check("guarded_diagonal_next_selected_true", summary["guarded_diagonal_dry_run_selected_next"] is True)
+          check("covariance_values_loaded_false", summary["covariance_values_loaded"] is False)
+          check("covariance_corrected_metric_allowed_now_false", summary["covariance_corrected_metric_allowed_now"] is False)
+          check("new_observed_values_loaded_false", summary["new_observed_values_loaded"] is False)
+          check("prediction_loaded_true", summary["prediction_loaded"] is True)
+          check("residuals_computed_false_this_gate", summary["residuals_computed"] is False)
+          check("new_chi_square_computed_false", summary["new_chi_square_computed"] is False)
+          check("likelihood_computed_false", summary["likelihood_computed"] is False)
+          check("p_values_computed_false", summary["p_values_computed"] is False)
+          check("score_valid_false", summary["score_valid"] is False)
+          check("support_allowed_false", summary["support_allowed"] is False)
+          check("limitations_rows_eq_4", len(limitations) == 4)
+          check("gap_rows_eq_3", len(gaps) == 3)
+          check("route_options_rows_eq_3", len(route_options) == 3)
+          check("selected_next_route_is_v4_411", summary["selected_next_route"].startswith("v4_411"))
+          check("no_diagonal_terms_computed_now", all(str(r["diagonal_term_computed_now"]) == "False" for r in v411_rows))
+          check("no_chi_square_sum_computed_now", all(str(r["chi_square_sum_computed_now"]) == "False" for r in v411_rows))
+          check("all_v411_rows_no_support", all(str(r["support_allowed"]) == "False" for r in v411_rows))
+
+          failed = [c["gate"] for c in checks if not c["passed"]]
+          summary["rules_total"] = len(checks)
+          summary["rules_passed"] = len(checks) - len(failed)
+          summary["failed_gates"] = "none" if not failed else ";".join(failed)
+
+          write_csv("v4_410_rule_checks.csv", checks, ["gate", "passed"])
+          write_csv("v4_410_uncertainty_covariance_treatment_review_NO_SUPPORT.csv", treatment_rows)
+          write_csv("v4_410_input_packet_FOR_V4_411_EBOSS_GUARDED_DIAGONAL_DRY_RUN_NO_SUPPORT.csv", v411_rows)
+          write_csv("v4_410_limitations_after_uncertainty_review.csv", limitations)
+          write_csv("v4_410_gap_status_after_uncertainty_review.csv", gaps)
+          write_csv("v4_410_next_route_options.csv", route_options)
+
+          with (OUTDIR / "v4_410_summary.json").open("w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          with (OUTDIR / "v4_410_summary.md").open("w", encoding="utf-8") as f:
+              f.write(f"# TAIRID {VERSION} eBOSS Uncertainty / Covariance Treatment Review\n\n")
+              f.write(f"Result: {summary['expected_result']}\n\n")
+              f.write(f"Rules: {summary['rules_passed']} / {summary['rules_total']} passed\n\n")
+              f.write("This gate selects a guarded diagonal dry-run using official one-sigma uncertainties for the next gate while keeping covariance recovery separate. It computes no chi-square, likelihood, p-values, validated score, or support claim.\n")
+
+          zip_name = "tairid-v4-410-eboss-uncertainty-covariance-treatment-review-no-chi-square-no-support-output.zip"
+          with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_DEFLATED) as z:
+              for file in sorted(OUTDIR.rglob("*")):
+                  z.write(file, file.as_posix())
+
+          print(f"{summary['rules_passed']} / {summary['rules_total']} rules passed")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"observed_value_rows = {summary['observed_value_rows']}")
+          print(f"guarded_residual_rows = {summary['guarded_residual_rows']}")
+          print(f"uncertainty_review_rows = {summary['uncertainty_review_rows']}")
+          print(f"official_one_sigma_available_rows = {summary['official_one_sigma_available_rows']}")
+          print(f"guarded_diagonal_dry_run_selected_next = {summary['guarded_diagonal_dry_run_selected_next']}")
+          print(f"v4_411_input_rows = {summary['v4_411_input_rows']}")
+          print(f"new_chi_square_computed = {summary['new_chi_square_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"p_values_computed = {summary['p_values_computed']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          if failed:
+              raise SystemExit(1)
+          PY
+          python run_tairid_v4_410.py
+
+      - name: Upload v4.410 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-410-eboss-uncertainty-covariance-treatment-review-no-chi-square-no-support-output
+          path: tairid-v4-410-eboss-uncertainty-covariance-treatment-review-no-chi-square-no-support-output.zip
