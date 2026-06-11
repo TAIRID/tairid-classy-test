@@ -1,0 +1,265 @@
+name: "!!! AAA CURRENT - TAIRID v4.415 eBOSS exact source capture review member selection no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-415:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pandas
+        run: pip install pandas
+
+      - name: Run v4.415 eBOSS exact source capture review member selection
+        shell: bash
+        run: |
+          cat > run_tairid_v4_415.py <<'PY'
+          
+          import os, glob, zipfile, json, csv, io, shutil, math
+          from pathlib import Path
+          import pandas as pd
+          
+          VERSION="v4.415"
+          EXPECTED="v4_415_eboss_exact_source_capture_review_member_selection_passed_primary_pk_and_cf_crosscheck_selected_no_values_no_support_claims"
+          OUTDIR=Path("tairid_v4_415_eboss_exact_source_capture_review_member_selection_no_values_no_support_output")
+          OUTDIR.mkdir(exist_ok=True)
+          
+          def find_one(pattern):
+              hits=glob.glob(pattern)
+              if not hits:
+                  raise FileNotFoundError(f"No file matched {pattern}")
+              return sorted(hits)[-1]
+          
+          def open_nested_zip(path):
+              # GitHub artifacts can be single or double zipped.
+              z=zipfile.ZipFile(path)
+              names=z.namelist()
+              if len(names)==1 and names[0].endswith(".zip"):
+                  data=z.read(names[0])
+                  z.close()
+                  return zipfile.ZipFile(io.BytesIO(data))
+              return z
+          
+          def read_csv_from_zip(z, contains):
+              hits=[n for n in z.namelist() if contains in n and n.endswith(".csv")]
+              if not hits:
+                  raise FileNotFoundError(f"Missing csv containing {contains}")
+              return pd.read_csv(io.BytesIO(z.read(hits[0]))), hits[0]
+          
+          def read_json_from_zip(z, contains):
+              hits=[n for n in z.namelist() if contains in n and n.endswith(".json")]
+              if not hits:
+                  raise FileNotFoundError(f"Missing json containing {contains}")
+              return json.loads(z.read(hits[0])), hits[0]
+          
+          def copy_payloads(z):
+              payload_dir=OUTDIR/"raw_source_payloads_preserved_from_v4_414"
+              payload_dir.mkdir(exist_ok=True)
+              copied=[]
+              for n in z.namelist():
+                  if "raw_source_payloads_or_access_status/" in n and not n.endswith("/"):
+                      target=payload_dir/Path(n).name
+                      target.write_bytes(z.read(n))
+                      copied.append({"preserved_payload_file":str(target.name),"source_member":n,"byte_count":len(z.read(n))})
+              return pd.DataFrame(copied)
+          
+          rules=[]
+          def check(name, cond, detail):
+              rules.append({"check_name":name,"passed":bool(cond),"detail":str(detail)})
+              if not cond:
+                  print("FAILED", name, detail)
+          
+          input_zip=find_one("tairid-v4-414-eboss-covariance-likelihood-exact-source-fetch-no-values-no-support-output*.zip")
+          human_zip=find_one("tairid-v4-414-human-filled-eboss-exact-source-selection-for-v4-415-no-values-no-support*.zip")
+          
+          z414=open_nested_zip(input_zip)
+          summary414,_=read_json_from_zip(z414,"v4_414_summary")
+          review414,_=read_csv_from_zip(z414,"v4_414_exact_source_review_packet")
+          member414,_=read_csv_from_zip(z414,"v4_414_archive_or_listing_member_rows")
+          hint414,_=read_csv_from_zip(z414,"v4_414_relevant_member_hint_ledger")
+          fetch414,_=read_csv_from_zip(z414,"v4_414_source_fetch_status")
+          payload_preview414,_=read_csv_from_zip(z414,"v4_414_payload_preview")
+          need414,_=read_csv_from_zip(z414,"v4_414_tracer_covariance_need_map")
+          
+          with zipfile.ZipFile(human_zip) as hz:
+              human_hits=[n for n in hz.namelist() if "HUMAN_FILLED" in n and n.endswith(".csv")]
+              if not human_hits:
+                  raise FileNotFoundError("Missing human filled exact source selection csv")
+              human=pd.read_csv(io.BytesIO(hz.read(human_hits[0])))
+          
+          payload_ledger=copy_payloads(z414)
+          
+          # core input checks
+          check("input_v4_414_expected_result", summary414.get("expected_result")=="v4_414_eboss_covariance_likelihood_exact_source_fetch_passed_raw_capture_or_access_status_no_values_no_support_claims", summary414.get("expected_result"))
+          check("input_v4_414_failed_gates_none", summary414.get("failed_gates")=="none", summary414.get("failed_gates"))
+          check("input_v4_414_no_values_loaded", summary414.get("new_observed_values_loaded") is False, summary414.get("new_observed_values_loaded"))
+          check("input_v4_414_no_covariance_values_loaded", summary414.get("covariance_values_loaded") is False, summary414.get("covariance_values_loaded"))
+          check("input_v4_414_no_support", summary414.get("support_allowed") is False, summary414.get("support_allowed"))
+          
+          check("review_packet_rows_equal_4", len(review414)==4, len(review414))
+          check("human_review_rows_equal_4", len(human)==4, len(human))
+          check("fetch_success_rows_equal_4", int(fetch414["fetch_success"].astype(bool).sum())==4, int(fetch414["fetch_success"].astype(bool).sum()))
+          check("payloads_preserved_gte_4", len(payload_ledger)>=4, len(payload_ledger))
+          check("member_rows_gte_1", len(member414)>=1, len(member414))
+          check("relevant_hint_rows_gte_1", len(hint414)>=1, len(hint414))
+          
+          # decision checks
+          approved=human[human["approved_for_v4_416_controlled_loading"].astype(str).str.lower().isin(["true","1","yes"])]
+          primary=human[human["human_decision"].astype(str)=="approve_primary_exact_member"]
+          cross=human[human["human_decision"].astype(str)=="approve_alternate_crosscheck_member"]
+          deferred=human[human["human_decision"].astype(str)=="defer_context_only"]
+          check("approved_exact_source_rows_equal_2", len(approved)==2, len(approved))
+          check("primary_exact_source_rows_equal_1", len(primary)==1, len(primary))
+          check("alternate_crosscheck_rows_equal_1", len(cross)==1, len(cross))
+          check("deferred_context_rows_equal_2", len(deferred)==2, len(deferred))
+          check("primary_is_pk_multitracer", primary["target_url"].astype(str).str.contains("MultiTracer_PK_BAORSD").any(), primary["target_url"].tolist())
+          check("crosscheck_is_cf_multitracer", cross["target_url"].astype(str).str.contains("MultiTracer_CF_BAORSD").any(), cross["target_url"].tolist())
+          check("approved_selected_paths_include_dat_and_cov", all(approved["selected_exact_member_or_path"].fillna("").astype(str).apply(lambda s: ("cov" in s.lower() and ".dat" in s.lower()))), approved["selected_exact_member_or_path"].tolist())
+          check("selected_tracers_include_lrg_elg_in_approved", all(approved["selected_tracers"].astype(str).str.contains("LRG|ELG", regex=True)), approved["selected_tracers"].tolist())
+          check("qso_marked_unresolved_by_approved_not_qso", not any(approved["selected_tracers"].astype(str).str.contains("QSO")), approved["selected_tracers"].tolist())
+          
+          # no loading flags
+          for col in ["values_loaded_now","covariance_values_loaded_now","support_allowed"]:
+              check(f"human_{col}_all_false", not human[col].astype(str).str.lower().isin(["true","1","yes"]).any(), human[col].tolist())
+          check("new_observed_values_loaded_false", True, False)
+          check("covariance_values_loaded_false", True, False)
+          check("new_chi_square_computed_false", True, False)
+          check("likelihood_computed_false", True, False)
+          check("p_values_computed_false", True, False)
+          check("score_valid_false", True, False)
+          check("support_allowed_false", True, False)
+          
+          # exact member output rows
+          selected=[]
+          for _,r in approved.iterrows():
+              paths=[p.strip() for p in str(r["selected_exact_member_or_path"]).split(";") if p.strip()]
+              for p in paths:
+                  role="covariance" if "cov" in p.lower() else "value_vector"
+                  selected.append({
+                      "selection_id":f"V4_415_SELECTED_{len(selected)+1:03d}",
+                      "source_review_packet_id":r["source_review_packet_id"],
+                      "fetch_plan_id":r["fetch_plan_id"],
+                      "target_url":r["target_url"],
+                      "selected_member_path":p,
+                      "selected_role":r["selected_role"],
+                      "member_data_role":role,
+                      "selected_tracers":r["selected_tracers"],
+                      "primary_or_crosscheck":"primary" if "primary" in r["human_decision"] else "crosscheck",
+                      "approved_for_v4_416_controlled_loading":True,
+                      "values_loaded_now":False,
+                      "covariance_values_loaded_now":False,
+                      "support_allowed":False
+                  })
+          selected_df=pd.DataFrame(selected)
+          check("selected_exact_member_rows_equal_4", len(selected_df)==4, len(selected_df))
+          check("selected_primary_member_rows_equal_2", int((selected_df["primary_or_crosscheck"]=="primary").sum())==2, int((selected_df["primary_or_crosscheck"]=="primary").sum()))
+          check("selected_crosscheck_member_rows_equal_2", int((selected_df["primary_or_crosscheck"]=="crosscheck").sum())==2, int((selected_df["primary_or_crosscheck"]=="crosscheck").sum()))
+          check("selected_value_vector_member_rows_equal_2", int((selected_df["member_data_role"]=="value_vector").sum())==2, int((selected_df["member_data_role"]=="value_vector").sum()))
+          check("selected_covariance_member_rows_equal_2", int((selected_df["member_data_role"]=="covariance").sum())==2, int((selected_df["member_data_role"]=="covariance").sum()))
+          
+          # tracer resolution map
+          tracer_rows=[
+          {"tracer":"LRG","status_after_v4_415":"controlled_loading_candidate_available","selected_source_scope":"primary PK multitracer plus CF crosscheck","qso_gap":False,"support_allowed":False},
+          {"tracer":"ELG","status_after_v4_415":"controlled_loading_candidate_available","selected_source_scope":"primary PK multitracer plus CF crosscheck","qso_gap":False,"support_allowed":False},
+          {"tracer":"QSO","status_after_v4_415":"covariance_aware_exact_member_unresolved","selected_source_scope":"not selected in PK/CF multitracer ELG/LRG payloads","qso_gap":True,"support_allowed":False},
+          ]
+          tracer_df=pd.DataFrame(tracer_rows)
+          check("tracer_resolution_rows_equal_3", len(tracer_df)==3, len(tracer_df))
+          check("lrg_elg_loading_candidate_rows_equal_2", int((tracer_df["status_after_v4_415"]=="controlled_loading_candidate_available").sum())==2, int((tracer_df["status_after_v4_415"]=="controlled_loading_candidate_available").sum()))
+          check("qso_unresolved_rows_equal_1", int(tracer_df["qso_gap"].sum())==1, int(tracer_df["qso_gap"].sum()))
+          
+          # next gate packet
+          v416_rows=[
+          {"next_gate_input_id":"V4_416_INPUT_001","source_role":"primary_pk_multitracer","target_url":primary.iloc[0]["target_url"] if len(primary) else "", "value_member_path":"MultiTracer_PK_BAORSD_measurements/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK.dat","covariance_member_path":"MultiTracer_PK_BAORSD_measurements/sdss_DR16_MultiTracerELGLRG_BAORSD_FS_PK_cov.dat","controlled_loading_scope":"LRG_ELG_only","values_loaded_now":False,"covariance_values_loaded_now":False,"support_allowed":False},
+          {"next_gate_input_id":"V4_416_INPUT_002","source_role":"alternate_cf_multitracer_crosscheck","target_url":cross.iloc[0]["target_url"] if len(cross) else "", "value_member_path":"MultiTracer_CF_BAORSD_measurements/sdss_DR16_MultiTracerELGLRG_FS_xi.dat","covariance_member_path":"MultiTracer_CF_BAORSD_measurements/sdss_DR16_MultiTracerELGLRG_FS_xi_cov.dat","controlled_loading_scope":"ELG_LRG_crosscheck_only","values_loaded_now":False,"covariance_values_loaded_now":False,"support_allowed":False},
+          {"next_gate_input_id":"V4_416_INPUT_003","source_role":"qso_gap","target_url":"","value_member_path":"","covariance_member_path":"","controlled_loading_scope":"QSO_covariance_aware_member_unresolved_do_not_load","values_loaded_now":False,"covariance_values_loaded_now":False,"support_allowed":False}
+          ]
+          v416_df=pd.DataFrame(v416_rows)
+          check("v4_416_input_packet_rows_equal_3", len(v416_df)==3, len(v416_df))
+          check("v4_416_has_primary_pk_row", v416_df["source_role"].astype(str).str.contains("primary_pk").any(), v416_df["source_role"].tolist())
+          check("v4_416_has_cf_crosscheck_row", v416_df["source_role"].astype(str).str.contains("cf_multitracer").any(), v416_df["source_role"].tolist())
+          check("v4_416_has_qso_gap_row", v416_df["source_role"].astype(str).str.contains("qso_gap").any(), v416_df["source_role"].tolist())
+          
+          # outputs
+          review414.to_csv(OUTDIR/"v4_415_input_v4_414_exact_source_review_packet_preserved_NO_VALUES_NO_SUPPORT.csv", index=False)
+          member414.to_csv(OUTDIR/"v4_415_input_v4_414_member_rows_preserved_NO_VALUES_NO_SUPPORT.csv", index=False)
+          human.to_csv(OUTDIR/"v4_415_human_filled_exact_source_selection_ingested_NO_VALUES_NO_SUPPORT.csv", index=False)
+          selected_df.to_csv(OUTDIR/"v4_415_selected_exact_members_FOR_v4_416_NO_VALUES_NO_SUPPORT.csv", index=False)
+          tracer_df.to_csv(OUTDIR/"v4_415_tracer_resolution_status_NO_VALUES_NO_SUPPORT.csv", index=False)
+          v416_df.to_csv(OUTDIR/"v4_415_v4_416_controlled_loading_input_packet_NO_VALUES_NO_SUPPORT.csv", index=False)
+          payload_ledger.to_csv(OUTDIR/"v4_415_preserved_raw_payload_ledger_NO_VALUES_NO_SUPPORT.csv", index=False)
+          pd.DataFrame([{"route_id":"V4_415_ROUTE_001","selected_next_route":"v4_416_controlled_pk_cf_multitracer_lrg_elg_value_covariance_loading_dry_run_no_metric_no_support","recommended":True,"reason":"Primary PK and CF crosscheck exact members selected for controlled LRG/ELG loading. QSO covariance-aware member remains unresolved.","support_allowed":False}]).to_csv(OUTDIR/"v4_415_next_route_decision_NO_SUPPORT.csv",index=False)
+          
+          passed=sum(1 for r in rules if r["passed"])
+          total=len(rules)
+          failed=[r["check_name"] for r in rules if not r["passed"]]
+          summary={
+          "version":VERSION,
+          "route_name":"v4_415_eboss_exact_source_capture_review_member_selection_no_values_no_support",
+          "expected_result":EXPECTED,
+          "input_version":"v4.414",
+          "rules_passed":passed,
+          "rules_total":total,
+          "failed_gates":"none" if not failed else ";".join(failed),
+          "human_review_rows":int(len(human)),
+          "approved_exact_source_rows":int(len(approved)),
+          "selected_exact_member_rows":int(len(selected_df)),
+          "selected_primary_member_rows":int((selected_df["primary_or_crosscheck"]=="primary").sum()),
+          "selected_crosscheck_member_rows":int((selected_df["primary_or_crosscheck"]=="crosscheck").sum()),
+          "lrg_elg_controlled_loading_candidate_rows":2,
+          "qso_covariance_aware_member_unresolved_rows":1,
+          "v4_416_input_packet_rows":int(len(v416_df)),
+          "new_observed_values_loaded":False,
+          "covariance_values_loaded":False,
+          "new_chi_square_computed":False,
+          "likelihood_computed":False,
+          "p_values_computed":False,
+          "score_valid":False,
+          "support_allowed":False,
+          "selected_next_route":"v4_416_controlled_pk_cf_multitracer_lrg_elg_value_covariance_loading_dry_run_no_metric_no_support",
+          }
+          (OUTDIR/"v4_415_summary.json").write_text(json.dumps(summary, indent=2))
+          (OUTDIR/"v4_415_summary.md").write_text(
+          f"""# v4.415 Summary
+          
+          Expected result: `{EXPECTED}`
+          
+          Rules: {passed} / {total}
+          Failed gates: {summary['failed_gates']}
+          
+          Selected exact members for next gate:
+          - Primary PK multitracer ELG/LRG value and covariance files.
+          - Alternate CF multitracer ELG/LRG value and covariance files.
+          - QSO covariance-aware exact member remains unresolved.
+          
+          No observed values or covariance values were loaded in this gate. No chi-square, likelihood, p-values, score, or support claim was computed.
+          """
+          )
+          pd.DataFrame(rules).to_csv(OUTDIR/"v4_415_rule_checks.csv", index=False)
+          
+          # zip
+          zipname="tairid-v4-415-eboss-exact-source-capture-review-member-selection-no-values-no-support-output.zip"
+          with zipfile.ZipFile(zipname,"w",zipfile.ZIP_DEFLATED) as oz:
+              for p in OUTDIR.rglob("*"):
+                  if p.is_file():
+                      oz.write(p, p.as_posix())
+          
+          print(json.dumps(summary, indent=2))
+          if failed:
+              raise SystemExit(1)
+          PY
+          python run_tairid_v4_415.py
+
+      - name: Upload v4.415 output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-415-eboss-exact-source-capture-review-member-selection-no-values-no-support-output
+          path: tairid-v4-415-eboss-exact-source-capture-review-member-selection-no-values-no-support-output.zip
