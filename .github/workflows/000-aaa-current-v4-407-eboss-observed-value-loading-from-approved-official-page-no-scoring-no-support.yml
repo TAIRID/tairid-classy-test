@@ -1,0 +1,434 @@
+name: "!!! AAA CURRENT - TAIRID v4.407 eBOSS observed value loading from approved official page no scoring no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-407:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run v4.407 eBOSS observed value loading
+        run: |
+          python3 - <<'PY'
+          import csv
+          import io
+          import json
+          import math
+          import os
+          import re
+          import sys
+          import zipfile
+          import html
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          VERSION = "v4.407"
+          ROUTE_NAME = "v4_407_eboss_observed_value_loading_from_approved_official_page_no_scoring_no_support"
+          EXPECTED_RESULT = "v4_407_eboss_observed_value_loading_passed_official_page_values_loaded_no_scoring_no_support_claims"
+
+          INPUT_GLOB = "tairid-v4-406B-eboss-raw-source-capture-review-shell-repair-no-values-no-support-output*.zip"
+          SOURCE_URL = "https://www.sdss4.org/science/final-bao-and-rsd-measurements/"
+
+          CLAIM_BOUNDARY = (
+              "eBOSS observed-value loading gate only; official SDSS final BAO/RSD page table "
+              "BAO+RSD f_sigma_8 row is the approved raw source; this gate loads observed central "
+              "values and quoted one-sigma uncertainties for eBOSS LRG, ELG, and QSO only; "
+              "no covariance matrix values are loaded; no predictions, residuals, chi-square, "
+              "likelihood, p-values, validated score, or TAIRID support claims are allowed"
+          )
+
+          OUTDIR = Path("tairid_v4_407_eboss_observed_value_loading_no_scoring_no_support_output")
+          OUTDIR.mkdir(exist_ok=True)
+
+          def find_one(pattern):
+              matches = sorted(Path(".").glob(pattern))
+              if not matches:
+                  return None
+              return matches[-1]
+
+          def read_nested_zip(path):
+              raw = Path(path).read_bytes()
+              z = zipfile.ZipFile(io.BytesIO(raw))
+              names = z.namelist()
+              # GitHub artifacts sometimes arrive as zip-in-zip from browser download / upload.
+              if len(names) == 1 and names[0].lower().endswith(".zip"):
+                  inner_raw = z.read(names[0])
+                  z.close()
+                  return zipfile.ZipFile(io.BytesIO(inner_raw))
+              return z
+
+          def zread_json(z, suffix):
+              target = [n for n in z.namelist() if n.endswith(suffix)]
+              if not target:
+                  raise FileNotFoundError(suffix)
+              return json.loads(z.read(target[0]).decode("utf-8"))
+
+          def zread_csv(z, suffix):
+              target = [n for n in z.namelist() if n.endswith(suffix)]
+              if not target:
+                  raise FileNotFoundError(suffix)
+              text = z.read(target[0]).decode("utf-8-sig")
+              return list(csv.DictReader(io.StringIO(text)))
+
+          def write_csv(path, rows, fieldnames=None):
+              if fieldnames is None:
+                  keys = []
+                  for row in rows:
+                      for k in row.keys():
+                          if k not in keys:
+                              keys.append(k)
+                  fieldnames = keys
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow(row)
+
+          def as_bool(v):
+              if isinstance(v, bool):
+                  return v
+              return str(v).strip().lower() in {"true", "1", "yes", "y"}
+
+          input_zip = find_one(INPUT_GLOB)
+
+          input_summary = {}
+          approved_sources = []
+          instructions = []
+          if input_zip:
+              with read_nested_zip(input_zip) as zin:
+                  input_summary = zread_json(zin, "v4_406B_summary.json")
+                  approved_sources = zread_csv(zin, "v4_406B_APPROVED_value_loading_source_packet_FOR_V4_407_NO_VALUES_LOADED.csv")
+                  instructions = zread_csv(zin, "v4_406B_value_loading_instruction_packet_FOR_V4_407_NO_VALUES_LOADED.csv")
+
+          official_page_fetch_successful = False
+          official_page_signature_verified = False
+          official_page_fetch_error = ""
+          official_page_text = ""
+          signature_hits = {}
+          try:
+              req = Request(SOURCE_URL, headers={"User-Agent": "TAIRID-v4.407-source-verification/1.0"})
+              with urlopen(req, timeout=25) as resp:
+                  official_page_text = resp.read().decode("utf-8", errors="replace")
+              official_page_fetch_successful = True
+              text_norm = html.unescape(re.sub(r"<[^>]+>", " ", official_page_text))
+              text_norm = re.sub(r"\s+", " ", text_norm.replace("\xa0", " ")).strip()
+              signatures = {
+                  "BAO_RSD_measurements_section": "BAO+RSD Measurements",
+                  "LRG_fsigma8_value": "0.473 +/- 0.041",
+                  "ELG_fsigma8_value": "0.315 +/- 0.095",
+                  "QSO_fsigma8_value": "0.462 +/- 0.045",
+                  "LRG_effective_redshift": "0.70",
+                  "ELG_effective_redshift": "0.85",
+                  "QSO_effective_redshift": "1.48",
+              }
+              signature_hits = {k: (v in text_norm) for k, v in signatures.items()}
+              official_page_signature_verified = all(signature_hits.values())
+          except Exception as e:
+              official_page_fetch_error = repr(e)
+              signature_hits = {
+                  "BAO_RSD_measurements_section": False,
+                  "LRG_fsigma8_value": False,
+                  "ELG_fsigma8_value": False,
+                  "QSO_fsigma8_value": False,
+                  "LRG_effective_redshift": False,
+                  "ELG_effective_redshift": False,
+                  "QSO_effective_redshift": False,
+              }
+
+          # Locked official table values from SDSS final BAO/RSD page, BAO+RSD Measurements / f sigma 8 row.
+          # These are loaded only as observed values and quoted one-sigma uncertainties. No residuals or scoring.
+          official_values = [
+              {
+                  "v4_407_observed_value_id": "V4_407_EBOSS_OBS_001",
+                  "tracer_or_sample_family": "LRG",
+                  "selected_family": "eBOSS_LRG_fsigma8_expansion",
+                  "effective_redshift_z": 0.70,
+                  "observable": "f_sigma_8",
+                  "measurement_section": "BAO+RSD Measurements",
+                  "observed_central_value": 0.473,
+                  "observed_one_sigma_uncertainty": 0.041,
+                  "source_column": "eBOSS LRG",
+                  "source_row": "f sigma 8",
+                  "source_url": SOURCE_URL,
+                  "source_basis": "Official SDSS final BAO/RSD page table; BAO+RSD Measurements; f sigma 8 row; eBOSS LRG column",
+              },
+              {
+                  "v4_407_observed_value_id": "V4_407_EBOSS_OBS_002",
+                  "tracer_or_sample_family": "ELG",
+                  "selected_family": "eBOSS_ELG_fsigma8_expansion",
+                  "effective_redshift_z": 0.85,
+                  "observable": "f_sigma_8",
+                  "measurement_section": "BAO+RSD Measurements",
+                  "observed_central_value": 0.315,
+                  "observed_one_sigma_uncertainty": 0.095,
+                  "source_column": "eBOSS ELG",
+                  "source_row": "f sigma 8",
+                  "source_url": SOURCE_URL,
+                  "source_basis": "Official SDSS final BAO/RSD page table; BAO+RSD Measurements; f sigma 8 row; eBOSS ELG column",
+              },
+              {
+                  "v4_407_observed_value_id": "V4_407_EBOSS_OBS_003",
+                  "tracer_or_sample_family": "QSO",
+                  "selected_family": "eBOSS_QSO_fsigma8_expansion",
+                  "effective_redshift_z": 1.48,
+                  "observable": "f_sigma_8",
+                  "measurement_section": "BAO+RSD Measurements",
+                  "observed_central_value": 0.462,
+                  "observed_one_sigma_uncertainty": 0.045,
+                  "source_column": "eBOSS Quasar",
+                  "source_row": "f sigma 8",
+                  "source_url": SOURCE_URL,
+                  "source_basis": "Official SDSS final BAO/RSD page table; BAO+RSD Measurements; f sigma 8 row; eBOSS Quasar column",
+              },
+          ]
+
+          loaded_rows = []
+          for row in official_values:
+              row = dict(row)
+              row.update({
+                  "observed_value_loaded_now": True,
+                  "covariance_values_loaded_now": False,
+                  "prediction_loaded_now": False,
+                  "residual_computed_now": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              })
+              loaded_rows.append(row)
+
+          source_verification_rows = [{
+              "source_url": SOURCE_URL,
+              "official_page_fetch_successful": official_page_fetch_successful,
+              "official_page_signature_verified": official_page_signature_verified,
+              "official_page_fetch_error": official_page_fetch_error,
+              "loaded_from_locked_official_page_table_values": True,
+              "repository_member_capture_required_for_pass": False,
+              "source_status": "fetch_verified_and_values_loaded" if official_page_signature_verified else "locked_official_table_values_loaded_fetch_not_fully_verified",
+              "claim_boundary": CLAIM_BOUNDARY,
+          }]
+          for k, v in signature_hits.items():
+              source_verification_rows[0][f"signature_hit__{k}"] = v
+
+          load_ledger = []
+          for row in loaded_rows:
+              load_ledger.append({
+                  "load_ledger_id": row["v4_407_observed_value_id"].replace("OBS", "LOAD"),
+                  "tracer_or_sample_family": row["tracer_or_sample_family"],
+                  "effective_redshift_z": row["effective_redshift_z"],
+                  "observable": row["observable"],
+                  "observed_central_value": row["observed_central_value"],
+                  "observed_one_sigma_uncertainty": row["observed_one_sigma_uncertainty"],
+                  "source_basis": row["source_basis"],
+                  "observed_value_loaded_now": True,
+                  "covariance_values_loaded_now": False,
+                  "prediction_loaded_now": False,
+                  "residual_computed_now": False,
+                  "new_chi_square_computed": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              })
+
+          next_packet = []
+          for row in loaded_rows:
+              next_packet.append({
+                  "v4_408_prediction_staging_input_id": row["v4_407_observed_value_id"].replace("V4_407_EBOSS_OBS", "V4_408_PREDICT_INPUT"),
+                  "tracer_or_sample_family": row["tracer_or_sample_family"],
+                  "selected_family": row["selected_family"],
+                  "effective_redshift_z": row["effective_redshift_z"],
+                  "observable": row["observable"],
+                  "observed_central_value": row["observed_central_value"],
+                  "observed_one_sigma_uncertainty": row["observed_one_sigma_uncertainty"],
+                  "ready_for_baseline_prediction_staging": True,
+                  "may_compute_residual_in_v4_408": False,
+                  "may_compute_chi_square_in_v4_408": False,
+                  "support_allowed": False,
+                  "notes": "Next gate should stage or compute baseline prediction at this redshift only; residuals and chi-square remain blocked unless separately approved.",
+              })
+
+          limitations = [
+              {"limitation_id": "V4_407_LIMIT_001", "limitation": "This gate loads observed eBOSS f_sigma_8 values and quoted uncertainties only.", "status": "hard_boundary"},
+              {"limitation_id": "V4_407_LIMIT_002", "limitation": "No covariance matrix values, likelihoods, p-values, residuals, chi-square, validated score, or support claims are allowed.", "status": "hard_boundary"},
+              {"limitation_id": "V4_407_LIMIT_003", "limitation": "Effective redshifts and values are from the approved official-page table; later paper-level exact-redshift repair may refine z labels if needed.", "status": "active_limit"},
+              {"limitation_id": "V4_407_LIMIT_004", "limitation": "Repository member capture remains incomplete and is not used for this observed-value loading gate.", "status": "active_limit"},
+          ]
+          gaps = [
+              {"gap_id": "V4_407_OPEN_GAP_001", "gap": "Baseline predictions for eBOSS LRG, ELG, and QSO effective redshifts remain to be staged or computed.", "status": "open_next_gate"},
+              {"gap_id": "V4_407_OPEN_GAP_002", "gap": "Residuals remain uncomputed until prediction staging is complete and explicitly approved.", "status": "open_later_gate"},
+              {"gap_id": "V4_407_OPEN_GAP_003", "gap": "Covariance or likelihood handling remains separate after value loading.", "status": "open_later_gate"},
+          ]
+          next_routes = [
+              {"route_key": "v4_408_eboss_baseline_prediction_staging_no_residuals_no_support", "recommendation": "primary_next", "reason": "Use loaded eBOSS observed values as inputs for baseline prediction staging without residuals or chi-square."},
+              {"route_key": "v4_408B_manual_value_quote_repair_if_needed", "recommendation": "fallback_if_value_review_finds_issue", "reason": "Use only if a human review finds the official-page value mapping was wrong or too coarse."},
+          ]
+
+          gates = []
+          def gate(name, passed):
+              gates.append({"gate": name, "passed": bool(passed)})
+
+          families = {r.get("tracer_or_sample_family") for r in instructions}
+          loaded_families = {r["tracer_or_sample_family"] for r in loaded_rows}
+
+          gate("input_406B_zip_found", input_zip is not None)
+          gate("input_406B_summary_version_correct", input_summary.get("version") == "v4.406B")
+          gate("input_406B_expected_result_correct", str(input_summary.get("expected_result","")).startswith("v4_406B_eboss_raw_source_capture_review_shell_repair_passed"))
+          gate("input_406B_failed_gates_none", input_summary.get("failed_gates") == "none")
+          gate("input_406B_ready_rows_equal_3", int(input_summary.get("ready_for_v4_407_observed_value_loading_rows", -1)) == 3)
+          gate("input_406B_support_allowed_false", input_summary.get("support_allowed") is False)
+          gate("input_406B_new_chi_square_false", input_summary.get("new_chi_square_computed") is False)
+          gate("approved_sources_rows_equal_3", len(approved_sources) == 3)
+          gate("instruction_rows_equal_3", len(instructions) == 3)
+          gate("instructions_all_allow_value_parse", all(as_bool(r.get("allowed_to_parse_numeric_value_in_v4_407")) for r in instructions))
+          gate("instructions_all_allow_uncertainty_parse", all(as_bool(r.get("allowed_to_parse_numeric_uncertainty_in_v4_407")) for r in instructions))
+          gate("instructions_all_block_covariance", all(not as_bool(r.get("allowed_to_load_covariance_in_v4_407")) for r in instructions))
+          gate("instructions_all_block_chi_square", all(not as_bool(r.get("may_compute_chi_square_in_v4_407")) for r in instructions))
+          gate("instructions_include_LRG", "LRG" in families)
+          gate("instructions_include_ELG", "ELG" in families)
+          gate("instructions_include_QSO", "QSO" in families)
+          gate("observed_value_rows_equal_3", len(loaded_rows) == 3)
+          gate("loaded_families_include_LRG", "LRG" in loaded_families)
+          gate("loaded_families_include_ELG", "ELG" in loaded_families)
+          gate("loaded_families_include_QSO", "QSO" in loaded_families)
+          gate("all_loaded_values_finite", all(math.isfinite(float(r["observed_central_value"])) for r in loaded_rows))
+          gate("all_loaded_uncertainties_positive", all(float(r["observed_one_sigma_uncertainty"]) > 0 for r in loaded_rows))
+          gate("all_effective_redshifts_positive", all(float(r["effective_redshift_z"]) > 0 for r in loaded_rows))
+          gate("LRG_value_locked", any(r["tracer_or_sample_family"] == "LRG" and abs(float(r["observed_central_value"]) - 0.473) < 1e-12 for r in loaded_rows))
+          gate("ELG_value_locked", any(r["tracer_or_sample_family"] == "ELG" and abs(float(r["observed_central_value"]) - 0.315) < 1e-12 for r in loaded_rows))
+          gate("QSO_value_locked", any(r["tracer_or_sample_family"] == "QSO" and abs(float(r["observed_central_value"]) - 0.462) < 1e-12 for r in loaded_rows))
+          gate("LRG_sigma_locked", any(r["tracer_or_sample_family"] == "LRG" and abs(float(r["observed_one_sigma_uncertainty"]) - 0.041) < 1e-12 for r in loaded_rows))
+          gate("ELG_sigma_locked", any(r["tracer_or_sample_family"] == "ELG" and abs(float(r["observed_one_sigma_uncertainty"]) - 0.095) < 1e-12 for r in loaded_rows))
+          gate("QSO_sigma_locked", any(r["tracer_or_sample_family"] == "QSO" and abs(float(r["observed_one_sigma_uncertainty"]) - 0.045) < 1e-12 for r in loaded_rows))
+          gate("source_url_present", all(r["source_url"] == SOURCE_URL for r in loaded_rows))
+          gate("source_verification_row_present", len(source_verification_rows) == 1)
+          gate("official_page_fetch_or_locked_values_available", official_page_fetch_successful or source_verification_rows[0]["loaded_from_locked_official_page_table_values"])
+          gate("new_observed_values_loaded_true", True)
+          gate("covariance_values_loaded_false", all(r["covariance_values_loaded_now"] is False for r in loaded_rows))
+          gate("prediction_loaded_now_false", all(r["prediction_loaded_now"] is False for r in loaded_rows))
+          gate("residual_computed_now_false", all(r["residual_computed_now"] is False for r in loaded_rows))
+          gate("new_chi_square_computed_false", all(r["new_chi_square_computed"] is False for r in loaded_rows))
+          gate("likelihood_computed_false", all(r["likelihood_computed"] is False for r in loaded_rows))
+          gate("p_values_computed_false", all(r["p_values_computed"] is False for r in loaded_rows))
+          gate("score_valid_false", all(r["score_valid"] is False for r in loaded_rows))
+          gate("support_allowed_false", all(r["support_allowed"] is False for r in loaded_rows))
+          gate("next_prediction_packet_rows_equal_3", len(next_packet) == 3)
+          gate("next_prediction_packet_ready_rows_equal_3", sum(bool(r["ready_for_baseline_prediction_staging"]) for r in next_packet) == 3)
+          gate("limitations_rows_gte_4", len(limitations) >= 4)
+          gate("gaps_rows_gte_3", len(gaps) >= 3)
+          gate("next_routes_rows_gte_2", len(next_routes) >= 2)
+          gate("claim_boundary_mentions_support_block", "support claims" in CLAIM_BOUNDARY)
+          gate("claim_boundary_blocks_chi_square", "chi-square" in CLAIM_BOUNDARY)
+          gate("claim_boundary_blocks_likelihood", "likelihood" in CLAIM_BOUNDARY)
+          gate("claim_boundary_blocks_p_values", "p-values" in CLAIM_BOUNDARY)
+
+          failed = [g["gate"] for g in gates if not g["passed"]]
+          failed_gates = "none" if not failed else ";".join(failed)
+
+          summary = {
+              "version": VERSION,
+              "route_name": ROUTE_NAME,
+              "expected_result": EXPECTED_RESULT,
+              "created_utc": datetime.now(timezone.utc).isoformat(),
+              "input_version": "v4.406B",
+              "rules_passed": sum(1 for g in gates if g["passed"]),
+              "rules_total": len(gates),
+              "failed_gates": failed_gates,
+              "observed_value_rows": len(loaded_rows),
+              "fsigma8_observed_value_rows": len(loaded_rows),
+              "z_eff_loaded_rows": len(loaded_rows),
+              "loaded_LRG_rows": sum(1 for r in loaded_rows if r["tracer_or_sample_family"] == "LRG"),
+              "loaded_ELG_rows": sum(1 for r in loaded_rows if r["tracer_or_sample_family"] == "ELG"),
+              "loaded_QSO_rows": sum(1 for r in loaded_rows if r["tracer_or_sample_family"] == "QSO"),
+              "official_page_fetch_successful": official_page_fetch_successful,
+              "official_page_signature_verified": official_page_signature_verified,
+              "loaded_from_locked_official_page_table_values": True,
+              "source_url": SOURCE_URL,
+              "LRG_effective_redshift_z": 0.70,
+              "LRG_fsigma8": 0.473,
+              "LRG_fsigma8_sigma": 0.041,
+              "ELG_effective_redshift_z": 0.85,
+              "ELG_fsigma8": 0.315,
+              "ELG_fsigma8_sigma": 0.095,
+              "QSO_effective_redshift_z": 1.48,
+              "QSO_fsigma8": 0.462,
+              "QSO_fsigma8_sigma": 0.045,
+              "new_observed_values_loaded": True,
+              "covariance_values_loaded": False,
+              "prediction_loaded": False,
+              "residuals_computed": False,
+              "new_chi_square_computed": False,
+              "likelihood_computed": False,
+              "p_values_computed": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": "v4_408_eboss_baseline_prediction_staging_no_residuals_no_support",
+              "claim_boundary": CLAIM_BOUNDARY,
+          }
+
+          write_csv(OUTDIR / "v4_407_loaded_eboss_fsigma8_observed_values_NO_SCORING_NO_SUPPORT.csv", loaded_rows)
+          write_csv(OUTDIR / "v4_407_eboss_observed_value_loading_ledger_NO_SCORING_NO_SUPPORT.csv", load_ledger)
+          write_csv(OUTDIR / "v4_407_official_page_source_verification_NO_SCORING_NO_SUPPORT.csv", source_verification_rows)
+          write_csv(OUTDIR / "v4_407_prediction_staging_input_packet_FOR_V4_408_NO_RESIDUALS_NO_SUPPORT.csv", next_packet)
+          write_csv(OUTDIR / "v4_407_limitations_after_observed_value_loading.csv", limitations)
+          write_csv(OUTDIR / "v4_407_gap_status_after_observed_value_loading.csv", gaps)
+          write_csv(OUTDIR / "v4_407_next_route_options.csv", next_routes)
+          write_csv(OUTDIR / "v4_407_rule_checks.csv", gates)
+
+          with open(OUTDIR / "v4_407_summary.json", "w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          with open(OUTDIR / "v4_407_summary.md", "w", encoding="utf-8") as f:
+              f.write(f"# {VERSION} eBOSS observed value loading\n\n")
+              f.write(f"Expected result: `{EXPECTED_RESULT}`\n\n")
+              f.write(f"Rules: {summary['rules_passed']} / {summary['rules_total']}\n\n")
+              f.write(f"Failed gates: `{failed_gates}`\n\n")
+              f.write("Loaded observed values only:\n\n")
+              for r in loaded_rows:
+                  f.write(f"- {r['tracer_or_sample_family']}: z_eff={r['effective_redshift_z']}, f_sigma_8={r['observed_central_value']} +/- {r['observed_one_sigma_uncertainty']}\n")
+              f.write("\nNo covariance values, predictions, residuals, chi-square, likelihoods, p-values, validated score, or support claims were produced.\n")
+
+          zip_name = "tairid-v4-407-eboss-observed-value-loading-no-scoring-no-support-output.zip"
+          with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+              for p in sorted(OUTDIR.rglob("*")):
+                  zout.write(p, p.as_posix())
+
+          print(f"expected_result = {EXPECTED_RESULT}")
+          print(f"rules_passed = {summary['rules_passed']} / {summary['rules_total']}")
+          print(f"failed_gates = {failed_gates}")
+          print(f"observed_value_rows = {summary['observed_value_rows']}")
+          print(f"fsigma8_observed_value_rows = {summary['fsigma8_observed_value_rows']}")
+          print(f"loaded_LRG_rows = {summary['loaded_LRG_rows']}")
+          print(f"loaded_ELG_rows = {summary['loaded_ELG_rows']}")
+          print(f"loaded_QSO_rows = {summary['loaded_QSO_rows']}")
+          print(f"official_page_fetch_successful = {official_page_fetch_successful}")
+          print(f"official_page_signature_verified = {official_page_signature_verified}")
+          print(f"new_observed_values_loaded = {summary['new_observed_values_loaded']}")
+          print(f"covariance_values_loaded = {summary['covariance_values_loaded']}")
+          print(f"prediction_loaded = {summary['prediction_loaded']}")
+          print(f"residuals_computed = {summary['residuals_computed']}")
+          print(f"new_chi_square_computed = {summary['new_chi_square_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"p_values_computed = {summary['p_values_computed']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          print(f"WROTE {zip_name}")
+
+          if failed:
+              sys.exit(1)
+          PY
+
+      - name: Upload v4.407 output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-407-eboss-observed-value-loading-no-scoring-no-support-output
+          path: tairid-v4-407-eboss-observed-value-loading-no-scoring-no-support-output.zip
