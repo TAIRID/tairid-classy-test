@@ -1,0 +1,405 @@
+name: "!!! AAA CURRENT - TAIRID v4.408 eBOSS baseline prediction staging no residuals no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-408:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run v4.408 eBOSS baseline prediction staging
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import csv, io, json, math, os, zipfile
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          VERSION = "v4.408"
+          ROUTE = "v4_408_eboss_baseline_prediction_staging_no_residuals_no_support"
+          EXPECTED = "v4_408_eboss_baseline_prediction_staging_passed_predictions_loaded_no_residuals_no_support_claims"
+          INPUT_EXPECTED = "v4_407_eboss_observed_value_loading_passed_official_page_values_loaded_no_scoring_no_support_claims"
+          OUTDIR = Path("tairid_v4_408_eboss_baseline_prediction_staging_no_residuals_no_support_output")
+          OUTDIR.mkdir(exist_ok=True)
+
+          CLAIM_BOUNDARY = (
+              "eBOSS baseline prediction staging gate only; this gate uses the previously approved Planck 2018 "
+              "baseline constants omega_m0=0.315, sigma8_0=0.811, and growth_index_gamma=6/11 to compute "
+              "baseline f_sigma_8 predictions at the already loaded eBOSS LRG, ELG, and QSO effective redshifts; "
+              "observed values are preserved only as staging context; residuals are not computed; covariance matrix "
+              "values are not loaded; no chi-square, likelihood, p-values, validated score, or TAIRID support claims are allowed"
+          )
+
+          OMEGA_M0 = 0.315
+          SIGMA8_0 = 0.811
+          GAMMA = 6/11
+
+          def write_csv(path, rows, fieldnames=None):
+              path = OUTDIR / path
+              if fieldnames is None:
+                  fieldnames = list(rows[0].keys()) if rows else []
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow(r)
+
+          def read_zip_payload(path: Path):
+              with zipfile.ZipFile(path, "r") as z:
+                  names = z.namelist()
+                  # GitHub/mobile sometimes wraps output ZIP inside another ZIP of the same name.
+                  if len(names) == 1 and names[0].lower().endswith(".zip"):
+                      nested_bytes = z.read(names[0])
+                      with zipfile.ZipFile(io.BytesIO(nested_bytes), "r") as nz:
+                          return {n: nz.read(n) for n in nz.namelist()}
+                  return {n: z.read(n) for n in names}
+
+          def find_member(payload, suffix):
+              matches = [n for n in payload if n.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Missing member ending with {suffix}")
+              return matches[0]
+
+          def read_csv_member(payload, suffix):
+              name = find_member(payload, suffix)
+              text = payload[name].decode("utf-8-sig")
+              return list(csv.DictReader(io.StringIO(text))), name
+
+          def read_json_member(payload, suffix):
+              name = find_member(payload, suffix)
+              return json.loads(payload[name].decode("utf-8")), name
+
+          def omega_m_z(z):
+              ez2 = OMEGA_M0 * (1 + z) ** 3 + (1 - OMEGA_M0)
+              return OMEGA_M0 * (1 + z) ** 3 / ez2
+
+          def f_growth(z):
+              return omega_m_z(z) ** GAMMA
+
+          def growth_D(z, steps=6000):
+              # Integrates d ln D / d ln a = f(a), normalized D(a=1)=1.
+              a_target = 1.0 / (1.0 + z)
+              x0 = 0.0
+              x1 = math.log(a_target)
+              if abs(x1) < 1e-15:
+                  return 1.0
+              h = (x1 - x0) / steps
+              total = 0.0
+              for i in range(steps + 1):
+                  x = x0 + i * h
+                  a = math.exp(x)
+                  zz = (1.0 / a) - 1.0
+                  fx = f_growth(zz)
+                  weight = 0.5 if i in (0, steps) else 1.0
+                  total += weight * fx
+              lnD = h * total
+              return math.exp(lnD)
+
+          def pred_fsigma8(z):
+              fz = f_growth(z)
+              Dz = growth_D(z)
+              return fz * SIGMA8_0 * Dz, fz, Dz, omega_m_z(z)
+
+          def b(x):
+              if isinstance(x, bool):
+                  return x
+              if x is None:
+                  return False
+              return str(x).strip().lower() in ("true", "1", "yes")
+
+          # Locate input zip.
+          input_candidates = sorted(
+              [p for p in Path(".").glob("*.zip") if "v4-407" in p.name and "observed-value-loading" in p.name],
+              key=lambda p: p.stat().st_mtime,
+              reverse=True,
+          )
+          input_zip_found = bool(input_candidates)
+          if not input_candidates:
+              raise FileNotFoundError("Could not find v4.407 observed-value-loading ZIP in repo root.")
+          input_zip = input_candidates[0]
+          payload = read_zip_payload(input_zip)
+
+          summary, summary_member = read_json_member(payload, "v4_407_summary.json")
+          observed_rows, observed_member = read_csv_member(payload, "v4_407_loaded_eboss_fsigma8_observed_values_NO_SCORING_NO_SUPPORT.csv")
+          prediction_inputs, prediction_input_member = read_csv_member(payload, "v4_407_prediction_staging_input_packet_FOR_V4_408_NO_RESIDUALS_NO_SUPPORT.csv")
+
+          # Preserve only expected tracer rows and sort deterministically.
+          family_order = {"LRG": 0, "ELG": 1, "QSO": 2}
+          observed_rows = sorted(observed_rows, key=lambda r: family_order.get(r.get("tracer_or_sample_family", ""), 99))
+          prediction_inputs = sorted(prediction_inputs, key=lambda r: family_order.get(r.get("tracer_or_sample_family", ""), 99))
+
+          prediction_rows = []
+          residual_input_rows = []
+          for i, row in enumerate(observed_rows, start=1):
+              fam = row["tracer_or_sample_family"]
+              z = float(row["effective_redshift_z"])
+              obs = float(row["observed_central_value"])
+              sig = float(row["observed_one_sigma_uncertainty"])
+              pred, fz, Dz, Omz = pred_fsigma8(z)
+              prediction_rows.append({
+                  "v4_408_prediction_id": f"V4_408_EBOSS_PRED_{i:03d}",
+                  "tracer_or_sample_family": fam,
+                  "effective_redshift_z": f"{z:.12g}",
+                  "observable": "f_sigma_8",
+                  "baseline_prediction_fsigma8": f"{pred:.15g}",
+                  "omega_m_z": f"{Omz:.15g}",
+                  "growth_rate_f_z": f"{fz:.15g}",
+                  "growth_factor_D_z": f"{Dz:.15g}",
+                  "omega_m0": f"{OMEGA_M0:.15g}",
+                  "sigma8_0": f"{SIGMA8_0:.15g}",
+                  "growth_index_gamma": f"{GAMMA:.15g}",
+                  "baseline_method": "flat_LCDM_growth_index_gamma_prediction_fsigma8_equals_Omega_m_z_power_gamma_times_sigma8_0_times_D_z",
+                  "prediction_loaded_now": True,
+                  "observed_value_preserved_as_context": True,
+                  "residual_computed_now": False,
+                  "covariance_values_loaded_now": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              })
+              residual_input_rows.append({
+                  "v4_409_residual_input_id": f"V4_409_EBOSS_RESIDUAL_INPUT_{i:03d}",
+                  "tracer_or_sample_family": fam,
+                  "effective_redshift_z": f"{z:.12g}",
+                  "observable": "f_sigma_8",
+                  "observed_central_value": f"{obs:.15g}",
+                  "observed_one_sigma_uncertainty": f"{sig:.15g}",
+                  "baseline_prediction_fsigma8": f"{pred:.15g}",
+                  "ready_for_residual_review": True,
+                  "may_compute_residual_in_v4_409": True,
+                  "may_compute_chi_square_in_v4_409": False,
+                  "covariance_values_loaded": False,
+                  "support_allowed": False,
+                  "notes": "Residual may be computed only in the next explicitly guarded gate; chi-square remains blocked until residual review and uncertainty/covariance handling are explicitly approved.",
+              })
+
+          baseline_constants = [
+              {
+                  "baseline_constant_id": "V4_408_BASELINE_CONST_001",
+                  "parameter_or_method": "omega_m0",
+                  "approved_value": f"{OMEGA_M0:.15g}",
+                  "source_basis": "Preserved numeric baseline approval from earlier TAIRID SDSS/RSD lane: Planck 2018 Base-LambdaCDM matter density parameter.",
+                  "used_in_prediction_now": True,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "baseline_constant_id": "V4_408_BASELINE_CONST_002",
+                  "parameter_or_method": "sigma8_0",
+                  "approved_value": f"{SIGMA8_0:.15g}",
+                  "source_basis": "Preserved numeric baseline approval from earlier TAIRID SDSS/RSD lane: Planck 2018 Base-LambdaCDM sigma8 parameter.",
+                  "used_in_prediction_now": True,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+              {
+                  "baseline_constant_id": "V4_408_BASELINE_CONST_003",
+                  "parameter_or_method": "growth_index_gamma",
+                  "approved_value": f"{GAMMA:.15g}",
+                  "source_basis": "Preserved numeric baseline approval from earlier TAIRID SDSS/RSD lane: growth-index approximation gamma=6/11 for LambdaCDM.",
+                  "used_in_prediction_now": True,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              },
+          ]
+
+          method_ledger = [
+              {
+                  "method_step_id": "V4_408_METHOD_001",
+                  "method_step": "Use loaded eBOSS effective redshifts from v4.407.",
+                  "status": "applied",
+                  "support_allowed": False,
+              },
+              {
+                  "method_step_id": "V4_408_METHOD_002",
+                  "method_step": "Compute Omega_m(z) from flat LambdaCDM using omega_m0=0.315.",
+                  "status": "applied",
+                  "support_allowed": False,
+              },
+              {
+                  "method_step_id": "V4_408_METHOD_003",
+                  "method_step": "Compute f(z)=Omega_m(z)^gamma with gamma=6/11.",
+                  "status": "applied",
+                  "support_allowed": False,
+              },
+              {
+                  "method_step_id": "V4_408_METHOD_004",
+                  "method_step": "Compute normalized linear growth factor D(z) by integrating dlnD/dlna=f(a), with D(0)=1.",
+                  "status": "applied",
+                  "support_allowed": False,
+              },
+              {
+                  "method_step_id": "V4_408_METHOD_005",
+                  "method_step": "Stage baseline f_sigma8 prediction as f(z)*sigma8_0*D(z); do not compute residuals.",
+                  "status": "applied_no_residuals",
+                  "support_allowed": False,
+              },
+          ]
+
+          limitations = [
+              {"limitation_id": "V4_408_LIMIT_001", "limitation": "This gate stages baseline predictions only; it does not compute residuals.", "status": "hard_boundary"},
+              {"limitation_id": "V4_408_LIMIT_002", "limitation": "No covariance values, likelihoods, p-values, chi-square, validated score, or support claims are allowed.", "status": "hard_boundary"},
+              {"limitation_id": "V4_408_LIMIT_003", "limitation": "The prediction uses the previously approved simple growth-index baseline, not a full Boltzmann solver or full likelihood.", "status": "active_limit"},
+              {"limitation_id": "V4_408_LIMIT_004", "limitation": "Observed values are preserved only to create the next residual-review input packet.", "status": "active_limit"},
+          ]
+          gaps = [
+              {"gap_id": "V4_408_OPEN_GAP_001", "gap": "Residuals remain uncomputed until the next explicit residual-review gate.", "status": "open_next_gate"},
+              {"gap_id": "V4_408_OPEN_GAP_002", "gap": "Covariance or likelihood handling remains separate and unloaded.", "status": "open_later_gate"},
+              {"gap_id": "V4_408_OPEN_GAP_003", "gap": "No eBOSS chi-square or support interpretation exists at this stage.", "status": "blocked_here"},
+          ]
+          next_routes = [
+              {"route_key": "v4_409_eboss_guarded_residual_staging_no_chi_square_no_support", "recommendation": "primary_next", "reason": "Compute and review residuals from staged observed values and baseline predictions, while keeping chi-square blocked."},
+              {"route_key": "v4_408B_prediction_method_review_if_needed", "recommendation": "fallback_if_prediction_method_is_contested", "reason": "Use only if the growth-index baseline formula or constants need a separate human review before residuals."},
+          ]
+
+          rules = []
+          def rule(name, passed):
+              rules.append({"gate": name, "passed": bool(passed)})
+
+          families = {r.get("tracer_or_sample_family") for r in observed_rows}
+          pred_families = {r.get("tracer_or_sample_family") for r in prediction_rows}
+          pred_values = [float(r["baseline_prediction_fsigma8"]) for r in prediction_rows]
+
+          rule("input_407_zip_found", input_zip_found)
+          rule("input_407_summary_version_correct", summary.get("version") == "v4.407")
+          rule("input_407_expected_result_correct", summary.get("expected_result") == INPUT_EXPECTED)
+          rule("input_407_failed_gates_none", summary.get("failed_gates") == "none")
+          rule("input_407_observed_values_loaded_true", summary.get("new_observed_values_loaded") is True)
+          rule("input_407_prediction_loaded_false", summary.get("prediction_loaded") is False)
+          rule("input_407_residuals_computed_false", summary.get("residuals_computed") is False)
+          rule("input_407_support_allowed_false", summary.get("support_allowed") is False)
+          rule("observed_rows_equal_3", len(observed_rows) == 3)
+          rule("prediction_input_rows_equal_3", len(prediction_inputs) == 3)
+          rule("observed_families_include_LRG", "LRG" in families)
+          rule("observed_families_include_ELG", "ELG" in families)
+          rule("observed_families_include_QSO", "QSO" in families)
+          rule("baseline_constants_rows_equal_3", len(baseline_constants) == 3)
+          rule("omega_m0_locked", abs(OMEGA_M0 - 0.315) < 1e-15)
+          rule("sigma8_0_locked", abs(SIGMA8_0 - 0.811) < 1e-15)
+          rule("growth_index_gamma_locked", abs(GAMMA - (6/11)) < 1e-15)
+          rule("prediction_rows_equal_3", len(prediction_rows) == 3)
+          rule("prediction_families_include_LRG", "LRG" in pred_families)
+          rule("prediction_families_include_ELG", "ELG" in pred_families)
+          rule("prediction_families_include_QSO", "QSO" in pred_families)
+          rule("all_predictions_finite", all(math.isfinite(v) for v in pred_values))
+          rule("all_predictions_positive", all(v > 0 for v in pred_values))
+          rule("all_prediction_loaded_flags_true", all(b(r["prediction_loaded_now"]) for r in prediction_rows))
+          rule("all_residual_computed_flags_false", all(not b(r["residual_computed_now"]) for r in prediction_rows))
+          rule("all_covariance_loaded_flags_false", all(not b(r["covariance_values_loaded_now"]) for r in prediction_rows))
+          rule("all_chi_square_flags_false", all(not b(r["new_chi_square_computed"]) for r in prediction_rows))
+          rule("all_likelihood_flags_false", all(not b(r["likelihood_computed"]) for r in prediction_rows))
+          rule("all_p_value_flags_false", all(not b(r["p_values_computed"]) for r in prediction_rows))
+          rule("all_score_valid_flags_false", all(not b(r["score_valid"]) for r in prediction_rows))
+          rule("all_support_allowed_flags_false", all(not b(r["support_allowed"]) for r in prediction_rows))
+          rule("residual_input_packet_rows_equal_3", len(residual_input_rows) == 3)
+          rule("residual_input_all_ready_for_next_gate", all(b(r["ready_for_residual_review"]) for r in residual_input_rows))
+          rule("residual_input_all_block_chi_square", all(not b(r["may_compute_chi_square_in_v4_409"]) for r in residual_input_rows))
+          rule("method_ledger_rows_equal_5", len(method_ledger) == 5)
+          rule("limitations_rows_gte_4", len(limitations) >= 4)
+          rule("gaps_rows_gte_3", len(gaps) >= 3)
+          rule("next_routes_rows_gte_2", len(next_routes) >= 2)
+          rule("claim_boundary_mentions_no_residuals", "residuals are not computed" in CLAIM_BOUNDARY)
+          rule("claim_boundary_blocks_chi_square", "no chi-square" in CLAIM_BOUNDARY)
+          rule("claim_boundary_blocks_likelihood", "likelihood" in CLAIM_BOUNDARY)
+          rule("claim_boundary_blocks_p_values", "p-values" in CLAIM_BOUNDARY)
+          rule("claim_boundary_mentions_support_block", "support claims" in CLAIM_BOUNDARY)
+
+          failed = [r["gate"] for r in rules if not r["passed"]]
+          summary_out = {
+              "version": VERSION,
+              "route_name": ROUTE,
+              "expected_result": EXPECTED,
+              "input_version": "v4.407",
+              "created_utc": datetime.now(timezone.utc).isoformat(),
+              "rules_passed": sum(1 for r in rules if r["passed"]),
+              "rules_total": len(rules),
+              "failed_gates": "none" if not failed else ";".join(failed),
+              "observed_value_rows": len(observed_rows),
+              "prediction_rows": len(prediction_rows),
+              "baseline_constants_rows": len(baseline_constants),
+              "LRG_baseline_prediction_fsigma8": float(next(r for r in prediction_rows if r["tracer_or_sample_family"]=="LRG")["baseline_prediction_fsigma8"]),
+              "ELG_baseline_prediction_fsigma8": float(next(r for r in prediction_rows if r["tracer_or_sample_family"]=="ELG")["baseline_prediction_fsigma8"]),
+              "QSO_baseline_prediction_fsigma8": float(next(r for r in prediction_rows if r["tracer_or_sample_family"]=="QSO")["baseline_prediction_fsigma8"]),
+              "omega_m0": OMEGA_M0,
+              "sigma8_0": SIGMA8_0,
+              "growth_index_gamma": GAMMA,
+              "new_observed_values_loaded": False,
+              "prediction_loaded": True,
+              "residuals_computed": False,
+              "covariance_values_loaded": False,
+              "new_chi_square_computed": False,
+              "likelihood_computed": False,
+              "p_values_computed": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "claim_boundary": CLAIM_BOUNDARY,
+              "selected_next_route": "v4_409_eboss_guarded_residual_staging_no_chi_square_no_support",
+          }
+
+          # Write outputs.
+          write_csv("v4_408_baseline_constants_preserved_NO_RESIDUALS_NO_SUPPORT.csv", baseline_constants)
+          write_csv("v4_408_eboss_baseline_prediction_staging_NO_RESIDUALS_NO_SUPPORT.csv", prediction_rows)
+          write_csv("v4_408_prediction_method_ledger_NO_SUPPORT.csv", method_ledger)
+          write_csv("v4_408_residual_input_packet_FOR_V4_409_NO_CHI_SQUARE_NO_SUPPORT.csv", residual_input_rows)
+          write_csv("v4_408_limitations_after_prediction_staging.csv", limitations)
+          write_csv("v4_408_gap_status_after_prediction_staging.csv", gaps)
+          write_csv("v4_408_next_route_options.csv", next_routes)
+          write_csv("v4_408_rule_checks.csv", rules)
+          (OUTDIR / "v4_408_summary.json").write_text(json.dumps(summary_out, indent=2, sort_keys=True), encoding="utf-8")
+          (OUTDIR / "v4_408_summary.md").write_text(
+              f"# v4.408 eBOSS baseline prediction staging\n\n"
+              f"Expected result: `{EXPECTED}`\n\n"
+              f"Rules: {summary_out['rules_passed']} / {summary_out['rules_total']}\n\n"
+              f"Failed gates: `{summary_out['failed_gates']}`\n\n"
+              f"Baseline predictions staged only:\n\n"
+              f"- LRG: f_sigma_8_prediction={summary_out['LRG_baseline_prediction_fsigma8']:.15g}\n"
+              f"- ELG: f_sigma_8_prediction={summary_out['ELG_baseline_prediction_fsigma8']:.15g}\n"
+              f"- QSO: f_sigma_8_prediction={summary_out['QSO_baseline_prediction_fsigma8']:.15g}\n\n"
+              f"No residuals, covariance values, chi-square, likelihoods, p-values, validated score, or support claims were produced.\n",
+              encoding="utf-8",
+          )
+
+          zip_name = "tairid-v4-408-eboss-baseline-prediction-staging-no-residuals-no-support-output.zip"
+          with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_DEFLATED) as z:
+              for path in sorted(OUTDIR.iterdir()):
+                  z.write(path, arcname=f"{OUTDIR.name}/{path.name}")
+
+          print(f"Expected result: {EXPECTED}")
+          print(f"rules_passed = {summary_out['rules_passed']} / {summary_out['rules_total']}")
+          print(f"failed_gates = {summary_out['failed_gates']}")
+          print(f"observed_value_rows = {summary_out['observed_value_rows']}")
+          print(f"prediction_rows = {summary_out['prediction_rows']}")
+          print(f"baseline_constants_rows = {summary_out['baseline_constants_rows']}")
+          print(f"LRG_baseline_prediction_fsigma8 = {summary_out['LRG_baseline_prediction_fsigma8']}")
+          print(f"ELG_baseline_prediction_fsigma8 = {summary_out['ELG_baseline_prediction_fsigma8']}")
+          print(f"QSO_baseline_prediction_fsigma8 = {summary_out['QSO_baseline_prediction_fsigma8']}")
+          print(f"prediction_loaded = {summary_out['prediction_loaded']}")
+          print(f"residuals_computed = {summary_out['residuals_computed']}")
+          print(f"covariance_values_loaded = {summary_out['covariance_values_loaded']}")
+          print(f"new_chi_square_computed = {summary_out['new_chi_square_computed']}")
+          print(f"likelihood_computed = {summary_out['likelihood_computed']}")
+          print(f"p_values_computed = {summary_out['p_values_computed']}")
+          print(f"score_valid = {summary_out['score_valid']}")
+          print(f"support_allowed = {summary_out['support_allowed']}")
+
+          if failed:
+              raise SystemExit(1)
+
+          PY
+
+      - name: Upload v4.408 output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-408-eboss-baseline-prediction-staging-no-residuals-no-support-output
+          path: tairid-v4-408-eboss-baseline-prediction-staging-no-residuals-no-support-output.zip
