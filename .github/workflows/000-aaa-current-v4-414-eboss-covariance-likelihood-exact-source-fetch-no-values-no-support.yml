@@ -1,0 +1,505 @@
+name: "!!! AAA CURRENT - TAIRID v4.414 eBOSS covariance likelihood exact source fetch no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-414:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run v4.414 eBOSS covariance likelihood exact source fetch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import csv, io, json, os, glob, zipfile, re, hashlib, urllib.request, urllib.error
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from urllib.parse import urljoin
+
+          VERSION = "v4.414"
+          ROUTE_NAME = "v4_414_eboss_covariance_likelihood_exact_source_fetch_no_values_no_support"
+          EXPECTED_RESULT = "v4_414_eboss_covariance_likelihood_exact_source_fetch_passed_raw_capture_or_access_status_no_values_no_support_claims"
+          OUTDIR = Path("tairid_v4_414_eboss_covariance_likelihood_exact_source_fetch_no_values_no_support_output")
+          OUTZIP = Path("tairid-v4-414-eboss-covariance-likelihood-exact-source-fetch-no-values-no-support-output.zip")
+
+          NEW_OBSERVED_VALUES_LOADED = False
+          COVARIANCE_VALUES_LOADED = False
+          NEW_CHI_SQUARE_COMPUTED = False
+          LIKELIHOOD_COMPUTED = False
+          P_VALUES_COMPUTED = False
+          SCORE_VALID = False
+          SUPPORT_ALLOWED = False
+
+          RELEVANCE_TERMS = [
+              "cov", "covariance", "like", "likelihood", "chain", "chains", "fsig", "fsigma", "f_sigma",
+              "baorsd", "bao", "rsd", "lrg", "elg", "qso", "quasar", "multitracer", "multi", "tracer",
+              "consensus", "dmdh", "dm_hz", "hz", "dv", "fap", "measure"
+          ]
+
+          def csv_write(path, rows, fieldnames=None):
+              path = OUTDIR / path
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if fieldnames is None:
+                  keys = []
+                  for row in rows:
+                      for k in row.keys():
+                          if k not in keys:
+                              keys.append(k)
+                  fieldnames = keys
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow(row)
+
+          def read_csv_text(text):
+              return list(csv.DictReader(io.StringIO(text)))
+
+          def find_input_zip():
+              patterns = [
+                  "tairid-v4-413-eboss-covariance-likelihood-source-reopen-no-values-no-support-output*.zip",
+                  "**/tairid-v4-413-eboss-covariance-likelihood-source-reopen-no-values-no-support-output*.zip",
+              ]
+              hits = []
+              for pat in patterns:
+                  hits.extend(glob.glob(pat, recursive=True))
+              hits = sorted(set(hits))
+              if not hits:
+                  raise FileNotFoundError("Missing v4.413 output zip")
+              return Path(hits[0])
+
+          def get_zip_reader(path):
+              raw = path.read_bytes()
+              outer = zipfile.ZipFile(io.BytesIO(raw))
+              names = outer.namelist()
+              inner = [n for n in names if n.endswith(".zip")]
+              if len(names) == 1 and inner:
+                  return zipfile.ZipFile(io.BytesIO(outer.read(inner[0])))
+              return outer
+
+          def read_member_by_suffix(z, suffix):
+              matches = [n for n in z.namelist() if n.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Missing member ending with {suffix}")
+              return z.read(matches[0]).decode("utf-8")
+
+          def safe_id(value):
+              return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")[:120] or "payload"
+
+          def relevant_score(text):
+              low = text.lower()
+              hits = [t for t in RELEVANCE_TERMS if t in low]
+              return len(hits), ";".join(hits)
+
+          def http_fetch(url, timeout=30):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "TAIRID-v4.414-source-capture-no-values-no-support/1.0",
+                      "Accept": "*/*",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as resp:
+                      data = resp.read()
+                      headers = dict(resp.headers.items())
+                      return {
+                          "ok": True,
+                          "status_code": getattr(resp, "status", "unknown"),
+                          "final_url": resp.geturl(),
+                          "headers": headers,
+                          "data": data,
+                          "error_type": "",
+                          "error_message": "",
+                      }
+              except Exception as e:
+                  return {
+                      "ok": False,
+                      "status_code": "",
+                      "final_url": url,
+                      "headers": {},
+                      "data": b"",
+                      "error_type": type(e).__name__,
+                      "error_message": str(e)[:500],
+                  }
+
+          def extract_href_links(raw_text, base_url):
+              links = []
+              for m in re.finditer(r'href=["\']([^"\']+)["\']', raw_text, flags=re.I):
+                  href = m.group(1).strip()
+                  if href and href not in ("#",):
+                      links.append(urljoin(base_url, href))
+              # loose fallback for plain Apache/SVN listings
+              for m in re.finditer(r'>([^<]+\.(?:zip|txt|dat|csv|fits|gz|tar|npy|npz|pkl|json|ini|yaml|yml))<', raw_text, flags=re.I):
+                  links.append(urljoin(base_url, m.group(1).strip()))
+              dedup = []
+              seen = set()
+              for link in links:
+                  if link not in seen:
+                      seen.add(link)
+                      dedup.append(link)
+              return dedup
+
+          def main():
+              OUTDIR.mkdir(parents=True, exist_ok=True)
+              raw_dir = OUTDIR / "raw_source_payloads_or_access_status"
+              raw_dir.mkdir(parents=True, exist_ok=True)
+
+              input_zip = find_input_zip()
+              z = get_zip_reader(input_zip)
+              summary_413 = json.loads(read_member_by_suffix(z, "v4_413_summary.json"))
+              fetch_plan = read_csv_text(read_member_by_suffix(z, "v4_413_v4_414_exact_source_fetch_plan_NO_VALUES_NO_SUPPORT.csv"))
+              source_manifest = read_csv_text(read_member_by_suffix(z, "v4_413_covariance_likelihood_source_reopen_manifest_NO_VALUES_NO_SUPPORT.csv"))
+              tracer_need = read_csv_text(read_member_by_suffix(z, "v4_413_tracer_covariance_need_map_NO_VALUES_NO_SUPPORT.csv"))
+
+              fetch_status_rows = []
+              member_rows = []
+              relevant_hint_rows = []
+              payload_preview_rows = []
+              review_rows = []
+              raw_capture_rows = []
+
+              for idx, row in enumerate(fetch_plan, start=1):
+                  fetch_id = row["fetch_plan_id"]
+                  url = row["target_url"]
+                  target_type = row.get("target_type", "")
+                  result = http_fetch(url)
+                  data = result["data"]
+                  sha = hashlib.sha256(data).hexdigest() if data else ""
+
+                  ext = ".bin"
+                  if "zip" in target_type.lower() or url.lower().endswith(".zip"):
+                      ext = ".zip"
+                  elif "html" in target_type.lower() or "repository" in target_type.lower():
+                      ext = ".html"
+                  payload_name = f"{fetch_id}_{safe_id(url.split('/')[-1] or 'index')}{ext}"
+                  payload_rel = f"raw_source_payloads_or_access_status/{payload_name}"
+                  payload_path = OUTDIR / payload_rel
+
+                  if result["ok"] and data:
+                      payload_path.write_bytes(data)
+                      access_status_rel = ""
+                  else:
+                      access_status_rel = f"raw_source_payloads_or_access_status/{fetch_id}_ACCESS_STATUS.txt"
+                      (OUTDIR / access_status_rel).write_text(
+                          f"url={url}\nstatus_code={result['status_code']}\nerror_type={result['error_type']}\nerror_message={result['error_message']}\n",
+                          encoding="utf-8",
+                      )
+                      payload_rel = ""
+
+                  content_type = result["headers"].get("Content-Type", "")
+                  content_length_header = result["headers"].get("Content-Length", "")
+                  fetch_status_rows.append({
+                      "fetch_plan_id": fetch_id,
+                      "target_url": url,
+                      "target_type": target_type,
+                      "fetch_attempted": True,
+                      "fetch_success": bool(result["ok"]),
+                      "status_code": result["status_code"],
+                      "content_type": content_type,
+                      "content_length_header": content_length_header,
+                      "downloaded_byte_count": len(data),
+                      "sha256_if_downloaded": sha,
+                      "payload_file_if_downloaded": payload_rel,
+                      "access_status_file_if_not_downloaded": access_status_rel,
+                      "final_url": result["final_url"],
+                      "error_type": result["error_type"],
+                      "error_message": result["error_message"],
+                      "new_observed_values_loaded": False,
+                      "covariance_values_loaded": False,
+                      "support_allowed": False,
+                  })
+
+                  raw_capture_rows.append({
+                      "fetch_plan_id": fetch_id,
+                      "capture_type": "payload" if result["ok"] else "access_status",
+                      "capture_file": payload_rel or access_status_rel,
+                      "capture_is_sufficient_for_human_review": True,
+                      "values_loaded_now": False,
+                      "covariance_values_loaded_now": False,
+                      "support_allowed": False,
+                  })
+
+                  text_preview = ""
+                  detected_links = []
+                  zip_members_this = 0
+                  relevant_members_this = 0
+
+                  if result["ok"] and data:
+                      if ext == ".zip":
+                          try:
+                              with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                                  for member_idx, info in enumerate(archive.infolist(), start=1):
+                                      member_name = info.filename
+                                      score, terms = relevant_score(member_name)
+                                      is_relevant = score > 0
+                                      if is_relevant:
+                                          relevant_members_this += 1
+                                      zip_members_this += 1
+                                      member_rows.append({
+                                          "member_row_id": f"{fetch_id}_MEMBER_{member_idx:04d}",
+                                          "fetch_plan_id": fetch_id,
+                                          "source_url": url,
+                                          "member_name": member_name,
+                                          "member_file_size": info.file_size,
+                                          "member_compressed_size": info.compress_size,
+                                          "member_is_directory": info.is_dir(),
+                                          "relevance_score_from_name_only": score,
+                                          "relevance_terms_from_name_only": terms,
+                                          "candidate_for_v4_415_human_review": is_relevant,
+                                          "values_loaded_now": False,
+                                          "covariance_values_loaded_now": False,
+                                          "support_allowed": False,
+                                      })
+                                      if is_relevant:
+                                          relevant_hint_rows.append({
+                                              "hint_id": f"{fetch_id}_RELEVANT_MEMBER_{relevant_members_this:04d}",
+                                              "fetch_plan_id": fetch_id,
+                                              "hint_type": "archive_member_name",
+                                              "hint_text": member_name,
+                                              "hint_url_or_member": member_name,
+                                              "relevance_terms": terms,
+                                              "needs_human_review_before_loading": True,
+                                              "support_allowed": False,
+                                          })
+                          except Exception as e:
+                              member_rows.append({
+                                  "member_row_id": f"{fetch_id}_ZIP_PARSE_ERROR",
+                                  "fetch_plan_id": fetch_id,
+                                  "source_url": url,
+                                  "member_name": "",
+                                  "member_file_size": "",
+                                  "member_compressed_size": "",
+                                  "member_is_directory": "",
+                                  "relevance_score_from_name_only": 0,
+                                  "relevance_terms_from_name_only": "",
+                                  "candidate_for_v4_415_human_review": False,
+                                  "values_loaded_now": False,
+                                  "covariance_values_loaded_now": False,
+                                  "support_allowed": False,
+                                  "parse_error": str(e)[:300],
+                              })
+                      else:
+                          try:
+                              raw_text = data[:200000].decode("utf-8", errors="replace")
+                              text_preview = re.sub(r"\s+", " ", raw_text[:1500]).strip()
+                              detected_links = extract_href_links(raw_text, result["final_url"])
+                              for link_idx, link in enumerate(detected_links, start=1):
+                                  score, terms = relevant_score(link)
+                                  is_relevant = score > 0
+                                  member_rows.append({
+                                      "member_row_id": f"{fetch_id}_LINK_{link_idx:04d}",
+                                      "fetch_plan_id": fetch_id,
+                                      "source_url": url,
+                                      "member_name": link,
+                                      "member_file_size": "",
+                                      "member_compressed_size": "",
+                                      "member_is_directory": "",
+                                      "relevance_score_from_name_only": score,
+                                      "relevance_terms_from_name_only": terms,
+                                      "candidate_for_v4_415_human_review": is_relevant,
+                                      "values_loaded_now": False,
+                                      "covariance_values_loaded_now": False,
+                                      "support_allowed": False,
+                                  })
+                                  if is_relevant:
+                                      relevant_members_this += 1
+                                      relevant_hint_rows.append({
+                                          "hint_id": f"{fetch_id}_RELEVANT_LINK_{relevant_members_this:04d}",
+                                          "fetch_plan_id": fetch_id,
+                                          "hint_type": "page_or_listing_link",
+                                          "hint_text": link,
+                                          "hint_url_or_member": link,
+                                          "relevance_terms": terms,
+                                          "needs_human_review_before_loading": True,
+                                          "support_allowed": False,
+                                      })
+                          except Exception as e:
+                              text_preview = f"TEXT_PREVIEW_ERROR: {type(e).__name__}: {str(e)[:300]}"
+
+                  payload_preview_rows.append({
+                      "fetch_plan_id": fetch_id,
+                      "target_url": url,
+                      "fetch_success": bool(result["ok"]),
+                      "downloaded_byte_count": len(data),
+                      "detected_link_count_if_text": len(detected_links),
+                      "archive_member_count_if_zip": zip_members_this,
+                      "relevant_hint_count": relevant_members_this,
+                      "text_preview_first_1500_chars_if_text": text_preview,
+                      "values_loaded_now": False,
+                      "covariance_values_loaded_now": False,
+                      "support_allowed": False,
+                  })
+
+                  review_rows.append({
+                      "review_packet_id": f"V4_414_REVIEW_{idx:03d}",
+                      "fetch_plan_id": fetch_id,
+                      "target_url": url,
+                      "target_type": target_type,
+                      "fetch_success": bool(result["ok"]),
+                      "payload_or_access_status_captured": True,
+                      "archive_or_listing_members_detected": zip_members_this + len(detected_links),
+                      "relevant_member_hints_detected": relevant_members_this,
+                      "recommended_human_review_action": "review_detected_member_hints_before_value_or_covariance_loading" if relevant_members_this else "review_payload_or_access_status_and_supply_exact_member_path_if_needed",
+                      "allowed_next_gate": "v4_415_eboss_exact_source_capture_review_and_member_selection_no_values_no_support",
+                      "values_loaded_now": False,
+                      "covariance_values_loaded_now": False,
+                      "support_allowed": False,
+                  })
+
+              if not member_rows:
+                  member_rows.append({
+                      "member_row_id": "V4_414_NO_MEMBERS_DETECTED",
+                      "fetch_plan_id": "all",
+                      "source_url": "",
+                      "member_name": "",
+                      "member_file_size": "",
+                      "member_compressed_size": "",
+                      "member_is_directory": "",
+                      "relevance_score_from_name_only": 0,
+                      "relevance_terms_from_name_only": "",
+                      "candidate_for_v4_415_human_review": False,
+                      "values_loaded_now": False,
+                      "covariance_values_loaded_now": False,
+                      "support_allowed": False,
+                      "note": "No crawlable members detected; access-status evidence is still preserved for human review.",
+                  })
+
+              limitations = [
+                  {"limit_id": "V4_414_LIMIT_001", "limitation": "This gate captures raw source payloads, listings, member hints, or access-status evidence only.", "status": "active", "support_allowed": False},
+                  {"limit_id": "V4_414_LIMIT_002", "limitation": "No covariance values are loaded or interpreted in v4.414.", "status": "active", "support_allowed": False},
+                  {"limit_id": "V4_414_LIMIT_003", "limitation": "No new chi-square, likelihood, p-values, validated score, or support claim is produced.", "status": "active", "support_allowed": False},
+                  {"limit_id": "V4_414_LIMIT_004", "limitation": "Repository listings may expose hints that still require human selection before loading any value or covariance material.", "status": "active", "support_allowed": False},
+              ]
+
+              next_routes = [
+                  {"route_id": "V4_414_ROUTE_001", "route_name": "v4_415_eboss_exact_source_capture_review_and_member_selection_no_values_no_support", "recommended": True, "reason": "Review fetched payloads/member hints/access-status evidence and select exact member path before any covariance-aware metric.", "support_allowed": False},
+                  {"route_id": "V4_414_ROUTE_002", "route_name": "v4_415_alt_manual_exact_member_path_request_no_support", "recommended": False, "reason": "Use only if no fetched payload or member hint is sufficient for selecting exact source material.", "support_allowed": False},
+              ]
+
+              source_fetch_attempt_rows = len(fetch_status_rows)
+              successful_fetch_rows = sum(1 for r in fetch_status_rows if str(r["fetch_success"]) == "True")
+              access_status_or_payload_rows = sum(1 for r in raw_capture_rows if r["capture_file"])
+              relevant_hint_rows_count = len(relevant_hint_rows)
+              review_packet_rows = len(review_rows)
+              archive_or_listing_member_rows = len(member_rows)
+              source_capture_rows = len(raw_capture_rows)
+
+              checks = []
+              def add_check(name, passed, detail):
+                  checks.append({"check_name": name, "passed": bool(passed), "detail": str(detail)})
+
+              add_check("input_v4_413_expected_result", summary_413.get("expected_result") == "v4_413_eboss_covariance_likelihood_source_reopen_passed_fetch_plan_created_no_values_no_support_claims", summary_413.get("expected_result"))
+              add_check("input_v4_413_failed_gates_none", summary_413.get("failed_gates") == "none", summary_413.get("failed_gates"))
+              add_check("input_v4_413_selected_next_route_v4_414", summary_413.get("selected_next_route") == "v4_414_eboss_covariance_likelihood_exact_source_fetch_no_values_no_support", summary_413.get("selected_next_route"))
+              add_check("input_v4_413_no_covariance_values_loaded", summary_413.get("covariance_values_loaded") is False, summary_413.get("covariance_values_loaded"))
+              add_check("input_v4_413_no_support_allowed", summary_413.get("support_allowed") is False, summary_413.get("support_allowed"))
+              add_check("fetch_plan_rows_equal_4", len(fetch_plan) == 4, len(fetch_plan))
+              add_check("source_reopen_manifest_rows_equal_4", len(source_manifest) == 4, len(source_manifest))
+              add_check("tracer_need_rows_equal_3", len(tracer_need) == 3, len(tracer_need))
+              add_check("tracer_need_has_lrg_elg_qso", {r.get("tracer") for r in tracer_need} == {"LRG", "ELG", "QSO"}, {r.get("tracer") for r in tracer_need})
+              add_check("source_fetch_attempt_rows_equal_4", source_fetch_attempt_rows == 4, source_fetch_attempt_rows)
+              add_check("source_capture_rows_equal_4", source_capture_rows == 4, source_capture_rows)
+              add_check("access_status_or_payload_rows_equal_4", access_status_or_payload_rows == 4, access_status_or_payload_rows)
+              add_check("review_packet_rows_equal_4", review_packet_rows == 4, review_packet_rows)
+              add_check("payload_preview_rows_equal_4", len(payload_preview_rows) == 4, len(payload_preview_rows))
+              add_check("member_listing_rows_gte_1_or_access_status_preserved", archive_or_listing_member_rows >= 1, archive_or_listing_member_rows)
+              add_check("relevant_hint_rows_recorded_nonnegative", relevant_hint_rows_count >= 0, relevant_hint_rows_count)
+              add_check("successful_fetch_rows_recorded_nonnegative", successful_fetch_rows >= 0, successful_fetch_rows)
+              add_check("official_page_target_attempted", any("final-bao-and-rsd-measurements" in r["target_url"] for r in fetch_status_rows), "official page attempted")
+              add_check("svn_repository_target_attempted", any("svn.sdss.org/public/data/eboss/DR16cosmo" in r["target_url"] for r in fetch_status_rows), "svn root attempted")
+              add_check("multitracer_cf_target_attempted", any("MultiTracer_CF_BAORSD_measurements.zip" in r["target_url"] for r in fetch_status_rows), "CF zip attempted")
+              add_check("multitracer_pk_target_attempted", any("MultiTracer_PK_BAORSD_measurements.zip" in r["target_url"] for r in fetch_status_rows), "PK zip attempted")
+              add_check("all_fetch_rows_values_loaded_false", all(str(r["new_observed_values_loaded"]) == "False" for r in fetch_status_rows), "no observed values loaded")
+              add_check("all_fetch_rows_covariance_loaded_false", all(str(r["covariance_values_loaded"]) == "False" for r in fetch_status_rows), "no covariance loaded")
+              add_check("all_capture_rows_covariance_loaded_false", all(str(r["covariance_values_loaded_now"]) == "False" for r in raw_capture_rows), "no covariance loaded in capture rows")
+              add_check("all_review_rows_support_false", all(str(r["support_allowed"]) == "False" for r in review_rows), "support blocked")
+              add_check("limitations_rows_equal_4", len(limitations) == 4, len(limitations))
+              add_check("next_routes_rows_equal_2", len(next_routes) == 2, len(next_routes))
+              add_check("recommended_next_route_v4_415", any(str(r["recommended"]) == "True" and "v4_415" in r["route_name"] for r in next_routes), "v4.415 selected")
+              add_check("new_observed_values_loaded_false", NEW_OBSERVED_VALUES_LOADED is False, NEW_OBSERVED_VALUES_LOADED)
+              add_check("covariance_values_loaded_false", COVARIANCE_VALUES_LOADED is False, COVARIANCE_VALUES_LOADED)
+              add_check("new_chi_square_computed_false", NEW_CHI_SQUARE_COMPUTED is False, NEW_CHI_SQUARE_COMPUTED)
+              add_check("likelihood_computed_false", LIKELIHOOD_COMPUTED is False, LIKELIHOOD_COMPUTED)
+              add_check("p_values_computed_false", P_VALUES_COMPUTED is False, P_VALUES_COMPUTED)
+              add_check("score_valid_false", SCORE_VALID is False, SCORE_VALID)
+              add_check("support_allowed_false", SUPPORT_ALLOWED is False, SUPPORT_ALLOWED)
+              add_check("expected_result_label", EXPECTED_RESULT == "v4_414_eboss_covariance_likelihood_exact_source_fetch_passed_raw_capture_or_access_status_no_values_no_support_claims", EXPECTED_RESULT)
+
+              failed = [c["check_name"] for c in checks if not c["passed"]]
+              failed_gates = ";".join(failed) if failed else "none"
+
+              summary = {
+                  "version": VERSION,
+                  "route_name": ROUTE_NAME,
+                  "expected_result": EXPECTED_RESULT,
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "input_version": "v4.413",
+                  "rules_passed": sum(1 for c in checks if c["passed"]),
+                  "rules_total": len(checks),
+                  "failed_gates": failed_gates,
+                  "source_fetch_attempt_rows": source_fetch_attempt_rows,
+                  "successful_fetch_rows": successful_fetch_rows,
+                  "source_capture_rows": source_capture_rows,
+                  "access_status_or_payload_rows": access_status_or_payload_rows,
+                  "archive_or_listing_member_rows": archive_or_listing_member_rows,
+                  "relevant_member_hint_rows": relevant_hint_rows_count,
+                  "exact_source_review_packet_rows": review_packet_rows,
+                  "tracer_covariance_need_rows": len(tracer_need),
+                  "eboss_guarded_diagonal_chi_square_dry_run_sum": summary_413.get("eboss_guarded_diagonal_chi_square_dry_run_sum"),
+                  "boss_primary_fullcov_chi_square_dry_run_sum": summary_413.get("boss_primary_fullcov_chi_square_dry_run_sum"),
+                  "largest_eboss_diagonal_term_tracer": summary_413.get("largest_eboss_diagonal_term_tracer"),
+                  "new_observed_values_loaded": NEW_OBSERVED_VALUES_LOADED,
+                  "covariance_values_loaded": COVARIANCE_VALUES_LOADED,
+                  "new_chi_square_computed": NEW_CHI_SQUARE_COMPUTED,
+                  "likelihood_computed": LIKELIHOOD_COMPUTED,
+                  "p_values_computed": P_VALUES_COMPUTED,
+                  "score_valid": SCORE_VALID,
+                  "support_allowed": SUPPORT_ALLOWED,
+                  "selected_next_route": "v4_415_eboss_exact_source_capture_review_and_member_selection_no_values_no_support",
+              }
+
+              csv_write("v4_414_source_fetch_status_NO_VALUES_NO_SUPPORT.csv", fetch_status_rows)
+              csv_write("v4_414_raw_capture_file_ledger_NO_VALUES_NO_SUPPORT.csv", raw_capture_rows)
+              csv_write("v4_414_archive_or_listing_member_rows_NO_VALUES_NO_SUPPORT.csv", member_rows)
+              csv_write("v4_414_relevant_member_hint_ledger_NO_VALUES_NO_SUPPORT.csv", relevant_hint_rows, fieldnames=[
+                  "hint_id", "fetch_plan_id", "hint_type", "hint_text", "hint_url_or_member", "relevance_terms", "needs_human_review_before_loading", "support_allowed"
+              ] if relevant_hint_rows else ["hint_id", "fetch_plan_id", "hint_type", "hint_text", "hint_url_or_member", "relevance_terms", "needs_human_review_before_loading", "support_allowed"])
+              csv_write("v4_414_payload_preview_NO_VALUES_NO_SUPPORT.csv", payload_preview_rows)
+              csv_write("v4_414_exact_source_review_packet_NO_VALUES_NO_SUPPORT.csv", review_rows)
+              csv_write("v4_414_tracer_covariance_need_map_preserved_NO_VALUES_NO_SUPPORT.csv", tracer_need)
+              csv_write("v4_414_limitations.csv", limitations)
+              csv_write("v4_414_next_route_decision_NO_SUPPORT.csv", next_routes)
+              csv_write("v4_414_rule_checks.csv", checks)
+              (OUTDIR / "v4_414_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+              (OUTDIR / "v4_414_summary.md").write_text(
+                  f"# v4.414 eBOSS covariance/likelihood exact source fetch\n\n"
+                  f"Expected result: `{EXPECTED_RESULT}`\n\n"
+                  f"Rules: {summary['rules_passed']} / {summary['rules_total']} passed.\n\n"
+                  f"Failed gates: `{failed_gates}`\n\n"
+                  f"This gate fetches or captures access-status evidence for exact eBOSS covariance/likelihood source material. "
+                  f"It does not load observed values, load covariance values, compute chi-square, compute likelihood, compute p-values, validate score, or permit support claims.\n",
+                  encoding="utf-8",
+              )
+
+              with zipfile.ZipFile(OUTZIP, "w", zipfile.ZIP_DEFLATED) as zout:
+                  for file in OUTDIR.rglob("*"):
+                      if file.is_file():
+                          zout.write(file, file.relative_to(OUTDIR.parent))
+
+              print(json.dumps(summary, indent=2, sort_keys=True))
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Upload v4.414 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-414-eboss-covariance-likelihood-exact-source-fetch-no-values-no-support-output
+          path: tairid-v4-414-eboss-covariance-likelihood-exact-source-fetch-no-values-no-support-output.zip
