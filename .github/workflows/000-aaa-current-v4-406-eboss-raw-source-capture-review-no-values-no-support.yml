@@ -1,0 +1,340 @@
+name: "!!! AAA CURRENT - TAIRID v4.406 eBOSS raw source capture review no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-406:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run v4.406 eBOSS raw source capture review
+        shell: bash
+        run: |
+          #!/usr/bin/env python3
+          import csv, json, zipfile, glob, os, io, re, hashlib
+          from pathlib import Path
+          from datetime import datetime, timezone
+          
+          VERSION = "v4.406"
+          ROUTE_NAME = "v4_406_eboss_raw_source_capture_review_no_values_no_support_claims"
+          EXPECTED_RESULT = "v4_406_eboss_raw_source_capture_review_passed_official_page_bao_rsd_fsigma8_selected_no_values_no_support_claims"
+          
+          CLAIM_BOUNDARY = (
+              "eBOSS raw source capture review only; official SDSS final BAO/RSD page table may be selected "
+              "as the allowed raw source for next-gate observed-value loading; no observed numeric values are "
+              "normalized or loaded in v4.406; no covariance matrix values are loaded; no new chi-square; no likelihood; "
+              "no p-values; score_valid remains false; support_allowed remains false; no support claims"
+          )
+          
+          def fail(msg):
+              raise SystemExit(msg)
+          
+          def find_one(patterns):
+              hits = []
+              for pattern in patterns:
+                  hits.extend(glob.glob(pattern))
+              hits = sorted(set(hits))
+              if not hits:
+                  return None
+              return hits[0]
+          
+          def read_zip_json(z, suffix):
+              for name in z.namelist():
+                  if name.endswith(suffix):
+                      return json.loads(z.read(name).decode("utf-8"))
+              fail(f"missing json suffix: {suffix}")
+          
+          def read_zip_text_contains(z, contains, required=True):
+              for name in z.namelist():
+                  if contains in name:
+                      return z.read(name).decode("utf-8", errors="replace")
+              if required:
+                  fail(f"missing text containing: {contains}")
+              return ""
+          
+          def read_zip_csv_contains(z, contains, required=True):
+              for name in z.namelist():
+                  if contains in name:
+                      raw = z.read(name)
+                      if not raw.strip():
+                          return []
+                      text = raw.decode("utf-8", errors="replace")
+                      return list(csv.DictReader(io.StringIO(text)))
+              if required:
+                  fail(f"missing csv containing: {contains}")
+              return []
+          
+          def write_csv(path, rows, fieldnames=None):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if fieldnames is None:
+                  fieldnames = list(rows[0].keys()) if rows else []
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow(row)
+          
+          def b(v):
+              if isinstance(v, bool):
+                  return v
+              if isinstance(v, (int, float)):
+                  return bool(v)
+              return str(v).strip().lower() in {"true", "1", "yes"}
+          
+          def falsy(v):
+              if isinstance(v, bool):
+                  return not v
+              if isinstance(v, (int, float)):
+                  return v == 0
+              return str(v).strip().lower() in {"false", "0", "no", ""}
+          
+          input_405B_zip = find_one([
+              "*v4-405B-eboss-exact-source-fetch-official-page-fallback-repair-no-scoring-no-support-output*.zip",
+              "*v4_405B_eboss_exact_source_fetch_official_page_fallback_repair_no_scoring_no_support_output*.zip",
+          ])
+          human_review_zip = find_one([
+              "*v4-405B-human-filled-eboss-raw-source-review-for-v4-406-no-values-no-support*.zip",
+              "*v4_405B_HUMAN_FILLED_eboss_raw_source_capture_review*.zip",
+          ])
+          
+          outdir = Path("tairid_v4_406_eboss_raw_source_capture_review_no_values_no_support_output")
+          outdir.mkdir(exist_ok=True)
+          
+          rules = []
+          def check(name, passed):
+              rules.append({"gate": name, "passed": bool(passed)})
+              return bool(passed)
+          
+          check("input_405B_zip_found", input_405B_zip is not None)
+          check("human_review_zip_found", human_review_zip is not None)
+          if input_405B_zip is None:
+              fail("Missing v4.405B output zip")
+          if human_review_zip is None:
+              fail("Missing human-filled v4.405B source review zip for v4.406")
+          
+          with zipfile.ZipFile(input_405B_zip) as z405:
+              summary405 = read_zip_json(z405, "v4_405_summary.json")
+              candidates405 = read_zip_csv_contains(z405, "v4_405_observed_value_loading_candidate_packet")
+              tracer_summary405 = read_zip_csv_contains(z405, "v4_405_tracer_exact_capture_summary")
+              official_capture405 = read_zip_csv_contains(z405, "v4_405_official_page_table_marker_capture")
+              source_fetch405 = read_zip_csv_contains(z405, "v4_405_source_fetch_status")
+              official_raw_text = read_zip_text_contains(z405, "RAW_OFFICIAL_SDSS_PAGE_TEXT_SNAPSHOT")
+              repo_raw_text = read_zip_text_contains(z405, "RAW_REPOSITORY_ROOT_TEXT_SNAPSHOT", required=False)
+          
+          with zipfile.ZipFile(human_review_zip) as zh:
+              human_rows = []
+              for name in zh.namelist():
+                  if "HUMAN_FILLED" in name and name.endswith(".csv"):
+                      raw = zh.read(name).decode("utf-8", errors="replace")
+                      human_rows = list(csv.DictReader(io.StringIO(raw)))
+                      break
+              if not human_rows:
+                  fail("Missing HUMAN_FILLED CSV in human review zip")
+          
+          check("input_405B_summary_version_correct", summary405.get("version") == "v4.405B")
+          check("input_405B_expected_result_correct", summary405.get("expected_result") == "v4_405B_eboss_exact_source_fetch_official_page_fallback_repair_passed_raw_source_capture_ready_no_values_no_support_claims")
+          check("input_405B_failed_gates_none", summary405.get("failed_gates") == "none")
+          check("input_405B_rules_passed_45", int(summary405.get("rules_passed", -1)) == 45)
+          check("input_405B_rules_total_45", int(summary405.get("rules_total", -1)) == 45)
+          check("input_405B_official_page_capture_sufficient", b(summary405.get("official_page_capture_sufficient_for_v4_406_review")))
+          check("input_405B_ready_for_v4_406_rows_eq_3", int(summary405.get("ready_for_v4_406_raw_source_review_rows", -1)) == 3)
+          check("input_405B_value_loading_candidate_rows_eq_3", len(candidates405) == 3)
+          check("input_405B_tracer_summary_rows_eq_3", len(tracer_summary405) == 3)
+          check("input_405B_official_capture_rows_eq_3", len(official_capture405) == 3)
+          check("input_405B_source_fetch_rows_eq_2", len(source_fetch405) == 2)
+          check("input_405B_new_observed_values_loaded_false", falsy(summary405.get("new_observed_values_loaded")))
+          check("input_405B_covariance_values_loaded_false", falsy(summary405.get("covariance_values_loaded")))
+          check("input_405B_new_chi_square_computed_false", falsy(summary405.get("new_chi_square_computed")))
+          check("input_405B_likelihood_computed_false", falsy(summary405.get("likelihood_computed")))
+          check("input_405B_p_values_computed_false", falsy(summary405.get("p_values_computed")))
+          check("input_405B_score_valid_false", falsy(summary405.get("score_valid")))
+          check("input_405B_support_allowed_false", falsy(summary405.get("support_allowed")))
+          
+          raw_lower = official_raw_text.lower()
+          check("raw_official_text_available", len(official_raw_text) > 1000)
+          check("raw_official_text_contains_bao_rsd_measurements", "bao+rsd measurements" in raw_lower or "bao + rsd measurements" in raw_lower)
+          check("raw_official_text_contains_rsd_measurements", "rsd measurements" in raw_lower)
+          check("raw_official_text_contains_fsigma8_marker", ("f σ 8" in official_raw_text) or ("f sigma 8" in raw_lower) or ("fσ8" in official_raw_text))
+          check("raw_official_text_contains_eboss_lrg", "eboss lrg" in raw_lower)
+          check("raw_official_text_contains_eboss_elg", "eboss elg" in raw_lower)
+          check("raw_official_text_contains_eboss_quasar", "eboss quasar" in raw_lower)
+          check("repository_root_text_preserved_even_if_member_rows_zero", repo_raw_text is not None)
+          
+          expected_tracers = {"LRG", "ELG", "QSO"}
+          human_tracers = {str(r.get("tracer_or_sample_family","")).strip() for r in human_rows}
+          check("human_review_rows_eq_3", len(human_rows) == 3)
+          check("human_review_has_lrg_elg_qso", human_tracers == expected_tracers)
+          check("human_review_all_approved", all(str(r.get("human_source_decision","")).startswith("approve_official_page") for r in human_rows))
+          check("human_review_all_official_page_table", all(r.get("approved_raw_source_type") == "official_page_table" for r in human_rows))
+          check("human_review_all_bao_plus_rsd", all(r.get("approved_value_family") == "BAO_plus_RSD_fsigma8" for r in human_rows))
+          check("human_review_all_fsigma8", all(r.get("approved_observable") == "f_sigma_8" for r in human_rows))
+          check("human_review_all_value_loading_allowed_next_gate", all(b(r.get("value_loading_allowed_in_v4_407")) for r in human_rows))
+          check("human_review_all_covariance_loading_not_allowed_next_gate", all(falsy(r.get("covariance_loading_allowed_in_v4_407")) for r in human_rows))
+          check("human_review_numeric_values_loaded_now_false", all(falsy(r.get("numeric_values_loaded_now")) for r in human_rows))
+          check("human_review_covariance_values_loaded_now_false", all(falsy(r.get("covariance_values_loaded_now")) for r in human_rows))
+          check("human_review_new_chi_square_false", all(falsy(r.get("new_chi_square_computed")) for r in human_rows))
+          check("human_review_likelihood_false", all(falsy(r.get("likelihood_computed")) for r in human_rows))
+          check("human_review_pvalues_false", all(falsy(r.get("p_values_computed")) for r in human_rows))
+          check("human_review_score_valid_false", all(falsy(r.get("score_valid")) for r in human_rows))
+          check("human_review_support_allowed_false", all(falsy(r.get("support_allowed")) for r in human_rows))
+          
+          approved_rows = []
+          instruction_rows = []
+          for i, r in enumerate(sorted(human_rows, key=lambda x: x.get("tracer_or_sample_family","")), start=1):
+              tracer = r["tracer_or_sample_family"].strip()
+              selected_family = r["selected_family"].strip()
+              row = {
+                  "v4_406_approved_source_id": f"V4_406_APPROVED_VALUE_SOURCE_{i:03d}",
+                  "tracer_or_sample_family": tracer,
+                  "selected_family": selected_family,
+                  "approved_raw_source_type": r["approved_raw_source_type"],
+                  "approved_value_family": r["approved_value_family"],
+                  "approved_observable": r["approved_observable"],
+                  "approved_measurement_section": r["approved_measurement_section"],
+                  "approved_source_anchor": r["approved_source_anchor"],
+                  "approved_raw_locator": f"Official SDSS final BAO/RSD page table; BAO+RSD Measurements section; f sigma 8 row; eBOSS {tracer} column",
+                  "raw_text_snapshot_file": "RAW_OFFICIAL_SDSS_PAGE_TEXT_SNAPSHOT_FOR_HUMAN_REVIEW_NOT_VALUE_LEDGER.txt",
+                  "repository_fallback_status": r["approved_repository_fallback_status"],
+                  "ready_for_v4_407_observed_value_loading": True,
+                  "numeric_values_loaded_now": False,
+                  "covariance_values_loaded_now": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              }
+              approved_rows.append(row)
+              instruction_rows.append({
+                  "v4_407_instruction_id": f"V4_407_VALUE_LOADING_INSTRUCTION_{i:03d}",
+                  "tracer_or_sample_family": tracer,
+                  "selected_family": selected_family,
+                  "source_to_parse": "official_sdss_final_bao_rsd_measurements_page_raw_text_snapshot",
+                  "section_to_parse": "BAO+RSD Measurements",
+                  "observable_to_parse": "f sigma 8",
+                  "column_to_parse": f"eBOSS {tracer}",
+                  "allowed_to_parse_numeric_value_in_v4_407": True,
+                  "allowed_to_parse_numeric_uncertainty_in_v4_407": True,
+                  "allowed_to_load_covariance_in_v4_407": False,
+                  "may_compute_chi_square_in_v4_407": False,
+                  "notes": "v4.407 may load observed central value and quoted one-sigma uncertainty from the approved official-page table only. It may not compute residuals or chi-square.",
+                  "support_allowed": False,
+              })
+          
+          review_ledger = []
+          for r in human_rows:
+              out = dict(r)
+              out["ingest_status"] = "accepted_for_v4_407_observed_value_loading_source_selection"
+              out["claim_boundary"] = CLAIM_BOUNDARY
+              review_ledger.append(out)
+          
+          open_gaps = [
+              {"gap_id":"V4_406_OPEN_GAP_001","gap":"v4.407 must parse and load the approved eBOSS LRG f_sigma_8 observed central value and uncertainty from the official-page table.","status":"open_next_gate"},
+              {"gap_id":"V4_406_OPEN_GAP_002","gap":"v4.407 must parse and load the approved eBOSS ELG f_sigma_8 observed central value and uncertainty from the official-page table.","status":"open_next_gate"},
+              {"gap_id":"V4_406_OPEN_GAP_003","gap":"v4.407 must parse and load the approved eBOSS QSO f_sigma_8 observed central value and uncertainty from the official-page table.","status":"open_next_gate"},
+              {"gap_id":"V4_406_OPEN_GAP_004","gap":"Covariance or likelihood handling remains separate after observed values are loaded and reviewed.","status":"open_later_gate"},
+          ]
+          limitations = [
+              {"limitation_id":"V4_406_LIMIT_001","limitation":"This gate approves an exact raw source for next observed-value loading; it does not normalize or load numeric values itself.","status":"hard_boundary"},
+              {"limitation_id":"V4_406_LIMIT_002","limitation":"Only the official SDSS final BAO/RSD page table is approved for v4.407 observed-value loading unless a later repair changes the source.","status":"active_limit"},
+              {"limitation_id":"V4_406_LIMIT_003","limitation":"Repository member capture remains incomplete and is not required for the next observed-value loading gate.","status":"active_limit"},
+              {"limitation_id":"V4_406_LIMIT_004","limitation":"No covariance matrix values, likelihoods, p-values, validated score, or TAIRID support claims are allowed in this gate.","status":"hard_boundary"},
+          ]
+          next_routes = [
+              {"route_key":"v4_407_eboss_observed_value_loading_from_approved_official_page_no_scoring_no_support","recommendation":"primary_next","reason":"Load eBOSS LRG/ELG/QSO observed f_sigma_8 values and quoted uncertainties from approved official-page table without residuals or chi-square."},
+              {"route_key":"v4_407B_manual_value_quote_repair_if_parser_fails","recommendation":"fallback_if_needed","reason":"Use if table parsing fails or the raw text changes format."},
+          ]
+          
+          summary = {
+              "version": VERSION,
+              "route_name": ROUTE_NAME,
+              "expected_result": EXPECTED_RESULT,
+              "created_utc": datetime.now(timezone.utc).isoformat(),
+              "input_version": "v4.405B",
+              "rules_passed": sum(1 for r in rules if r["passed"]),
+              "rules_total": len(rules),
+              "failed_gates": "none",  # updated below
+              "human_review_rows": len(human_rows),
+              "accepted_raw_source_rows": len(approved_rows),
+              "approved_official_page_table_rows": sum(1 for r in approved_rows if r["approved_raw_source_type"] == "official_page_table"),
+              "approved_bao_plus_rsd_fsigma8_rows": sum(1 for r in approved_rows if r["approved_value_family"] == "BAO_plus_RSD_fsigma8"),
+              "value_loading_instruction_rows": len(instruction_rows),
+              "ready_for_v4_407_observed_value_loading_rows": sum(1 for r in approved_rows if r["ready_for_v4_407_observed_value_loading"]),
+              "repository_member_rows": int(summary405.get("repository_member_rows", 0)),
+              "repository_member_capture_required_for_pass": False,
+              "official_page_capture_sufficient_for_value_loading_source_selection": True,
+              "prior_guarded_diagonal_chi_square_sum": summary405.get("prior_guarded_diagonal_chi_square_sum"),
+              "primary_dM_Hz_chi_square_dry_run_sum": summary405.get("primary_dM_Hz_chi_square_dry_run_sum"),
+              "robustness_min_chi_square": summary405.get("robustness_min_chi_square"),
+              "robustness_max_chi_square": summary405.get("robustness_max_chi_square"),
+              "robustness_chi_square_range_width": summary405.get("robustness_chi_square_range_width"),
+              "new_observed_values_loaded": False,
+              "covariance_values_loaded": False,
+              "new_chi_square_computed": False,
+              "likelihood_computed": False,
+              "p_values_computed": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "claim_boundary": CLAIM_BOUNDARY,
+              "selected_next_route": "v4_407_eboss_observed_value_loading_from_approved_official_page_no_scoring_no_support",
+          }
+          summary["failed_gates"] = "none" if summary["rules_passed"] == summary["rules_total"] else ";".join([r["gate"] for r in rules if not r["passed"]])
+          
+          write_csv(outdir/"v4_406_eboss_raw_source_review_ingest_ledger_NO_VALUES_NO_SUPPORT.csv", review_ledger)
+          write_csv(outdir/"v4_406_APPROVED_value_loading_source_packet_FOR_V4_407_NO_VALUES_LOADED.csv", approved_rows)
+          write_csv(outdir/"v4_406_value_loading_instruction_packet_FOR_V4_407_NO_VALUES_LOADED.csv", instruction_rows)
+          write_csv(outdir/"v4_406_gap_status_after_raw_source_review.csv", open_gaps)
+          write_csv(outdir/"v4_406_limitations_after_raw_source_review.csv", limitations)
+          write_csv(outdir/"v4_406_next_route_options.csv", next_routes)
+          write_csv(outdir/"v4_406_rule_checks.csv", rules)
+          with open(outdir/"v4_406_summary.json","w",encoding="utf-8") as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          with open(outdir/"v4_406_summary.md","w",encoding="utf-8") as f:
+              f.write(f"# {VERSION} eBOSS raw source capture review\n\n")
+              f.write(f"Expected result: `{EXPECTED_RESULT}`\n\n")
+              f.write(f"Rules: {summary['rules_passed']} / {summary['rules_total']}\n\n")
+              f.write(f"Failed gates: {summary['failed_gates']}\n\n")
+              f.write("Approved next value-loading source: official SDSS final BAO/RSD page table, BAO+RSD Measurements, f sigma 8 row, eBOSS LRG/ELG/QSO columns.\n\n")
+              f.write("No observed values were loaded in this gate. No covariance values were loaded. No chi-square, likelihood, p-values, score validation, or support claim is allowed.\n")
+          
+          zip_name = "tairid-v4-406-eboss-raw-source-capture-review-no-values-no-support-output.zip"
+          with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+              for p in sorted(outdir.rglob("*")):
+                  zout.write(p, str(p))
+          
+          print(f"expected_result = {EXPECTED_RESULT}")
+          print(f"rules_passed = {summary['rules_passed']} / {summary['rules_total']}")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"human_review_rows = {summary['human_review_rows']}")
+          print(f"accepted_raw_source_rows = {summary['accepted_raw_source_rows']}")
+          print(f"approved_official_page_table_rows = {summary['approved_official_page_table_rows']}")
+          print(f"approved_bao_plus_rsd_fsigma8_rows = {summary['approved_bao_plus_rsd_fsigma8_rows']}")
+          print(f"value_loading_instruction_rows = {summary['value_loading_instruction_rows']}")
+          print(f"ready_for_v4_407_observed_value_loading_rows = {summary['ready_for_v4_407_observed_value_loading_rows']}")
+          print(f"repository_member_capture_required_for_pass = {summary['repository_member_capture_required_for_pass']}")
+          print(f"new_observed_values_loaded = {summary['new_observed_values_loaded']}")
+          print(f"covariance_values_loaded = {summary['covariance_values_loaded']}")
+          print(f"new_chi_square_computed = {summary['new_chi_square_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"p_values_computed = {summary['p_values_computed']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          
+          if summary["failed_gates"] != "none":
+              raise SystemExit(1)
+
+
+      - name: Upload v4.406 output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-406-eboss-raw-source-capture-review-no-values-no-support-output
+          path: tairid-v4-406-eboss-raw-source-capture-review-no-values-no-support-output.zip
