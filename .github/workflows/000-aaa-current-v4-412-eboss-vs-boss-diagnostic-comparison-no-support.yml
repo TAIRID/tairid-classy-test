@@ -1,0 +1,463 @@
+name: "!!! AAA CURRENT - TAIRID v4.412 eBOSS vs BOSS diagnostic comparison no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-412:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run v4.412 eBOSS vs BOSS diagnostic comparison
+        shell: bash
+        run: |
+          python3 <<'PY'
+
+          import csv, io, json, math, os, glob, zipfile
+          from pathlib import Path
+          from datetime import datetime, timezone
+          
+          VERSION = "v4.412"
+          ROUTE_NAME = "v4_412_eboss_vs_boss_diagnostic_comparison_no_support"
+          EXPECTED_RESULT = "v4_412_eboss_vs_boss_diagnostic_comparison_passed_metric_contrast_created_no_support_claims"
+          OUTDIR = Path("tairid_v4_412_eboss_vs_boss_diagnostic_comparison_no_support_output")
+          OUTZIP = Path("tairid-v4-412-eboss-vs-boss-diagnostic-comparison-no-support-output.zip")
+          
+          BOSS_PRIOR_DIAGONAL = 1.362038876169214
+          BOSS_PRIMARY_FULLCOV = 1.384804886905097
+          BOSS_ROBUSTNESS_MIN = 1.2298323467773977
+          BOSS_ROBUSTNESS_MAX = 1.384804886905097
+          BOSS_ROBUSTNESS_RANGE = 0.15497254012769934
+          BOSS_DOF_CANDIDATE = 3
+          
+          def as_bool(x):
+              if isinstance(x, bool):
+                  return x
+              if x is None:
+                  return False
+              return str(x).strip().lower() in ("true", "1", "yes", "y")
+          
+          def read_csv_text(text):
+              return list(csv.DictReader(io.StringIO(text)))
+          
+          def csv_write(path, rows, fieldnames=None):
+              path = OUTDIR / path
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if fieldnames is None:
+                  keys = []
+                  for row in rows:
+                      for k in row.keys():
+                          if k not in keys:
+                              keys.append(k)
+                  fieldnames = keys
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow(row)
+          
+          def find_input_zip():
+              pats = [
+                  "tairid-v4-411-eboss-guarded-diagonal-chi-square-dry-run-no-likelihood-no-support-output*.zip",
+                  "**/tairid-v4-411-eboss-guarded-diagonal-chi-square-dry-run-no-likelihood-no-support-output*.zip",
+              ]
+              hits = []
+              for pat in pats:
+                  hits.extend(glob.glob(pat, recursive=True))
+              hits = sorted(set(hits))
+              if not hits:
+                  raise FileNotFoundError("Missing v4.411 output zip")
+              return Path(hits[0])
+          
+          def get_zip_reader(path):
+              outer_bytes = path.read_bytes()
+              outer = zipfile.ZipFile(io.BytesIO(outer_bytes))
+              names = outer.namelist()
+              inner_zip_names = [n for n in names if n.endswith(".zip")]
+              if len(names) == 1 and inner_zip_names:
+                  return zipfile.ZipFile(io.BytesIO(outer.read(inner_zip_names[0])))
+              return outer
+          
+          def read_member_by_suffix(z, suffix):
+              matches = [n for n in z.namelist() if n.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Missing member ending with {suffix}")
+              return z.read(matches[0]).decode("utf-8")
+          
+          def finite(x):
+              try:
+                  return math.isfinite(float(x))
+              except Exception:
+                  return False
+          
+          def near(a, b, tol=1e-12):
+              return abs(float(a) - float(b)) <= tol
+          
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          input_zip = find_input_zip()
+          z = get_zip_reader(input_zip)
+          
+          summary = json.loads(read_member_by_suffix(z, "v4_411_summary.json"))
+          terms = read_csv_text(read_member_by_suffix(z, "v4_411_eboss_guarded_diagonal_chi_square_terms_NO_SUPPORT.csv"))
+          comparison_input = read_csv_text(read_member_by_suffix(z, "v4_411_input_packet_FOR_V4_412_EBOSS_VS_BOSS_COMPARISON_NO_SUPPORT.csv"))
+          rule_checks_411 = read_csv_text(read_member_by_suffix(z, "v4_411_rule_checks.csv"))
+          
+          eboss_sum = float(summary["guarded_diagonal_chi_square_dry_run_sum"])
+          eboss_dof = int(summary["degrees_of_freedom_candidate"])
+          largest_term_tracer = summary["largest_diagonal_term_tracer"]
+          largest_term_value = float(summary["largest_diagonal_term_value"])
+          
+          e_minus_boss_diag = eboss_sum - BOSS_PRIOR_DIAGONAL
+          e_minus_boss_full = eboss_sum - BOSS_PRIMARY_FULLCOV
+          e_to_boss_diag = eboss_sum / BOSS_PRIOR_DIAGONAL
+          e_to_boss_full = eboss_sum / BOSS_PRIMARY_FULLCOV
+          eboss_per_dof = eboss_sum / eboss_dof
+          boss_full_per_dof = BOSS_PRIMARY_FULLCOV / BOSS_DOF_CANDIDATE
+          boss_diag_per_dof = BOSS_PRIOR_DIAGONAL / BOSS_DOF_CANDIDATE
+          
+          term_values = {r["tracer_or_sample_family"]: float(r["guarded_diagonal_chi_square_term"]) for r in terms}
+          resid_sigmas = {r["tracer_or_sample_family"]: float(r["residual_in_one_sigma_units"]) for r in terms}
+          resids = {r["tracer_or_sample_family"]: float(r["signed_residual_observed_minus_baseline"]) for r in terms}
+          
+          comparison_rows = [
+              {
+                  "comparison_id": "V4_412_COMPARE_001",
+                  "diagnostic_family": "BOSS_DR12_prior_guarded_diagonal",
+                  "row_scope": "three_BOSS_DR12_fsigma8_rows",
+                  "metric_type": "guarded_diagonal_chi_square_reference",
+                  "chi_square_dry_run_sum": BOSS_PRIOR_DIAGONAL,
+                  "degrees_of_freedom_candidate": BOSS_DOF_CANDIDATE,
+                  "chi_square_per_candidate_dof": boss_diag_per_dof,
+                  "covariance_treatment": "diagonal_only_reference",
+                  "interpretation_boundary": "reference only; no likelihood; no p-values; no support claim",
+                  "support_allowed": False,
+              },
+              {
+                  "comparison_id": "V4_412_COMPARE_002",
+                  "diagnostic_family": "BOSS_DR12_primary_dM_Hz_fsig",
+                  "row_scope": "three_BOSS_DR12_fsigma8_rows",
+                  "metric_type": "covariance_corrected_chi_square_dry_run_reference",
+                  "chi_square_dry_run_sum": BOSS_PRIMARY_FULLCOV,
+                  "degrees_of_freedom_candidate": BOSS_DOF_CANDIDATE,
+                  "chi_square_per_candidate_dof": boss_full_per_dof,
+                  "covariance_treatment": "primary_human_approved_3x3_covariance_subblock",
+                  "interpretation_boundary": "reference only; no likelihood; no p-values; no support claim",
+                  "support_allowed": False,
+              },
+              {
+                  "comparison_id": "V4_412_COMPARE_003",
+                  "diagnostic_family": "BOSS_DR12_robustness_band",
+                  "row_scope": "primary_plus_preserved_alternate_covariance_candidates",
+                  "metric_type": "robustness_band_reference",
+                  "chi_square_dry_run_sum": "",
+                  "degrees_of_freedom_candidate": BOSS_DOF_CANDIDATE,
+                  "chi_square_per_candidate_dof": "",
+                  "covariance_treatment": "primary_and_alternate_covariance_candidates",
+                  "robustness_min_chi_square": BOSS_ROBUSTNESS_MIN,
+                  "robustness_max_chi_square": BOSS_ROBUSTNESS_MAX,
+                  "robustness_chi_square_range_width": BOSS_ROBUSTNESS_RANGE,
+                  "interpretation_boundary": "narrow robustness band reference only; no support claim",
+                  "support_allowed": False,
+              },
+              {
+                  "comparison_id": "V4_412_COMPARE_004",
+                  "diagnostic_family": "eBOSS_LRG_ELG_QSO",
+                  "row_scope": "three_eBOSS_fsigma8_tracer_rows",
+                  "metric_type": "guarded_diagonal_chi_square_dry_run",
+                  "chi_square_dry_run_sum": eboss_sum,
+                  "degrees_of_freedom_candidate": eboss_dof,
+                  "chi_square_per_candidate_dof": eboss_per_dof,
+                  "covariance_treatment": "official_one_sigma_uncertainties_only_no_covariance",
+                  "interpretation_boundary": "guarded diagonal dry-run only; no eBOSS covariance loaded; no likelihood; no p-values; no support claim",
+                  "support_allowed": False,
+              },
+          ]
+          
+          delta_rows = [
+              {
+                  "delta_id": "V4_412_DELTA_001",
+                  "comparison": "eBOSS_diagonal_minus_BOSS_prior_diagonal",
+                  "left_metric": eboss_sum,
+                  "right_metric": BOSS_PRIOR_DIAGONAL,
+                  "difference": e_minus_boss_diag,
+                  "ratio": e_to_boss_diag,
+                  "interpretation": "eBOSS guarded diagonal dry-run is higher than prior BOSS diagonal reference",
+                  "support_allowed": False,
+              },
+              {
+                  "delta_id": "V4_412_DELTA_002",
+                  "comparison": "eBOSS_diagonal_minus_BOSS_primary_fullcov",
+                  "left_metric": eboss_sum,
+                  "right_metric": BOSS_PRIMARY_FULLCOV,
+                  "difference": e_minus_boss_full,
+                  "ratio": e_to_boss_full,
+                  "interpretation": "eBOSS guarded diagonal dry-run is higher than primary BOSS covariance-corrected reference",
+                  "support_allowed": False,
+              },
+              {
+                  "delta_id": "V4_412_DELTA_003",
+                  "comparison": "eBOSS_per_dof_minus_BOSS_primary_fullcov_per_dof",
+                  "left_metric": eboss_per_dof,
+                  "right_metric": boss_full_per_dof,
+                  "difference": eboss_per_dof - boss_full_per_dof,
+                  "ratio": eboss_per_dof / boss_full_per_dof,
+                  "interpretation": "per-row diagonal eBOSS contrast is higher than BOSS full-covariance reference, but covariance treatment differs",
+                  "support_allowed": False,
+              },
+              {
+                  "delta_id": "V4_412_DELTA_004",
+                  "comparison": "eBOSS_diagonal_minus_BOSS_robustness_max",
+                  "left_metric": eboss_sum,
+                  "right_metric": BOSS_ROBUSTNESS_MAX,
+                  "difference": eboss_sum - BOSS_ROBUSTNESS_MAX,
+                  "ratio": eboss_sum / BOSS_ROBUSTNESS_MAX,
+                  "interpretation": "eBOSS diagonal dry-run lies above the prior BOSS robustness band; not directly comparable until eBOSS covariance is addressed",
+                  "support_allowed": False,
+              },
+          ]
+          
+          shape_rows = [
+              {
+                  "finding_id": "V4_412_FINDING_001",
+                  "finding": "The eBOSS guarded diagonal dry-run sum is higher than the BOSS DR12 covariance-repaired reference.",
+                  "evidence": f"eBOSS={eboss_sum}; BOSS_primary_fullcov={BOSS_PRIMARY_FULLCOV}; difference={e_minus_boss_full}",
+                  "interpretation_boundary": "metric contrast only; no support claim",
+                  "support_allowed": False,
+              },
+              {
+                  "finding_id": "V4_412_FINDING_002",
+                  "finding": "The eBOSS residual shape is mixed rather than uniformly high or uniformly low.",
+                  "evidence": f"LRG={resids.get('LRG')}; ELG={resids.get('ELG')}; QSO={resids.get('QSO')}",
+                  "interpretation_boundary": "shape description only; no physical interpretation yet",
+                  "support_allowed": False,
+              },
+              {
+                  "finding_id": "V4_412_FINDING_003",
+                  "finding": "QSO is the largest eBOSS diagonal term and largest absolute one-sigma residual.",
+                  "evidence": f"QSO term={term_values.get('QSO')}; QSO sigma={resid_sigmas.get('QSO')}",
+                  "interpretation_boundary": "term-level diagnostic only",
+                  "support_allowed": False,
+              },
+              {
+                  "finding_id": "V4_412_FINDING_004",
+                  "finding": "ELG contributes the second-largest eBOSS diagonal term and is the only negative residual.",
+                  "evidence": f"ELG term={term_values.get('ELG')}; ELG sigma={resid_sigmas.get('ELG')}",
+                  "interpretation_boundary": "term-level diagnostic only",
+                  "support_allowed": False,
+              },
+              {
+                  "finding_id": "V4_412_FINDING_005",
+                  "finding": "LRG remains close to baseline under the diagonal treatment.",
+                  "evidence": f"LRG term={term_values.get('LRG')}; LRG sigma={resid_sigmas.get('LRG')}",
+                  "interpretation_boundary": "term-level diagnostic only",
+                  "support_allowed": False,
+              },
+              {
+                  "finding_id": "V4_412_FINDING_006",
+                  "finding": "The eBOSS result cannot be compared as a final scientific score against BOSS until covariance or likelihood treatment is repaired.",
+                  "evidence": "eBOSS uses official one-sigma diagonal uncertainties only; BOSS primary reference uses a covariance-corrected dry run.",
+                  "interpretation_boundary": "methodology limitation",
+                  "support_allowed": False,
+              },
+          ]
+          
+          route_rows = [
+              {
+                  "route_id": "V4_412_ROUTE_001",
+                  "route_name": "v4_413_eboss_covariance_likelihood_source_reopen_no_support",
+                  "recommended": True,
+                  "reason": "eBOSS diagonal metric is higher than BOSS references; covariance/likelihood source treatment is required before stronger interpretation.",
+                  "new_values_to_load_next": "covariance_or_likelihood_source_material_only_if_exact_source_available",
+                  "support_allowed": False,
+              },
+              {
+                  "route_id": "V4_412_ROUTE_002",
+                  "route_name": "v4_413_alt_stop_after_diagonal_metric_no_support",
+                  "recommended": False,
+                  "reason": "Stopping now would leave an inflated/ambiguous diagonal-only eBOSS comparison unresolved.",
+                  "new_values_to_load_next": "none",
+                  "support_allowed": False,
+              },
+          ]
+          
+          limitations_rows = [
+              {
+                  "limitation_id": "V4_412_LIMIT_001",
+                  "limitation": "eBOSS comparison is diagonal-only and uses official one-sigma values; no eBOSS covariance has been loaded.",
+                  "status": "active_limit",
+              },
+              {
+                  "limitation_id": "V4_412_LIMIT_002",
+                  "limitation": "BOSS and eBOSS metrics are not methodologically identical because BOSS has covariance-corrected reference values while eBOSS does not yet.",
+                  "status": "active_limit",
+              },
+              {
+                  "limitation_id": "V4_412_LIMIT_003",
+                  "limitation": "No likelihood or p-values have been computed.",
+                  "status": "active_limit",
+              },
+              {
+                  "limitation_id": "V4_412_LIMIT_004",
+                  "limitation": "The result does not validate score_valid and does not permit support_allowed.",
+                  "status": "active_limit",
+              },
+          ]
+          
+          gap_rows = [
+              {
+                  "gap_id": "V4_412_GAP_001",
+                  "gap": "Exact eBOSS covariance or likelihood source treatment remains open.",
+                  "next_gate": "v4_413",
+              },
+              {
+                  "gap_id": "V4_412_GAP_002",
+                  "gap": "eBOSS diagonal metric must be stress-tested before any writeup stronger than a guarded comparison.",
+                  "next_gate": "v4_413_or_later",
+              },
+          ]
+          
+          summary_out = {
+              "version": VERSION,
+              "route_name": ROUTE_NAME,
+              "expected_result": EXPECTED_RESULT,
+              "input_version": "v4.411",
+              "created_utc": datetime.now(timezone.utc).isoformat(),
+              "rules_passed": None,
+              "rules_total": None,
+              "failed_gates": None,
+              "boss_prior_diagonal_chi_square_sum": BOSS_PRIOR_DIAGONAL,
+              "boss_primary_fullcov_chi_square_dry_run_sum": BOSS_PRIMARY_FULLCOV,
+              "boss_robustness_min_chi_square": BOSS_ROBUSTNESS_MIN,
+              "boss_robustness_max_chi_square": BOSS_ROBUSTNESS_MAX,
+              "boss_robustness_chi_square_range_width": BOSS_ROBUSTNESS_RANGE,
+              "eboss_guarded_diagonal_chi_square_dry_run_sum": eboss_sum,
+              "eboss_minus_boss_primary_fullcov_chi_square": e_minus_boss_full,
+              "eboss_to_boss_primary_fullcov_ratio": e_to_boss_full,
+              "eboss_chi_square_per_candidate_dof": eboss_per_dof,
+              "boss_primary_fullcov_chi_square_per_candidate_dof": boss_full_per_dof,
+              "largest_eboss_diagonal_term_tracer": largest_term_tracer,
+              "largest_eboss_diagonal_term_value": largest_term_value,
+              "comparison_rows": len(comparison_rows),
+              "delta_rows": len(delta_rows),
+              "shape_finding_rows": len(shape_rows),
+              "selected_next_route": "v4_413_eboss_covariance_likelihood_source_reopen_no_support",
+              "new_chi_square_computed": False,
+              "new_metric_comparison_created": True,
+              "covariance_values_loaded": False,
+              "covariance_corrected_metric_computed": False,
+              "likelihood_computed": False,
+              "p_values_computed": False,
+              "score_valid": False,
+              "support_allowed": False,
+          }
+          
+          rules = []
+          def check(gate, condition):
+              rules.append({"gate": gate, "passed": bool(condition)})
+          
+          check("input_411_zip_found", input_zip.exists())
+          check("input_411_summary_found", summary.get("version") == "v4.411")
+          check("input_411_failed_gates_none", str(summary.get("failed_gates")) == "none")
+          check("input_411_rules_all_passed", int(summary.get("rules_passed", -1)) == int(summary.get("rules_total", -2)))
+          check("input_411_diagonal_chi_square_computed_true", as_bool(summary.get("diagonal_chi_square_computed")))
+          check("input_411_new_chi_square_computed_true", as_bool(summary.get("new_chi_square_computed")))
+          check("input_411_support_allowed_false", not as_bool(summary.get("support_allowed")))
+          check("input_411_likelihood_false", not as_bool(summary.get("likelihood_computed")))
+          check("input_411_p_values_false", not as_bool(summary.get("p_values_computed")))
+          check("input_411_score_valid_false", not as_bool(summary.get("score_valid")))
+          check("terms_rows_equal_3", len(terms) == 3)
+          check("comparison_input_rows_equal_3", len(comparison_input) == 3)
+          check("each_term_finite", all(finite(r.get("guarded_diagonal_chi_square_term")) for r in terms))
+          check("each_residual_sigma_finite", all(finite(r.get("residual_in_one_sigma_units")) for r in terms))
+          check("term_sum_matches_summary", near(sum(float(r["guarded_diagonal_chi_square_term"]) for r in terms), eboss_sum, 1e-11))
+          check("eboss_sum_matches_locked_expected", near(eboss_sum, 5.667511116395863, 1e-12))
+          check("largest_term_tracer_is_qso", largest_term_tracer == "QSO")
+          check("largest_term_value_matches_qso_term", near(largest_term_value, term_values.get("QSO"), 1e-12))
+          check("positive_residual_count_2", int(summary.get("positive_residual_rows", -1)) == 2)
+          check("negative_residual_count_1", int(summary.get("negative_residual_rows", -1)) == 1)
+          check("boss_prior_diagonal_finite", finite(BOSS_PRIOR_DIAGONAL))
+          check("boss_primary_fullcov_finite", finite(BOSS_PRIMARY_FULLCOV))
+          check("boss_robustness_band_ordered", BOSS_ROBUSTNESS_MIN <= BOSS_ROBUSTNESS_MAX)
+          check("boss_robustness_width_matches", near(BOSS_ROBUSTNESS_MAX - BOSS_ROBUSTNESS_MIN, BOSS_ROBUSTNESS_RANGE, 1e-12))
+          check("eboss_above_boss_prior_diagonal", eboss_sum > BOSS_PRIOR_DIAGONAL)
+          check("eboss_above_boss_primary_fullcov", eboss_sum > BOSS_PRIMARY_FULLCOV)
+          check("eboss_above_boss_robustness_max", eboss_sum > BOSS_ROBUSTNESS_MAX)
+          check("comparison_rows_equal_4", len(comparison_rows) == 4)
+          check("delta_rows_equal_4", len(delta_rows) == 4)
+          check("shape_rows_equal_6", len(shape_rows) == 6)
+          check("route_rows_equal_2", len(route_rows) == 2)
+          check("limitations_rows_equal_4", len(limitations_rows) == 4)
+          check("gap_rows_equal_2", len(gap_rows) == 2)
+          check("new_metric_comparison_created_true", summary_out["new_metric_comparison_created"] is True)
+          check("new_chi_square_computed_false_in_v4_412", summary_out["new_chi_square_computed"] is False)
+          check("covariance_values_loaded_false", summary_out["covariance_values_loaded"] is False)
+          check("covariance_corrected_metric_computed_false", summary_out["covariance_corrected_metric_computed"] is False)
+          check("likelihood_computed_false", summary_out["likelihood_computed"] is False)
+          check("p_values_computed_false", summary_out["p_values_computed"] is False)
+          check("score_valid_false", summary_out["score_valid"] is False)
+          check("support_allowed_false", summary_out["support_allowed"] is False)
+          check("selected_next_route_is_v4_413", summary_out["selected_next_route"].startswith("v4_413"))
+          check("no_input_rule_failures_from_v4_411", all(as_bool(r.get("passed")) for r in rule_checks_411))
+          
+          failed = [r["gate"] for r in rules if not r["passed"]]
+          summary_out["rules_passed"] = sum(1 for r in rules if r["passed"])
+          summary_out["rules_total"] = len(rules)
+          summary_out["failed_gates"] = "none" if not failed else ";".join(failed)
+          
+          csv_write("v4_412_boss_eboss_diagnostic_comparison_NO_SUPPORT.csv", comparison_rows)
+          csv_write("v4_412_boss_vs_eboss_metric_deltas_NO_SUPPORT.csv", delta_rows)
+          csv_write("v4_412_eboss_shape_findings_NO_SUPPORT.csv", shape_rows)
+          csv_write("v4_412_next_route_decision_NO_SUPPORT.csv", route_rows)
+          csv_write("v4_412_limitations_after_comparison.csv", limitations_rows)
+          csv_write("v4_412_gap_status_after_comparison.csv", gap_rows)
+          csv_write("v4_412_rule_checks.csv", rules)
+          
+          (OUTDIR / "v4_412_summary.json").write_text(json.dumps(summary_out, indent=2, sort_keys=True), encoding="utf-8")
+          (OUTDIR / "v4_412_summary.md").write_text(
+              "\n".join([
+                  "# TAIRID v4.412 eBOSS vs BOSS Diagnostic Comparison",
+                  "",
+                  f"Expected result: {EXPECTED_RESULT}",
+                  f"Rules: {summary_out['rules_passed']} / {summary_out['rules_total']}",
+                  f"Failed gates: {summary_out['failed_gates']}",
+                  "",
+                  f"BOSS primary full-covariance dry-run chi-square: {BOSS_PRIMARY_FULLCOV}",
+                  f"eBOSS guarded diagonal dry-run chi-square: {eboss_sum}",
+                  f"Difference: {e_minus_boss_full}",
+                  f"Ratio: {e_to_boss_full}",
+                  "",
+                  "Boundary: metric contrast only; no new chi-square in v4.412; no likelihood; no p-values; no validated score; no TAIRID support claim.",
+                  "Next route: v4.413 eBOSS covariance/likelihood source reopen.",
+                  "",
+              ]),
+              encoding="utf-8",
+          )
+          
+          if OUTZIP.exists():
+              OUTZIP.unlink()
+          with zipfile.ZipFile(OUTZIP, "w", compression=zipfile.ZIP_DEFLATED) as out:
+              for file in sorted(OUTDIR.rglob("*")):
+                  if file.is_file():
+                      out.write(file, arcname=str(file))
+          
+          print(f"{summary_out['rules_passed']} / {summary_out['rules_total']} rules passed")
+          print(f"failed_gates = {summary_out['failed_gates']}")
+          print(f"BOSS primary fullcov chi-square = {BOSS_PRIMARY_FULLCOV}")
+          print(f"eBOSS guarded diagonal chi-square = {eboss_sum}")
+          print(f"eBOSS minus BOSS primary fullcov = {e_minus_boss_full}")
+          print(f"eBOSS to BOSS primary fullcov ratio = {e_to_boss_full}")
+          print(f"largest eBOSS term tracer = {largest_term_tracer}")
+          print(f"new_chi_square_computed = {summary_out['new_chi_square_computed']}")
+          print(f"support_allowed = {summary_out['support_allowed']}")
+          
+          if failed:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload v4.412 output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-412-eboss-vs-boss-diagnostic-comparison-no-support-output
+          path: tairid-v4-412-eboss-vs-boss-diagnostic-comparison-no-support-output.zip
