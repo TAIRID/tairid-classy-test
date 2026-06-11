@@ -1,0 +1,539 @@
+name: "!!! AAA CURRENT - TAIRID v4.405 eBOSS exact source fetch table header file member capture no support"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-v4-405:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run v4.405 eBOSS exact source fetch table/header/member capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          import sys
+          import zipfile
+          import hashlib
+          import html
+          import urllib.request
+          import urllib.parse
+          from datetime import datetime, timezone
+          from pathlib import Path
+          
+          VERSION = "v4.405"
+          ROUTE_NAME = "v4_405_eboss_exact_source_fetch_table_header_and_file_member_capture_no_scoring_no_support_claims"
+          EXPECTED_RESULT = "v4_405_eboss_exact_source_fetch_table_header_file_member_capture_passed_raw_source_capture_ready_no_values_no_support_claims"
+          INPUT_GLOB_MARKER = "tairid-v4-404-eboss-observed-value-covariance-availability-gate-no-values-no-support-output"
+          OUTDIR = Path("tairid_v4_405_eboss_exact_source_fetch_table_header_file_member_capture_no_support_output")
+          OUTZIP = "tairid-v4-405-eboss-exact-source-fetch-table-header-file-member-capture-no-scoring-no-support-output.zip"
+          
+          CLAIM_BOUNDARY = (
+              "eBOSS exact source fetch, table/header capture, and repository member capture only; "
+              "raw source text may be preserved for later human review; no observed numeric values are normalized or loaded into the testing ledger; "
+              "no covariance matrix values are loaded into the testing ledger; no new chi-square; no likelihood; no p-values; "
+              "score_valid remains false; support_allowed remains false; no support claims"
+          )
+          
+          TRACERS = [
+              ("LRG", "eBOSS_LRG_fsigma8_expansion", ["eBOSS LRG", "LRG"]),
+              ("ELG", "eBOSS_ELG_fsigma8_expansion", ["eBOSS ELG", "ELG"]),
+              ("QSO", "eBOSS_QSO_fsigma8_expansion", ["eBOSS Quasar", "eBOSS QSO", "Quasar", "QSO"]),
+          ]
+          
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+          
+          def norm_bool(v):
+              if isinstance(v, bool):
+                  return v
+              return str(v).strip().lower() in {"true", "1", "yes", "y"}
+          
+          def find_file(pattern):
+              candidates = []
+              for p in Path(".").glob("*.zip"):
+                  if pattern in p.name:
+                      candidates.append(p)
+              candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+              return candidates[0] if candidates else None
+          
+          def zip_read_text(z, suffix):
+              matches = [n for n in z.namelist() if n.endswith(suffix)]
+              if not matches:
+                  raise FileNotFoundError(f"Missing {suffix} in zip")
+              return z.read(matches[0]).decode("utf-8", errors="replace")
+          
+          def read_csv_from_zip(z, suffix):
+              text = zip_read_text(z, suffix)
+              return list(csv.DictReader(text.splitlines()))
+          
+          def write_csv(path, rows, fieldnames=None):
+              path = Path(path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if fieldnames is None:
+                  keys = []
+                  for row in rows:
+                      for k in row.keys():
+                          if k not in keys:
+                              keys.append(k)
+                  fieldnames = keys
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow(row)
+          
+          def safe_int(x, default=0):
+              try:
+                  return int(float(x))
+              except Exception:
+                  return default
+          
+          def safe_float(x, default=None):
+              try:
+                  return float(x)
+              except Exception:
+                  return default
+          
+          def fetch_url(url, label, max_bytes=2_000_000):
+              row = {
+                  "fetch_label": label,
+                  "requested_url": url,
+                  "final_url": "",
+                  "fetch_success": False,
+                  "http_status": "",
+                  "content_type": "",
+                  "content_length_bytes": 0,
+                  "sha256_16": "",
+                  "error": "",
+                  "fetched_utc": now_iso(),
+              }
+              try:
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": "TAIRID-v4.405-source-capture-no-scoring/1.0 (+bounded audit workflow)",
+                          "Accept": "text/html,text/plain,application/octet-stream,*/*",
+                      },
+                  )
+                  with urllib.request.urlopen(req, timeout=45) as resp:
+                      data = resp.read(max_bytes + 1)
+                      if len(data) > max_bytes:
+                          data = data[:max_bytes]
+                          row["error"] = "content_truncated_to_max_bytes"
+                      row["http_status"] = getattr(resp, "status", "")
+                      row["final_url"] = resp.geturl()
+                      row["content_type"] = resp.headers.get("content-type", "")
+                      row["content_length_bytes"] = len(data)
+                      row["sha256_16"] = hashlib.sha256(data).hexdigest()[:16]
+                      row["fetch_success"] = 200 <= int(row["http_status"]) < 400
+                      text = data.decode("utf-8", errors="replace")
+                      return row, text, data
+              except Exception as e:
+                  row["error"] = repr(e)
+                  return row, "", b""
+          
+          def strip_html_to_text(raw):
+              raw = re.sub(r"(?is)<script.*?</script>", " ", raw)
+              raw = re.sub(r"(?is)<style.*?</style>", " ", raw)
+              raw = re.sub(r"(?is)<br\s*/?>", "\n", raw)
+              raw = re.sub(r"(?is)</(p|div|tr|td|th|li|h1|h2|h3|h4)>", "\n", raw)
+              raw = re.sub(r"(?is)<[^>]+>", " ", raw)
+              raw = html.unescape(raw)
+              raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
+              raw = re.sub(r"\n\s+", "\n", raw)
+              raw = re.sub(r"\n{3,}", "\n\n", raw)
+              return raw.strip()
+          
+          def context_around(text, terms, window=650):
+              lower = text.lower()
+              best = None
+              for term in terms:
+                  idx = lower.find(term.lower())
+                  if idx >= 0:
+                      best = idx
+                      break
+              if best is None:
+                  return ""
+              start = max(0, best - window)
+              end = min(len(text), best + window)
+              snippet = text[start:end]
+              return re.sub(r"\s+", " ", snippet).strip()
+          
+          def extract_href_members(raw_html, base_url):
+              members = []
+              for m in re.finditer(r'(?is)<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', raw_html):
+                  href = html.unescape(m.group(1).strip())
+                  label = strip_html_to_text(m.group(2)).strip()
+                  if not href or href.startswith("#") or href.startswith("?") or href.lower().startswith("mailto:"):
+                      continue
+                  full = urllib.parse.urljoin(base_url, href)
+                  members.append((label, href, full))
+              return members
+          
+          def is_probably_same_host(url, root):
+              try:
+                  return urllib.parse.urlparse(url).netloc == urllib.parse.urlparse(root).netloc
+              except Exception:
+                  return False
+          
+          def is_relevant_member(path_text):
+              s = path_text.lower()
+              keys = ["lrg", "elg", "qso", "quasar", "fsig", "fsigma", "f_sigma", "rsd", "bao", "cov", "chain", "like", "likelihood", "consensus", "dr16"]
+              return any(k in s for k in keys)
+          
+          def member_tracer_label(path_text):
+              s = path_text.lower()
+              hits = []
+              if "lrg" in s:
+                  hits.append("LRG")
+              if "elg" in s:
+                  hits.append("ELG")
+              if "qso" in s or "quasar" in s:
+                  hits.append("QSO")
+              if not hits:
+                  hits.append("GENERAL")
+              return "|".join(hits)
+          
+          OUTDIR.mkdir(exist_ok=True)
+          rules = []
+          def rule(gate, passed):
+              rules.append({"gate": gate, "passed": bool(passed)})
+          
+          input_zip = find_file(INPUT_GLOB_MARKER)
+          rule("input_404_zip_found", input_zip is not None)
+          if input_zip is None:
+              raise SystemExit("Missing v4.404 input zip")
+          
+          with zipfile.ZipFile(input_zip) as z:
+              summary_404 = json.loads(zip_read_text(z, "v4_404_summary.json"))
+              locator_rows = read_csv_from_zip(z, "v4_404_exact_source_locator_packet_FOR_V4_405_NO_VALUES_NO_SUPPORT.csv")
+              route_rows = read_csv_from_zip(z, "v4_404_route_status_summary.csv")
+              availability_rows = read_csv_from_zip(z, "v4_404_eboss_tracer_source_family_availability_NO_VALUES_NO_SUPPORT.csv")
+          
+          rule("input_404_summary_version_correct", summary_404.get("version") == "v4.404")
+          rule("input_404_expected_result_correct", "passed_source_family_available" in summary_404.get("expected_result", ""))
+          rule("input_404_rules_all_passed", safe_int(summary_404.get("rules_passed")) == safe_int(summary_404.get("rules_total")))
+          rule("input_404_failed_gates_none", summary_404.get("failed_gates") == "none")
+          rule("input_404_selected_next_route_correct", summary_404.get("selected_next_route") == "v4_405_eboss_exact_source_fetch_table_header_and_file_member_capture_no_scoring_no_support_claims")
+          rule("input_404_exact_locator_rows_equal_9", len(locator_rows) == 9)
+          rule("input_404_tracer_availability_rows_equal_3", len(availability_rows) == 3)
+          rule("input_404_new_observed_values_loaded_false", summary_404.get("new_observed_values_loaded") is False)
+          rule("input_404_covariance_values_loaded_false", summary_404.get("covariance_values_loaded") is False)
+          rule("input_404_new_chi_square_computed_false", summary_404.get("new_chi_square_computed") is False)
+          rule("input_404_likelihood_computed_false", summary_404.get("likelihood_computed") is False)
+          rule("input_404_p_values_computed_false", summary_404.get("p_values_computed") is False)
+          rule("input_404_score_valid_false", summary_404.get("score_valid") is False)
+          rule("input_404_support_allowed_false", summary_404.get("support_allowed") is False)
+          
+          primary_anchors = sorted(set(r.get("primary_source_anchor", "") for r in locator_rows if r.get("primary_source_anchor")))
+          repo_anchors = sorted(set(r.get("repository_source_anchor", "") for r in locator_rows if r.get("repository_source_anchor")))
+          rule("one_primary_source_anchor", len(primary_anchors) == 1)
+          rule("one_repository_source_anchor", len(repo_anchors) == 1)
+          primary_url = primary_anchors[0] if primary_anchors else ""
+          repo_url = repo_anchors[0] if repo_anchors else ""
+          
+          fetch_rows = []
+          official_fetch, official_text_raw, official_bytes = fetch_url(primary_url, "official_sdss_final_bao_rsd_page")
+          fetch_rows.append(official_fetch)
+          repo_root_fetch, repo_text_raw, repo_bytes = fetch_url(repo_url, "official_sdss_dr16cosmo_repository_root")
+          fetch_rows.append(repo_root_fetch)
+          
+          official_text = strip_html_to_text(official_text_raw)
+          rule("official_page_fetch_success", bool(official_fetch["fetch_success"]))
+          rule("official_page_content_length_gt_1000", int(official_fetch["content_length_bytes"]) > 1000)
+          rule("repository_root_fetch_success", bool(repo_root_fetch["fetch_success"]))
+          rule("repository_root_content_length_gt_100", int(repo_root_fetch["content_length_bytes"]) > 100)
+          
+          official_markers = {
+              "has_eboss_lrg": "eBOSS LRG" in official_text,
+              "has_eboss_elg": "eBOSS ELG" in official_text,
+              "has_quasar_or_qso": ("eBOSS Quasar" in official_text or "quasars" in official_text or "QSO" in official_text),
+              "has_rsd_measurements": "RSD Measurements" in official_text or "redshift space distortions" in official_text,
+              "has_fsigma_marker": ("f σ" in official_text or "fσ" in official_text or "sigma" in official_text.lower()),
+              "has_likelihood_covariance_chain_marker": all(k in official_text.lower() for k in ["likelihood", "covariance", "chains"]),
+          }
+          for k, v in official_markers.items():
+              rule(f"official_page_marker_{k}", v)
+          
+          official_capture_rows = []
+          for tracer, family, terms in TRACERS:
+              snippet = context_around(official_text, terms + ["RSD Measurements", "BAO+RSD Measurements", "f σ"], window=700)
+              official_capture_rows.append({
+                  "v4_405_official_capture_id": f"V4_405_OFFICIAL_PAGE_CAPTURE_{len(official_capture_rows)+1:03d}",
+                  "tracer_or_sample_family": tracer,
+                  "selected_family": family,
+                  "primary_source_anchor": primary_url,
+                  "official_page_fetch_success": official_fetch["fetch_success"],
+                  "official_marker_found": bool(snippet),
+                  "raw_source_context_snippet_for_human_review": snippet[:1400],
+                  "numeric_values_normalized_or_loaded_into_testing_ledger": False,
+                  "covariance_values_loaded_into_testing_ledger": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              })
+          rule("official_capture_rows_equal_3", len(official_capture_rows) == 3)
+          rule("official_capture_markers_all_found", all(norm_bool(r["official_marker_found"]) for r in official_capture_rows))
+          
+          # Crawl repository listing shallowly and preserve raw member names/URLs only.
+          crawl_page_rows = []
+          member_rows = []
+          relevant_member_rows = []
+          if repo_root_fetch["fetch_success"]:
+              queue = [(repo_url, 0)]
+              visited = set()
+              max_pages = 80
+              while queue and len(visited) < max_pages:
+                  url, depth = queue.pop(0)
+                  if url in visited:
+                      continue
+                  if not is_probably_same_host(url, repo_url):
+                      continue
+                  visited.add(url)
+                  fetch, text_raw, data = fetch_url(url, f"repository_crawl_depth_{depth}", max_bytes=1_000_000)
+                  crawl_page_rows.append({
+                      "v4_405_repository_crawl_page_id": f"V4_405_REPO_CRAWL_PAGE_{len(crawl_page_rows)+1:03d}",
+                      "crawl_url": url,
+                      "crawl_depth": depth,
+                      "fetch_success": fetch["fetch_success"],
+                      "http_status": fetch["http_status"],
+                      "content_length_bytes": fetch["content_length_bytes"],
+                      "sha256_16": fetch["sha256_16"],
+                      "error": fetch["error"],
+                  })
+                  if not fetch["fetch_success"]:
+                      continue
+                  for label, href, full in extract_href_members(text_raw, url):
+                      parsed = urllib.parse.urlparse(full)
+                      root_parsed = urllib.parse.urlparse(repo_url)
+                      if parsed.netloc != root_parsed.netloc:
+                          continue
+                      if href in {"../", ".."} or full.rstrip("/") == url.rstrip("/"):
+                          continue
+                      is_dir = full.endswith("/")
+                      member = {
+                          "v4_405_repository_member_id": f"V4_405_REPO_MEMBER_{len(member_rows)+1:04d}",
+                          "parent_url": url,
+                          "member_label": label,
+                          "member_href": href,
+                          "member_url": full,
+                          "crawl_depth": depth,
+                          "is_directory": is_dir,
+                          "is_relevant_candidate_member": is_relevant_member(full + " " + label),
+                          "tracer_marker": member_tracer_label(full + " " + label),
+                          "numeric_values_normalized_or_loaded_into_testing_ledger": False,
+                          "covariance_values_loaded_into_testing_ledger": False,
+                          "new_chi_square_computed": False,
+                          "likelihood_computed": False,
+                          "p_values_computed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                          "claim_boundary": CLAIM_BOUNDARY,
+                      }
+                      member_rows.append(member)
+                      if member["is_relevant_candidate_member"]:
+                          relevant_member_rows.append(member)
+                      # Follow likely useful directories, but avoid crawling huge unrelated trees.
+                      path_low = (full + " " + label).lower()
+                      follow_keys = ["consensus", "likelihood", "chain", "cov", "lrg", "elg", "qso", "bao", "rsd", "data", "results"]
+                      if is_dir and depth < 3 and (depth < 1 or any(k in path_low for k in follow_keys)):
+                          if full not in visited and len(queue) < 120:
+                              queue.append((full, depth + 1))
+          
+          rule("repository_crawl_page_rows_gte_1", len(crawl_page_rows) >= 1)
+          rule("repository_member_rows_gte_1", len(member_rows) >= 1)
+          rule("repository_relevant_member_rows_gte_1", len(relevant_member_rows) >= 1)
+          
+          tracer_summary_rows = []
+          candidate_rows = []
+          ready_count = 0
+          for idx, (tracer, family, terms) in enumerate(TRACERS, start=1):
+              page_row = next((r for r in official_capture_rows if r["tracer_or_sample_family"] == tracer), {})
+              rel_for_tracer = [r for r in relevant_member_rows if tracer in str(r.get("tracer_marker", ""))]
+              general_rel = [r for r in relevant_member_rows if "GENERAL" in str(r.get("tracer_marker", ""))]
+              repo_count = len(rel_for_tracer)
+              ready = bool(page_row.get("official_marker_found")) and bool(repo_root_fetch["fetch_success"]) and len(crawl_page_rows) >= 1
+              if ready:
+                  ready_count += 1
+              tracer_summary_rows.append({
+                  "v4_405_tracer_capture_summary_id": f"V4_405_TRACER_CAPTURE_SUMMARY_{idx:03d}",
+                  "tracer_or_sample_family": tracer,
+                  "selected_family": family,
+                  "official_page_marker_found": bool(page_row.get("official_marker_found")),
+                  "repository_root_fetched": repo_root_fetch["fetch_success"],
+                  "repository_relevant_member_count_with_tracer_marker": repo_count,
+                  "repository_general_relevant_member_count": len(general_rel),
+                  "ready_for_v4_406_raw_source_review": ready,
+                  "numeric_values_normalized_or_loaded_into_testing_ledger": False,
+                  "covariance_values_loaded_into_testing_ledger": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              })
+              candidate_rows.append({
+                  "v4_405_value_loading_candidate_id": f"V4_405_VALUE_LOADING_CANDIDATE_{idx:03d}",
+                  "tracer_or_sample_family": tracer,
+                  "selected_family": family,
+                  "source_status": "raw_source_captured_for_v4_406_human_review_not_loaded_as_values",
+                  "primary_source_anchor": primary_url,
+                  "repository_source_anchor": repo_url,
+                  "raw_official_page_context_available": bool(page_row.get("official_marker_found")),
+                  "repository_member_candidates_available": repo_count > 0 or len(general_rel) > 0,
+                  "next_required_action": "human_review_exact_raw_source_capture_and_select_allowed_value_loading_source",
+                  "may_load_numeric_values_in_v4_405": False,
+                  "may_load_covariance_values_in_v4_405": False,
+                  "numeric_values_normalized_or_loaded_into_testing_ledger": False,
+                  "covariance_values_loaded_into_testing_ledger": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+              })
+          
+          rule("tracer_capture_summary_rows_equal_3", len(tracer_summary_rows) == 3)
+          rule("ready_for_v4_406_rows_equal_3", ready_count == 3)
+          rule("value_loading_candidate_rows_equal_3", len(candidate_rows) == 3)
+          rule("value_loading_candidates_not_loaded_now", all(not norm_bool(r["numeric_values_normalized_or_loaded_into_testing_ledger"]) for r in candidate_rows))
+          rule("covariance_candidates_not_loaded_now", all(not norm_bool(r["covariance_values_loaded_into_testing_ledger"]) for r in candidate_rows))
+          
+          limitations_rows = [
+              {"limitation_id": "V4_405_LIMIT_001", "limitation": "Raw source text and repository members may be captured, but no observed values are normalized into a testing ledger in this gate.", "status": "active_limit"},
+              {"limitation_id": "V4_405_LIMIT_002", "limitation": "Repository member discovery is source-structure dependent and may require human narrowing before values are loaded.", "status": "active_limit"},
+              {"limitation_id": "V4_405_LIMIT_003", "limitation": "No covariance matrix values are loaded here; covariance handling remains a later controlled gate.", "status": "active_limit"},
+              {"limitation_id": "V4_405_LIMIT_004", "limitation": "No likelihood, p-values, validated score, or support claim is allowed.", "status": "hard_boundary"},
+          ]
+          gap_rows = [
+              {"gap_id": "V4_405_OPEN_GAP_001", "gap": "Human review must confirm the exact table line or repository file member to use for LRG observed f_sigma8.", "status": "open_next_gate"},
+              {"gap_id": "V4_405_OPEN_GAP_002", "gap": "Human review must confirm the exact table line or repository file member to use for ELG observed f_sigma8.", "status": "open_next_gate"},
+              {"gap_id": "V4_405_OPEN_GAP_003", "gap": "Human review must confirm the exact table line or repository file member to use for QSO observed f_sigma8.", "status": "open_next_gate"},
+              {"gap_id": "V4_405_OPEN_GAP_004", "gap": "After source selection, values must be loaded in a separate guarded value-loading gate.", "status": "open_next_gate"},
+          ]
+          route_rows_out = [
+              {"route_key": "v4_406_eboss_raw_source_capture_review_no_values_no_support", "recommendation": "primary_next", "reason": "Review raw captured table/source/member evidence and approve exact allowed value-loading source without computing scores."},
+              {"route_key": "v4_406B_repository_member_retry_or_manual_locator_repair", "recommendation": "fallback_if_needed", "reason": "Use only if repository member capture is incomplete or SDSS remote listing changes."},
+          ]
+          
+          # Final invariant rules.
+          rule("new_observed_values_loaded_false", True)
+          rule("covariance_values_loaded_false", True)
+          rule("new_chi_square_computed_false", True)
+          rule("likelihood_computed_false", True)
+          rule("p_values_computed_false", True)
+          rule("score_valid_false", True)
+          rule("support_allowed_false", True)
+          rule("claim_boundary_mentions_no_support", "no support claims" in CLAIM_BOUNDARY)
+          
+          failed = [r["gate"] for r in rules if not r["passed"]]
+          summary = {
+              "version": VERSION,
+              "route_name": ROUTE_NAME,
+              "expected_result": EXPECTED_RESULT,
+              "input_version": "v4.404",
+              "created_utc": now_iso(),
+              "rules_passed": len(rules) - len(failed),
+              "rules_total": len(rules),
+              "failed_gates": "none" if not failed else ";".join(failed),
+              "source_fetch_rows": len(fetch_rows),
+              "successful_fetch_rows": sum(1 for r in fetch_rows if r["fetch_success"]),
+              "official_page_capture_rows": len(official_capture_rows),
+              "repository_crawl_page_rows": len(crawl_page_rows),
+              "repository_member_rows": len(member_rows),
+              "repository_relevant_member_rows": len(relevant_member_rows),
+              "tracer_capture_summary_rows": len(tracer_summary_rows),
+              "ready_for_v4_406_raw_source_review_rows": ready_count,
+              "value_loading_candidate_rows": len(candidate_rows),
+              "prior_guarded_diagonal_chi_square_sum": summary_404.get("prior_guarded_diagonal_chi_square_sum"),
+              "primary_dM_Hz_chi_square_dry_run_sum": summary_404.get("primary_dM_Hz_chi_square_dry_run_sum"),
+              "robustness_min_chi_square": summary_404.get("robustness_min_chi_square"),
+              "robustness_max_chi_square": summary_404.get("robustness_max_chi_square"),
+              "robustness_chi_square_range_width": summary_404.get("robustness_chi_square_range_width"),
+              "new_observed_values_loaded": False,
+              "covariance_values_loaded": False,
+              "new_chi_square_computed": False,
+              "likelihood_computed": False,
+              "p_values_computed": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "claim_boundary": CLAIM_BOUNDARY,
+              "selected_next_route": "v4_406_eboss_raw_source_capture_review_no_values_no_support",
+          }
+          
+          write_csv(OUTDIR / "v4_405_source_fetch_status_NO_SCORING_NO_SUPPORT.csv", fetch_rows)
+          write_csv(OUTDIR / "v4_405_official_page_table_marker_capture_RAW_SOURCE_ONLY_NO_VALUES_LOADED.csv", official_capture_rows)
+          write_csv(OUTDIR / "v4_405_repository_crawl_pages_RAW_SOURCE_ONLY.csv", crawl_page_rows)
+          write_csv(OUTDIR / "v4_405_repository_member_capture_RAW_SOURCE_ONLY_NO_VALUES_LOADED.csv", member_rows)
+          write_csv(OUTDIR / "v4_405_repository_relevant_member_candidates_RAW_SOURCE_ONLY_NO_VALUES_LOADED.csv", relevant_member_rows)
+          write_csv(OUTDIR / "v4_405_tracer_exact_capture_summary_NO_VALUES_LOADED_NO_SUPPORT.csv", tracer_summary_rows)
+          write_csv(OUTDIR / "v4_405_observed_value_loading_candidate_packet_FOR_V4_406_RAW_SOURCE_ONLY_NO_VALUES_LOADED.csv", candidate_rows)
+          write_csv(OUTDIR / "v4_405_limitations_after_exact_source_capture.csv", limitations_rows)
+          write_csv(OUTDIR / "v4_405_gap_status_after_exact_source_capture.csv", gap_rows)
+          write_csv(OUTDIR / "v4_405_next_route_options.csv", route_rows_out)
+          write_csv(OUTDIR / "v4_405_rule_checks.csv", rules)
+          
+          with (OUTDIR / "v4_405_summary.json").open("w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          with (OUTDIR / "v4_405_summary.md").open("w", encoding="utf-8") as f:
+              f.write(f"# TAIRID {VERSION} eBOSS Exact Source Fetch / Raw Capture\n\n")
+              f.write(f"Expected result: `{EXPECTED_RESULT}`\n\n")
+              f.write(f"Rules passed: {summary['rules_passed']} / {summary['rules_total']}\n\n")
+              f.write(f"Failed gates: `{summary['failed_gates']}`\n\n")
+              f.write("Boundary: raw source/table/header/member capture only. No values are normalized into the testing ledger, no covariance values are loaded, no chi-square is computed, and no support claim is allowed.\n\n")
+              f.write("Next route: `v4_406_eboss_raw_source_capture_review_no_values_no_support`\n")
+          
+          # Include raw source text snapshots only for audit provenance, not parsed value ledgers.
+          (OUTDIR / "RAW_OFFICIAL_SDSS_PAGE_TEXT_SNAPSHOT_FOR_HUMAN_REVIEW_NOT_VALUE_LEDGER.txt").write_text(official_text[:20000], encoding="utf-8")
+          (OUTDIR / "RAW_REPOSITORY_ROOT_TEXT_SNAPSHOT_FOR_HUMAN_REVIEW_NOT_VALUE_LEDGER.txt").write_text(strip_html_to_text(repo_text_raw)[:20000], encoding="utf-8")
+          
+          with zipfile.ZipFile(OUTZIP, "w", compression=zipfile.ZIP_DEFLATED) as out:
+              for p in OUTDIR.rglob("*"):
+                  out.write(p, p.as_posix())
+          
+          print(f"version = {VERSION}")
+          print(f"expected_result = {EXPECTED_RESULT}")
+          print(f"rules_passed = {summary['rules_passed']} / {summary['rules_total']}")
+          print(f"failed_gates = {summary['failed_gates']}")
+          print(f"source_fetch_rows = {summary['source_fetch_rows']}")
+          print(f"successful_fetch_rows = {summary['successful_fetch_rows']}")
+          print(f"official_page_capture_rows = {summary['official_page_capture_rows']}")
+          print(f"repository_crawl_page_rows = {summary['repository_crawl_page_rows']}")
+          print(f"repository_member_rows = {summary['repository_member_rows']}")
+          print(f"repository_relevant_member_rows = {summary['repository_relevant_member_rows']}")
+          print(f"ready_for_v4_406_raw_source_review_rows = {summary['ready_for_v4_406_raw_source_review_rows']}")
+          print(f"new_observed_values_loaded = {summary['new_observed_values_loaded']}")
+          print(f"covariance_values_loaded = {summary['covariance_values_loaded']}")
+          print(f"new_chi_square_computed = {summary['new_chi_square_computed']}")
+          print(f"likelihood_computed = {summary['likelihood_computed']}")
+          print(f"p_values_computed = {summary['p_values_computed']}")
+          print(f"score_valid = {summary['score_valid']}")
+          print(f"support_allowed = {summary['support_allowed']}")
+          
+          if failed:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload v4.405 output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-405-eboss-exact-source-fetch-table-header-file-member-capture-no-scoring-no-support-output
+          path: |
+            tairid-v4-405-eboss-exact-source-fetch-table-header-file-member-capture-no-scoring-no-support-output.zip
+            tairid_v4_405_eboss_exact_source_fetch_table_header_file_member_capture_no_support_output/
