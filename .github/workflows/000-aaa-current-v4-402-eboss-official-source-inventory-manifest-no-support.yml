@@ -1,0 +1,373 @@
+name: "!!! AAA CURRENT - TAIRID v4.402 eBOSS official source inventory manifest no support"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-v4-402-eboss-official-source-inventory-manifest-no-support:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run v4.402 eBOSS official source inventory manifest no support
+        shell: bash
+        run: |
+          cat > run_tairid_v4_402_eboss_official_source_inventory_manifest_no_support.py <<'PY'
+
+          import csv
+          import glob
+          import json
+          import os
+          import sys
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          VERSION = "v4.402"
+          ROUTE_NAME = "v4_402_eboss_official_source_inventory_manifest_no_values_no_support_claims"
+          EXPECTED_RESULT = "v4_402_eboss_official_source_inventory_manifest_passed_no_values_no_support_claims"
+          INPUT_VERSION = "v4.401"
+          OUTPUT_DIR = Path("tairid_v4_402_eboss_official_source_inventory_manifest_no_support_output")
+          OUTPUT_ZIP = Path("tairid-v4-402-eboss-official-source-inventory-manifest-no-values-no-support-output.zip")
+
+          CLAIM_BOUNDARY = (
+              "eBOSS official source inventory manifest only; source candidates may be listed for later human review; "
+              "no new observed values loaded; no covariance values loaded; no new chi-square computed; no likelihood; "
+              "no p-values; score_valid remains false; support_allowed remains false; no support claims"
+          )
+
+          def fail(msg):
+              print(f"FAILED: {msg}")
+              raise SystemExit(1)
+
+          def find_input_zip():
+              pats = [
+                  "tairid-v4-401-broader-source-expansion-review-ingest-no-values-no-support-output*.zip",
+                  "*v4-401*source-expansion-review-ingest*no-values*no-support*.zip",
+                  "*v4_401*source_expansion_review_ingest*no_values*no_support*.zip",
+              ]
+              hits = []
+              for pat in pats:
+                  hits.extend(glob.glob(pat))
+              hits = sorted(set(hits), key=lambda p: os.path.getmtime(p), reverse=True)
+              if not hits:
+                  fail("Could not find v4.401 review ingest output zip in repo root.")
+              return Path(hits[0])
+
+          def read_zip_member_text(zf, suffix):
+              matches = [n for n in zf.namelist() if n.endswith(suffix)]
+              if not matches:
+                  fail(f"Missing required member ending with {suffix}")
+              # prefer the deepest/non-self member if duplicates exist
+              matches = sorted(matches, key=lambda n: (n.count("/"), len(n)), reverse=True)
+              return zf.read(matches[0]).decode("utf-8")
+
+          def read_zip_csv(zf, suffix):
+              import io
+              return list(csv.DictReader(io.StringIO(read_zip_member_text(zf, suffix))))
+
+          def read_zip_json(zf, suffix):
+              return json.loads(read_zip_member_text(zf, suffix))
+
+          def bool_false(v):
+              if isinstance(v, bool):
+                  return v is False
+              s = str(v).strip().lower()
+              return s in ("false", "0", "0.0", "no", "")
+
+          def write_csv(path, rows, fieldnames=None):
+              path = Path(path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              if fieldnames is None:
+                  fieldnames = list(rows[0].keys()) if rows else []
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow(r)
+
+          def make_rows(summary, approved):
+              manifest_rows = []
+              review_rows = []
+              requirement_rows = []
+              route_rows = []
+              gap_rows = []
+              limit_rows = []
+
+              # Stable, non-value source candidates. These are locator notes, not loaded measurements.
+              source_roles = [
+                  (
+                      "observed_value_source",
+                      "official/public paper table or data-release table containing eBOSS tracer f_sigma8 result",
+                      "redshift; observed f_sigma8; uncertainty definition; citation/provenance",
+                      "human must confirm exact table/file before any value loading",
+                  ),
+                  (
+                      "covariance_or_uncertainty_source",
+                      "official/public covariance, likelihood, chain, or uncertainty documentation for the same tracer",
+                      "covariance availability; diagonal uncertainty; correlation handling; exact definition",
+                      "human must confirm covariance status before any scoring",
+                  ),
+                  (
+                      "observable_definition_source",
+                      "official/public documentation that defines observable family and parameterization",
+                      "whether result is f_sigma8, fsig8, or requires conversion/parking",
+                      "human must confirm definition match before any value loading",
+                  ),
+              ]
+
+              locator_by_tracer = {
+                  "LRG": {
+                      "source_family_label": "eBOSS DR16 LRG RSD/BAO consensus products",
+                      "candidate_locator": "SDSS/eBOSS DR16 public cosmology papers and data products for LRG consensus clustering, RSD/BAO, and covariance/likelihood material",
+                      "preferred_next_action": "review LRG official paper table and matching public covariance/likelihood data product",
+                  },
+                  "ELG": {
+                      "source_family_label": "eBOSS DR16 ELG RSD/BAO consensus products",
+                      "candidate_locator": "SDSS/eBOSS DR16 public cosmology papers and data products for ELG clustering, RSD/BAO, and covariance/likelihood material",
+                      "preferred_next_action": "review ELG official paper table and matching public covariance/likelihood data product",
+                  },
+                  "QSO": {
+                      "source_family_label": "eBOSS DR16 QSO RSD/BAO consensus products",
+                      "candidate_locator": "SDSS/eBOSS DR16 public cosmology papers and data products for quasar clustering, RSD/BAO, and covariance/likelihood material",
+                      "preferred_next_action": "review QSO official paper table and matching public covariance/likelihood data product",
+                  },
+              }
+
+              approved_sorted = sorted(approved, key=lambda r: int(str(r.get("priority", "999")).strip() or 999))
+
+              for i, r in enumerate(approved_sorted, start=1):
+                  fam = r["candidate_family"]
+                  tracer = r["tracer_or_sample_family"]
+                  loc = locator_by_tracer.get(tracer, locator_by_tracer["LRG"])
+                  review_rows.append({
+                      "v4_402_review_id": f"V4_402_REVIEW_{i:03d}",
+                      "selected_family": fam,
+                      "survey_or_release_family": r["survey_or_release_family"],
+                      "tracer_or_sample_family": tracer,
+                      "source_family_label": loc["source_family_label"],
+                      "candidate_locator": loc["candidate_locator"],
+                      "preferred_next_action": loc["preferred_next_action"],
+                      "human_exact_source_decision": "",
+                      "human_exact_source_notes": "",
+                      "approve_for_source_candidate_staging_now": "",
+                      "observed_values_to_load_now": False,
+                      "covariance_values_to_load_now": False,
+                      "new_chi_square_computed": False,
+                      "score_valid": False,
+                      "support_allowed": False,
+                      "claim_boundary": CLAIM_BOUNDARY,
+                  })
+                  for j, (role, source_description, must_confirm, blocked_now) in enumerate(source_roles, start=1):
+                      idx = (i - 1) * len(source_roles) + j
+                      manifest_rows.append({
+                          "v4_402_source_candidate_id": f"V4_402_SOURCE_{idx:03d}",
+                          "selected_family": fam,
+                          "survey_or_release_family": r["survey_or_release_family"],
+                          "tracer_or_sample_family": tracer,
+                          "source_role": role,
+                          "source_family_label": loc["source_family_label"],
+                          "candidate_locator": loc["candidate_locator"],
+                          "source_description": source_description,
+                          "must_confirm_before_values": must_confirm,
+                          "blocked_now": blocked_now,
+                          "values_loaded_now": False,
+                          "covariance_values_loaded_now": False,
+                          "new_chi_square_computed": False,
+                          "likelihood_computed": False,
+                          "p_values_computed": False,
+                          "score_valid": False,
+                          "support_allowed": False,
+                      })
+                      requirement_rows.append({
+                          "v4_402_requirement_id": f"V4_402_REQ_{idx:03d}",
+                          "selected_family": fam,
+                          "tracer_or_sample_family": tracer,
+                          "requirement_type": role,
+                          "requirement": must_confirm,
+                          "values_loaded_now": False,
+                          "support_allowed": False,
+                      })
+
+              route_rows = [
+                  {"status_id": "V4_402_STATUS_001", "status": "official_source_inventory_manifest_created", "detail": "eBOSS LRG, ELG, and QSO official source inventory candidates were staged for human review only."},
+                  {"status_id": "V4_402_STATUS_002", "status": "values_still_blocked", "detail": "No observed values or covariance values were loaded in v4.402."},
+                  {"status_id": "V4_402_STATUS_003", "status": "next_route_selected", "detail": "v4.403 source candidate review / accepted-source staging is the next gate."},
+                  {"status_id": "V4_402_STATUS_004", "status": "support_still_blocked", "detail": "support_allowed=false remains active."},
+              ]
+              gap_rows = [
+                  {"gap_id": "V4_402_GAP_001", "gap": "Human review must identify/approve exact eBOSS source files or paper tables.", "status_after_v4_402": "selected_next", "next_gate": "v4_403_source_candidate_review_accepted_source_staging"},
+                  {"gap_id": "V4_402_GAP_002", "gap": "Observed eBOSS values remain unloaded.", "status_after_v4_402": "still_blocked", "next_gate": "later_after_source_candidate_acceptance"},
+                  {"gap_id": "V4_402_GAP_003", "gap": "Covariance availability and definition matching remain unconfirmed.", "status_after_v4_402": "still_open", "next_gate": "v4_403_then_v4_404_availability_gate"},
+                  {"gap_id": "V4_402_GAP_004", "gap": "No broader scientific support claim is permitted.", "status_after_v4_402": "still_blocked", "next_gate": "no_support_claims_allowed"},
+              ]
+              limit_rows = [
+                  {"limit_id": "V4_402_LIMIT_001", "limit": "This is an official source inventory manifest only, not a numeric source test.", "status": "active_limit"},
+                  {"limit_id": "V4_402_LIMIT_002", "limit": "Source rows are locator candidates and review requirements, not loaded observed values.", "status": "active_limit"},
+                  {"limit_id": "V4_402_LIMIT_003", "limit": "No observed values or covariance values are loaded in v4.402.", "status": "blocked_by_design"},
+                  {"limit_id": "V4_402_LIMIT_004", "limit": "No chi-square, likelihood, p-values, score validation, or support claim is allowed.", "status": "blocked_by_design"},
+              ]
+              return manifest_rows, review_rows, requirement_rows, route_rows, gap_rows, limit_rows
+
+          def main():
+              input_zip = find_input_zip()
+              print(f"Using input zip: {input_zip}")
+
+              with zipfile.ZipFile(input_zip, "r") as zf:
+                  summary_401 = read_zip_json(zf, "v4_401_summary.json")
+                  approved = read_zip_csv(zf, "v4_401_APPROVED_eboss_source_inventory_candidates_NO_VALUES_NO_SUPPORT.csv")
+
+              rules = []
+              def gate(name, passed):
+                  rules.append({"gate": name, "passed": bool(passed)})
+
+              gate("input_401_zip_found", input_zip.exists())
+              gate("input_401_summary_version_correct", summary_401.get("version") == "v4.401")
+              gate("input_401_expected_result_correct", summary_401.get("expected_result") == "v4_401_broader_source_expansion_review_ingest_passed_eboss_lrg_elg_qso_selected_no_values_no_support_claims")
+              gate("input_401_rules_all_passed", summary_401.get("failed_gates") == "none" and int(summary_401.get("rules_passed", 0)) == int(summary_401.get("rules_total", -1)))
+              gate("input_401_selected_route_is_v4_402", summary_401.get("selected_next_route") == ROUTE_NAME)
+              gate("input_401_selected_lane_eboss", summary_401.get("selected_first_expansion_lane") == "eBOSS_LRG_ELG_QSO")
+              gate("input_401_no_observed_values_loaded", bool_false(summary_401.get("new_observed_values_loaded")))
+              gate("input_401_no_covariance_values_loaded", bool_false(summary_401.get("covariance_values_loaded")))
+              gate("input_401_no_new_chi_square", bool_false(summary_401.get("new_chi_square_computed")))
+              gate("input_401_no_likelihood", bool_false(summary_401.get("likelihood_computed")))
+              gate("input_401_no_p_values", bool_false(summary_401.get("p_values_computed")))
+              gate("input_401_score_valid_false", bool_false(summary_401.get("score_valid")))
+              gate("input_401_support_allowed_false", bool_false(summary_401.get("support_allowed")))
+              gate("approved_source_inventory_rows_equal_3", len(approved) == 3)
+
+              approved_tracers = sorted({r.get("tracer_or_sample_family") for r in approved})
+              gate("approved_tracers_are_lrg_elg_qso", approved_tracers == ["ELG", "LRG", "QSO"])
+              gate("approved_all_source_inventory_only", all(r.get("inventory_target") == "official_public_source_and_covariance_availability_only" for r in approved))
+              gate("approved_no_values_to_load_now", all(bool_false(r.get("observed_values_to_load_now")) for r in approved))
+              gate("approved_no_covariance_to_load_now", all(bool_false(r.get("covariance_values_to_load_now")) for r in approved))
+              gate("approved_support_false", all(bool_false(r.get("support_allowed")) for r in approved))
+
+              manifest_rows, review_rows, requirement_rows, route_rows, gap_rows, limit_rows = make_rows(summary_401, approved)
+
+              gate("official_source_manifest_rows_equal_9", len(manifest_rows) == 9)
+              gate("source_review_packet_rows_equal_3", len(review_rows) == 3)
+              gate("source_inventory_requirement_rows_equal_9", len(requirement_rows) == 9)
+              gate("source_roles_cover_three_per_tracer", all(
+                  len([r for r in manifest_rows if r["tracer_or_sample_family"] == tracer]) == 3
+                  for tracer in ["LRG", "ELG", "QSO"]
+              ))
+              gate("review_packet_has_three_tracers", sorted({r["tracer_or_sample_family"] for r in review_rows}) == ["ELG", "LRG", "QSO"])
+              gate("manifest_values_loaded_false", all(bool_false(r["values_loaded_now"]) for r in manifest_rows))
+              gate("manifest_covariance_loaded_false", all(bool_false(r["covariance_values_loaded_now"]) for r in manifest_rows))
+              gate("manifest_no_new_chi_square", all(bool_false(r["new_chi_square_computed"]) for r in manifest_rows))
+              gate("manifest_no_likelihood", all(bool_false(r["likelihood_computed"]) for r in manifest_rows))
+              gate("manifest_no_p_values", all(bool_false(r["p_values_computed"]) for r in manifest_rows))
+              gate("manifest_score_valid_false", all(bool_false(r["score_valid"]) for r in manifest_rows))
+              gate("manifest_support_allowed_false", all(bool_false(r["support_allowed"]) for r in manifest_rows))
+              gate("review_no_values_to_load_now", all(bool_false(r["observed_values_to_load_now"]) for r in review_rows))
+              gate("review_no_covariance_to_load_now", all(bool_false(r["covariance_values_to_load_now"]) for r in review_rows))
+              gate("review_no_new_chi_square", all(bool_false(r["new_chi_square_computed"]) for r in review_rows))
+              gate("review_score_valid_false", all(bool_false(r["score_valid"]) for r in review_rows))
+              gate("review_support_allowed_false", all(bool_false(r["support_allowed"]) for r in review_rows))
+              gate("route_rows_equal_4", len(route_rows) == 4)
+              gate("gap_rows_equal_4", len(gap_rows) == 4)
+              gate("limitations_rows_equal_4", len(limit_rows) == 4)
+
+              summary = {
+                  "version": VERSION,
+                  "route_name": ROUTE_NAME,
+                  "expected_result": EXPECTED_RESULT,
+                  "input_version": INPUT_VERSION,
+                  "created_utc": datetime.now(timezone.utc).isoformat(),
+                  "rules_passed": sum(1 for r in rules if r["passed"]),
+                  "rules_total": len(rules),
+                  "failed_gates": "none",
+                  "approved_eboss_lane_rows": len(approved),
+                  "official_source_manifest_rows": len(manifest_rows),
+                  "source_review_packet_rows": len(review_rows),
+                  "source_inventory_requirement_rows": len(requirement_rows),
+                  "eboss_lrg_source_manifest_rows": len([r for r in manifest_rows if r["tracer_or_sample_family"] == "LRG"]),
+                  "eboss_elg_source_manifest_rows": len([r for r in manifest_rows if r["tracer_or_sample_family"] == "ELG"]),
+                  "eboss_qso_source_manifest_rows": len([r for r in manifest_rows if r["tracer_or_sample_family"] == "QSO"]),
+                  "prior_guarded_diagonal_chi_square_sum": summary_401.get("prior_guarded_diagonal_chi_square_sum"),
+                  "primary_dM_Hz_chi_square_dry_run_sum": summary_401.get("primary_dM_Hz_chi_square_dry_run_sum"),
+                  "robustness_min_chi_square": summary_401.get("robustness_min_chi_square"),
+                  "robustness_max_chi_square": summary_401.get("robustness_max_chi_square"),
+                  "robustness_chi_square_range_width": summary_401.get("robustness_chi_square_range_width"),
+                  "new_observed_values_loaded": False,
+                  "covariance_values_loaded": False,
+                  "new_chi_square_computed": False,
+                  "likelihood_computed": False,
+                  "p_values_computed": False,
+                  "score_valid": False,
+                  "support_allowed": False,
+                  "claim_boundary": CLAIM_BOUNDARY,
+                  "selected_next_route": "v4_403_eboss_source_candidate_review_and_accepted_source_staging_no_values_no_support_claims",
+              }
+
+              # Rule for summary consistency after it exists
+              gate("summary_no_observed_values_loaded", summary["new_observed_values_loaded"] is False)
+              gate("summary_no_covariance_values_loaded", summary["covariance_values_loaded"] is False)
+              gate("summary_no_new_chi_square", summary["new_chi_square_computed"] is False)
+              gate("summary_no_likelihood", summary["likelihood_computed"] is False)
+              gate("summary_no_p_values", summary["p_values_computed"] is False)
+              gate("summary_score_valid_false", summary["score_valid"] is False)
+              gate("summary_support_allowed_false", summary["support_allowed"] is False)
+              gate("selected_next_route_is_v4_403", summary["selected_next_route"] == "v4_403_eboss_source_candidate_review_and_accepted_source_staging_no_values_no_support_claims")
+
+              # update summary counts after final gate additions
+              summary["rules_passed"] = sum(1 for r in rules if r["passed"])
+              summary["rules_total"] = len(rules)
+              failed = [r["gate"] for r in rules if not r["passed"]]
+              summary["failed_gates"] = "none" if not failed else "|".join(failed)
+
+              if OUTPUT_DIR.exists():
+                  import shutil
+                  shutil.rmtree(OUTPUT_DIR)
+              OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+              write_csv(OUTPUT_DIR / "v4_402_eboss_official_source_inventory_manifest_NO_VALUES_NO_SUPPORT.csv", manifest_rows)
+              write_csv(OUTPUT_DIR / "v4_402_HUMAN_FILL_eboss_source_candidate_review_NO_VALUES_NO_SUPPORT.csv", review_rows)
+              write_csv(OUTPUT_DIR / "v4_402_next_gate_exact_source_requirements_NO_VALUES_NO_SUPPORT.csv", requirement_rows)
+              write_csv(OUTPUT_DIR / "v4_402_route_status_summary.csv", route_rows)
+              write_csv(OUTPUT_DIR / "v4_402_gap_status_after_source_inventory_manifest.csv", gap_rows)
+              write_csv(OUTPUT_DIR / "v4_402_limitations_after_source_inventory_manifest.csv", limit_rows)
+              write_csv(OUTPUT_DIR / "v4_402_rule_checks.csv", rules)
+
+              with (OUTPUT_DIR / "v4_402_summary.json").open("w", encoding="utf-8") as f:
+                  json.dump(summary, f, indent=2)
+              with (OUTPUT_DIR / "v4_402_summary.md").open("w", encoding="utf-8") as f:
+                  f.write(f"# {VERSION} eBOSS official source inventory manifest\n\n")
+                  f.write(f"Expected result: `{EXPECTED_RESULT}`\n\n")
+                  f.write(f"Rules: {summary['rules_passed']} / {summary['rules_total']} passed\n\n")
+                  f.write(f"Failed gates: `{summary['failed_gates']}`\n\n")
+                  f.write("This packet stages official eBOSS LRG/ELG/QSO source inventory candidates for human review only. ")
+                  f.write("It loads no observed values, no covariance values, computes no chi-square, and permits no support claims.\n")
+
+              if OUTPUT_ZIP.exists():
+                  OUTPUT_ZIP.unlink()
+              with zipfile.ZipFile(OUTPUT_ZIP, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(OUTPUT_DIR.rglob("*")):
+                      z.write(p, p.as_posix())
+
+              print(json.dumps(summary, indent=2))
+              print(f"WROTE {OUTPUT_ZIP}")
+
+              if failed:
+                  fail("Rule checks failed: " + ", ".join(failed))
+
+          if __name__ == "__main__":
+              main()
+
+          PY
+          python run_tairid_v4_402_eboss_official_source_inventory_manifest_no_support.py
+
+      - name: Upload v4.402 eBOSS official source inventory manifest no support output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-402-eboss-official-source-inventory-manifest-no-values-no-support-output
+          path: |
+            tairid-v4-402-eboss-official-source-inventory-manifest-no-values-no-support-output.zip
+            tairid_v4_402_eboss_official_source_inventory_manifest_no_support_output/**
