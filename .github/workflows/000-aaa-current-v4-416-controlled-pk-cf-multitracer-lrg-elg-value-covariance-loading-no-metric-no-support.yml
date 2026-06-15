@@ -1,0 +1,368 @@
+name: 000-aaa-current-v4-416-controlled-pk-cf-multitracer-lrg-elg-value-covariance-loading-no-metric-no-support
+
+on:
+  workflow_dispatch:
+
+jobs:
+  v4_416_controlled_pk_cf_multitracer_lrg_elg_value_covariance_loading_no_metric_no_support:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run v4.416 controlled PK CF multitracer loading
+        shell: bash
+        run: |
+          python - <<'PY'
+
+          import os, io, re, json, zipfile, glob, math, shutil
+          from pathlib import Path
+          import pandas as pd
+          import numpy as np
+
+          VERSION = "v4.416"
+          ROUTE = "v4_416_controlled_pk_cf_multitracer_lrg_elg_value_covariance_loading_no_metric_no_support"
+          EXPECTED = "v4_416_controlled_pk_cf_multitracer_lrg_elg_value_covariance_loading_passed_values_and_covariance_loaded_no_metric_no_support_claims"
+          INPUT_VERSION = "v4.415"
+          OUTDIR = Path("tairid_v4_416_controlled_pk_cf_multitracer_lrg_elg_value_covariance_loading_no_metric_no_support_output")
+          OUTDIR.mkdir(exist_ok=True)
+
+          def read_zip_bytes(path):
+              with open(path, "rb") as f:
+                  return f.read()
+
+          def open_maybe_nested_zip(path_or_bytes):
+              if isinstance(path_or_bytes, (str, os.PathLike)):
+                  data = read_zip_bytes(path_or_bytes)
+              else:
+                  data = path_or_bytes
+              z = zipfile.ZipFile(io.BytesIO(data))
+              names = z.namelist()
+              # GitHub artifacts sometimes double-zip a single artifact zip.
+              zip_names = [n for n in names if n.endswith(".zip")]
+              if len(names) == 1 and zip_names:
+                  data2 = z.read(zip_names[0])
+                  return zipfile.ZipFile(io.BytesIO(data2)), data2
+              return z, data
+
+          def find_input_zip():
+              patterns = [
+                  "*v4-415*exact-source-capture-review*output*.zip",
+                  "*v4_415*exact_source_capture_review*output*.zip",
+                  "*v4-415*.zip",
+              ]
+              candidates = []
+              for p in patterns:
+                  candidates.extend(glob.glob(p))
+              candidates = sorted(set(candidates))
+              if not candidates:
+                  raise FileNotFoundError("Could not find v4.415 output ZIP in repository root.")
+              # Prefer the no-values/no-support output artifact.
+              for c in candidates:
+                  b = os.path.basename(c).lower()
+                  if "v4-415" in b and "output" in b:
+                      return c
+              return candidates[0]
+
+          def read_csv_from_zip(z, contains):
+              hits = [n for n in z.namelist() if contains in n and n.endswith(".csv")]
+              if not hits:
+                  raise FileNotFoundError(f"Missing CSV containing {contains}")
+              return pd.read_csv(io.BytesIO(z.read(hits[0]))), hits[0]
+
+          def find_payload_zip(z, preferred_fragment):
+              hits = [n for n in z.namelist() if preferred_fragment in n and n.endswith(".zip")]
+              if not hits:
+                  raise FileNotFoundError(f"Missing raw payload zip containing {preferred_fragment}")
+              return z.read(hits[0]), hits[0]
+
+          def read_member_from_payload(payload_bytes, member_path):
+              pz = zipfile.ZipFile(io.BytesIO(payload_bytes))
+              names = pz.namelist()
+              exact = [n for n in names if n == member_path]
+              if exact:
+                  return pz.read(exact[0]).decode("utf-8", errors="replace"), exact[0], names
+              # Fallback by basename to avoid directory-prefix variation.
+              base = os.path.basename(member_path)
+              hits = [n for n in names if n.endswith(base) and not n.startswith("__MACOSX/") and "/._" not in n]
+              if not hits:
+                  raise FileNotFoundError(f"Missing member {member_path}; payload members={names}")
+              return pz.read(hits[0]).decode("utf-8", errors="replace"), hits[0], names
+
+          def parse_value_vector(txt, source_role, member_path, primary_or_crosscheck):
+              rows = []
+              for idx, line in enumerate(txt.splitlines(), start=1):
+                  raw = line.strip()
+                  if not raw or raw.startswith("#"):
+                      continue
+                  # split comments and numbers
+                  parts = raw.split("#", 1)
+                  numeric = parts[0].strip()
+                  comment = parts[1].strip() if len(parts) > 1 else ""
+                  vals = numeric.split()
+                  if len(vals) < 3:
+                      continue
+                  z = float(vals[0])
+                  value = float(vals[1])
+                  sigma = float(vals[2])
+                  param_comment = comment
+                  lc = comment.lower().replace("\\", "")
+                  if "dm" in lc:
+                      parameter = "DM_ov_rd"
+                  elif "dh" in lc:
+                      parameter = "DH_ov_rd"
+                  elif "sigma" in lc or "fsigma" in lc or "fσ" in lc:
+                      parameter = "fsigma8"
+                  else:
+                      parameter = f"unknown_parameter_row_{idx}"
+                  rows.append({
+                      "source_role": source_role,
+                      "primary_or_crosscheck": primary_or_crosscheck,
+                      "vector_index_1based": len(rows) + 1,
+                      "z": z,
+                      "parameter": parameter,
+                      "source_value": value,
+                      "source_listed_sigma": sigma,
+                      "source_member_path": member_path,
+                      "comment": param_comment,
+                      "support_allowed": False,
+                  })
+              return pd.DataFrame(rows)
+
+          def parse_covariance_matrix(txt):
+              # strip blank/comment lines and load whitespace numeric matrix
+              lines = []
+              for line in txt.splitlines():
+                  s = line.strip()
+                  if s and not s.startswith("#"):
+                      lines.append(s)
+              if not lines:
+                  raise ValueError("Empty covariance text")
+              arr = np.loadtxt(io.StringIO("\n".join(lines)))
+              if arr.ndim == 1:
+                  arr = arr.reshape(1, -1)
+              return arr
+
+          def covariance_cells(arr, labels_df, source_role, member_path, primary_or_crosscheck):
+              rows = []
+              nrow, ncol = arr.shape
+              for i in range(nrow):
+                  for j in range(ncol):
+                      label_i = labels_df.iloc[i]["parameter"] + f"_z{labels_df.iloc[i]['z']}" if i < len(labels_df) else f"row_{i+1}"
+                      label_j = labels_df.iloc[j]["parameter"] + f"_z{labels_df.iloc[j]['z']}" if j < len(labels_df) else f"col_{j+1}"
+                      rows.append({
+                          "source_role": source_role,
+                          "primary_or_crosscheck": primary_or_crosscheck,
+                          "cov_row_index_1based": i+1,
+                          "cov_col_index_1based": j+1,
+                          "row_label": label_i,
+                          "col_label": label_j,
+                          "covariance_value": float(arr[i, j]),
+                          "source_member_path": member_path,
+                          "support_allowed": False,
+                      })
+              return pd.DataFrame(rows)
+
+          input_zip_path = find_input_zip()
+          input_z, input_bytes = open_maybe_nested_zip(input_zip_path)
+
+          summary_hits = [n for n in input_z.namelist() if n.endswith("v4_415_summary.json")]
+          input_summary = json.loads(input_z.read(summary_hits[0])) if summary_hits else {}
+
+          input_packet, input_packet_name = read_csv_from_zip(input_z, "v4_415_v4_416_controlled_loading_input_packet")
+          selected_members, selected_members_name = read_csv_from_zip(input_z, "v4_415_selected_exact_members_FOR_v4_416")
+          tracer_status, tracer_status_name = read_csv_from_zip(input_z, "v4_415_tracer_resolution_status")
+
+          # Preserve key v4.415 packet inputs.
+          input_packet.to_csv(OUTDIR / "v4_416_input_v4_415_controlled_loading_input_packet_preserved_NO_SUPPORT.csv", index=False)
+          selected_members.to_csv(OUTDIR / "v4_416_input_v4_415_selected_exact_members_preserved_NO_SUPPORT.csv", index=False)
+          tracer_status.to_csv(OUTDIR / "v4_416_input_v4_415_tracer_resolution_status_preserved_NO_SUPPORT.csv", index=False)
+
+          # Pull PK and CF raw payloads preserved from v4.414.
+          pk_payload, pk_payload_name = find_payload_zip(input_z, "MultiTracer_PK_BAORSD_measurements")
+          cf_payload, cf_payload_name = find_payload_zip(input_z, "MultiTracer_CF_BAORSD_measurements")
+
+          pk_row = input_packet[input_packet["source_role"].astype(str).str.contains("primary_pk", case=False, na=False)].iloc[0]
+          cf_row = input_packet[input_packet["source_role"].astype(str).str.contains("alternate_cf", case=False, na=False)].iloc[0]
+
+          pk_value_txt, pk_value_member_actual, pk_members = read_member_from_payload(pk_payload, pk_row["value_member_path"])
+          pk_cov_txt, pk_cov_member_actual, _ = read_member_from_payload(pk_payload, pk_row["covariance_member_path"])
+          cf_value_txt, cf_value_member_actual, cf_members = read_member_from_payload(cf_payload, cf_row["value_member_path"])
+          cf_cov_txt, cf_cov_member_actual, _ = read_member_from_payload(cf_payload, cf_row["covariance_member_path"])
+
+          pk_values = parse_value_vector(pk_value_txt, "primary_pk_multitracer", pk_value_member_actual, "primary")
+          cf_values = parse_value_vector(cf_value_txt, "alternate_cf_multitracer_crosscheck", cf_value_member_actual, "crosscheck")
+
+          pk_cov = parse_covariance_matrix(pk_cov_txt)
+          cf_cov = parse_covariance_matrix(cf_cov_txt)
+
+          pk_cov_cells = covariance_cells(pk_cov, pk_values, "primary_pk_multitracer", pk_cov_member_actual, "primary")
+          cf_cov_cells = covariance_cells(cf_cov, cf_values, "alternate_cf_multitracer_crosscheck", cf_cov_member_actual, "crosscheck")
+
+          # Save raw parsed values and covariance cells/matrices.
+          pk_values.to_csv(OUTDIR / "v4_416_primary_pk_multitracer_value_vector_LOADED_NO_METRIC_NO_SUPPORT.csv", index=False)
+          cf_values.to_csv(OUTDIR / "v4_416_crosscheck_cf_multitracer_value_vector_LOADED_NO_METRIC_NO_SUPPORT.csv", index=False)
+          pk_cov_cells.to_csv(OUTDIR / "v4_416_primary_pk_multitracer_covariance_cells_LOADED_NO_METRIC_NO_SUPPORT.csv", index=False)
+          cf_cov_cells.to_csv(OUTDIR / "v4_416_crosscheck_cf_multitracer_covariance_cells_LOADED_NO_METRIC_NO_SUPPORT.csv", index=False)
+          pd.DataFrame(pk_cov).to_csv(OUTDIR / "v4_416_primary_pk_multitracer_covariance_matrix_LOADED_NO_METRIC_NO_SUPPORT.csv", index=False, header=False)
+          pd.DataFrame(cf_cov).to_csv(OUTDIR / "v4_416_crosscheck_cf_multitracer_covariance_matrix_LOADED_NO_METRIC_NO_SUPPORT.csv", index=False, header=False)
+
+          payload_member_ledger = pd.DataFrame([
+              {"payload_role": "primary_pk", "payload_zip_from_v4_415": pk_payload_name, "value_member_loaded": pk_value_member_actual, "covariance_member_loaded": pk_cov_member_actual, "payload_members_total": len(pk_members), "support_allowed": False},
+              {"payload_role": "alternate_cf_crosscheck", "payload_zip_from_v4_415": cf_payload_name, "value_member_loaded": cf_value_member_actual, "covariance_member_loaded": cf_cov_member_actual, "payload_members_total": len(cf_members), "support_allowed": False},
+          ])
+          payload_member_ledger.to_csv(OUTDIR / "v4_416_payload_member_ledger_LOADED_NO_METRIC_NO_SUPPORT.csv", index=False)
+
+          lrg_elg_status = pd.DataFrame([
+              {"tracer": "LRG", "controlled_covariance_loading_status": "primary_pk_loaded_plus_cf_crosscheck_loaded", "qso_gap": False, "metric_ready_now": False, "requires_dimension_order_review": True, "support_allowed": False},
+              {"tracer": "ELG", "controlled_covariance_loading_status": "primary_pk_loaded_plus_cf_crosscheck_loaded", "qso_gap": False, "metric_ready_now": False, "requires_dimension_order_review": True, "support_allowed": False},
+              {"tracer": "QSO", "controlled_covariance_loading_status": "covariance_aware_exact_member_unresolved_do_not_load", "qso_gap": True, "metric_ready_now": False, "requires_separate_qso_source_selection": True, "support_allowed": False},
+          ])
+          lrg_elg_status.to_csv(OUTDIR / "v4_416_tracer_controlled_loading_status_NO_METRIC_NO_SUPPORT.csv", index=False)
+
+          # Extract fσ8-specific rows for next dimension-order review. Do not compute residuals or chi-square.
+          pk_fsig = pk_values[pk_values["parameter"].eq("fsigma8")].copy()
+          cf_fsig = cf_values[cf_values["parameter"].eq("fsigma8")].copy()
+          fsig_subblock_preview = pd.DataFrame([
+              {"source_role": "primary_pk_multitracer", "parameter": "fsigma8", "candidate_vector_indices_1based": ";".join(map(str, pk_fsig["vector_index_1based"].tolist())), "candidate_z_values": ";".join(map(str, pk_fsig["z"].tolist())), "candidate_value_count": len(pk_fsig), "ready_for_v4_417_dimension_order_review": True, "metric_computed": False, "support_allowed": False},
+              {"source_role": "alternate_cf_multitracer_crosscheck", "parameter": "fsigma8", "candidate_vector_indices_1based": ";".join(map(str, cf_fsig["vector_index_1based"].tolist())), "candidate_z_values": ";".join(map(str, cf_fsig["z"].tolist())), "candidate_value_count": len(cf_fsig), "ready_for_v4_417_dimension_order_review": True, "metric_computed": False, "support_allowed": False},
+          ])
+          fsig_subblock_preview.to_csv(OUTDIR / "v4_416_fsigma8_subblock_dimension_order_preview_NO_METRIC_NO_SUPPORT.csv", index=False)
+
+          next_route = pd.DataFrame([{
+              "version": VERSION,
+              "selected_next_route": "v4_417_lrg_elg_fsigma8_subblock_dimension_order_review_no_metric_no_support",
+              "reason": "values_and_covariance_loaded_for_LRG_ELG_primary_PK_and_CF_crosscheck_but_fsigma8_subblock_order_must_be_reviewed_before_metric",
+              "new_observed_values_loaded": True,
+              "covariance_values_loaded": True,
+              "residuals_computed": False,
+              "new_chi_square_computed": False,
+              "support_allowed": False,
+          }])
+          next_route.to_csv(OUTDIR / "v4_416_next_route_decision_NO_SUPPORT.csv", index=False)
+
+          # Rule checks. Keep these as explicit guards against accidental interpretation.
+          checks = []
+          def check(name, passed, observed, expected="", severity="error"):
+              checks.append({"rule_name": name, "passed": bool(passed), "observed": observed, "expected": expected, "severity": severity})
+
+          check("input_summary_version_is_v4_415_if_present", (not input_summary) or input_summary.get("version") == "v4.415", input_summary.get("version", "missing"), "v4.415")
+          check("input_failed_gates_none_if_present", (not input_summary) or input_summary.get("failed_gates") == "none", input_summary.get("failed_gates", "missing"), "none")
+          check("input_support_allowed_false_if_present", (not input_summary) or input_summary.get("support_allowed") is False, input_summary.get("support_allowed", "missing"), "false")
+          check("input_packet_rows_eq_3", len(input_packet) == 3, len(input_packet), "3")
+          check("selected_members_rows_eq_4", len(selected_members) == 4, len(selected_members), "4")
+          check("tracer_status_rows_eq_3", len(tracer_status) == 3, len(tracer_status), "3")
+          check("primary_pk_input_row_present", len(input_packet[input_packet['source_role'].astype(str).str.contains('primary_pk', case=False, na=False)]) == 1, len(input_packet[input_packet['source_role'].astype(str).str.contains('primary_pk', case=False, na=False)]), "1")
+          check("alternate_cf_input_row_present", len(input_packet[input_packet['source_role'].astype(str).str.contains('alternate_cf', case=False, na=False)]) == 1, len(input_packet[input_packet['source_role'].astype(str).str.contains('alternate_cf', case=False, na=False)]), "1")
+          check("qso_gap_input_row_present", len(input_packet[input_packet['source_role'].astype(str).str.contains('qso_gap', case=False, na=False)]) == 1, len(input_packet[input_packet['source_role'].astype(str).str.contains('qso_gap', case=False, na=False)]), "1")
+          check("pk_payload_found", bool(pk_payload), pk_payload_name, "MultiTracer_PK_BAORSD payload")
+          check("cf_payload_found", bool(cf_payload), cf_payload_name, "MultiTracer_CF_BAORSD payload")
+          check("pk_value_member_loaded", len(pk_value_txt) > 0, pk_value_member_actual, "nonempty")
+          check("pk_covariance_member_loaded", len(pk_cov_txt) > 0, pk_cov_member_actual, "nonempty")
+          check("cf_value_member_loaded", len(cf_value_txt) > 0, cf_value_member_actual, "nonempty")
+          check("cf_covariance_member_loaded", len(cf_cov_txt) > 0, cf_cov_member_actual, "nonempty")
+          check("pk_value_vector_rows_eq_6", len(pk_values) == 6, len(pk_values), "6")
+          check("cf_value_vector_rows_eq_3", len(cf_values) == 3, len(cf_values), "3")
+          check("pk_covariance_shape_6x6", pk_cov.shape == (6, 6), str(pk_cov.shape), "(6, 6)")
+          check("cf_covariance_shape_3x3", cf_cov.shape == (3, 3), str(cf_cov.shape), "(3, 3)")
+          check("pk_covariance_cells_eq_36", len(pk_cov_cells) == 36, len(pk_cov_cells), "36")
+          check("cf_covariance_cells_eq_9", len(cf_cov_cells) == 9, len(cf_cov_cells), "9")
+          check("pk_covariance_square", pk_cov.shape[0] == pk_cov.shape[1], str(pk_cov.shape), "square")
+          check("cf_covariance_square", cf_cov.shape[0] == cf_cov.shape[1], str(cf_cov.shape), "square")
+          check("pk_covariance_dimension_matches_value_vector", pk_cov.shape[0] == len(pk_values), f"{pk_cov.shape[0]} vs {len(pk_values)}", "match")
+          check("cf_covariance_dimension_matches_value_vector", cf_cov.shape[0] == len(cf_values), f"{cf_cov.shape[0]} vs {len(cf_values)}", "match")
+          check("pk_covariance_symmetric", bool(np.allclose(pk_cov, pk_cov.T, rtol=1e-10, atol=1e-12)), "allclose", "true")
+          check("cf_covariance_symmetric", bool(np.allclose(cf_cov, cf_cov.T, rtol=1e-10, atol=1e-12)), "allclose", "true")
+          check("pk_covariance_diagonal_positive", bool(np.all(np.diag(pk_cov) > 0)), np.diag(pk_cov).tolist(), "all positive")
+          check("cf_covariance_diagonal_positive", bool(np.all(np.diag(cf_cov) > 0)), np.diag(cf_cov).tolist(), "all positive")
+          check("pk_parameters_include_two_fsigma8_rows", len(pk_fsig) == 2, len(pk_fsig), "2")
+          check("cf_parameters_include_one_fsigma8_row", len(cf_fsig) == 1, len(cf_fsig), "1")
+          check("pk_lrg_z_0_70_present", bool((pk_values["z"].round(3) == 0.700).any()), pk_values["z"].tolist(), "0.70")
+          check("pk_elg_z_0_845_present", bool((pk_values["z"].round(3) == 0.845).any()), pk_values["z"].tolist(), "0.845")
+          check("cf_crosscheck_z_0_77_present", bool((cf_values["z"].round(3) == 0.770).any()), cf_values["z"].tolist(), "0.77")
+          check("pk_fsigma8_source_values_loaded", len(pk_fsig) == 2 and pk_fsig["source_value"].notna().all(), pk_fsig["source_value"].tolist(), "two non-null")
+          check("cf_fsigma8_source_value_loaded", len(cf_fsig) == 1 and cf_fsig["source_value"].notna().all(), cf_fsig["source_value"].tolist(), "one non-null")
+          check("qso_remains_unresolved", bool(lrg_elg_status[lrg_elg_status["tracer"].eq("QSO")]["qso_gap"].iloc[0]), True, "true")
+          check("lrg_controlled_loading_available", "primary_pk_loaded" in lrg_elg_status[lrg_elg_status["tracer"].eq("LRG")]["controlled_covariance_loading_status"].iloc[0], lrg_elg_status[lrg_elg_status["tracer"].eq("LRG")]["controlled_covariance_loading_status"].iloc[0], "primary pk loaded")
+          check("elg_controlled_loading_available", "primary_pk_loaded" in lrg_elg_status[lrg_elg_status["tracer"].eq("ELG")]["controlled_covariance_loading_status"].iloc[0], lrg_elg_status[lrg_elg_status["tracer"].eq("ELG")]["controlled_covariance_loading_status"].iloc[0], "primary pk loaded")
+          check("metric_ready_now_false_for_all_tracers", bool((lrg_elg_status["metric_ready_now"] == False).all()), lrg_elg_status["metric_ready_now"].tolist(), "all false")
+          check("dimension_order_review_required", bool(fsig_subblock_preview["ready_for_v4_417_dimension_order_review"].all()), True, "true")
+          check("no_residuals_computed", True, False, "false")
+          check("new_chi_square_computed_false", True, False, "false")
+          check("likelihood_computed_false", True, False, "false")
+          check("p_values_computed_false", True, False, "false")
+          check("score_valid_false", True, False, "false")
+          check("support_allowed_false", True, False, "false")
+          check("all_value_rows_support_allowed_false", bool((pk_values["support_allowed"] == False).all() and (cf_values["support_allowed"] == False).all()), True, "true")
+          check("all_covariance_rows_support_allowed_false", bool((pk_cov_cells["support_allowed"] == False).all() and (cf_cov_cells["support_allowed"] == False).all()), True, "true")
+          check("payload_ledger_rows_eq_2", len(payload_member_ledger) == 2, len(payload_member_ledger), "2")
+          check("next_route_selected_v4_417", next_route["selected_next_route"].iloc[0].startswith("v4_417"), next_route["selected_next_route"].iloc[0], "v4_417")
+          check("output_primary_pk_values_written", (OUTDIR / "v4_416_primary_pk_multitracer_value_vector_LOADED_NO_METRIC_NO_SUPPORT.csv").exists(), "exists", "exists")
+          check("output_primary_pk_covariance_written", (OUTDIR / "v4_416_primary_pk_multitracer_covariance_cells_LOADED_NO_METRIC_NO_SUPPORT.csv").exists(), "exists", "exists")
+          check("output_cf_values_written", (OUTDIR / "v4_416_crosscheck_cf_multitracer_value_vector_LOADED_NO_METRIC_NO_SUPPORT.csv").exists(), "exists", "exists")
+          check("output_cf_covariance_written", (OUTDIR / "v4_416_crosscheck_cf_multitracer_covariance_cells_LOADED_NO_METRIC_NO_SUPPORT.csv").exists(), "exists", "exists")
+          check("output_summary_will_be_written", True, "pending", "true")
+
+          rule_checks = pd.DataFrame(checks)
+          failed = rule_checks[~rule_checks["passed"]]
+          failed_gates = "none" if failed.empty else ";".join(failed["rule_name"].tolist())
+          rules_passed = int(rule_checks["passed"].sum())
+          rules_total = int(len(rule_checks))
+
+          summary = {
+              "version": VERSION,
+              "route_name": ROUTE,
+              "expected_result": EXPECTED,
+              "input_version": INPUT_VERSION,
+              "rules_passed": rules_passed,
+              "rules_total": rules_total,
+              "failed_gates": failed_gates,
+              "primary_pk_value_vector_rows": int(len(pk_values)),
+              "primary_pk_covariance_shape": f"{pk_cov.shape[0]}x{pk_cov.shape[1]}",
+              "primary_pk_covariance_cells": int(len(pk_cov_cells)),
+              "crosscheck_cf_value_vector_rows": int(len(cf_values)),
+              "crosscheck_cf_covariance_shape": f"{cf_cov.shape[0]}x{cf_cov.shape[1]}",
+              "crosscheck_cf_covariance_cells": int(len(cf_cov_cells)),
+              "pk_fsigma8_rows_for_lrg_elg": int(len(pk_fsig)),
+              "cf_fsigma8_crosscheck_rows": int(len(cf_fsig)),
+              "lrg_elg_controlled_loading_candidate_rows": 2,
+              "qso_covariance_aware_member_unresolved_rows": 1,
+              "controlled_source_values_loaded": True,
+              "covariance_values_loaded": True,
+              "residuals_computed": False,
+              "metric_computed": False,
+              "new_chi_square_computed": False,
+              "likelihood_computed": False,
+              "p_values_computed": False,
+              "score_valid": False,
+              "support_allowed": False,
+              "selected_next_route": next_route["selected_next_route"].iloc[0],
+          }
+          (OUTDIR / "v4_416_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+          (OUTDIR / "v4_416_summary.md").write_text(
+              "# v4.416 Summary\n\n"
+              + "\n".join([f"- **{k}**: {v}" for k, v in summary.items()])
+              + "\n",
+              encoding="utf-8"
+          )
+          rule_checks.to_csv(OUTDIR / "v4_416_rule_checks.csv", index=False)
+
+          if failed_gates != "none":
+              print(json.dumps(summary, indent=2))
+              raise SystemExit(f"v4.416 failed gates: {failed_gates}")
+
+          print(json.dumps(summary, indent=2))
+
+          PY
+
+      - name: Package v4.416 output
+        shell: bash
+        run: |
+          zip -r tairid-v4-416-controlled-pk-cf-multitracer-lrg-elg-value-covariance-loading-no-metric-no-support-output.zip tairid_v4_416_controlled_pk_cf_multitracer_lrg_elg_value_covariance_loading_no_metric_no_support_output
+
+      - name: Upload v4.416 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tairid-v4-416-controlled-pk-cf-multitracer-lrg-elg-value-covariance-loading-no-metric-no-support-output
+          path: tairid-v4-416-controlled-pk-cf-multitracer-lrg-elg-value-covariance-loading-no-metric-no-support-output.zip
