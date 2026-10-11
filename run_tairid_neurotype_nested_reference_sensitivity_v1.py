@@ -92,7 +92,11 @@ def transform_fold(raw, ids, test_ids, spec, domain):
             masktr = train[context_col] == context
             sample = pd.to_numeric(train.loc[masktr, col], errors="coerce")
             if sample.empty or not np.isfinite(sample).any():
-                raise ValueError(f"{domain}: missing train {context=} {col=}")
+                # The frozen zscore_by_context helper uses 0 when a context
+                # has no finite reference scale. Never inspect heldout values
+                # to fill such a column.
+                full.loc[full[context_col] == context, zcol] = 0.0
+                continue
             mu = float(sample.mean())
             sd = float(sample.std(ddof=0))
             mask = full[context_col] == context
@@ -295,6 +299,7 @@ def main():
         "and stronger external validation before promoting any finding.",
     ]
     (OUT / "sensitivity_summary.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines), flush=True)
     print(json.dumps({"status": envelope["status"],
                       "datasets": [{k:d[k] for k in ["dataset","n_subjects",
                                                      "n_controls","n_cases"]}
