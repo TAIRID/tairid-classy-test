@@ -155,8 +155,8 @@ def transform_fold(raw, ids, test_ids, spec, domain):
 def score_fold(train_rows, test_rows, y_train, columns):
     # Imputation of unavailable features is derived from train only; all
     # columns are fixed by train feature-family existence, not outcomes.
-    xtr = train_rows[columns].apply(pd.to_numeric, errors="coerce").to_numpy(float)
-    xte = test_rows[columns].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    xtr = train_rows[columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float, copy=True)
+    xte = test_rows[columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float, copy=True)
     xtr[~np.isfinite(xtr)] = np.nan
     xte[~np.isfinite(xte)] = np.nan
     mu = np.nanmean(xtr, axis=0)
